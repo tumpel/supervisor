@@ -589,13 +589,18 @@ ExecStopPost=/bin/sh -c 'if [ \"$$EXIT_CODE\" = exited ] && [ \"$$EXIT_STATUS\" 
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=3 5
+NotifyAccess=main
+FileDescriptorStoreMax={descriptors}
+FileDescriptorStorePreserve=yes
+TimeoutStopSec=infinity
 
 [Install]
 WantedBy=default.target
 ",
         rollback = ROLLBACK_SCRIPT.replace('$', "$$"),
         previous = previous.display(),
-        binary = binary.display()
+        binary = binary.display(),
+        descriptors = 3 * MAX_BOXES
     )
 }
 

@@ -6,6 +6,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::signal::unix::Signal;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -22,6 +23,7 @@ use tumpel_channel::{ChannelError, Event, HostChannel, Phase, Port, Signer, HEAR
 use crate::boot::BootOrder;
 use crate::dir::{self, ChannelFile, CHANNEL_FILE, CONFIG_FILE, KEY_FILE, RUNTIME_FILE};
 use crate::exchange::{Answer, Answers};
+use crate::fd_store;
 use crate::firecracker::Firecracker;
 use crate::guest_drive;
 use crate::lifecycle::{
@@ -73,11 +75,13 @@ impl Port for Outbox {
 pub enum Stopped {
     Revoked,
     HandedOver { binary: PathBuf, handover: Handover },
+    Terminated,
 }
 
 enum Served {
     Revoked,
     Updated,
+    Terminated,
 }
 
 type HostUpdater = Updater<HttpSource, IdleGate>;
@@ -343,34 +347,44 @@ fn start_boxes(
 
 async fn hand_over(
     commands: &UnboundedSender<BoxCommand>,
-    layout: &Layout,
     out: &UnboundedSender<ChannelHostMessage>,
-) -> Result<Stopped, Failure> {
-    let failed = |detail: String| {
-        fail(
-            SupervisorFailure::UpdateNotOnline,
-            format!("{detail}; systemd starts the unit again, and its ExecStartPre puts the previous binary back"),
-        )
-    };
+    keep: impl FnOnce(&Handover) -> Result<(), String>,
+) -> Result<Handover, String> {
     let (reply, answer) = oneshot::channel();
     let _ = commands.send(BoxCommand::HandOver(reply));
     let handover = answer
         .await
-        .map_err(|_| failed("the box runner stopped before it handed its boxes over".to_string()))?;
-    if let Err(error) = update::hand_over(layout, &handover.record) {
+        .map_err(|_| "the box runner stopped before it handed its boxes over".to_string())?;
+    if let Err(error) = keep(&handover) {
         for turn_id in handed_turns(&handover.record) {
             turn_failed(
                 out,
                 &turn_id,
                 TurnFailureReason::HarnessExited,
                 format!(
-                    "the box of turn {} could not be handed to the new supervisor binary: {error}; send the turn again",
+                    "the box of turn {} could not be handed to the next supervisor: {error}; send the turn again",
                     *turn_id
                 ),
             );
         }
-        return Err(failed(error));
+        return Err(error);
     }
+    Ok(handover)
+}
+
+async fn update_binary(
+    commands: &UnboundedSender<BoxCommand>,
+    layout: &Layout,
+    out: &UnboundedSender<ChannelHostMessage>,
+) -> Result<Stopped, Failure> {
+    let handover = hand_over(commands, out, |handover| update::hand_over(layout, &handover.record))
+        .await
+        .map_err(|detail| {
+            fail(
+                SupervisorFailure::UpdateNotOnline,
+                format!("{detail}; systemd starts the unit again, and its ExecStartPre puts the previous binary back"),
+            )
+        })?;
     eprintln!(
         "tumpel-supervisor: handing {} boxes to {}",
         handover.record.boxes.len(),
@@ -380,6 +394,23 @@ async fn hand_over(
         binary: layout.binary.clone(),
         handover,
     })
+}
+
+async fn terminate(commands: &UnboundedSender<BoxCommand>, layout: &Layout, out: &UnboundedSender<ChannelHostMessage>) {
+    let kept = hand_over(commands, out, |handover| {
+        dir::write_json(&layout.handover(), &handover.record).map_err(|error| format!("{error:#}"))?;
+        fd_store::keep(&handover.record)
+    })
+    .await;
+    match kept {
+        Ok(handover) => eprintln!(
+            "tumpel-supervisor: stopped and left {} boxes running; the next start of the unit takes them over",
+            handover.record.boxes.len()
+        ),
+        Err(error) => eprintln!(
+            "tumpel-supervisor: stopped and lost the running boxes: {error}; their turns failed, so the control plane offers them again"
+        ),
+    }
 }
 
 async fn abandon(commands: &UnboundedSender<BoxCommand>) {
@@ -454,7 +485,7 @@ fn read_handover(
             handover_lost(
                 layout,
                 out,
-                "this supervisor started without --handover, so the boxes ended with the binary that ran them",
+                "this supervisor started without the boxes' descriptors, so it cannot reach the boxes",
                 &handed_turns(&handover),
             );
             None
@@ -609,7 +640,7 @@ async fn online_deadline(deadline: Option<tokio::time::Instant>, mut confirmed: 
     }
 }
 
-pub async fn run(telemetry: Telemetry, handed: bool) -> Result<Stopped, Failure> {
+pub async fn run(telemetry: Telemetry, handed: bool, mut terminated: Signal) -> Result<Stopped, Failure> {
     let (out, mut from_box) = unbounded_channel();
     let started = start()?;
     let trial = match update::startup(&started.layout, &started.running, &out)
@@ -619,7 +650,12 @@ pub async fn run(telemetry: Telemetry, handed: bool) -> Result<Stopped, Failure>
         Startup::Trial(pending) => Some(pending),
     };
     let on_trial = trial.is_some();
-    let handover = read_handover(&started.layout, &out, handed);
+    let received = fd_store::received();
+    let handover = if received.is_empty() {
+        read_handover(&started.layout, &out, handed)
+    } else {
+        read_handover(&started.layout, &out, true).map(|handover| fd_store::restored(handover, &received))
+    };
     let keep_handover = handover.is_some();
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
@@ -670,6 +706,7 @@ pub async fn run(telemetry: Telemetry, handed: bool) -> Result<Stopped, Failure>
     let served = tokio::select! {
         served = serve(&mut channel, &url, heartbeat, &usage, &commands, &mut from_box, &config, &dir, &mut updates) => served,
         Some(()) = restarted.recv() => Ok(Served::Updated),
+        Some(()) = terminated.recv() => Ok(Served::Terminated),
         () = online_deadline(deadline, online) => Err(fail(
             SupervisorFailure::UpdateNotOnline,
             format!("this supervisor did not reach Welcome on {url} within {} s of its start after its swap; systemd restarts the unit, and its ExecStartPre puts the previous binary back", Limits::HOST.online.as_secs()),
@@ -677,7 +714,11 @@ pub async fn run(telemetry: Telemetry, handed: bool) -> Result<Stopped, Failure>
     };
     let stopped = match served {
         Ok(Served::Revoked) => Ok(Stopped::Revoked),
-        Ok(Served::Updated) => hand_over(&commands, &updates.layout, &updates.out).await,
+        Ok(Served::Updated) => update_binary(&commands, &updates.layout, &updates.out).await,
+        Ok(Served::Terminated) => {
+            terminate(&commands, &updates.layout, &updates.out).await;
+            Ok(Stopped::Terminated)
+        }
         Err(failure) => Err(failure),
     };
     if stopped.is_err() {

@@ -26,6 +26,7 @@ use crate::snapshot::Ext4Upper;
 const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/sbin/tumpel-init";
 const CONSOLE_TAIL: usize = 4096;
 const API_WAIT_STEP: Duration = Duration::from_millis(5);
+const UNIT_NOT_LOADED: i32 = 5;
 
 struct Layout {
     rootfs: PathBuf,
@@ -254,11 +255,31 @@ impl Process {
 
 fn end_child(pid: libc::pid_t) {
     let mut status = 0;
-    if unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) } != 0 {
+    let waited = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+    if waited == pid {
         return;
     }
     unsafe { libc::kill(pid, libc::SIGKILL) };
-    unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    if waited == 0 {
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    }
+}
+
+async fn end_leftover(scope: &str) -> Result<(), String> {
+    let stopped = Command::new("systemctl")
+        .args(["--user", "stop", scope])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|error| format!("starting systemctl to stop a leftover {scope}: {error}"))?;
+    if stopped.status.success() || stopped.status.code() == Some(UNIT_NOT_LOADED) {
+        return Ok(());
+    }
+    Err(format!(
+        "stopping the leftover {scope} failed with {}: {}; stop it with systemctl --user stop {scope}",
+        stopped.status,
+        String::from_utf8_lossy(&stopped.stderr).trim()
+    ))
 }
 
 fn inherited(fd: &impl AsFd, named: &str) -> Result<OwnedFd, String> {
@@ -288,17 +309,17 @@ fn ended(status: i32) -> String {
 fn alive(pid: libc::pid_t) -> Result<(), String> {
     let mut status = 0;
     let waited = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
-    if waited == 0 {
-        return Ok(());
-    }
     if waited == pid {
         return Err(format!(
             "its Firecracker process {pid} ended during the handover with {}",
             ended(status)
         ));
     }
+    if waited == 0 || unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(());
+    }
     Err(format!(
-        "its Firecracker process {pid} is no child of this supervisor ({}), so it ended with the binary that ran it",
+        "its Firecracker process {pid} ended before this supervisor started ({})",
         std::io::Error::last_os_error()
     ))
 }
@@ -434,6 +455,7 @@ impl Vmm for Firecracker {
             binary: self.binary.clone(),
             images: self.images.clone(),
             dir: self.data.join(format!("box{}", tap.index())),
+            scope: format!("tumpel-box{}.scope", tap.index()),
             session: session_dir(&self.data, session_id)?,
             device: tap.device(),
             mac: tap.guest_mac(),
@@ -494,6 +516,7 @@ pub struct FirecrackerBox {
     binary: PathBuf,
     images: PathBuf,
     dir: PathBuf,
+    scope: String,
     session: PathBuf,
     device: String,
     mac: String,
@@ -539,7 +562,12 @@ impl FirecrackerBox {
     async fn spawn(&mut self) -> Result<(), String> {
         create_private_dir(&self.dir)?;
         self.clear_sockets()?;
-        let mut child = Command::new(&self.binary)
+        end_leftover(&self.scope).await?;
+        let mut child = Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
+            .arg(&self.scope)
+            .arg("--")
+            .arg(&self.binary)
             .arg("--api-sock")
             .arg(self.api_socket())
             .args(["--level", "Warning"])
@@ -550,7 +578,7 @@ impl FirecrackerBox {
             .spawn()
             .map_err(|error| {
                 format!(
-                    "starting {}: {error}; set firecrackerPath in runtime.json",
+                    "starting {} in its own systemd user scope: {error}; install systemd-run and run the supervisor from its systemd user unit",
                     self.binary.display()
                 )
             })?;
@@ -572,7 +600,7 @@ impl FirecrackerBox {
         while UnixStream::connect(&socket).await.is_err() {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(format!(
-                    "Firecracker exited with {status} before opening its API socket"
+                    "Firecracker exited with {status} before opening its API socket; check that firecrackerPath in runtime.json names it"
                 ));
             }
             tokio::time::sleep(API_WAIT_STEP).await;

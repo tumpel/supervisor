@@ -3,6 +3,7 @@ mod check;
 mod dir;
 mod enrol;
 mod exchange;
+mod fd_store;
 mod firecracker;
 mod guest_drive;
 mod harness_result;

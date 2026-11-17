@@ -23,6 +23,7 @@ use super::{
 };
 use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers};
+use crate::fd_store;
 use crate::images::ImageOrder;
 use crate::pool::{Tap, TapPool};
 use crate::snapshot::{Born, Entry, Found, Kind, Scan, Upper};
@@ -1241,6 +1242,27 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
             "pause session-1"
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_supervisor_started_with_live_boxes_reattaches_them_and_their_turns_complete() {
+    let mut old = host("restart-turn", 2, Harness::SlowClone, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    assert_eq!(old.settle_until("claim turn-1").await, ["claim turn-1"]);
+    tokio::time::sleep(SLOW_CLONE / 2).await;
+    let handover = old.ask_handover().await.expect("the boxes are handed over");
+    old.log();
+    let machine = &handover.record.boxes[0].machine;
+    {
+        let mut hands = old.vmm.hands.lock().expect("hands");
+        let guest = hands.remove(&machine.guest_fd).expect("the handed guest connection");
+        hands.insert(40, guest);
+    }
+    let received = HashMap::from([(format!("box{}-guest", machine.process_id), 40)]);
+    let record = fd_store::restored(handover.record, &received);
+    let mut new = old.successor(&record, true);
+    assert_eq!(new.settle_until("complete 1").await, ["line 1 one", "complete 1"]);
+    assert_eq!(new.log(), ["reattach session-1 on tumpel0", "pause session-1"]);
 }
 
 #[tokio::test(start_paused = true)]

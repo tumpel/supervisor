@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tokio::signal::unix::{signal, SignalKind};
 use tumpel_api::types::SupervisorFailure;
 use tumpel_supervisor::{check, enrol, install, install_telemetry, on_trial, run, supervisor_dir, Enrolment, Stopped};
 
@@ -107,8 +108,15 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match runtime.block_on(run(telemetry, handover)) {
-                Ok(Stopped::Revoked) => ExitCode::SUCCESS,
+            let terminated = match runtime.block_on(async { signal(SignalKind::terminate()) }) {
+                Ok(terminated) => terminated,
+                Err(error) => {
+                    eprintln!("tumpel-supervisor: listening for SIGTERM failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match runtime.block_on(run(telemetry, handover, terminated)) {
+                Ok(Stopped::Revoked | Stopped::Terminated) => ExitCode::SUCCESS,
                 Ok(Stopped::HandedOver { binary, handover }) => {
                     let error = std::process::Command::new(&binary).args(["run", "--handover"]).exec();
                     eprintln!(

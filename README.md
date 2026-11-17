@@ -27,6 +27,10 @@ tumpel host mint-token --expires-in 600 | ssh <host> ./tumpel-supervisor install
 
 `cargo install tumpel-supervisor` builds the same binary, with the guest drive that ships inside the crate.
 
+## Restart and stop
+
+Each box runs in its own systemd user scope, `tumpel-box<k>.scope`, outside the `tumpel-supervisor` unit. A restart of the unit, a rerun of `install` or a stop and start leaves the boxes running: the stopping supervisor parks each running turn, hands the boxes' connections to systemd and exits, and the next start takes the boxes over and finishes their turns. A stopped unit leaves its boxes running until it starts again. To end every box, run `systemctl --user stop 'tumpel-box*.scope'`.
+
 ## Releases
 
 A push to `main` that changes the supervisor, or a manual run of the release workflow, releases the next `vX.Y.Z`. The binary, the crates and the GitHub release carry the same version.
