@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tumpel_api::types::RepositoryCloneFailureCause;
 
-use super::{git_environment, CloneFailure};
+use super::{git_environment, CloneFailure, GH_WRAPPER};
 use crate::memory::Confinement;
 
 const LIMIT: Duration = Duration::from_mins(1);
@@ -311,6 +311,98 @@ fn the_credential_helper_answers_each_owner_with_its_own_installation_token() {
     assert!(org.contains("password=ghs-org\n"), "{org}");
     let (stranger, refused) = fill("acme/app.git");
     assert!(!stranger.contains("password="), "{stranger}");
+    assert!(
+        refused.contains("no GitHub App installation of this tenant covers github.com/acme"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn the_gh_wrapper_picks_the_installation_token_of_the_owner_each_command_targets() {
+    let root = scratch("gh-wrapper");
+    let wrapper = root.join("wrapper");
+    let real = root.join("real");
+    std::fs::create_dir_all(&wrapper).expect("the wrapper directory is created");
+    std::fs::create_dir_all(&real).expect("the real gh directory is created");
+    std::fs::write(wrapper.join("gh"), GH_WRAPPER).expect("the wrapper is written");
+    std::fs::write(real.join("gh"), "#!/bin/sh\necho \"$GH_TOKEN $GITHUB_TOKEN\"\n").expect("a fake gh is written");
+    for gh in [wrapper.join("gh"), real.join("gh")] {
+        std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("gh is executable");
+    }
+    let checkout = root.join("checkout");
+    std::fs::create_dir_all(&checkout).expect("the checkout is created");
+    let environment = box_environment(&root, None);
+    git(&checkout, &environment, &["init", "--quiet"]);
+    git(
+        &checkout,
+        &environment,
+        &["remote", "add", "origin", "https://github.com/mvhenten/tumpel"],
+    );
+    let gh = |dir: &Path, repo: Option<&str>, args: &[&str]| {
+        let mut command = Command::new(wrapper.join("gh"));
+        command
+            .args(args)
+            .current_dir(dir)
+            .env_clear()
+            .env(
+                "PATH",
+                format!("{}:{}:/usr/bin:/bin", wrapper.display(), real.display()),
+            )
+            .env("HOME", &root)
+            .env(
+                "GIT_CEILING_DIRECTORIES",
+                root.parent().expect("the scratch directory has a parent"),
+            )
+            .env("GH_TOKEN", "ghs-mine")
+            .env("GITHUB_TOKEN", "ghs-mine")
+            .env("TUMPEL_GITHUB_TOKENS", "mvhenten=ghs-mine tumpel=ghs-org");
+        if let Some(repo) = repo {
+            command.env("GH_REPO", repo);
+        }
+        let output = command.output().expect("the wrapper runs");
+        (
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+    assert_eq!(gh(&checkout, None, &["pr", "list"]).0, "ghs-mine ghs-mine");
+    assert_eq!(
+        gh(&checkout, None, &["pr", "list", "-R", "tumpel/protocol"]).0,
+        "ghs-org ghs-org"
+    );
+    assert_eq!(
+        gh(&checkout, None, &["repo", "view", "Tumpel/protocol"]).0,
+        "ghs-org ghs-org"
+    );
+    assert_eq!(
+        gh(
+            &checkout,
+            None,
+            &["pr", "view", "https://github.com/tumpel/protocol/pull/1"]
+        )
+        .0,
+        "ghs-org ghs-org"
+    );
+    assert_eq!(
+        gh(&checkout, None, &["api", "-X", "GET", "repos/tumpel/protocol/pulls"]).0,
+        "ghs-org ghs-org"
+    );
+    assert_eq!(gh(&checkout, None, &["api", "/orgs/tumpel/repos"]).0, "ghs-org ghs-org");
+    assert_eq!(
+        gh(&checkout, None, &["api", "https://api.github.com/users/tumpel"]).0,
+        "ghs-org ghs-org"
+    );
+    assert_eq!(
+        gh(&checkout, None, &["api", "repos/{owner}/{repo}/pulls"]).0,
+        "ghs-mine ghs-mine"
+    );
+    assert_eq!(
+        gh(&checkout, Some("tumpel/protocol"), &["auth", "token"]).0,
+        "ghs-org ghs-org"
+    );
+    assert_eq!(gh(&root, None, &["api", "/user"]).0, "ghs-mine ghs-mine");
+    let (stranger, refused) = gh(&root, None, &["api", "repos/acme/app"]);
+    assert_eq!(stranger, "");
     assert!(
         refused.contains("no GitHub App installation of this tenant covers github.com/acme"),
         "{refused}"
