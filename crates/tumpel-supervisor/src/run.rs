@@ -2,11 +2,13 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use ring::signature::Ed25519KeyPair;
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::signal::unix::Signal;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -28,7 +30,7 @@ use crate::firecracker::Firecracker;
 use crate::guest_drive;
 use crate::lifecycle::{
     turn_failed, BoxTurn, Budgets, Command, Handover, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder,
-    TeardownOrder,
+    Taken, TeardownOrder,
 };
 use crate::pool::TapPool;
 use crate::store::HttpStore;
@@ -93,7 +95,6 @@ struct Updates {
     restart: UnboundedSender<()>,
     trial: Option<SupervisorUpdatePending>,
     confirmed: watch::Sender<bool>,
-    handover: bool,
     grace: Duration,
 }
 
@@ -119,11 +120,6 @@ impl Updates {
                 )
             })?;
             self.confirmed.send_replace(true);
-        }
-        if std::mem::take(&mut self.handover) {
-            if let Err(error) = update::forget_handover(&self.layout) {
-                eprintln!("tumpel-supervisor: {error}; delete it by hand");
-            }
         }
         self.announced();
         Ok(())
@@ -305,6 +301,10 @@ async fn boxes(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "run hands the box runner each piece it built separately"
+)]
 fn start_boxes(
     runtime: &SupervisorRuntime,
     pool: TapPool,
@@ -312,18 +312,19 @@ fn start_boxes(
     received: UnboundedReceiver<BoxCommand>,
     out: UnboundedSender<ChannelHostMessage>,
     telemetry: Telemetry,
-    handover: Option<SupervisorHandover>,
-) -> (Usage, IdleGate) {
+    taken: Option<(SupervisorHandover, Taken)>,
+    standing: PathBuf,
+) -> Result<(Usage, IdleGate), Failure> {
     let settings = Settings {
         budgets: Budgets::from(&runtime.budgets),
         warm_window: Duration::from_secs(u64::from(runtime.warm_window_seconds.get())),
         layer_cache_mib: runtime.layer_cache_mib,
         overlay_bytes: u64::try_from(runtime.overlay_mib).unwrap_or(0) * 1024 * 1024,
     };
-    let mut lifecycle = Lifecycle::new(Firecracker::new(runtime), store, settings, pool, out);
-    if let Some(handover) = handover {
-        lifecycle.reattach(handover, true);
-    }
+    let mut lifecycle = Lifecycle::new(Firecracker::new(runtime), store, settings, pool, out, standing);
+    lifecycle
+        .start(taken)
+        .map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
     let usage = Usage {
         box_capacity: runtime.box_capacity,
         warm: lifecycle.warm(),
@@ -342,20 +343,24 @@ fn start_boxes(
         to_lifecycle,
         to_setups,
     ));
-    (usage, idle)
+    Ok((usage, idle))
 }
 
 async fn hand_over(
     commands: &UnboundedSender<BoxCommand>,
+    layout: &Layout,
     out: &UnboundedSender<ChannelHostMessage>,
-    keep: impl FnOnce(&Handover) -> Result<(), String>,
+    keep: impl FnOnce() -> Result<(), String>,
 ) -> Result<Handover, String> {
     let (reply, answer) = oneshot::channel();
     let _ = commands.send(BoxCommand::HandOver(reply));
     let handover = answer
         .await
         .map_err(|_| "the box runner stopped before it handed its boxes over".to_string())?;
-    if let Err(error) = keep(&handover) {
+    let kept = dir::write_json(&layout.handover(), &handover.record)
+        .map_err(|error| format!("{error:#}"))
+        .and_then(|()| keep());
+    if let Err(error) = kept {
         for turn_id in handed_turns(&handover.record) {
             turn_failed(
                 out,
@@ -377,7 +382,7 @@ async fn update_binary(
     layout: &Layout,
     out: &UnboundedSender<ChannelHostMessage>,
 ) -> Result<Stopped, Failure> {
-    let handover = hand_over(commands, out, |handover| update::hand_over(layout, &handover.record))
+    let handover = hand_over(commands, layout, out, || update::hand_over(layout))
         .await
         .map_err(|detail| {
             fail(
@@ -396,21 +401,26 @@ async fn update_binary(
     })
 }
 
-async fn terminate(commands: &UnboundedSender<BoxCommand>, layout: &Layout, out: &UnboundedSender<ChannelHostMessage>) {
-    let kept = hand_over(commands, out, |handover| {
-        dir::write_json(&layout.handover(), &handover.record).map_err(|error| format!("{error:#}"))?;
-        fd_store::keep(&handover.record)
-    })
-    .await;
-    match kept {
-        Ok(handover) => eprintln!(
-            "tumpel-supervisor: stopped and left {} boxes running; the next start of the unit takes them over",
-            handover.record.boxes.len()
-        ),
-        Err(error) => eprintln!(
-            "tumpel-supervisor: stopped and lost the running boxes: {error}; their turns failed, so the control plane offers them again"
-        ),
-    }
+async fn terminate(
+    commands: &UnboundedSender<BoxCommand>,
+    layout: &Layout,
+    out: &UnboundedSender<ChannelHostMessage>,
+) -> Result<(), Failure> {
+    let handover = hand_over(commands, layout, out, || Ok(())).await.map_err(|detail| {
+        fail(
+            SupervisorFailure::ChannelStateLost,
+            format!("{detail}; the next start takes the running boxes over from the record of running boxes"),
+        )
+    })?;
+    eprintln!(
+        "tumpel-supervisor: stopped and left {} boxes running; the next start of the unit takes them over",
+        handover.record.boxes.len()
+    );
+    Ok(())
+}
+
+fn restarts(kind: SupervisorFailure) -> bool {
+    !matches!(kind, SupervisorFailure::NotEnrolled | SupervisorFailure::HostRevoked)
 }
 
 async fn abandon(commands: &UnboundedSender<BoxCommand>) {
@@ -640,7 +650,37 @@ async fn online_deadline(deadline: Option<tokio::time::Instant>, mut confirmed: 
     }
 }
 
-pub async fn run(telemetry: Telemetry, handed: bool, mut terminated: Signal) -> Result<Stopped, Failure> {
+fn read_standing(layout: &Layout) -> Option<SupervisorHandover> {
+    dir::read_json(&layout.boxes(), "SupervisorHandover").unwrap_or_else(|error| {
+        eprintln!("tumpel-supervisor: {error:#}; the boxes it names are stopped");
+        None
+    })
+}
+
+fn taken(
+    layout: &Layout,
+    out: &UnboundedSender<ChannelHostMessage>,
+    handed: bool,
+    mut received: BTreeMap<String, OwnedFd>,
+) -> Result<Option<(SupervisorHandover, Taken)>, Failure> {
+    let taken = match read_handover(layout, out, handed || !received.is_empty()) {
+        Some(handover) if received.is_empty() => Some((handover, Taken::Handed)),
+        Some(handover) => Some((fd_store::restored(handover, &mut received), Taken::Handed)),
+        None => read_standing(layout).map(|standing| (fd_store::restored(standing, &mut received), Taken::Crashed)),
+    };
+    if taken.is_some() {
+        update::forget_handover(layout).map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
+    }
+    Ok(taken)
+}
+
+pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, OwnedFd>) -> Result<Stopped, Failure> {
+    let mut terminated = signal(SignalKind::terminate()).map_err(|error| {
+        fail(
+            SupervisorFailure::NotEnrolled,
+            format!("listening for SIGTERM failed: {error}"),
+        )
+    })?;
     let (out, mut from_box) = unbounded_channel();
     let started = start()?;
     let trial = match update::startup(&started.layout, &started.running, &out)
@@ -650,13 +690,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, mut terminated: Signal) -> 
         Startup::Trial(pending) => Some(pending),
     };
     let on_trial = trial.is_some();
-    let received = fd_store::received();
-    let handover = if received.is_empty() {
-        read_handover(&started.layout, &out, handed)
-    } else {
-        read_handover(&started.layout, &out, true).map(|handover| fd_store::restored(handover, &received))
-    };
-    let keep_handover = handover.is_some();
+    let taken = taken(&started.layout, &out, handed, received)?;
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
         .await
@@ -669,8 +703,9 @@ pub async fn run(telemetry: Telemetry, handed: bool, mut terminated: Signal) -> 
         received,
         out.clone(),
         telemetry,
-        handover,
-    );
+        taken,
+        started.layout.boxes(),
+    )?;
     let url = started.url;
     let config = started.config;
     let heartbeat = Duration::from_secs(u64::from(started.runtime.heartbeat_interval_seconds.get()));
@@ -699,7 +734,6 @@ pub async fn run(telemetry: Telemetry, handed: bool, mut terminated: Signal) -> 
         restart,
         trial,
         confirmed,
-        handover: keep_handover,
         grace,
     };
     let deadline = on_trial.then(|| tokio::time::Instant::now() + Limits::HOST.online);
@@ -715,9 +749,12 @@ pub async fn run(telemetry: Telemetry, handed: bool, mut terminated: Signal) -> 
     let stopped = match served {
         Ok(Served::Revoked) => Ok(Stopped::Revoked),
         Ok(Served::Updated) => update_binary(&commands, &updates.layout, &updates.out).await,
-        Ok(Served::Terminated) => {
-            terminate(&commands, &updates.layout, &updates.out).await;
-            Ok(Stopped::Terminated)
+        Ok(Served::Terminated) => terminate(&commands, &updates.layout, &updates.out)
+            .await
+            .map(|()| Stopped::Terminated),
+        Err(failure) if restarts(failure.kind) => {
+            terminate(&commands, &updates.layout, &updates.out).await?;
+            Err(failure)
         }
         Err(failure) => Err(failure),
     };

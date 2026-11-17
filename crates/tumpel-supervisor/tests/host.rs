@@ -128,6 +128,7 @@ async fn a_shell_box_runs_a_turn_pauses_resumes_warm_and_its_drive_reads_back() 
         settings,
         TapPool::new(1).expect("pool"),
         out,
+        data.join("boxes.json"),
     );
     let (commands, from_test) = unbounded_channel();
     let running = tokio::spawn(lifecycle.run(from_test, unbounded_channel().1));

@@ -25,6 +25,7 @@ libc.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 ring.workspace = true
 serde.workspace = true
+sd-notify.workspace = true
 serde_json.workspace = true
 tar.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "sync", "fs"] }

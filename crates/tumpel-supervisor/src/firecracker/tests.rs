@@ -10,7 +10,7 @@ use serde_json::json;
 use tumpel_api::types::{GuestMessage, SupervisorHandoverMachine};
 use tumpel_guest::encode;
 
-use super::{adopt, alive, end_child, take, Firecracker};
+use super::{adopt, alive, take, Firecracker, Owner};
 use crate::lifecycle::{Guest, Machine, Vmm};
 use crate::pool::TapPool;
 
@@ -31,43 +31,51 @@ fn zombie(pid: libc::pid_t) {
     assert_eq!(waited, 0, "the child ends and stays a zombie");
 }
 
+const SCOPE: &str = "tumpel-box0.scope";
+
 fn reaped(pid: libc::pid_t) -> bool {
-    alive(pid).is_err_and(|error| error.contains("ended before this supervisor started"))
+    alive(pid, SCOPE).is_err_and(|error| error.contains("is no child"))
 }
 
-fn orphan() -> libc::pid_t {
+fn own_cgroup() -> String {
+    let cgroups = std::fs::read_to_string("/proc/self/cgroup").expect("this process's cgroup");
+    cgroups
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .and_then(|path| path.rsplit('/').next())
+        .expect("a unified cgroup")
+        .to_string()
+}
+
+#[test]
+fn alive_tells_a_running_child_from_a_zombie_and_a_stranger() {
+    let pid = sleeper();
+    assert_eq!(alive(pid, SCOPE), Ok(Owner::Child));
+    zombie(pid);
+    let ended = alive(pid, SCOPE).expect_err("a zombie is no live box");
+    assert!(ended.contains("ended during the handover with signal 9"), "{ended}");
+    assert!(reaped(pid), "alive reaps the zombie it reports");
+    let stranger = alive(1, SCOPE).expect_err("init runs in no box scope");
+    assert!(stranger.contains("runs in no tumpel-box0.scope"), "{stranger}");
+}
+
+#[test]
+fn a_process_that_is_no_child_is_a_box_only_inside_the_scope_of_its_box() {
     let output = std::process::Command::new("sh")
         .args(["-c", "sleep 60 >/dev/null 2>&1 & echo $!"])
         .output()
         .expect("sh starts");
-    String::from_utf8(output.stdout)
+    let pid: libc::pid_t = String::from_utf8(output.stdout)
         .expect("a pid")
         .trim()
         .parse()
-        .expect("a pid")
-}
-
-#[test]
-fn alive_tells_a_running_child_from_a_zombie_and_an_ended_process() {
-    let pid = sleeper();
-    assert_eq!(alive(pid), Ok(()));
-    zombie(pid);
-    let ended = alive(pid).expect_err("a zombie is no live box");
-    assert!(ended.contains("ended during the handover with signal 9"), "{ended}");
-    assert!(reaped(pid), "alive reaps the zombie it reports");
-}
-
-#[test]
-fn a_box_left_by_an_earlier_supervisor_process_is_alive_until_it_is_ended() {
-    let pid = orphan();
-    assert_eq!(
-        alive(pid),
-        Ok(()),
-        "a process this supervisor did not start is a live box"
-    );
-    end_child(pid);
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    assert!(reaped(pid), "end_child kills a box this supervisor did not start");
+        .expect("a pid");
+    let scope = own_cgroup();
+    let adopted = alive(pid, &scope);
+    let other = alive(pid, "tumpel-box9.scope");
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(adopted, Ok(Owner::Scope(scope)));
+    assert!(other.is_err_and(|error| error.contains("runs in no tumpel-box9.scope")));
 }
 
 #[test]

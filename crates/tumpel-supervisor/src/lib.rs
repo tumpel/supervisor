@@ -25,11 +25,13 @@ pub use check::check;
 pub use dir::supervisor_dir;
 pub use enrol::enrol;
 pub use exchange::{Answer, Answers};
+pub use fd_store::received as received_descriptors;
 pub use firecracker::{Firecracker, FirecrackerBox, VsockGuest};
 pub use images::{ImageOrder, Refusal};
 pub use install::{install, Enrolment};
 pub use lifecycle::{
-    BoxTurn, Budgets, Command, Guest, Handover, IdleGate, Input, Lifecycle, Machine, Settings, SnapshotOrder, Vmm,
+    BoxTurn, Budgets, Command, Guest, Handover, IdleGate, Input, Lifecycle, Machine, Settings, SnapshotOrder, Taken,
+    Vmm,
 };
 pub use pool::{PoolExhausted, Tap, TapPool};
 pub use run::{run, Failure, Stopped};
