@@ -732,6 +732,7 @@ impl GuestState {
             &self.memory.confinement,
             Duration::from_secs(u64::from(self.config.clone_seconds.get())),
             start.prebuild_commit_sha.as_deref().map(String::as_str),
+            Path::new(SETUP_PROGRAM),
         ) {
             return Ok(Err(failure));
         }

@@ -17,7 +17,14 @@ fn prepare(
     environment: &[(String, String)],
     limit: Duration,
 ) -> Result<(), CloneFailure> {
-    prepare_at(dir, repository, environment, limit, None)
+    prepare_at(
+        dir,
+        repository,
+        environment,
+        limit,
+        None,
+        Path::new("/nonexistent/prebuild.mjs"),
+    )
 }
 
 fn prepare_at(
@@ -26,11 +33,20 @@ fn prepare_at(
     environment: &[(String, String)],
     limit: Duration,
     prebuild_commit: Option<&str>,
+    start: &Path,
 ) -> Result<(), CloneFailure> {
     let confinement = Confinement::Score {
         score: c"/proc/self/oom_score_adj".to_owned(),
     };
-    super::prepare(dir, repository, environment, &confinement, limit, prebuild_commit)
+    super::prepare(
+        dir,
+        repository,
+        environment,
+        &confinement,
+        limit,
+        prebuild_commit,
+        start,
+    )
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -307,7 +323,7 @@ fn the_pre_push_hook_refuses_the_default_branch_and_force_pushes_and_lets_a_new_
 }
 
 #[test]
-fn a_prebuild_pins_its_commit_and_the_first_turn_restored_from_it_pulls_the_branch_once() {
+fn a_prebuild_pins_its_commit_and_the_first_turn_restored_from_it_pulls_the_branch_and_starts_once() {
     let root = scratch("prebuild");
     let environment = box_environment(&root, None);
     let source = public_repository(&root, &environment);
@@ -318,19 +334,66 @@ fn a_prebuild_pins_its_commit_and_the_first_turn_restored_from_it_pulls_the_bran
     git(&source, &environment, &["commit", "--quiet", "-m", "feat: later"]);
     let work = root.join("workspace");
     let url = source.display().to_string();
-    prepare_at(&work, &url, &environment, LIMIT, Some(&recorded)).expect("the prebuild clones at its commit");
+    let start = root.join("prebuild.mjs");
+    std::fs::write(&start, "#!/bin/sh\ntest -f NEWEST.md && echo \"$1\" >> ../started\n")
+        .expect("the start script is written");
+    std::fs::set_permissions(&start, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("the start script is executable");
+    prepare_at(&work, &url, &environment, LIMIT, Some(&recorded), &start).expect("the prebuild clones at its commit");
+    assert!(!root.join("started").exists());
     assert_eq!(text(&git(&work, &environment, &["rev-parse", "HEAD"])), recorded);
     assert_eq!(text(&git(&work, &environment, &["branch", "--show-current"])), "trunk");
     std::fs::write(source.join("NEWEST.md"), "newest\n").expect("a file is written");
     git(&source, &environment, &["add", "NEWEST.md"]);
     git(&source, &environment, &["commit", "--quiet", "-m", "feat: newest"]);
     let newest = text(&git(&source, &environment, &["rev-parse", "HEAD"]));
-    prepare(&work, &url, &environment, LIMIT).expect("the restored box pulls the branch");
+    prepare_at(&work, &url, &environment, LIMIT, None, &start).expect("the restored box pulls the branch");
     assert_eq!(text(&git(&work, &environment, &["rev-parse", "HEAD"])), newest);
+    assert_eq!(
+        std::fs::read_to_string(root.join("started")).expect("the start ran"),
+        "start\n"
+    );
     std::fs::write(work.join("CHANGE.md"), "change\n").expect("a file is written");
     git(&work, &environment, &["add", "CHANGE.md"]);
     git(&work, &environment, &["commit", "--quiet", "-m", "feat: change"]);
     let own = text(&git(&work, &environment, &["rev-parse", "HEAD"]));
-    prepare(&work, &url, &environment, LIMIT).expect("a later turn leaves the branch alone");
+    prepare_at(&work, &url, &environment, LIMIT, None, &start).expect("a later turn leaves the branch alone");
     assert_eq!(text(&git(&work, &environment, &["rev-parse", "HEAD"])), own);
+    assert_eq!(
+        std::fs::read_to_string(root.join("started")).expect("the start ran"),
+        "start\n"
+    );
+}
+
+#[test]
+fn a_failing_start_keeps_the_prebuild_marker_so_the_next_turn_starts_again() {
+    let root = scratch("prebuild-start-fails");
+    let environment = box_environment(&root, None);
+    let source = public_repository(&root, &environment);
+    git(&source, &environment, &["switch", "--quiet", "trunk"]);
+    let recorded = text(&git(&source, &environment, &["rev-parse", "HEAD"]));
+    let work = root.join("workspace");
+    let url = source.display().to_string();
+    let start = root.join("prebuild.mjs");
+    std::fs::write(
+        &start,
+        "#!/bin/sh\necho \"$1\" >> ../started\ntest -f ../passes || { echo broken >&2; exit 4; }\n",
+    )
+    .expect("the start script is written");
+    std::fs::set_permissions(&start, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("the start script is executable");
+    prepare_at(&work, &url, &environment, LIMIT, Some(&recorded), &start).expect("the prebuild clones at its commit");
+    let error = prepare_at(&work, &url, &environment, LIMIT, None, &start).expect_err("the start fails");
+    assert_eq!(error.cause, RepositoryCloneFailureCause::Other);
+    assert!(error.detail.starts_with("PostStartFailed: "), "{}", error.detail);
+    assert!(error.detail.contains("reported: broken"), "{}", error.detail);
+    assert!(work.join(".git/tumpel-prebuilt").exists());
+    std::fs::write(root.join("passes"), "").expect("a file is written");
+    prepare_at(&work, &url, &environment, LIMIT, None, &start).expect("the next turn starts again");
+    assert!(!work.join(".git/tumpel-prebuilt").exists());
+    prepare_at(&work, &url, &environment, LIMIT, None, &start).expect("a later turn does not start");
+    assert_eq!(
+        std::fs::read_to_string(root.join("started")).expect("the start ran"),
+        "start\nstart\n"
+    );
 }
