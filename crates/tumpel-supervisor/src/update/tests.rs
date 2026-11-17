@@ -12,8 +12,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    announced_release, confirm, refresh_unit, sha256_hex, startup, Idle, Layout, Limits, Outcome, Release, Source,
-    Startup, Updater, PENDING_FILE, REFUSAL_FILE, ROLLED_BACK_FILE, TRIAL_FILE,
+    announced_release, confirm, named, refresh_unit, sha256_hex, startup, Idle, Layout, Limits, Outcome, Release,
+    Source, Startup, Updater, PENDING_FILE, REFUSAL_FILE, ROLLED_BACK_FILE, TRIAL_FILE,
 };
 use crate::install::supervisor_unit_text;
 
@@ -68,6 +68,7 @@ impl Source for FakeSource {
         std::future::ready(Ok(Release {
             version: RELEASE_VERSION.parse().expect("a release version"),
             sha256: digest(&self.sha256),
+            supervisor_version: None,
             channel_protocol_version: self.channel_protocol_version,
         }))
     }
@@ -530,6 +531,7 @@ fn a_release_manifest_from_a_control_plane_that_serves_no_supervisor_version_is_
         "1111111111111111111111111111111111111111111111111111111111111111"
     );
     assert_eq!(release.channel_protocol_version, 19);
+    assert_eq!(named(&release), "111111111111");
 }
 
 #[test]
@@ -562,4 +564,5 @@ fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
         "3333333333333333333333333333333333333333333333333333333333333333"
     );
     assert_eq!(release.channel_protocol_version, 20);
+    assert_eq!(named(&release), "0.4.0 (333333333333)");
 }
