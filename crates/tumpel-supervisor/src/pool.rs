@@ -53,7 +53,7 @@ impl fmt::Display for PoolExhausted {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "all {} boxes held (TAP devices tumpel0 to tumpel{}) by running boxes or by paused boxes whose last turn is not in a snapshot yet; wait for a box to finish, or raise boxCapacity in runtime.json and rerun tumpel-supervisor install",
+            "all {} boxes held (TAP devices tumpel0 to tumpel{}) by running boxes or by paused boxes whose last turn is not in a snapshot yet; wait for a box to finish, or raise boxCapacity in runtime.json and restart tumpel-supervisor",
             self.size,
             self.size.saturating_sub(1)
         )
@@ -69,7 +69,7 @@ impl TapPool {
     pub fn new(size: u32) -> Result<Self, String> {
         if size == 0 || size > MAX_POOL_SIZE {
             return Err(format!(
-                "boxCapacity {size} is outside 1 to {MAX_POOL_SIZE}: device tumpel<k> routes 172.16.<k>.0/30, so k stays below {MAX_POOL_SIZE}; set boxCapacity in runtime.json and rerun tumpel-supervisor install"
+                "boxCapacity {size} is outside 1 to {MAX_POOL_SIZE}: device tumpel<k> routes 172.16.<k>.0/30, so k stays below {MAX_POOL_SIZE}; set boxCapacity in runtime.json and restart tumpel-supervisor"
             ));
         }
         let free = (0..size).filter_map(|index| u8::try_from(index).ok()).collect();
