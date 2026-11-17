@@ -1,6 +1,6 @@
 use std::io::{ErrorKind, Read, Write};
 use std::num::NonZeroU32;
-use std::os::fd::{IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -126,11 +126,15 @@ fn handed(vmm: &Firecracker, pid: libc::pid_t, guest_is_socket: bool) -> Handed 
     }
 }
 
+fn released(pipe: &mut std::io::PipeWriter) -> bool {
+    let capacity = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETPIPE_SZ) };
+    let overflow = vec![0u8; usize::try_from(capacity).expect("a pipe capacity") + 1];
+    pipe.write_all(&overflow)
+        .is_err_and(|error| error.kind() == ErrorKind::BrokenPipe)
+}
+
 fn closed(handed: &mut Handed) -> bool {
-    let pipes = [&mut handed.stdout, &mut handed.stderr].into_iter().all(|pipe| {
-        pipe.write_all(b"x")
-            .is_err_and(|error| error.kind() == ErrorKind::BrokenPipe)
-    });
+    let pipes = released(&mut handed.stdout) && released(&mut handed.stderr);
     let mut byte = [0u8; 1];
     let socket = handed.peer.read(&mut byte).is_ok_and(|read| read == 0);
     pipes && socket
@@ -187,9 +191,6 @@ async fn reattach_with_the_wrong_descriptor_kills_and_reaps_the_live_child_and_c
     };
     assert!(error.contains("is no socket"), "{error}");
     assert!(reaped(pid), "the live child is killed and reaped");
-    let pipes = [&mut handed.stdout, &mut handed.stderr].into_iter().all(|pipe| {
-        pipe.write_all(b"x")
-            .is_err_and(|error| error.kind() == ErrorKind::BrokenPipe)
-    });
+    let pipes = released(&mut handed.stdout) && released(&mut handed.stderr);
     assert!(pipes, "the console pipes are closed");
 }
