@@ -45,3 +45,5 @@ npm run supervisor:build
 ## Licence
 
 Apache-2.0. See `LICENSE` and `NOTICE`.
+
+Docs-only CI probe.
