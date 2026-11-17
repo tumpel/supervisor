@@ -1,0 +1,24 @@
+[package]
+name = "tumpel-guest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The agent inside a tumpel Firecracker box that runs a coding harness turn"
+readme = "../../README.md"
+
+[[bin]]
+name = "tumpel-guest"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+libc.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+tumpel-api.workspace = true
+
+[lints]
+workspace = true

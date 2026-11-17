@@ -1,0 +1,29 @@
+{
+  "name": "tumpel-supervisor",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "fix": "biome check --write . && cargo fmt --all",
+    "comments:check": "node npm-scripts/comments-check.mjs",
+    "secrets:check": "node npm-scripts/secrets-check.mjs",
+    "clippy": "cargo clippy --workspace --all-targets -- -D warnings",
+    "fmt:check": "cargo fmt --all --check",
+    "check": "npm run lint && npm run comments:check && npm run secrets:check && npm run clippy && npm run fmt:check",
+    "test": "cargo test --workspace",
+    "guest:build": "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p tumpel-guest --target ${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}",
+    "guest:drive": "node npm-scripts/guest-drive.mjs",
+    "supervisor:build": "npm run guest:build && npm run guest:drive && TUMPEL_GUEST_DRIVE=\"$PWD/.tmp/guest-drive/${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}.squashfs\" RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p tumpel-supervisor --target ${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}",
+    "prepare": "git config core.hooksPath .githooks"
+  },
+  "dependencies": {
+    "@tumpel/schemas": "https://github.com/tumpel/protocol/releases/download/v0.1.1/tumpel-schemas-0.1.1.tgz"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.8"
+  }
+}

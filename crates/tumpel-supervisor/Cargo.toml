@@ -1,0 +1,45 @@
+[package]
+name = "tumpel-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The tumpel host supervisor: boots Firecracker boxes and runs coding agent turns for the control plane"
+readme = "../../README.md"
+include = ["/Cargo.toml", "/build.rs", "/release_version.rs", "/src/**", "/guest-drive/*.squashfs"]
+
+[[bin]]
+name = "tumpel-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+ext4-view.workspace = true
+fastcdc.workspace = true
+futures-util.workspace = true
+hostname.workspace = true
+libc.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "sync", "fs"] }
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tumpel-api.workspace = true
+tumpel-channel.workspace = true
+tumpel-guest.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+host-tests = []
+
+[lints]
+workspace = true

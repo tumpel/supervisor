@@ -1,0 +1,336 @@
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+use tumpel_api::types::RepositoryCloneFailureCause;
+
+use super::{git_environment, CloneFailure};
+use crate::memory::Confinement;
+
+const LIMIT: Duration = Duration::from_mins(1);
+
+fn prepare(
+    dir: &Path,
+    repository: &str,
+    environment: &[(String, String)],
+    limit: Duration,
+) -> Result<(), CloneFailure> {
+    prepare_at(dir, repository, environment, limit, None)
+}
+
+fn prepare_at(
+    dir: &Path,
+    repository: &str,
+    environment: &[(String, String)],
+    limit: Duration,
+    prebuild_commit: Option<&str>,
+) -> Result<(), CloneFailure> {
+    let confinement = Confinement::Score {
+        score: c"/proc/self/oom_score_adj".to_owned(),
+    };
+    super::prepare(dir, repository, environment, &confinement, limit, prebuild_commit)
+}
+
+fn scratch(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/guest-tests")
+        .join(name);
+    match std::fs::remove_dir_all(&dir) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => panic!("clearing {}: {error}", dir.display()),
+        _ => {}
+    }
+    std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+    dir
+}
+
+fn box_environment(home: &Path, token: Option<&str>) -> Vec<(String, String)> {
+    let mut environment = vec![
+        ("PATH".to_string(), "/usr/local/bin:/usr/bin:/bin".to_string()),
+        ("HOME".to_string(), home.display().to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+    ];
+    if let Some(token) = token {
+        environment.push(("GITHUB_TOKEN".to_string(), token.to_string()));
+    }
+    environment.extend(git_environment("Ticket Worker", "ticket-worker@acme.test", token));
+    environment
+}
+
+fn git(dir: &Path, environment: &[(String, String)], args: &[&str]) -> Output {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env_clear()
+        .envs(environment.iter().map(|(name, value)| (name, value)))
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn public_repository(root: &Path, environment: &[(String, String)]) -> PathBuf {
+    let source = root.join("source");
+    std::fs::create_dir_all(&source).expect("the source directory is created");
+    git(&source, environment, &["init", "--quiet", "--initial-branch=trunk"]);
+    std::fs::write(source.join("README.md"), "hello\n").expect("a file is written");
+    git(&source, environment, &["add", "README.md"]);
+    git(&source, environment, &["commit", "--quiet", "-m", "chore: start"]);
+    git(&source, environment, &["switch", "--quiet", "-c", "feature"]);
+    source
+}
+
+#[test]
+fn a_public_repository_clones_at_its_default_branch_and_commits_carry_the_persona_identity() {
+    let root = scratch("public");
+    let environment = box_environment(&root, None);
+    let source = public_repository(&root, &environment);
+    git(&source, &environment, &["switch", "--quiet", "trunk"]);
+    let work = root.join("workspace");
+    let url = source.display().to_string();
+    prepare(&work, &url, &environment, LIMIT).expect("the public repository clones without a token");
+    assert_eq!(text(&git(&work, &environment, &["branch", "--show-current"])), "trunk");
+    std::fs::write(work.join("CHANGE.md"), "change\n").expect("a file is written");
+    git(&work, &environment, &["add", "CHANGE.md"]);
+    git(&work, &environment, &["commit", "--quiet", "-m", "feat: change"]);
+    assert_eq!(
+        text(&git(
+            &work,
+            &environment,
+            &["log", "-1", "--format=%an <%ae>|%cn <%ce>"]
+        )),
+        "Ticket Worker <ticket-worker@acme.test>|Ticket Worker <ticket-worker@acme.test>"
+    );
+}
+
+fn asking_for_credentials() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a local port is bound");
+    let port = listener.local_addr().expect("the port is known").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut reader = BufReader::new(stream.try_clone().expect("the stream is cloned"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 0) && line != "\r\n" {
+                line.clear();
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"acme\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    port
+}
+
+#[test]
+fn a_clone_the_host_refuses_without_a_token_fails_refused() {
+    let root = scratch("private-without-token");
+    let url = format!("http://127.0.0.1:{}/acme/app.git", asking_for_credentials());
+    let error =
+        prepare(&root.join("workspace"), &url, &box_environment(&root, None), LIMIT).expect_err("the clone is refused");
+    assert_eq!(error.cause, RepositoryCloneFailureCause::Refused, "{}", error.detail);
+    assert!(error.detail.contains("without GITHUB_TOKEN failed"), "{}", error.detail);
+    assert!(!root.join(".workspace.clone-credentials").exists());
+}
+
+#[test]
+fn a_clone_of_a_missing_repository_fails_other_and_carries_what_git_reported() {
+    let root = scratch("missing-without-token");
+    let missing = root.join("private.git").display().to_string();
+    let error =
+        prepare(&root.join("workspace"), &missing, &box_environment(&root, None), LIMIT).expect_err("the clone fails");
+    assert_eq!(error.cause, RepositoryCloneFailureCause::Other, "{}", error.detail);
+    assert!(error.detail.contains("git reported: fatal:"), "{}", error.detail);
+}
+
+#[test]
+fn a_failed_clone_with_a_token_does_not_show_the_token() {
+    let root = scratch("missing-with-token");
+    let missing = root.join("private.git").display().to_string();
+    let error = prepare(
+        &root.join("workspace"),
+        &missing,
+        &box_environment(&root, Some("ghp-test")),
+        LIMIT,
+    )
+    .expect_err("the clone fails");
+    assert!(error.detail.contains(" with GITHUB_TOKEN failed"), "{}", error.detail);
+    assert!(!error.detail.contains("ghp-test"), "{}", error.detail);
+}
+
+#[test]
+fn a_working_directory_with_files_but_no_repository_fails_directory_not_empty() {
+    let root = scratch("stray-files");
+    let work = root.join("workspace");
+    std::fs::create_dir_all(&work).expect("the working directory is made");
+    std::fs::write(work.join("notes.txt"), "stray\n").expect("a file is written");
+    let missing = root.join("gone.git").display().to_string();
+    let error = prepare(&work, &missing, &box_environment(&root, None), LIMIT).expect_err("the clone is refused");
+    assert_eq!(
+        error.cause,
+        RepositoryCloneFailureCause::DirectoryNotEmpty,
+        "{}",
+        error.detail
+    );
+}
+
+#[test]
+fn a_clone_from_a_host_that_never_answers_stops_at_its_limit_and_leaves_no_partial_clone() {
+    let root = scratch("stalled");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a local port is bound");
+    let port = listener.local_addr().expect("the port is known").port();
+    std::thread::spawn(move || {
+        let held: Vec<_> = listener.incoming().collect();
+        drop(held);
+    });
+    let work = root.join("workspace");
+    let started = Instant::now();
+    let error = prepare(
+        &work,
+        &format!("git://127.0.0.1:{port}/acme/app.git"),
+        &box_environment(&root, None),
+        Duration::from_secs(1),
+    )
+    .expect_err("the stalled clone is stopped");
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert_eq!(error.cause, RepositoryCloneFailureCause::TimedOut, "{}", error.detail);
+    assert!(
+        error.detail.contains("did not finish within 1 s (cloneSeconds"),
+        "{}",
+        error.detail
+    );
+    assert!(!work.exists());
+}
+
+fn credential_fill(root: &Path, token: Option<&str>, host: &str) -> String {
+    let mut child = Command::new("git")
+        .args(["credential", "fill"])
+        .current_dir(root)
+        .env_clear()
+        .envs(box_environment(root, token).iter().map(|(name, value)| (name, value)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("git credential runs");
+    child
+        .stdin
+        .take()
+        .expect("git credential reads standard input")
+        .write_all(format!("protocol=https\nhost={host}\npath=acme/app.git\n\n").as_bytes())
+        .expect("the request is written");
+    String::from_utf8_lossy(&child.wait_with_output().expect("git credential ends").stdout).to_string()
+}
+
+#[test]
+fn the_credential_helper_answers_github_with_the_token_from_the_environment() {
+    let root = scratch("credential-helper");
+    let answer = credential_fill(&root, Some("ghp-from-env"), "github.com");
+    assert!(answer.contains("username=x-access-token\n"), "{answer}");
+    assert!(answer.contains("password=ghp-from-env\n"), "{answer}");
+    assert!(!credential_fill(&root, Some("ghp-from-env"), "git.example.test").contains("ghp-from-env"));
+    assert!(!credential_fill(&root, None, "github.com").contains("password="));
+    assert!(!root.join(".git-credentials").exists());
+}
+
+fn refused_push(dir: &Path, environment: &[(String, String)], args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env_clear()
+        .envs(environment.iter().map(|(name, value)| (name, value)))
+        .output()
+        .expect("git runs");
+    assert!(!output.status.success(), "git {args:?} was not refused");
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+#[test]
+fn the_pre_push_hook_refuses_the_default_branch_and_force_pushes_and_lets_a_new_branch_through() {
+    let root = scratch("pre-push");
+    let environment = box_environment(&root, None);
+    let source = public_repository(&root, &environment);
+    let bare = root.join("origin.git");
+    git(
+        &root,
+        &environment,
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            &source.display().to_string(),
+            &bare.display().to_string(),
+        ],
+    );
+    git(&bare, &environment, &["symbolic-ref", "HEAD", "refs/heads/trunk"]);
+    let work = root.join("workspace");
+    prepare(&work, &bare.display().to_string(), &environment, LIMIT).expect("the bare repository clones");
+    std::fs::write(work.join("CHANGE.md"), "change\n").expect("a file is written");
+    git(&work, &environment, &["add", "CHANGE.md"]);
+    git(&work, &environment, &["commit", "--quiet", "-m", "feat: change"]);
+    let refusal = refused_push(&work, &environment, &["push", "origin", "HEAD:trunk"]);
+    assert!(
+        refusal.contains(
+            "Tumpel pushes to a branch and opens a draft pull request; the default branch is not pushed from a box"
+        ),
+        "{refusal}"
+    );
+    git(
+        &work,
+        &environment,
+        &["push", "--quiet", "origin", "HEAD:refs/heads/tumpel-change"],
+    );
+    git(
+        &work,
+        &environment,
+        &["commit", "--quiet", "--amend", "-m", "feat: rewritten"],
+    );
+    let forced = refused_push(
+        &work,
+        &environment,
+        &["push", "--force", "origin", "HEAD:tumpel-change"],
+    );
+    assert!(forced.contains("Tumpel does not force-push from a box"), "{forced}");
+    assert_eq!(
+        text(&git(&bare, &environment, &["rev-parse", "trunk"])),
+        text(&git(&source, &environment, &["rev-parse", "trunk"]))
+    );
+}
+
+#[test]
+fn a_prebuild_pins_its_commit_and_the_first_turn_restored_from_it_pulls_the_branch_once() {
+    let root = scratch("prebuild");
+    let environment = box_environment(&root, None);
+    let source = public_repository(&root, &environment);
+    git(&source, &environment, &["switch", "--quiet", "trunk"]);
+    let recorded = text(&git(&source, &environment, &["rev-parse", "HEAD"]));
+    std::fs::write(source.join("LATER.md"), "later\n").expect("a file is written");
+    git(&source, &environment, &["add", "LATER.md"]);
+    git(&source, &environment, &["commit", "--quiet", "-m", "feat: later"]);
+    let work = root.join("workspace");
+    let url = source.display().to_string();
+    prepare_at(&work, &url, &environment, LIMIT, Some(&recorded)).expect("the prebuild clones at its commit");
+    assert_eq!(text(&git(&work, &environment, &["rev-parse", "HEAD"])), recorded);
+    assert_eq!(text(&git(&work, &environment, &["branch", "--show-current"])), "trunk");
+    std::fs::write(source.join("NEWEST.md"), "newest\n").expect("a file is written");
+    git(&source, &environment, &["add", "NEWEST.md"]);
+    git(&source, &environment, &["commit", "--quiet", "-m", "feat: newest"]);
+    let newest = text(&git(&source, &environment, &["rev-parse", "HEAD"]));
+    prepare(&work, &url, &environment, LIMIT).expect("the restored box pulls the branch");
+    assert_eq!(text(&git(&work, &environment, &["rev-parse", "HEAD"])), newest);
+    std::fs::write(work.join("CHANGE.md"), "change\n").expect("a file is written");
+    git(&work, &environment, &["add", "CHANGE.md"]);
+    git(&work, &environment, &["commit", "--quiet", "-m", "feat: change"]);
+    let own = text(&git(&work, &environment, &["rev-parse", "HEAD"]));
+    prepare(&work, &url, &environment, LIMIT).expect("a later turn leaves the branch alone");
+    assert_eq!(text(&git(&work, &environment, &["rev-parse", "HEAD"])), own);
+}

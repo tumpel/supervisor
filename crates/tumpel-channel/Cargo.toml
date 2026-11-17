@@ -1,0 +1,16 @@
+[package]
+name = "tumpel-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The wire protocol between the tumpel control plane and its host supervisors"
+readme = "../../README.md"
+
+[dependencies]
+chrono.workspace = true
+serde_json.workspace = true
+tumpel-api.workspace = true
+
+[lints]
+workspace = true

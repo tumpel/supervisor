@@ -1,0 +1,1729 @@
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
+use std::io::{Cursor, Read};
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde_json::json;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tumpel_api::types::{
+    ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
+    ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld, ChannelSnapshotChunksHeldType,
+    ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType,
+    ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId,
+    GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover,
+    SupervisorHandoverMachine, TurnFailureReason,
+};
+
+use super::{
+    restore_budget, BoxTurn, Budgets, Command, Guest, Handover, Input, Lifecycle, Machine, Settings, SnapshotOrder,
+    TeardownOrder, Vmm,
+};
+use crate::boot::BootOrder;
+use crate::exchange::{Answer, Answers};
+use crate::images::ImageOrder;
+use crate::pool::{Tap, TapPool};
+use crate::snapshot::{Born, Entry, Found, Kind, Scan, Upper};
+use crate::store::{Store, UploadError};
+
+#[derive(Clone, Copy, PartialEq)]
+enum Harness {
+    Echo,
+    Reader,
+    Silent,
+    StallsAfterFirstLine,
+    SlowClone,
+    HangsCloning,
+    RefusesClone,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Boot {
+    Works,
+    Slow,
+    Hangs,
+    OldImage,
+    NewImage,
+}
+
+type Files = BTreeMap<Vec<u8>, (Found, Vec<u8>)>;
+
+#[derive(Clone)]
+struct Tree(Files);
+
+impl Upper for Tree {
+    fn scan(&self) -> Result<Scan, String> {
+        Ok(self
+            .0
+            .iter()
+            .map(|(path, (found, _))| (path.clone(), found.clone()))
+            .collect())
+    }
+
+    fn open(&self, path: &[u8]) -> Result<Box<dyn Read + '_>, String> {
+        let (_, text) = self.0.get(path).ok_or("no such file")?;
+        Ok(Box::new(Cursor::new(text.clone())))
+    }
+}
+
+type Drives = Arc<Mutex<HashMap<PathBuf, Files>>>;
+type Log = Arc<Mutex<Vec<String>>>;
+type Hands = Arc<Mutex<HashMap<i32, MemoryGuest>>>;
+
+fn note(log: &Log, event: String) {
+    log.lock().expect("log").push(event);
+}
+
+struct MemoryGuest {
+    harness: Harness,
+    log: Log,
+    drive: PathBuf,
+    drives: Drives,
+    lines: i64,
+    pending: VecDeque<GuestMessage>,
+    ready_at: Option<tokio::time::Instant>,
+}
+
+fn message(value: serde_json::Value) -> GuestMessage {
+    serde_json::from_value(value).expect("a guest message")
+}
+
+impl MemoryGuest {
+    fn send_now(&mut self, input: &GuestInput) {
+        let GuestInput::TurnStart(start) = input else {
+            return;
+        };
+        if start.turn_id.starts_with("late") {
+            note(&self.log, format!("start {}", *start.turn_id));
+        }
+        self.lines = start.last_line_seq.0;
+        self.ready_at = Some(tokio::time::Instant::now() + SLOW_CLONE);
+        if self.harness == Harness::HangsCloning {
+            return;
+        }
+        if self.harness == Harness::RefusesClone {
+            self.pending.push_back(message(json!({
+                "type": "TurnRepositoryCloneFailed", "turnId": *start.turn_id, "cause": "Refused", "detail": "git reported: denied"
+            })));
+            return;
+        }
+        self.pending.push_back(message(
+            json!({ "type": "TurnRepositoryReady", "turnId": *start.turn_id }),
+        ));
+        let texts: Vec<&str> = match self.harness {
+            Harness::Echo | Harness::Reader | Harness::SlowClone => start.prompt.lines().collect(),
+            Harness::StallsAfterFirstLine => start.prompt.lines().take(1).collect(),
+            Harness::HangsCloning | Harness::RefusesClone | Harness::Silent => Vec::new(),
+        };
+        for text in texts {
+            self.lines += 1;
+            self.pending.push_back(message(
+                json!({ "type": "TurnLine", "turnId": *start.turn_id, "lineSeq": self.lines, "text": text }),
+            ));
+        }
+        if matches!(self.harness, Harness::Echo | Harness::SlowClone) {
+            let file = format!("root/{}", *start.turn_id).into_bytes();
+            let found = Found {
+                entry: Entry {
+                    kind: Kind::File {
+                        size: start.prompt.len() as u64,
+                    },
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 1,
+                    mtime_nanos: 0,
+                },
+                born: Born { seconds: 1, nanos: 0 },
+            };
+            self.drives
+                .lock()
+                .expect("drives")
+                .entry(self.drive.clone())
+                .or_default()
+                .insert(file, (found, start.prompt.as_bytes().to_vec()));
+        }
+        if matches!(self.harness, Harness::Echo | Harness::Reader | Harness::SlowClone) {
+            self.pending.push_back(message(json!({
+                "type": "TurnEnd", "turnId": *start.turn_id, "reason": "Completed", "lastLineSeq": self.lines, "detail": ""
+            })));
+        }
+    }
+}
+
+impl Guest for MemoryGuest {
+    fn send(&mut self, input: &GuestInput) -> impl Future<Output = Result<(), String>> + Send {
+        self.send_now(input);
+        std::future::ready(Ok(()))
+    }
+
+    async fn receive(&mut self) -> Result<GuestMessage, String> {
+        let cloning = matches!(self.pending.front(), Some(GuestMessage::TurnRepositoryReady(_)));
+        if let (true, Harness::SlowClone, Some(ready_at)) = (cloning, self.harness, self.ready_at) {
+            tokio::time::sleep_until(ready_at).await;
+        }
+        match self.pending.pop_front() {
+            Some(message) => Ok(message),
+            None => std::future::pending().await,
+        }
+    }
+}
+
+fn restored(archive: &[u8]) -> Files {
+    let mut files = Files::new();
+    let mut archive = tar::Archive::new(Cursor::new(archive));
+    for entry in archive.entries().expect("entries") {
+        let mut entry = entry.expect("entry");
+        let path = entry.path_bytes().into_owned();
+        let header = entry.header().clone();
+        let mut text = Vec::new();
+        entry.read_to_end(&mut text).expect("content");
+        let kind = if header.entry_type().is_dir() {
+            Kind::Dir
+        } else {
+            Kind::File {
+                size: text.len() as u64,
+            }
+        };
+        let found = Found {
+            entry: Entry {
+                kind,
+                mode: header.mode().expect("mode"),
+                uid: header.uid().expect("uid"),
+                gid: header.gid().expect("gid"),
+                mtime: header.mtime().expect("mtime"),
+                mtime_nanos: 0,
+            },
+            born: Born { seconds: 2, nanos: 0 },
+        };
+        files.insert(path, (found, text));
+    }
+    files
+}
+
+struct MemoryMachine {
+    harness: Harness,
+    boot: Boot,
+    session: String,
+    tap: String,
+    drive: PathBuf,
+    drives: Drives,
+    log: Log,
+    hands: Hands,
+}
+
+impl Machine for MemoryMachine {
+    type Guest = MemoryGuest;
+
+    async fn start(
+        &mut self,
+        _image: &crate::boot::Boot,
+        restore: Option<&Path>,
+    ) -> Result<(MemoryGuest, GuestHello), String> {
+        let files = match restore {
+            Some(path) => {
+                let archive = std::fs::read(path).expect("restore drive");
+                let files = restored(&archive);
+                let names: Vec<String> = files
+                    .keys()
+                    .map(|key| String::from_utf8_lossy(key).into_owned())
+                    .collect();
+                note(&self.log, format!("restore {} {}", self.session, names.join(",")));
+                files
+            }
+            None => Files::new(),
+        };
+        if self.boot == Boot::Slow {
+            tokio::time::sleep(SLOW_BOOT).await;
+        }
+        note(&self.log, format!("boot {} on {}", self.session, self.tap));
+        if self.boot == Boot::Hangs {
+            std::future::pending::<()>().await;
+        }
+        self.drives.lock().expect("drives").insert(self.drive.clone(), files);
+        let hello = serde_json::from_value(json!({
+            "type": "GuestHello", "protocolVersion": match self.boot { Boot::OldImage => 1, Boot::NewImage => tumpel_api::types::GuestProtocol::VERSION + 1, _ => tumpel_api::types::GuestProtocol::VERSION }, "harness": "Shell", "harnessVersion": "1", "lastLineSeq": 0
+        }))
+        .expect("hello");
+        Ok((
+            MemoryGuest {
+                harness: self.harness,
+                log: Arc::clone(&self.log),
+                drive: self.drive.clone(),
+                drives: Arc::clone(&self.drives),
+                lines: 0,
+                pending: VecDeque::new(),
+                ready_at: None,
+            },
+            hello,
+        ))
+    }
+
+    fn pause(&mut self) -> impl Future<Output = Result<(), String>> + Send {
+        note(&self.log, format!("pause {}", self.session));
+        std::future::ready(Ok(()))
+    }
+
+    fn resume(&mut self) -> impl Future<Output = Result<(), String>> + Send {
+        note(&self.log, format!("resume {}", self.session));
+        std::future::ready(Ok(()))
+    }
+
+    fn drive(&self) -> PathBuf {
+        self.drive.clone()
+    }
+
+    async fn stop(self) {
+        self.drives.lock().expect("drives").remove(&self.drive);
+        note(&self.log, format!("stop {}", self.session));
+    }
+
+    fn console_tail(&self) -> String {
+        "[ console ]".to_string()
+    }
+
+    fn hand_over(self, guest: MemoryGuest) -> Result<(SupervisorHandoverMachine, Vec<OwnedFd>), String> {
+        let mut hands = self.hands.lock().expect("hands");
+        let guest_fd = i32::try_from(hands.len()).expect("a descriptor") + 3;
+        hands.insert(guest_fd, guest);
+        note(&self.log, format!("hand over {}", self.session));
+        let machine = serde_json::from_value(json!({
+            "processId": 100 + guest_fd, "apiSocket": "api.sock", "vsock": "v.sock", "guestFd": guest_fd,
+            "guestBuffer": "", "stdoutFd": 0, "stderrFd": 0, "consoleTail": ""
+        }))
+        .expect("a handed machine");
+        Ok((machine, Vec::new()))
+    }
+}
+
+#[derive(Clone)]
+struct MemoryVmm {
+    harness: Harness,
+    boot: Boot,
+    staging: PathBuf,
+    drives: Drives,
+    log: Log,
+    hands: Hands,
+}
+
+impl Vmm for MemoryVmm {
+    type Machine = MemoryMachine;
+    type Upper = Tree;
+
+    fn machine(&self, session_id: &EntityId, tap: &Tap) -> Result<MemoryMachine, String> {
+        Ok(MemoryMachine {
+            harness: self.harness,
+            boot: self.boot,
+            session: session_id.to_string(),
+            tap: tap.device(),
+            drive: self.staging.join(&**session_id).join("overlay"),
+            drives: Arc::clone(&self.drives),
+            log: Arc::clone(&self.log),
+            hands: Arc::clone(&self.hands),
+        })
+    }
+
+    fn reattach(
+        &self,
+        session_id: &EntityId,
+        tap: &Tap,
+        handed: &SupervisorHandoverMachine,
+    ) -> Result<(MemoryMachine, MemoryGuest), String> {
+        let guest = self
+            .hands
+            .lock()
+            .expect("hands")
+            .remove(&handed.guest_fd)
+            .ok_or_else(|| {
+                format!(
+                    "its Firecracker process {} ended during the handover",
+                    handed.process_id
+                )
+            })?;
+        note(&self.log, format!("reattach {} on {}", **session_id, tap.device()));
+        Ok((self.machine(session_id, tap)?, guest))
+    }
+
+    fn discard(&self, handed: &SupervisorHandoverMachine) {
+        self.hands.lock().expect("hands").remove(&handed.guest_fd);
+        note(&self.log, format!("discard {}", handed.process_id));
+    }
+
+    fn open_upper(&self, drive: &Path) -> Result<Tree, String> {
+        self.drives
+            .lock()
+            .expect("drives")
+            .get(drive)
+            .cloned()
+            .map(Tree)
+            .ok_or_else(|| format!("no drive at {}", drive.display()))
+    }
+
+    fn staging(&self, session_id: &EntityId) -> Result<PathBuf, String> {
+        Ok(self.staging.join(&**session_id))
+    }
+
+    fn chunk_cache(&self) -> PathBuf {
+        self.staging.join("chunks")
+    }
+
+    fn image_cache(&self) -> PathBuf {
+        self.staging.join("images")
+    }
+}
+
+#[derive(Default)]
+struct Index {
+    chunks: HashMap<String, ChannelChunkPlacement>,
+    packs: HashMap<String, std::num::NonZeroU64>,
+}
+
+#[derive(Default, Clone)]
+struct MemoryStore(Arc<Mutex<HashMap<String, Vec<u8>>>>, Log, Arc<Mutex<Index>>, Duration);
+
+const FETCHED_IMAGE_URL: &str = "https://r2.example.test/fetched/image";
+
+impl MemoryStore {
+    fn holds(&self, url: &str) -> bool {
+        self.0.lock().expect("store").contains_key(url)
+    }
+
+    fn uploads(&self) -> Vec<String> {
+        std::mem::take(&mut *self.1.lock().expect("uploads"))
+    }
+
+    fn get(&self, url: &str) -> Result<Vec<u8>, String> {
+        self.0
+            .lock()
+            .expect("store")
+            .get(url)
+            .cloned()
+            .ok_or_else(|| format!("GET {url} answered 404 Not Found"))
+    }
+
+    fn upload_checked_now(&self, url: &str, file: &Path, sha256: &str) -> Result<(), UploadError> {
+        let bytes = std::fs::read(file).map_err(|error| UploadError::Unreadable(error.to_string()))?;
+        if crate::snapshot::verified(sha256, &bytes).is_err() || !url.ends_with(sha256) {
+            return Err(UploadError::Rejected(format!("PUT {url} answered 400 BadDigest")));
+        }
+        self.0.lock().expect("store").insert(url.to_string(), bytes);
+        note(&self.1, url.to_string());
+        Ok(())
+    }
+
+    fn upload_now(&self, url: &str, file: &Path) -> Result<(), UploadError> {
+        let bytes = std::fs::read(file).map_err(|error| UploadError::Unreadable(error.to_string()))?;
+        self.0.lock().expect("store").insert(url.to_string(), bytes);
+        note(&self.1, url.to_string());
+        Ok(())
+    }
+
+    fn download_range_now(&self, url: &str, file: &Path, first: u64, last: u64) -> Result<(), String> {
+        let bytes = self.get(url)?;
+        let range = usize::try_from(first).expect("first")..=usize::try_from(last).expect("last");
+        let part = bytes.get(range).ok_or_else(|| format!("GET {url} answered 416"))?;
+        std::fs::write(file, part).map_err(|error| error.to_string())
+    }
+}
+
+impl Store for MemoryStore {
+    fn upload(&self, url: &str, file: &Path) -> impl Future<Output = Result<(), UploadError>> + Send {
+        std::future::ready(self.upload_now(url, file))
+    }
+
+    fn upload_checked(
+        &self,
+        url: &str,
+        file: &Path,
+        sha256: &str,
+    ) -> impl Future<Output = Result<(), UploadError>> + Send {
+        std::future::ready(self.upload_checked_now(url, file, sha256))
+    }
+
+    async fn download(&self, url: &str, file: &Path) -> Result<(), String> {
+        if url == FETCHED_IMAGE_URL {
+            tokio::time::sleep(self.3).await;
+        }
+        std::fs::write(file, self.get(url)?).map_err(|error| error.to_string())
+    }
+
+    fn download_range(
+        &self,
+        url: &str,
+        file: &Path,
+        first: u64,
+        last: u64,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        std::future::ready(self.download_range_now(url, file, first, last))
+    }
+}
+
+const WARM: Duration = Duration::from_millis(400);
+const SETTLE: Duration = Duration::from_millis(60);
+const SLOW_CLONE: Duration = Duration::from_millis(300);
+const SLOW_BOOT: Duration = Duration::from_millis(50);
+const LATE_CLAIM: Duration = Duration::from_millis(150);
+
+fn settings() -> Settings {
+    Settings {
+        budgets: Budgets {
+            boot: Duration::from_millis(300),
+            first_line: Duration::from_millis(200),
+            turn: Duration::from_millis(400),
+            snapshot: Duration::from_secs(5),
+        },
+        warm_window: WARM,
+        layer_cache_mib: std::num::NonZeroU32::MIN,
+        overlay_bytes: 1024 * 1024 * 1024,
+    }
+}
+
+fn describe(message: ChannelHostMessage) -> Option<String> {
+    Some(match message {
+        ChannelHostMessage::TurnClaim(claim) => format!("claim {}", *claim.turn_id),
+        ChannelHostMessage::TurnRepositoryReady(_)
+        | ChannelHostMessage::SnapshotChunks(_)
+        | ChannelHostMessage::SnapshotPacks(_)
+        | ChannelHostMessage::RestoreChunks(_)
+        | ChannelHostMessage::SupervisorUpdateStep(_)
+        | ChannelHostMessage::SupervisorUpdateFailed(_)
+        | ChannelHostMessage::TelemetryBatch(_) => return None,
+        ChannelHostMessage::TurnImageFetching(fetching) => format!("fetching {}", *fetching.image_digest),
+        ChannelHostMessage::TurnLine(line) => format!("line {} {}", line.line_seq.0, line.text),
+        ChannelHostMessage::TurnComplete(done) => format!("complete {}", done.last_line_seq.0),
+        ChannelHostMessage::TurnRepositoryCloneFailed(failed) => {
+            format!("clone failed {}: {}", failed.cause, failed.detail)
+        }
+        ChannelHostMessage::TurnFailed(failed) => format!("failed {}: {}", failed.reason, failed.detail),
+        ChannelHostMessage::SnapshotDone(_) => "snapshot done".to_string(),
+        ChannelHostMessage::SnapshotFailed(failed) => {
+            format!("snapshot failed {}: {}", failed.reason, failed.detail)
+        }
+        ChannelHostMessage::BoxGone(gone) => format!("box gone {}", *gone.session_id),
+        ChannelHostMessage::BoxTeardownFailed(failed) => {
+            format!("teardown failed {}: {}", failed.reason, failed.detail)
+        }
+        ChannelHostMessage::ClaudeSetupBoxUrl(printed) => format!("setup url {}", printed.sign_in_url),
+        ChannelHostMessage::ClaudeSetupBoxFailed(failed) => {
+            format!("setup failed {}: {}", failed.reason, failed.detail)
+        }
+    })
+}
+
+struct Host {
+    commands: UnboundedSender<Input>,
+    received: UnboundedReceiver<ChannelHostMessage>,
+    store: MemoryStore,
+    log: Log,
+    seq: i64,
+    clone_seconds: u32,
+    images: PathBuf,
+    vmm: MemoryVmm,
+    capacity: u32,
+    settings: Settings,
+}
+
+fn staging(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/lifecycle-tests")
+        .join(name);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("clearing the last run");
+    }
+    dir
+}
+
+fn host(name: &str, capacity: u32, harness: Harness, boot: Boot) -> Host {
+    host_with(name, capacity, harness, boot, settings(), 120)
+}
+
+fn host_with(name: &str, capacity: u32, harness: Harness, boot: Boot, settings: Settings, clone_seconds: u32) -> Host {
+    host_on(
+        name,
+        MemoryStore::default(),
+        capacity,
+        harness,
+        boot,
+        settings,
+        clone_seconds,
+    )
+}
+
+fn pack_url(digest: &str) -> String {
+    format!("https://store.example/packs/{digest}")
+}
+
+fn claim_answer(turn_id: EntityId) -> Answer {
+    if turn_id.starts_with("withdrawn") {
+        return Answer::Withdrawn(ChannelTurnWithdrawn {
+            turn_id,
+            type_: ChannelTurnWithdrawnType::TurnWithdrawn,
+        });
+    }
+    Answer::Claimed(ChannelTurnClaimed {
+        turn_id,
+        type_: ChannelTurnClaimedType::TurnClaimed,
+    })
+}
+
+fn control_plane(
+    store: MemoryStore,
+    answers: Answers,
+    log: Log,
+    mut from_lifecycle: UnboundedReceiver<ChannelHostMessage>,
+) -> UnboundedReceiver<ChannelHostMessage> {
+    let (forward, received) = unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(message) = from_lifecycle.recv().await {
+            let mut index = store.2.lock().expect("index");
+            match message {
+                ChannelHostMessage::SnapshotChunks(chunks) => {
+                    answers.deliver(Answer::ChunksHeld(ChannelSnapshotChunksHeld {
+                        held: chunks
+                            .digests
+                            .iter()
+                            .filter_map(|digest| index.chunks.get(digest.as_str()).cloned())
+                            .collect(),
+                        part: chunks.part,
+                        snapshot_id: chunks.snapshot_id,
+                        type_: ChannelSnapshotChunksHeldType::SnapshotChunksHeld,
+                    }));
+                }
+                ChannelHostMessage::SnapshotPacks(packs) => {
+                    for chunk in &packs.chunks {
+                        index
+                            .chunks
+                            .entry(chunk.digest.as_str().to_string())
+                            .or_insert_with(|| chunk.clone());
+                    }
+                    for pack in &packs.packs {
+                        index
+                            .packs
+                            .insert(pack.pack_digest.as_str().to_string(), pack.size_bytes);
+                    }
+                    answers.deliver(Answer::PackUploads(ChannelSnapshotPackUploads {
+                        part: packs.part,
+                        snapshot_id: packs.snapshot_id,
+                        type_: ChannelSnapshotPackUploadsType::SnapshotPackUploads,
+                        upload_expires_at: in_seconds(60),
+                        uploads: packs
+                            .packs
+                            .iter()
+                            .filter(|pack| !store.holds(&pack_url(&pack.pack_digest)))
+                            .map(|pack| ChannelPackUrl {
+                                pack_digest: pack.pack_digest.clone(),
+                                size_bytes: pack.size_bytes,
+                                url: pack_url(&pack.pack_digest),
+                            })
+                            .collect(),
+                    }));
+                }
+                ChannelHostMessage::RestoreChunks(chunks) => {
+                    let mut packs: Vec<ChannelPackUrl> = Vec::new();
+                    for chunk in &chunks.chunks {
+                        let Some(size) = index.packs.get(chunk.pack_digest.as_str()).copied() else {
+                            continue;
+                        };
+                        if packs.iter().all(|pack| pack.pack_digest != chunk.pack_digest) {
+                            packs.push(ChannelPackUrl {
+                                pack_digest: chunk.pack_digest.clone(),
+                                size_bytes: size,
+                                url: pack_url(&chunk.pack_digest),
+                            });
+                        }
+                    }
+                    answers.deliver(Answer::Downloads(ChannelRestoreDownloads {
+                        download_expires_at: in_seconds(60),
+                        packs,
+                        part: chunks.part,
+                        turn_id: chunks.turn_id,
+                        type_: ChannelRestoreDownloadsType::RestoreDownloads,
+                    }));
+                }
+                ChannelHostMessage::TurnClaim(claim) => {
+                    let turn_id = claim.turn_id.clone();
+                    let _ = forward.send(ChannelHostMessage::TurnClaim(claim));
+                    if !turn_id.starts_with("late") {
+                        answers.deliver(claim_answer(turn_id));
+                        continue;
+                    }
+                    note(&log, format!("claim {}", *turn_id));
+                    let answers = answers.clone();
+                    let log = Arc::clone(&log);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(LATE_CLAIM).await;
+                        note(&log, format!("claimed {}", *turn_id));
+                        answers.deliver(claim_answer(turn_id));
+                    });
+                }
+                other => {
+                    let _ = forward.send(other);
+                }
+            }
+        }
+    });
+    received
+}
+
+fn host_on(
+    name: &str,
+    store: MemoryStore,
+    capacity: u32,
+    harness: Harness,
+    boot: Boot,
+    settings: Settings,
+    clone_seconds: u32,
+) -> Host {
+    let staging = staging(name);
+    let vmm = MemoryVmm {
+        harness,
+        boot,
+        staging,
+        drives: Arc::default(),
+        log: Arc::default(),
+        hands: Arc::default(),
+    };
+    start_host(vmm, store, capacity, settings, clone_seconds, None)
+}
+
+fn start_host(
+    vmm: MemoryVmm,
+    store: MemoryStore,
+    capacity: u32,
+    settings: Settings,
+    clone_seconds: u32,
+    handover: Option<(SupervisorHandover, bool)>,
+) -> Host {
+    let log = Arc::clone(&vmm.log);
+    let images = vmm.staging.join("images");
+    let (out, from_lifecycle) = unbounded_channel();
+    let mut lifecycle = Lifecycle::new(
+        vmm.clone(),
+        store.clone(),
+        settings,
+        TapPool::new(capacity).expect("pool"),
+        out,
+    );
+    let received = control_plane(store.clone(), lifecycle.answers(), Arc::clone(&log), from_lifecycle);
+    if let Some((handover, adopt)) = handover {
+        lifecycle.reattach(handover, adopt);
+    }
+    let (commands, from_host) = unbounded_channel();
+    tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
+    Host {
+        commands,
+        received,
+        store,
+        log,
+        seq: 0,
+        clone_seconds,
+        images,
+        vmm,
+        capacity,
+        settings,
+    }
+}
+
+fn image(image_digest: &str, clone_seconds: u32, protocol: GuestHarnessProtocol) -> serde_json::Value {
+    json!({
+        "imageDigest": image_digest,
+        "kernelUrl": "https://example.com/vmlinux",
+        "kernelDigest": "b".repeat(64),
+        "baseRootfsUrl": "https://example.com/rootfs.squashfs",
+        "baseRootfsDigest": "c".repeat(64),
+        "harness": {
+            "harness": "Shell", "harnessVersion": "1", "protocol": protocol,
+            "command": ["/bin/sh", "-s"], "workingDirectory": "/root",
+            "environment": { "PATH": "/usr/bin:/bin", "HOME": "/root", "LANG": "C.UTF-8" }, "fixedVariables": [], "cloneSeconds": clone_seconds
+        },
+        "components": []
+    })
+}
+
+fn in_seconds(seconds: i64) -> chrono::DateTime<chrono::FixedOffset> {
+    (chrono::Utc::now() + chrono::Duration::seconds(seconds)).fixed_offset()
+}
+
+impl Host {
+    fn ask_handover(&self) -> tokio::sync::oneshot::Receiver<Handover> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.commands.send(Input::HandOver(reply)).expect("send");
+        answer
+    }
+
+    fn successor(self, handover: &SupervisorHandover, adopt: bool) -> Host {
+        let text = serde_json::to_string(handover).expect("the handover is JSON");
+        let record = serde_json::from_str(&text).expect("the handover reads back as a SupervisorHandover");
+        let Host {
+            vmm,
+            store,
+            capacity,
+            settings,
+            clone_seconds,
+            ..
+        } = self;
+        start_host(vmm, store, capacity, settings, clone_seconds, Some((record, adopt)))
+    }
+
+    async fn hand_over(self) -> Host {
+        let handover = self.ask_handover().await.expect("the boxes are handed over");
+        self.successor(&handover.record, true)
+    }
+
+    fn send(&self, command: Command) {
+        self.commands.send(Input::Command(command)).expect("send");
+    }
+
+    fn turn(&self, turn_id: &str, session_id: &str, prompt: &str, snapshots: Vec<ChannelSnapshotDownload>) {
+        self.turn_expiring(turn_id, session_id, prompt, snapshots, 300);
+    }
+
+    fn turn_expiring(
+        &self,
+        turn_id: &str,
+        session_id: &str,
+        prompt: &str,
+        snapshots: Vec<ChannelSnapshotDownload>,
+        expires_in: i64,
+    ) {
+        let turn = self.box_turn(turn_id, session_id, prompt, snapshots, expires_in);
+        self.send(Command::Turn(Box::new(turn)));
+    }
+
+    fn turn_speaking(&self, protocol: GuestHarnessProtocol, turn_id: &str, session_id: &str, prompt: &str) {
+        let mut turn = self.box_turn(turn_id, session_id, prompt, Vec::new(), 300);
+        turn.image = BootOrder::Full(self.cached_image(protocol));
+        self.send(Command::Turn(Box::new(turn)));
+    }
+
+    fn cached_image(&self, protocol: GuestHarnessProtocol) -> ImageOrder {
+        let image_digest = format!("{:0>64}", format!("{}{}", self.clone_seconds, protocol as u8));
+        std::fs::create_dir_all(&self.images).expect("the image cache is created");
+        std::fs::write(
+            self.images.join(format!("{image_digest}.json")),
+            image(&image_digest, self.clone_seconds, protocol).to_string(),
+        )
+        .expect("the manifest is cached");
+        ImageOrder {
+            download: serde_json::from_value(json!({
+                "kind": "Full",
+                "imageDigest": image_digest,
+                "kernelDigest": "b".repeat(64),
+                "manifestDigest": "d".repeat(64),
+                "imageUrl": "https://r2.example.test/image",
+                "kernelUrl": "https://r2.example.test/kernel",
+                "manifestUrl": "https://r2.example.test/manifest",
+                "downloadExpiresAt": in_seconds(300).to_rfc3339(),
+                "fetchSeconds": 5
+            }))
+            .expect("download"),
+            harness: "Shell".to_string(),
+            harness_version: "1".to_string(),
+        }
+    }
+
+    fn uncached_image(&self) -> ImageOrder {
+        let sha256 = |bytes: &[u8]| crate::snapshot::hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+        let rootfs = b"fetched rootfs".to_vec();
+        let kernel = b"fetched kernel".to_vec();
+        let image_digest = sha256(&rootfs);
+        let mut manifest = image(&image_digest, self.clone_seconds, GuestHarnessProtocol::ShellLines);
+        manifest["kernelDigest"] = json!(sha256(&kernel));
+        let manifest = manifest.to_string().into_bytes();
+        let order = ImageOrder {
+            download: serde_json::from_value(json!({
+                "kind": "Full",
+                "imageDigest": image_digest,
+                "kernelDigest": sha256(&kernel),
+                "manifestDigest": sha256(&manifest),
+                "imageUrl": FETCHED_IMAGE_URL,
+                "kernelUrl": "https://r2.example.test/fetched/kernel",
+                "manifestUrl": "https://r2.example.test/fetched/manifest",
+                "downloadExpiresAt": in_seconds(300).to_rfc3339(),
+                "fetchSeconds": 5
+            }))
+            .expect("download"),
+            harness: "Shell".to_string(),
+            harness_version: "1".to_string(),
+        };
+        let mut store = self.store.0.lock().expect("store");
+        store.insert(order.download.image_url.clone(), rootfs);
+        store.insert(order.download.kernel_url.clone(), kernel);
+        store.insert(order.download.manifest_url.clone(), manifest);
+        order
+    }
+
+    fn turn_fetching(&self, turn_id: &str, snapshots: Vec<ChannelSnapshotDownload>, expires_in: i64) -> ImageOrder {
+        let mut turn = self.box_turn(turn_id, "session-1", "two", snapshots, expires_in);
+        let order = self.uncached_image();
+        turn.image = BootOrder::Full(order.clone());
+        self.send(Command::Turn(Box::new(turn)));
+        order
+    }
+
+    fn box_turn(
+        &self,
+        turn_id: &str,
+        session_id: &str,
+        prompt: &str,
+        snapshots: Vec<ChannelSnapshotDownload>,
+        expires_in: i64,
+    ) -> BoxTurn {
+        BoxTurn {
+            turn_id: turn_id.try_into().expect("turn id"),
+            session_id: session_id.try_into().expect("session id"),
+            box_id: format!("box-{session_id}").try_into().expect("box id"),
+            image: BootOrder::Full(self.cached_image(GuestHarnessProtocol::ShellLines)),
+            model: "default".try_into().expect("model"),
+            prompt: prompt.to_string().try_into().expect("prompt"),
+            credential: serde_json::from_value(json!({
+                "credentialHandoverId": "credential-1",
+                "expiresAt": in_seconds(expires_in).to_rfc3339(),
+                "variables": [{ "name": "ANTHROPIC_API_KEY", "value": "in-memory" }]
+            }))
+            .expect("grant"),
+            last_line_seq: Sequence(0),
+            snapshots,
+            persona_files: Vec::new(),
+            repository: "https://github.com/acme/app.git".try_into().expect("repository"),
+            git_author_name: "Tumpel Agent".try_into().expect("author name"),
+            git_author_email: "agent@tumpel.invalid".try_into().expect("author email"),
+            files_cache: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/lifecycle-tests/persona-files"),
+            prebuild_commit_sha: None,
+        }
+    }
+
+    fn turn_in_box(&self, turn_id: &str, session_id: &str, box_id: &str, prompt: &str) {
+        let mut turn = self.box_turn(turn_id, session_id, prompt, Vec::new(), 300);
+        turn.box_id = box_id.try_into().expect("box id");
+        self.send(Command::Turn(Box::new(turn)));
+    }
+
+    fn discard(&self, session_id: &str) {
+        let order = TeardownOrder {
+            session_id: session_id.try_into().expect("session id"),
+            box_id: format!("box-{session_id}").try_into().expect("box id"),
+        };
+        self.send(Command::Discard(order));
+    }
+
+    fn teardown(&self, session_id: &str) {
+        let order = TeardownOrder {
+            session_id: session_id.try_into().expect("session id"),
+            box_id: format!("box-{session_id}").try_into().expect("box id"),
+        };
+        self.send(Command::Teardown(order));
+    }
+
+    fn snapshot(&mut self, session_id: &str) -> ChannelSnapshotDownload {
+        self.snapshot_expiring(session_id, 60)
+    }
+
+    fn snapshot_expiring(&mut self, session_id: &str, expires_in: i64) -> ChannelSnapshotDownload {
+        self.seq += 1;
+        let url = format!("https://store.example/{session_id}/{}", self.seq);
+        let order = SnapshotOrder {
+            snapshot_id: format!("snapshot-{}", self.seq).try_into().expect("snapshot id"),
+            session_id: session_id.try_into().expect("session id"),
+            box_id: format!("box-{session_id}").try_into().expect("box id"),
+            snapshot_seq: Sequence(self.seq),
+            upload_url: url.clone(),
+            upload_expires_at: in_seconds(expires_in),
+        };
+        self.send(Command::Snapshot(order));
+        serde_json::from_value(json!({
+            "snapshotId": format!("snapshot-{}", self.seq),
+            "snapshotSeq": self.seq,
+            "storageKey": format!("tenant/{session_id}/{}", self.seq),
+            "downloadUrl": url,
+            "downloadExpiresAt": in_seconds(60).to_rfc3339(),
+        }))
+        .expect("download")
+    }
+
+    async fn settle(&mut self, wait: Duration) -> Vec<String> {
+        tokio::time::sleep(wait).await;
+        let mut seen = Vec::new();
+        while let Ok(message) = self.received.try_recv() {
+            seen.extend(describe(message));
+        }
+        seen
+    }
+
+    async fn settle_until(&mut self, last: &str) -> Vec<String> {
+        let mut seen = Vec::new();
+        while seen.last().map(String::as_str) != Some(last) {
+            let message = tokio::time::timeout(settings().budgets.snapshot, self.received.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no {last} within the snapshot budget, saw {seen:?}"))
+                .expect("an open channel");
+            seen.extend(describe(message));
+        }
+        seen
+    }
+
+    fn log(&self) -> Vec<String> {
+        std::mem::take(&mut *self.log.lock().expect("log"))
+    }
+}
+
+#[tokio::test]
+async fn a_turn_inside_the_warm_window_resumes_the_paused_box() {
+    let mut host = host("resume", 2, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one\ntwo", Vec::new());
+    assert_eq!(
+        host.settle(SETTLE).await,
+        ["claim turn-1", "line 1 one", "line 2 two", "complete 2"]
+    );
+    host.turn("turn-2", "session-1", "three", Vec::new());
+    assert_eq!(
+        host.settle(SETTLE).await,
+        ["claim turn-2", "line 1 three", "complete 1"]
+    );
+    assert_eq!(
+        host.log(),
+        [
+            "boot session-1 on tumpel0",
+            "pause session-1",
+            "resume session-1",
+            "pause session-1"
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_claim_goes_out_before_the_boot_and_the_harness_starts_only_once_both_are_done() {
+    let mut host = host("claim-before-boot", 1, Harness::Echo, Boot::Slow);
+    note(&host.log, "offer late-1".to_string());
+    host.turn("late-1", "session-1", "one", Vec::new());
+    assert_eq!(
+        host.settle(LATE_CLAIM + SETTLE).await,
+        ["claim late-1", "line 1 one", "complete 1"]
+    );
+    assert_eq!(
+        host.log(),
+        [
+            "offer late-1",
+            "claim late-1",
+            "boot session-1 on tumpel0",
+            "claimed late-1",
+            "start late-1",
+            "pause session-1"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_turn_the_control_plane_withdraws_at_its_claim_never_reaches_the_harness() {
+    let mut host = host("claim-withdrawn", 2, Harness::Echo, Boot::Works);
+    host.turn("withdrawn-1", "session-1", "one", Vec::new());
+    assert_eq!(host.settle(SETTLE).await, ["claim withdrawn-1"]);
+    assert_eq!(host.log(), ["boot session-1 on tumpel0", "pause session-1"]);
+    host.turn("turn-2", "session-1", "two", Vec::new());
+    assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
+}
+
+#[tokio::test]
+async fn a_resume_cancels_the_expiry_armed_at_pause() {
+    let mut host = host("cancel", 2, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.snapshot("session-1");
+    host.settle(WARM / 2).await;
+    host.turn("turn-2", "session-1", "two", Vec::new());
+    host.snapshot("session-1");
+    host.settle(WARM * 3 / 4).await;
+    assert!(!host.log().iter().any(|event| event.starts_with("stop")));
+    host.settle(WARM / 2).await;
+    assert_eq!(host.log(), ["stop session-1"]);
+}
+
+fn pack_uploads(uploads: &[String]) -> usize {
+    uploads.iter().filter(|url| url.contains("/packs/")).count()
+}
+
+#[tokio::test]
+async fn an_expired_box_waits_for_its_snapshot_and_the_next_turn_restores_from_the_latest() {
+    let mut host = host("expire", 2, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    assert_eq!(pack_uploads(&host.store.uploads()), 2);
+    host.turn("turn-2", "session-1", "two", Vec::new());
+    host.settle(WARM + SETTLE).await;
+    assert!(!host.log().contains(&"stop session-1".to_string()));
+    let second = host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    assert_eq!(host.log(), ["stop session-1"]);
+    let uploads = host.store.uploads();
+    assert_eq!(pack_uploads(&uploads), 2, "{uploads:?}");
+    assert_eq!(uploads.last(), Some(&second.download_url));
+
+    host.turn("turn-3", "session-1", "three", vec![second]);
+    assert_eq!(
+        host.settle(SETTLE).await,
+        ["claim turn-3", "line 1 three", "complete 1"]
+    );
+    assert_eq!(
+        host.log(),
+        [
+            "restore session-1 root/turn-1,root/turn-2",
+            "boot session-1 on tumpel0",
+            "pause session-1"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_snapshot_uploads_no_chunk_the_store_holds_already() {
+    let mut host = host("dedup", 2, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "same bytes", Vec::new());
+    host.turn("turn-2", "session-2", "same bytes", Vec::new());
+    host.settle(SETTLE).await;
+    host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    assert_eq!(pack_uploads(&host.store.uploads()), 2);
+
+    let second = host.snapshot("session-2");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    let uploads = host.store.uploads();
+    assert_eq!(uploads.last(), Some(&second.download_url));
+    let packs: Vec<Vec<u8>> = uploads
+        .iter()
+        .filter(|url| url.contains("/packs/"))
+        .map(|url| host.store.get(url).expect("pack"))
+        .collect();
+    assert_eq!(packs.len(), 1, "{uploads:?}");
+    assert!(!packs[0].windows(10).any(|bytes| bytes == b"same bytes"));
+}
+
+#[tokio::test]
+async fn a_box_on_another_host_downloads_the_chunks_its_cache_lacks() {
+    let mut first = host("first-host", 1, Harness::Echo, Boot::Works);
+    first.turn("turn-1", "session-1", "one", Vec::new());
+    first.settle(SETTLE).await;
+    let snapshot = first.snapshot("session-1");
+    assert_eq!(first.settle_until("snapshot done").await, ["snapshot done"]);
+
+    let mut second = host_on(
+        "second-host",
+        first.store.clone(),
+        1,
+        Harness::Echo,
+        Boot::Works,
+        settings(),
+        120,
+    );
+    second.turn("turn-2", "session-1", "two", vec![snapshot]);
+    assert_eq!(
+        second.settle(SETTLE).await,
+        ["claim turn-2", "line 1 two", "complete 1"]
+    );
+    assert_eq!(second.log()[0], "restore session-1 root/turn-1");
+}
+
+#[tokio::test]
+async fn a_snapshot_after_a_restore_on_another_host_uploads_no_chunk() {
+    let mut first = host("restored-first", 1, Harness::Echo, Boot::Works);
+    first.turn("turn-1", "session-1", "one", Vec::new());
+    first.settle(SETTLE).await;
+    let snapshot = first.snapshot("session-1");
+    assert_eq!(first.settle_until("snapshot done").await, ["snapshot done"]);
+    first.store.uploads();
+
+    let mut second = host_on(
+        "restored-second",
+        first.store.clone(),
+        1,
+        Harness::Reader,
+        Boot::Works,
+        settings(),
+        120,
+    );
+    second.seq = first.seq;
+    second.turn("turn-2", "session-1", "two", vec![snapshot]);
+    assert_eq!(
+        second.settle(SETTLE).await,
+        ["claim turn-2", "line 1 two", "complete 1"]
+    );
+    let again = second.snapshot("session-1");
+    assert_eq!(second.settle_until("snapshot done").await, ["snapshot done"]);
+    assert_eq!(second.store.uploads(), [again.download_url]);
+}
+
+#[tokio::test]
+async fn a_restore_missing_a_chunk_fails_the_turn_snapshot_unreadable() {
+    let mut first = host("missing-chunk", 1, Harness::Echo, Boot::Works);
+    first.turn("turn-1", "session-1", "one", Vec::new());
+    first.settle(SETTLE).await;
+    let snapshot = first.snapshot("session-1");
+    first.settle(SETTLE).await;
+    first
+        .store
+        .0
+        .lock()
+        .expect("store")
+        .retain(|url, _| !url.contains("/packs/"));
+
+    let mut second = host_on(
+        "missing-chunk-2",
+        first.store.clone(),
+        1,
+        Harness::Echo,
+        Boot::Works,
+        settings(),
+        120,
+    );
+    second.turn("turn-2", "session-1", "two", vec![snapshot]);
+    let seen = second.settle(SETTLE).await;
+    assert!(
+        seen.len() == 2
+            && seen[0] == "claim turn-2"
+            && seen[1].starts_with(&format!("failed {}", TurnFailureReason::SnapshotUnreadable))
+            && seen[1].contains("snapshot-1 (seq 1) of session session-1"),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_claim_past_the_pool_is_refused_until_a_clean_paused_box_can_be_evicted() {
+    let mut host = host("pool", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.turn("turn-2", "session-2", "two", Vec::new());
+    let refused = host.settle(SETTLE).await;
+    assert!(
+        refused.len() == 1
+            && refused[0].starts_with(&format!("failed {}", TurnFailureReason::PoolExhausted))
+            && refused[0].contains("all 1 boxes held"),
+        "{refused:?}"
+    );
+    host.snapshot("session-1");
+    host.settle(SETTLE).await;
+    host.log();
+    host.turn("turn-3", "session-2", "three", Vec::new());
+    assert_eq!(
+        host.settle(SETTLE).await,
+        ["claim turn-3", "line 1 three", "complete 1"]
+    );
+    assert_eq!(
+        host.log(),
+        ["stop session-1", "boot session-2 on tumpel0", "pause session-2"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there() {
+    let mut old = host("handover-turn", 2, Harness::SlowClone, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    assert_eq!(old.settle_until("claim turn-1").await, ["claim turn-1"]);
+    tokio::time::sleep(SLOW_CLONE / 2).await;
+    old.log();
+    let answer = old.ask_handover();
+    old.turn("turn-2", "session-2", "two", Vec::new());
+    let handover = answer.await.expect("the boxes are handed over");
+    let refused = format!(
+        "failed {}: this host is handing its boxes to a new supervisor binary and took no turn turn-2; the control plane offers it to another host",
+        TurnFailureReason::HostUpdating
+    );
+    assert_eq!(old.settle_until(&refused).await, [refused]);
+    let mut new = old.successor(&handover.record, true);
+    assert_eq!(new.settle_until("complete 1").await, ["line 1 one", "complete 1"]);
+    assert_eq!(
+        new.log(),
+        [
+            "hand over session-1",
+            "reattach session-1 on tumpel0",
+            "pause session-1"
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_handed_box_whose_process_ended_fails_its_turn_and_frees_its_tap() {
+    let mut old = host("handover-ended", 1, Harness::SlowClone, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("claim turn-1").await;
+    tokio::time::sleep(SLOW_CLONE / 2).await;
+    let handover = old.ask_handover().await.expect("the boxes are handed over");
+    old.vmm.hands.lock().expect("hands").clear();
+    let mut new = old.successor(&handover.record, true);
+    let failed = format!(
+        "failed {}: box box-session-1 of session session-1 was lost in the handover to this supervisor binary: its Firecracker process 103 ended during the handover; send the turn again",
+        TurnFailureReason::HarnessExited
+    );
+    assert_eq!(new.settle_until(&failed).await, [failed]);
+    new.log();
+    new.turn("turn-2", "session-2", "two", Vec::new());
+    new.settle_until("complete 1").await;
+    assert_eq!(
+        new.log()[0],
+        "boot session-2 on tumpel0",
+        "the only TAP device of the host is free again"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_handover_read_by_a_binary_started_without_handover_fails_its_turns_and_adopts_nothing() {
+    let mut old = host("handover-not-adopted", 1, Harness::SlowClone, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("claim turn-1").await;
+    tokio::time::sleep(SLOW_CLONE / 2).await;
+    let handover = old.ask_handover().await.expect("the boxes are handed over");
+    old.log();
+    let mut new = old.successor(&handover.record, false);
+    let failed = format!(
+        "failed {}: box box-session-1 of session session-1 was lost in the handover to this supervisor binary: this supervisor started without --handover, so the box ended with the binary that ran it; send the turn again",
+        TurnFailureReason::HarnessExited
+    );
+    assert_eq!(new.settle_until(&failed).await, [failed]);
+    assert!(new.log().is_empty(), "nothing is reattached or discarded");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_warm_box_handed_over_takes_the_next_turn_without_a_boot() {
+    let mut old = host("handover-warm", 1, Harness::Echo, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    old.log();
+    let mut new = old.hand_over().await;
+    new.turn("turn-2", "session-1", "two", Vec::new());
+    assert_eq!(
+        new.settle_until("complete 1").await,
+        ["claim turn-2", "line 1 two", "complete 1"]
+    );
+    assert_eq!(
+        new.log(),
+        [
+            "hand over session-1",
+            "reattach session-1 on tumpel0",
+            "resume session-1",
+            "pause session-1"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_snapshot_with_no_box_of_the_session_fails_box_not_found() {
+    let mut host = host("missing", 1, Harness::Echo, Boot::Works);
+    host.snapshot("session-1");
+    let seen = host.settle(SETTLE).await;
+    assert!(
+        seen[0].starts_with(&format!(
+            "snapshot failed {}",
+            ChannelSnapshotFailureReason::BoxNotFound
+        )),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_upload_past_its_url_expiry_fails_upload_expired_and_keeps_the_box_dirty() {
+    let mut host = host("upload", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.snapshot_expiring("session-1", -1);
+    let seen = host.settle(SETTLE).await;
+    assert!(
+        seen[0].starts_with(&format!(
+            "snapshot failed {}",
+            ChannelSnapshotFailureReason::UploadExpired
+        )),
+        "{seen:?}"
+    );
+    host.turn("turn-2", "session-2", "two", Vec::new());
+    let refused = host.settle(SETTLE).await;
+    assert!(
+        refused[0].starts_with(&format!("failed {}", TurnFailureReason::PoolExhausted)),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_guest_on_another_protocol_fails_the_boot_naming_both_versions_and_the_fix() {
+    let oldest = tumpel_api::types::GuestProtocol::OLDEST;
+    let supported = tumpel_api::types::GuestProtocol::VERSION;
+    let cases = [
+        (
+            Boot::OldImage,
+            format!("speaks guest protocol 1, this supervisor speaks {oldest} to {supported}; the image is older than the supervisor, push an images-vX.Y.Z tag to publish images built for it"),
+        ),
+        (
+            Boot::NewImage,
+            format!("speaks guest protocol {}, this supervisor speaks {oldest} to {supported}; the image is newer than the supervisor, update the supervisor", supported + 1),
+        ),
+    ];
+    for (index, (boot, expected)) in cases.into_iter().enumerate() {
+        let mut host = host(&format!("image-{index}"), 1, Harness::Echo, boot);
+        host.turn("turn-1", "session-1", "one", Vec::new());
+        let seen = host.settle(Duration::from_millis(600)).await;
+        let last = seen.last().expect("a failure");
+        assert!(last.starts_with("failed BoxBootFailed"), "{seen:?}");
+        assert!(last.contains(&expected), "{last}");
+    }
+}
+
+#[tokio::test]
+async fn each_phase_that_runs_out_names_its_failure_and_returns_the_tap() {
+    let cases = [
+        (
+            Harness::Silent,
+            Boot::Works,
+            TurnFailureReason::NoFirstOutput,
+            "firstLineSeconds",
+        ),
+        (
+            Harness::StallsAfterFirstLine,
+            Boot::Works,
+            TurnFailureReason::TurnTimedOut,
+            "turnSeconds",
+        ),
+        (
+            Harness::Echo,
+            Boot::Hangs,
+            TurnFailureReason::BoxBootFailed,
+            "bootSeconds",
+        ),
+    ];
+    for (index, (harness, boot, reason, budget)) in cases.into_iter().enumerate() {
+        let mut host = host(&format!("budget-{index}"), 1, harness, boot);
+        host.turn("turn-1", "session-1", "one\ntwo", Vec::new());
+        let seen = host.settle(Duration::from_millis(600)).await;
+        let last = seen.last().expect("a failure");
+        assert!(last.starts_with(&format!("failed {reason}")), "{seen:?}");
+        assert!(last.contains(budget) && last.contains("[ console ]"), "{last}");
+        host.log();
+        host.turn_expiring("turn-2", "session-2", "three", Vec::new(), 300);
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(host.log()[0], "boot session-2 on tumpel0");
+    }
+}
+
+#[tokio::test]
+async fn a_clone_that_hangs_fails_no_first_output_after_clone_seconds_and_the_first_line_budget() {
+    let mut settings = settings();
+    settings.budgets.turn = Duration::from_secs(5);
+    let mut host = host_with("hangs-cloning", 1, Harness::HangsCloning, Boot::Works, settings, 1);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    let seen = host.settle(Duration::from_millis(1500)).await;
+    let last = seen.last().expect("a failure");
+    assert!(
+        last.starts_with(&format!("failed {}", TurnFailureReason::NoFirstOutput)),
+        "{seen:?}"
+    );
+    assert!(
+        last.contains("cloneSeconds 1") && last.contains("firstLineSeconds"),
+        "{last}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_clone_reaches_the_channel_with_its_cause_after_the_claim() {
+    let mut host = host("refuses-clone", 1, Harness::RefusesClone, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    assert_eq!(
+        host.settle(SETTLE).await,
+        ["claim turn-1", "clone failed Refused: git reported: denied"]
+    );
+}
+
+#[tokio::test]
+async fn the_first_line_budget_starts_when_the_repository_is_ready() {
+    let mut host = host("slow-clone", 1, Harness::SlowClone, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    assert_eq!(
+        host.settle(SLOW_CLONE + SETTLE).await,
+        ["claim turn-1", "line 1 one", "complete 1"]
+    );
+}
+
+#[tokio::test]
+async fn a_line_after_the_error_result_keeps_the_turn_failed() {
+    let mut host = host("error-result", 1, Harness::Echo, Boot::Works);
+    let prompt = "{\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 500\"}\n{\"type\":\"system\"}";
+    host.turn_speaking(GuestHarnessProtocol::ClaudeStreamJson, "turn-1", "session-1", prompt);
+    let seen = host.settle(SETTLE).await;
+    let last = seen.last().expect("a failure");
+    assert!(
+        last.starts_with(&format!("failed {}", TurnFailureReason::HarnessReportedError)),
+        "{seen:?}"
+    );
+    assert!(last.contains("API Error: 500"), "{last}");
+}
+
+#[tokio::test]
+async fn an_expired_grant_is_refused_before_any_box_boots() {
+    let mut host = host("grant", 1, Harness::Echo, Boot::Works);
+    host.turn_expiring("turn-1", "session-1", "one", Vec::new(), -1);
+    let seen = host.settle(SETTLE).await;
+    assert!(
+        seen.len() == 1 && seen[0].starts_with(&format!("failed {}", TurnFailureReason::DispatchCredentialExpired)),
+        "{seen:?}"
+    );
+    assert_eq!(host.log(), Vec::<String>::new());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_snapshot_after_expiry_keeps_the_box_until_a_snapshot_holds_the_last_turn() {
+    let mut host = host("failed-expired", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(WARM + SETTLE).await;
+    host.log();
+    host.snapshot_expiring("session-1", -1);
+    let seen = host.settle(SETTLE).await;
+    assert!(
+        seen[0].starts_with(&format!(
+            "snapshot failed {}",
+            ChannelSnapshotFailureReason::UploadExpired
+        )),
+        "{seen:?}"
+    );
+    assert_eq!(host.log(), Vec::<String>::new());
+    host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    assert_eq!(host.log(), ["stop session-1"]);
+}
+
+#[tokio::test]
+async fn a_teardown_after_the_snapshot_stops_a_clean_box_inside_the_warm_window_and_the_next_turn_boots_cold() {
+    let mut host = host("teardown-clean", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    let first = host.snapshot("session-1");
+    host.teardown("session-1");
+    assert_eq!(
+        host.settle_until("box gone session-1").await,
+        ["snapshot done", "box gone session-1"]
+    );
+    assert_eq!(
+        host.log(),
+        ["boot session-1 on tumpel0", "pause session-1", "stop session-1"]
+    );
+
+    host.teardown("session-1");
+    assert_eq!(host.settle(SETTLE).await, ["box gone session-1"]);
+    assert_eq!(host.log(), Vec::<String>::new());
+
+    host.turn("turn-2", "session-1", "two", vec![first]);
+    assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
+    assert_eq!(
+        host.log(),
+        [
+            "restore session-1 root/turn-1",
+            "boot session-1 on tumpel0",
+            "pause session-1"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_teardown_of_a_box_with_an_unsnapshotted_turn_fails_box_dirty_and_keeps_the_box() {
+    let mut host = host("teardown-dirty", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.log();
+    host.teardown("session-1");
+    let seen = host.settle(SETTLE).await;
+    assert!(
+        seen.len() == 1
+            && seen[0].starts_with(&format!(
+                "teardown failed {}",
+                ChannelBoxTeardownFailureReason::BoxDirty
+            ))
+            && seen[0].contains("session-1"),
+        "{seen:?}"
+    );
+    assert_eq!(host.log(), Vec::<String>::new());
+
+    host.turn("turn-2", "session-1", "two", Vec::new());
+    assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
+    assert_eq!(host.log(), ["resume session-1", "pause session-1"]);
+}
+
+#[tokio::test]
+async fn a_turn_for_another_box_of_the_session_stops_the_warm_box_and_boots_fresh() {
+    let mut host = host("moved-back", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.log();
+    host.turn_in_box("turn-2", "session-1", "box-session-1-again", "two");
+    assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
+    assert_eq!(
+        host.log(),
+        ["stop session-1", "boot session-1 on tumpel0", "pause session-1"]
+    );
+}
+
+#[tokio::test]
+async fn a_discard_drops_a_box_with_an_unsnapshotted_turn_and_answers_box_gone() {
+    let mut host = host("discard-dirty", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.log();
+    host.discard("session-1");
+    assert_eq!(host.settle(SETTLE).await, ["box gone session-1"]);
+    assert_eq!(host.log(), ["stop session-1"]);
+}
+
+const IMAGE_FETCH: Duration = Duration::from_millis(1200);
+
+fn fetching_host(name: &str, store: &MemoryStore) -> Host {
+    let mut store = store.clone();
+    store.3 = IMAGE_FETCH;
+    host_on(name, store, 1, Harness::Echo, Boot::Works, settings(), 120)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cold_turn_downloads_its_snapshot_before_a_fetch_that_outlasts_the_snapshot_urls() {
+    let mut first = host("fetch-first", 1, Harness::Echo, Boot::Works);
+    first.turn("turn-1", "session-1", "one", Vec::new());
+    first.settle(SETTLE).await;
+    let mut snapshot = first.snapshot("session-1");
+    assert_eq!(first.settle_until("snapshot done").await, ["snapshot done"]);
+    snapshot.download_expires_at = in_seconds(1);
+
+    let mut second = fetching_host("fetch-second", &first.store);
+    let order = second.turn_fetching("turn-2", vec![snapshot], 300);
+    let digest = order.download.image_digest.as_str().to_string();
+    assert_eq!(
+        second.settle(IMAGE_FETCH + SETTLE * 4).await,
+        [
+            "claim turn-2".to_string(),
+            format!("fetching {digest}"),
+            "line 1 two".to_string(),
+            "complete 1".to_string()
+        ]
+    );
+    assert_eq!(
+        second.log(),
+        [
+            "restore session-1 root/turn-1",
+            "boot session-1 on tumpel0",
+            "pause session-1"
+        ]
+    );
+    assert!(second.images.join(format!("{digest}.ext4")).exists());
+}
+
+#[tokio::test]
+async fn a_dispatch_credential_that_expires_during_the_fetch_fails_the_turn_before_the_box_boots() {
+    let store = MemoryStore::default();
+    let mut host = fetching_host("fetch-expired", &store);
+    host.turn_fetching("turn-1", Vec::new(), 1);
+    let seen = host.settle(IMAGE_FETCH + SETTLE * 4).await;
+    assert!(
+        seen.len() == 3
+            && seen[0] == "claim turn-1"
+            && seen[2].starts_with(&format!("failed {}", TurnFailureReason::DispatchCredentialExpired))
+            && seen[2].contains("after its guest image was fetched"),
+        "{seen:?}"
+    );
+    assert_eq!(host.log(), Vec::<String>::new());
+}
+
+#[test]
+fn the_restore_budget_grows_from_the_boot_budget_by_started_32_mib_and_started_2000_entries() {
+    let boot = Duration::from_secs(30);
+    let mib = 1024 * 1024;
+    assert_eq!(restore_budget(boot, 0, 0), boot);
+    assert_eq!(restore_budget(boot, 1, 0), Duration::from_secs(31));
+    assert_eq!(restore_budget(boot, 32 * mib, 0), Duration::from_secs(31));
+    assert_eq!(restore_budget(boot, 32 * mib + 1, 0), Duration::from_secs(32));
+    assert_eq!(restore_budget(boot, 0, 1), Duration::from_secs(31));
+    assert_eq!(restore_budget(boot, 0, 2_001), Duration::from_secs(32));
+    assert_eq!(
+        restore_budget(boot, 8 * 1024 * mib, 400_000),
+        Duration::from_secs(30 + 256 + 200)
+    );
+}
+
+async fn restoring(name: &str, settings: Settings) -> (Host, ChannelSnapshotDownload) {
+    let mut first = host(&format!("{name}-first"), 1, Harness::Echo, Boot::Works);
+    first.turn("turn-1", "session-1", "one", Vec::new());
+    first.settle(SETTLE).await;
+    let snapshot = first.snapshot("session-1");
+    assert_eq!(first.settle_until("snapshot done").await, ["snapshot done"]);
+    let mut second = host_on(name, first.store.clone(), 1, Harness::Echo, Boot::Works, settings, 120);
+    second.seq = first.seq;
+    (second, snapshot)
+}
+
+#[tokio::test]
+async fn a_snapshot_larger_than_the_overlay_drive_fails_snapshot_unreadable_naming_both_sizes() {
+    let mut settings = settings();
+    settings.overlay_bytes = 1;
+    let (mut host, snapshot) = restoring("overlay-too-small", settings).await;
+    host.turn("turn-2", "session-1", "two", vec![snapshot]);
+    let seen = host.settle(SETTLE).await;
+    assert!(
+        seen.len() == 2
+            && seen[1].starts_with(&format!("failed {}", TurnFailureReason::SnapshotUnreadable))
+            && seen[1].contains("more than the 1 bytes of the box's overlay drive")
+            && seen[1].contains("overlayMib"),
+        "{seen:?}"
+    );
+}
+
+const O_NONBLOCK: i32 = 0o4000;
+
+fn stuck_archive(name: &str) -> PathBuf {
+    let session = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/lifecycle-tests")
+        .join(name)
+        .join("session-1");
+    std::fs::create_dir_all(&session).expect("session staging");
+    let archive = session.join("restore.tar");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&archive)
+        .status()
+        .expect("mkfifo");
+    assert!(made.success(), "mkfifo {}", archive.display());
+    archive
+}
+
+fn release(archive: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    drop(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(archive)
+            .expect("releasing the stuck writer"),
+    );
+}
+
+#[tokio::test]
+async fn a_stuck_reassembly_outlasts_the_boot_budget_then_fails_with_its_size() {
+    let (mut host, snapshot) = restoring("stuck-reassembly", settings()).await;
+    let archive = stuck_archive("stuck-reassembly");
+    host.turn("turn-2", "session-1", "two", vec![snapshot]);
+    let early = host.settle(settings().budgets.boot * 2).await;
+    let seen = host.settle(Duration::from_secs(3)).await;
+    release(&archive);
+    assert_eq!(early, ["claim turn-2"]);
+    assert!(
+        seen.len() == 1
+            && seen[0].starts_with(&format!("failed {}", TurnFailureReason::SnapshotUnreadable))
+            && seen[0].contains("took longer than 2 s for")
+            && seen[0].contains("bytes in"),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_restore_that_outlasts_the_dispatch_credential_fails_dispatch_credential_expired() {
+    let (mut host, snapshot) = restoring("stuck-credential", settings()).await;
+    let archive = stuck_archive("stuck-credential");
+    host.turn_expiring("turn-2", "session-1", "two", vec![snapshot], 1);
+    let seen = host.settle(Duration::from_millis(1500)).await;
+    release(&archive);
+    assert!(
+        seen.len() == 2
+            && seen[1].starts_with(&format!("failed {}", TurnFailureReason::DispatchCredentialExpired))
+            && seen[1].contains("while its snapshot was restored"),
+        "{seen:?}"
+    );
+}
