@@ -70,7 +70,12 @@ fn box_environment(home: &Path, token: Option<&str>) -> Vec<(String, String)> {
     if let Some(token) = token {
         environment.push(("GITHUB_TOKEN".to_string(), token.to_string()));
     }
-    environment.extend(git_environment("Ticket Worker", "ticket-worker@acme.test", token));
+    environment.extend(git_environment(
+        "Ticket Worker",
+        "ticket-worker@acme.test",
+        token,
+        false,
+    ));
     environment
 }
 
@@ -256,6 +261,60 @@ fn the_credential_helper_answers_github_with_the_token_from_the_environment() {
     assert!(!credential_fill(&root, Some("ghp-from-env"), "git.example.test").contains("ghp-from-env"));
     assert!(!credential_fill(&root, None, "github.com").contains("password="));
     assert!(!root.join(".git-credentials").exists());
+}
+
+#[test]
+fn the_credential_helper_answers_each_owner_with_its_own_installation_token() {
+    let root = scratch("owner-helper");
+    let mut environment = vec![
+        ("PATH".to_string(), "/usr/local/bin:/usr/bin:/bin".to_string()),
+        ("HOME".to_string(), root.display().to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ("GITHUB_TOKEN".to_string(), "ghs-mine".to_string()),
+        (
+            "TUMPEL_GITHUB_TOKENS".to_string(),
+            "mvhenten=ghs-mine tumpel=ghs-org".to_string(),
+        ),
+    ];
+    environment.extend(git_environment(
+        "Ticket Worker",
+        "ticket-worker@acme.test",
+        Some("ghs-mine"),
+        true,
+    ));
+    let fill = |path: &str| {
+        let mut child = Command::new("git")
+            .args(["credential", "fill"])
+            .current_dir(&root)
+            .env_clear()
+            .envs(environment.iter().map(|(name, value)| (name, value)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("git credential runs");
+        child
+            .stdin
+            .take()
+            .expect("git credential reads standard input")
+            .write_all(format!("protocol=https\nhost=github.com\npath={path}\n\n").as_bytes())
+            .expect("the request is written");
+        let output = child.wait_with_output().expect("git credential ends");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+    let (mine, _) = fill("mvhenten/tumpel.git");
+    assert!(mine.contains("password=ghs-mine\n"), "{mine}");
+    let (org, _) = fill("Tumpel/protocol.git");
+    assert!(org.contains("password=ghs-org\n"), "{org}");
+    let (stranger, refused) = fill("acme/app.git");
+    assert!(!stranger.contains("password="), "{stranger}");
+    assert!(
+        refused.contains("no GitHub App installation of this tenant covers github.com/acme"),
+        "{refused}"
+    );
 }
 
 fn refused_push(dir: &Path, environment: &[(String, String)], args: &[&str]) -> String {

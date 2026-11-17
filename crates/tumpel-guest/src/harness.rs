@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -30,6 +31,8 @@ const CODEX_THREAD_FILE: &str = "/var/lib/tumpel/codex-thread";
 const CODEX_USAGE_FILE: &str = "/var/lib/tumpel/codex-usage.json";
 const WRITTEN_FILE: &str = "/var/lib/tumpel/persona-files.json";
 const SETUP_PROGRAM: &str = "/opt/tumpel/prebuild.mjs";
+const GH_DIR: &str = "/var/lib/tumpel/bin";
+const GH_WRAPPER: &str = "/var/lib/tumpel/bin/gh";
 pub const STDERR_TAIL: usize = 4096;
 
 enum Output {
@@ -77,9 +80,22 @@ fn image_environment(config: &GuestHarness) -> Vec<(String, String)> {
         .collect()
 }
 
+fn owner_tokens(start: &GuestTurnStart) -> bool {
+    start
+        .credential
+        .variables
+        .iter()
+        .any(|variable| variable.name.as_str() == repository::OWNER_TOKENS)
+}
+
 fn environment(config: &GuestHarness, start: &GuestTurnStart) -> Vec<(String, String)> {
+    let routed = owner_tokens(start);
     image_environment(config)
         .into_iter()
+        .map(|(name, value)| match name.as_str() {
+            "PATH" if routed => (name, format!("{GH_DIR}:{value}")),
+            _ => (name, value),
+        })
         .chain(
             config
                 .fixed_variables
@@ -106,6 +122,7 @@ fn turn_environment(start: &GuestTurnStart) -> Vec<(String, String)> {
         &start.git_author_name,
         &start.git_author_email,
         token,
+        owner_tokens(start),
     ));
     environment
 }
@@ -563,6 +580,10 @@ impl GuestState {
             serde_json::to_vec(&written).map_err(|error| error.to_string())?,
         )
         .map_err(|error| format!("writing {WRITTEN_FILE}: {error}"))?;
+        std::fs::create_dir_all(GH_DIR).map_err(|error| format!("creating {GH_DIR}: {error}"))?;
+        std::fs::write(GH_WRAPPER, repository::GH_WRAPPER).map_err(|error| format!("writing {GH_WRAPPER}: {error}"))?;
+        std::fs::set_permissions(GH_WRAPPER, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("making {GH_WRAPPER} executable: {error}"))?;
         let (program, arguments) = self
             .config
             .command
