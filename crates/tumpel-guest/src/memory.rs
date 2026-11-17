@@ -197,7 +197,7 @@ impl Memory {
 
     pub fn out_of_memory(&self, victim: &Victim, stderr_tail: &str) -> String {
         format!(
-            "the box ran out of its {} MiB of memory and the kernel killed {} with the harness tree ({}); give boxes more memoryMib in the host's runtime.json or have the persona run lighter builds; {stderr_tail}",
+            "the box ran out of its {} MiB of memory and the kernel killed {} with the harness tree ({}); give the persona more boxMemoryMib or have it run lighter builds; {stderr_tail}",
             self.box_mib, victim.process, victim.line
         )
     }

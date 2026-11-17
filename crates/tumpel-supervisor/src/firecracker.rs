@@ -386,7 +386,7 @@ impl Firecracker {
         handed: &SupervisorHandoverMachine,
         taken: &mut Taken,
     ) -> Result<(FirecrackerBox, VsockGuest), String> {
-        let mut machine = self.machine(session_id, tap)?;
+        let mut machine = self.machine(session_id, tap, None)?;
         if Path::new(&handed.api_socket) != machine.api_socket() || Path::new(&handed.vsock) != machine.vsock() {
             return Err(format!(
                 "it was handed over with API socket {} and vsock {}, and this supervisor runs box {} at {} and {}; set dataDir in runtime.json back to what the previous binary used",
@@ -429,7 +429,7 @@ impl Vmm for Firecracker {
     type Machine = FirecrackerBox;
     type Upper = Ext4Upper;
 
-    fn machine(&self, session_id: &EntityId, tap: &Tap) -> Result<FirecrackerBox, String> {
+    fn machine(&self, session_id: &EntityId, tap: &Tap, memory_mib: Option<i32>) -> Result<FirecrackerBox, String> {
         Ok(FirecrackerBox {
             binary: self.binary.clone(),
             images: self.images.clone(),
@@ -439,7 +439,7 @@ impl Vmm for Firecracker {
             mac: tap.guest_mac(),
             boot_args: format!("{BOOT_ARGS} {}", tap.kernel_ip()),
             vcpus: self.vcpus,
-            memory_mib: self.memory_mib,
+            memory_mib: memory_mib.unwrap_or(self.memory_mib),
             overlay_bytes: self.overlay_bytes,
             process: None,
             stdout: None,

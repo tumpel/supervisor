@@ -312,7 +312,7 @@ impl Vmm for MemoryVmm {
     type Machine = MemoryMachine;
     type Upper = Tree;
 
-    fn machine(&self, session_id: &EntityId, tap: &Tap) -> Result<MemoryMachine, String> {
+    fn machine(&self, session_id: &EntityId, tap: &Tap, _memory_mib: Option<i32>) -> Result<MemoryMachine, String> {
         Ok(MemoryMachine {
             harness: self.harness,
             boot: self.boot,
@@ -343,7 +343,7 @@ impl Vmm for MemoryVmm {
                 )
             })?;
         note(&self.log, format!("reattach {} on {}", **session_id, tap.device()));
-        Ok((self.machine(session_id, tap)?, guest))
+        Ok((self.machine(session_id, tap, None)?, guest))
     }
 
     fn discard(&self, handed: &SupervisorHandoverMachine) {
@@ -892,6 +892,7 @@ impl Host {
             git_author_email: "agent@tumpel.invalid".try_into().expect("author email"),
             files_cache: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/lifecycle-tests/persona-files"),
             prebuild_commit_sha: None,
+            box_memory_mib: None,
         }
     }
 

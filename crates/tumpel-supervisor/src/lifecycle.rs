@@ -137,7 +137,7 @@ pub trait Machine: Send + 'static {
 pub trait Vmm: Send + Sync + 'static {
     type Machine: Machine;
     type Upper: crate::snapshot::Upper;
-    fn machine(&self, session_id: &EntityId, tap: &Tap) -> Result<Self::Machine, String>;
+    fn machine(&self, session_id: &EntityId, tap: &Tap, memory_mib: Option<i32>) -> Result<Self::Machine, String>;
     fn reattach(
         &self,
         session_id: &EntityId,
@@ -167,6 +167,7 @@ pub struct BoxTurn {
     pub git_author_email: EmailAddress,
     pub files_cache: PathBuf,
     pub prebuild_commit_sha: Option<String>,
+    pub box_memory_mib: Option<i32>,
 }
 
 pub struct SnapshotOrder {
@@ -740,7 +741,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 return Outcome::Gone(tap);
             }
         };
-        let mut machine = match self.vmm.machine(&turn.session_id, &tap) {
+        let mut machine = match self.vmm.machine(&turn.session_id, &tap, turn.box_memory_mib) {
             Ok(machine) => machine,
             Err(error) => {
                 turn_failed(

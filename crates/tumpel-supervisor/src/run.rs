@@ -251,6 +251,7 @@ fn command(files_cache: &Path, offer: ChannelTurnOffer) -> Command {
         git_author_email: offer.git_author_email,
         files_cache: files_cache.to_path_buf(),
         prebuild_commit_sha: offer.prebuild_commit_sha.map(String::from),
+        box_memory_mib: offer.box_memory_mib,
     }))
 }
 
