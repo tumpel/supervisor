@@ -217,26 +217,8 @@ fn stored(socket: &std::os::unix::net::UnixDatagram) -> std::collections::BTreeM
     }
 }
 
-#[tokio::test]
-async fn a_box_runs_in_its_own_scope_and_a_supervisor_started_after_a_crash_takes_it_over() {
-    if std::env::var("TUMPEL_KVM").as_deref() != Ok("1") {
-        eprintln!(
-            "skipped: set TUMPEL_KVM=1 and TUMPEL_IMAGE_MANIFEST on a host with /dev/kvm, a systemd user manager and the TAP device tumpel0"
-        );
-        return;
-    }
-    let manifest_path = PathBuf::from(
-        std::env::var("TUMPEL_IMAGE_MANIFEST").expect("TUMPEL_IMAGE_MANIFEST names a Shell image manifest"),
-    );
-    let image: GuestImageManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("manifest"))
-        .expect("a GuestImageManifest");
-    let data = home().join("development").join(".tmp").join("tumpel-host-crash-test");
-    if data.exists() {
-        std::fs::remove_dir_all(&data).expect("clearing the last run");
-    }
-    std::fs::create_dir_all(&data).expect("the data directory");
-    let systemd = std::os::unix::net::UnixDatagram::bind(data.join("notify.sock")).expect("a stand-in for systemd");
-    std::env::set_var("NOTIFY_SOCKET", data.join("notify.sock"));
+#[cfg(test)]
+fn crash_runtime(data: &std::path::Path, manifest_path: &std::path::Path) -> (SupervisorRuntime, Settings) {
     let runtime: SupervisorRuntime = serde_json::from_value(json!({
         "firecrackerPath": std::env::var("TUMPEL_FIRECRACKER").map_or_else(|_| home().join(".local/bin/firecracker"), PathBuf::from),
         "imageCacheDir": manifest_path.parent().expect("cache dir"),
@@ -247,7 +229,7 @@ async fn a_box_runs_in_its_own_scope_and_a_supervisor_started_after_a_crash_take
         "memoryMib": 512,
         "overlayMib": 1024,
         "layerCacheMib": 1024,
-        "budgets": { "bootSeconds": 30, "firstLineSeconds": 10, "turnSeconds": 30, "snapshotSeconds": 30 },
+        "budgets": { "bootSeconds": 30, "firstLineSeconds": 90, "turnSeconds": 120, "snapshotSeconds": 30 },
         "heartbeatIntervalSeconds": 10,
         "updateGraceSeconds": 600
     }))
@@ -258,37 +240,94 @@ async fn a_box_runs_in_its_own_scope_and_a_supervisor_started_after_a_crash_take
         layer_cache_mib: runtime.layer_cache_mib,
         overlay_bytes: u64::try_from(runtime.overlay_mib).unwrap_or(0) * 1024 * 1024,
     };
-    let standing = data.join("boxes.json");
+    (runtime, settings)
+}
+
+#[cfg(test)]
+fn crash_paths() -> (PathBuf, PathBuf) {
+    let manifest_path = PathBuf::from(
+        std::env::var("TUMPEL_IMAGE_MANIFEST").expect("TUMPEL_IMAGE_MANIFEST names a Shell image manifest"),
+    );
+    (
+        home().join("development").join(".tmp").join("tumpel-host-crash-test"),
+        manifest_path,
+    )
+}
+
+#[tokio::test]
+#[ignore = "the crashing supervisor of the crash host test; that test starts it and kills it mid-turn"]
+async fn crashing_supervisor() {
+    let (data, manifest_path) = crash_paths();
+    let image: GuestImageManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("manifest"))
+        .expect("a GuestImageManifest");
+    let (runtime, settings) = crash_runtime(&data, &manifest_path);
     let (out, mut received) = unbounded_channel();
-    let mut crashed = Lifecycle::new(
+    let mut lifecycle = Lifecycle::new(
         Firecracker::new(&runtime),
         HttpStore::new().expect("store"),
         settings,
         TapPool::new(1).expect("pool"),
         out,
-        standing.clone(),
+        data.join("boxes.json"),
     );
-    crashed.start(None).expect("the first supervisor starts");
+    lifecycle.start(None).expect("the crashing supervisor starts");
     let (commands, from_test) = unbounded_channel();
-    let _crashed = tokio::spawn(crashed.run(from_test, unbounded_channel().1));
-    commands.send(turn(&image, "turn-1", "echo one", 0)).expect("send");
-    assert_eq!(
-        until_complete(&mut received).await,
-        ["claim turn-1", "ready turn-1", "line 1 one", "complete 1"]
-    );
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _running = tokio::spawn(lifecycle.run(from_test, unbounded_channel().1));
+    commands
+        .send(turn(&image, "turn-1", "sleep 60\necho too late", 0))
+        .expect("send");
+    while let Some(message) = received.recv().await {
+        if matches!(message, ChannelHostMessage::TurnRepositoryReady(_)) {
+            println!("TURN RUNNING");
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
+#[tokio::test]
+async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_its_next_turn() {
+    if std::env::var("TUMPEL_KVM").as_deref() != Ok("1") {
+        eprintln!(
+            "skipped: set TUMPEL_KVM=1 and TUMPEL_IMAGE_MANIFEST on a host with /dev/kvm, a systemd user manager and the TAP device tumpel0"
+        );
+        return;
+    }
+    let (data, manifest_path) = crash_paths();
+    let image: GuestImageManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("manifest"))
+        .expect("a GuestImageManifest");
+    if data.exists() {
+        std::fs::remove_dir_all(&data).expect("clearing the last run");
+    }
+    std::fs::create_dir_all(&data).expect("the data directory");
+    let systemd = std::os::unix::net::UnixDatagram::bind(data.join("notify.sock")).expect("a stand-in for systemd");
+    let mut crashing = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", "crashing_supervisor", "--ignored", "--nocapture"])
+        .env("NOTIFY_SOCKET", data.join("notify.sock"))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("the crashing supervisor starts");
+    let output = crashing.stdout.take().expect("its output");
+    let running = std::io::BufRead::lines(std::io::BufReader::new(output))
+        .map_while(Result::ok)
+        .any(|line| line == "TURN RUNNING");
+    assert!(running, "the crashing supervisor reaches its sleeping turn");
+    crashing.kill().expect("the supervisor crashes");
+    crashing.wait().expect("the crashed supervisor is reaped");
+
+    let standing = data.join("boxes.json");
     let record: tumpel_api::types::SupervisorHandover =
         serde_json::from_str(&std::fs::read_to_string(&standing).expect("boxes.json")).expect("a SupervisorHandover");
     let pid = record.boxes[0].machine.process_id;
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("the box's cgroup");
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("the box outlives its supervisor");
     assert!(
         cgroup.lines().any(|line| line.ends_with("/tumpel-box0.scope")),
-        "the box runs outside the supervisor's cgroup: {cgroup}"
+        "the box runs in its own scope: {cgroup}"
     );
 
+    std::env::set_var("NOTIFY_SOCKET", data.join("notify.sock"));
     let mut descriptors = stored(&systemd);
     let record = restored_descriptors(record, &mut descriptors);
+    let (runtime, settings) = crash_runtime(&data, &manifest_path);
     let (out, mut received) = unbounded_channel();
     let mut taker = Lifecycle::new(
         Firecracker::new(&runtime),
@@ -296,20 +335,33 @@ async fn a_box_runs_in_its_own_scope_and_a_supervisor_started_after_a_crash_take
         settings,
         TapPool::new(1).expect("pool"),
         out,
-        standing,
+        standing.clone(),
     );
     taker
         .start(Some((record, Taken::Crashed)))
         .expect("the next supervisor takes the box over");
+    let failed = received.recv().await.expect("the cut turn is reported");
+    assert!(
+        matches!(&failed, ChannelHostMessage::TurnFailed(failed) if *failed.turn_id == "turn-1"),
+        "{failed:?}"
+    );
     let (commands, from_test) = unbounded_channel();
     let running = tokio::spawn(taker.run(from_test, unbounded_channel().1));
     let started = Instant::now();
-    commands.send(turn(&image, "turn-2", "echo two", 1)).expect("send");
-    assert_eq!(
-        until_complete(&mut received).await,
-        ["claim turn-2", "ready turn-2", "line 2 two", "complete 2"]
+    commands.send(turn(&image, "turn-2", "echo two", 0)).expect("send");
+    let seen = until_complete(&mut received).await;
+    assert_eq!(seen.first().map(String::as_str), Some("claim turn-2"));
+    assert!(seen.iter().any(|line| line.ends_with(" two")), "{seen:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
+        "the next turn did not wait for the cut turn's sleep"
     );
-    println!("turn on the taken-over box {} ms", started.elapsed().as_millis());
+    let after: tumpel_api::types::SupervisorHandover =
+        serde_json::from_str(&std::fs::read_to_string(&standing).expect("boxes.json")).expect("a SupervisorHandover");
+    assert_eq!(
+        after.boxes[0].machine.process_id, pid,
+        "the next turn ran on the same Firecracker"
+    );
     drop(commands);
     running.await.expect("the lifecycle stops");
     std::fs::remove_dir_all(&data).expect("removing the test data");
