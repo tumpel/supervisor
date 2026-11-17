@@ -521,7 +521,8 @@ fn a_prebuild_pins_its_commit_and_the_first_turn_restored_from_it_pulls_the_bran
     git(&source, &environment, &["add", "LATER.md"]);
     git(&source, &environment, &["commit", "--quiet", "-m", "feat: later"]);
     let work = root.join("workspace");
-    let url = source.display().to_string();
+    git(&source, &environment, &["config", "uploadpack.allowFilter", "true"]);
+    let url = format!("file://{}", source.display());
     let start = root.join("prebuild.mjs");
     std::fs::write(&start, "#!/bin/sh\ntest -f NEWEST.md && echo \"$1\" >> ../started\n")
         .expect("the start script is written");
@@ -530,6 +531,14 @@ fn a_prebuild_pins_its_commit_and_the_first_turn_restored_from_it_pulls_the_bran
     prepare_at(&work, &url, &environment, LIMIT, Some(&recorded), &start).expect("the prebuild clones at its commit");
     assert!(!root.join("started").exists());
     assert_eq!(text(&git(&work, &environment, &["rev-parse", "HEAD"])), recorded);
+    assert_eq!(
+        text(&git(
+            &work,
+            &environment,
+            &["config", "remote.origin.partialclonefilter"]
+        )),
+        "blob:none"
+    );
     assert_eq!(text(&git(&work, &environment, &["branch", "--show-current"])), "trunk");
     std::fs::write(source.join("NEWEST.md"), "newest\n").expect("a file is written");
     git(&source, &environment, &["add", "NEWEST.md"]);
