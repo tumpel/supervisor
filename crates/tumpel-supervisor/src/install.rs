@@ -26,6 +26,7 @@ const NETWORK_MANAGER_CONF: &str = "/etc/NetworkManager/conf.d/90-tumpel-unmanag
 const NETWORK_MANAGER_TEXT: &str = "[keyfile]\nunmanaged-devices=interface-name:tumpel*\n";
 const WAIT_ONLINE: &str = "/usr/lib/systemd/systemd-networkd-wait-online";
 const MAX_BOXES: u32 = 256;
+const TAP_POOL: u32 = 64;
 
 pub struct Enrolment {
     pub endpoint: String,
@@ -241,7 +242,7 @@ fn load_runtime() -> Result<SupervisorRuntime> {
     dir::ensure_dir(&dir)?;
     dir::write_json(&dir.join(RUNTIME_FILE), &runtime)?;
     eprintln!(
-        "wrote the default {}; edit boxCapacity there and rerun install to change the pool",
+        "wrote the default {}; edit boxCapacity there and restart {SUPERVISOR_UNIT} to change the box limit",
         dir.join(RUNTIME_FILE).display()
     );
     Ok(runtime)
@@ -395,6 +396,10 @@ fn probe_host_network() -> Result<HostNetwork> {
         .context("starting systemctl is-active systemd-networkd")?
         .success();
     Ok(host_network(Path::new("/"), networkd))
+}
+
+fn tap_pool_size(boxes: u32) -> u32 {
+    boxes.max(TAP_POOL)
 }
 
 fn tap_unit_text(boxes: u32, user: &str) -> String {
@@ -666,7 +671,7 @@ pub async fn install(enrolment: Option<Enrolment>) -> Result<()> {
     dir::ensure_dir(&staging)?;
     install_firecracker(&runtime, &staging).await?;
     install_filter(&staging)?;
-    install_tap_pool(boxes, &account, &staging)?;
+    install_tap_pool(tap_pool_size(boxes), &account, &staging)?;
     install_unit(&account)?;
     std::fs::remove_dir(&staging).with_context(|| format!("removing {}", staging.display()))?;
     if let (Some(enrolment), Some(token)) = (enrolment, token) {
