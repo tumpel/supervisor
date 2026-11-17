@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::io::{Cursor, Read};
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,8 +17,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    restore_budget, BoxTurn, Budgets, Command, Guest, Handover, Input, Lifecycle, Machine, Settings, SnapshotOrder,
-    Taken, TeardownOrder, Vmm,
+    restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SnapshotOrder, Taken,
+    TeardownOrder, Vmm,
 };
 use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers};
@@ -287,7 +286,7 @@ impl Machine for MemoryMachine {
         "[ console ]".to_string()
     }
 
-    fn hand_over(self, guest: MemoryGuest) -> Result<(SupervisorHandoverMachine, Vec<OwnedFd>), String> {
+    fn hand_over(self, guest: MemoryGuest) -> Result<SupervisorHandoverMachine, String> {
         let mut hands = self.hands.lock().expect("hands");
         let guest_fd = i32::try_from(hands.len()).expect("a descriptor") + 3;
         hands.insert(guest_fd, guest);
@@ -297,7 +296,7 @@ impl Machine for MemoryMachine {
             "guestBuffer": "", "stdoutFd": 0, "stderrFd": 0, "consoleTail": ""
         }))
         .expect("a handed machine");
-        Ok((machine, Vec::new()))
+        Ok(machine)
     }
 
     fn record(&self) -> Result<SupervisorHandoverMachine, String> {
@@ -771,7 +770,7 @@ fn in_seconds(seconds: i64) -> chrono::DateTime<chrono::FixedOffset> {
 }
 
 impl Host {
-    fn ask_handover(&self) -> tokio::sync::oneshot::Receiver<Handover> {
+    fn ask_handover(&self) -> tokio::sync::oneshot::Receiver<SupervisorHandover> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         self.commands.send(Input::HandOver(reply)).expect("send");
         answer
@@ -834,7 +833,7 @@ impl Host {
 
     async fn hand_over(self) -> Host {
         let handover = self.ask_handover().await.expect("the boxes are handed over");
-        self.successor(&handover.record)
+        self.successor(&handover)
     }
 
     fn send(&self, command: Command) {
@@ -1296,7 +1295,7 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
         TurnFailureReason::HostUpdating
     );
     assert_eq!(old.settle_until(&refused).await, [refused]);
-    let mut new = old.successor(&handover.record);
+    let mut new = old.successor(&handover);
     assert_eq!(new.settle_until("complete 1").await, ["line 1 one", "complete 1"]);
     assert_eq!(
         new.log(),
@@ -1377,7 +1376,7 @@ async fn a_handed_box_whose_process_ended_fails_its_turn_and_frees_its_tap() {
     tokio::time::sleep(SLOW_CLONE / 2).await;
     let handover = old.ask_handover().await.expect("the boxes are handed over");
     old.vmm.hands.lock().expect("hands").clear();
-    let mut new = old.successor(&handover.record);
+    let mut new = old.successor(&handover);
     let failed = format!(
         "failed {}: box box-session-1 of session session-1 was lost in the handover to this supervisor binary: its Firecracker process 103 ended during the handover; send the turn again",
         TurnFailureReason::HarnessExited

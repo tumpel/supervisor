@@ -29,8 +29,8 @@ use crate::fd_store;
 use crate::firecracker::Firecracker;
 use crate::guest_drive;
 use crate::lifecycle::{
-    turn_failed, BoxTurn, Budgets, Command, Handover, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder,
-    Taken, TeardownOrder,
+    turn_failed, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder, Taken,
+    TeardownOrder,
 };
 use crate::pool::TapPool;
 use crate::store::HttpStore;
@@ -76,7 +76,7 @@ impl Port for Outbox {
 
 pub enum Stopped {
     Revoked,
-    HandedOver { binary: PathBuf, handover: Handover },
+    Updated,
     Terminated,
 }
 
@@ -214,7 +214,7 @@ enum BoxCommand {
     Discard(ChannelBoxDiscard),
     Answer(Answer),
     Setup(SetupCommand),
-    HandOver(oneshot::Sender<Handover>),
+    HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>),
 }
 
@@ -346,75 +346,39 @@ fn start_boxes(
     Ok((usage, idle))
 }
 
-async fn hand_over(
-    commands: &UnboundedSender<BoxCommand>,
-    layout: &Layout,
-    out: &UnboundedSender<ChannelHostMessage>,
-    keep: impl FnOnce() -> Result<(), String>,
-) -> Result<Handover, String> {
-    let (reply, answer) = oneshot::channel();
-    let _ = commands.send(BoxCommand::HandOver(reply));
-    let handover = answer
-        .await
-        .map_err(|_| "the box runner stopped before it handed its boxes over".to_string())?;
-    let kept = dir::write_json(&layout.handover(), &handover.record)
-        .map_err(|error| format!("{error:#}"))
-        .and_then(|()| keep());
-    if let Err(error) = kept {
-        for turn_id in handed_turns(&handover.record) {
-            turn_failed(
-                out,
-                &turn_id,
-                TurnFailureReason::HarnessExited,
-                format!(
-                    "the box of turn {} could not be handed to the next supervisor: {error}; send the turn again",
-                    *turn_id
-                ),
-            );
-        }
-        return Err(error);
-    }
-    Ok(handover)
-}
-
-async fn update_binary(
-    commands: &UnboundedSender<BoxCommand>,
-    layout: &Layout,
-    out: &UnboundedSender<ChannelHostMessage>,
-) -> Result<Stopped, Failure> {
-    let handover = hand_over(commands, layout, out, || update::hand_over(layout))
-        .await
-        .map_err(|detail| {
-            fail(
-                SupervisorFailure::UpdateNotOnline,
-                format!("{detail}; systemd starts the unit again, and its ExecStartPre puts the previous binary back"),
-            )
-        })?;
-    eprintln!(
-        "tumpel-supervisor: handing {} boxes to {}",
-        handover.record.boxes.len(),
-        layout.binary.display()
-    );
-    Ok(Stopped::HandedOver {
-        binary: layout.binary.clone(),
-        handover,
-    })
-}
-
 async fn terminate(
     commands: &UnboundedSender<BoxCommand>,
     layout: &Layout,
     out: &UnboundedSender<ChannelHostMessage>,
 ) -> Result<(), Failure> {
-    let handover = hand_over(commands, layout, out, || Ok(())).await.map_err(|detail| {
+    let (reply, answer) = oneshot::channel();
+    let _ = commands.send(BoxCommand::HandOver(reply));
+    let handover = answer.await.map_err(|_| {
         fail(
             SupervisorFailure::ChannelStateLost,
-            format!("{detail}; the next start takes the running boxes over from the record of running boxes"),
+            "the box runner stopped before it handed its boxes over",
         )
     })?;
+    if let Err(error) = dir::write_json(&layout.handover(), &handover) {
+        for turn_id in handed_turns(&handover) {
+            turn_failed(
+                out,
+                &turn_id,
+                TurnFailureReason::HarnessExited,
+                format!(
+                    "the box of turn {} could not be handed to the next supervisor: {error:#}; send the turn again",
+                    *turn_id
+                ),
+            );
+        }
+        return Err(fail(
+            SupervisorFailure::ChannelStateLost,
+            format!("{error:#}; the next start takes the running boxes over from the record of running boxes"),
+        ));
+    }
     eprintln!(
         "tumpel-supervisor: stopped and left {} boxes running; the next start of the unit takes them over",
-        handover.record.boxes.len()
+        handover.boxes.len()
     );
     Ok(())
 }
@@ -748,7 +712,9 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     };
     let stopped = match served {
         Ok(Served::Revoked) => Ok(Stopped::Revoked),
-        Ok(Served::Updated) => update_binary(&commands, &updates.layout, &updates.out).await,
+        Ok(Served::Updated) => terminate(&commands, &updates.layout, &updates.out)
+            .await
+            .map(|()| Stopped::Updated),
         Ok(Served::Terminated) => terminate(&commands, &updates.layout, &updates.out)
             .await
             .map(|()| Stopped::Terminated),

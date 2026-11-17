@@ -301,20 +301,6 @@ fn end_child(pid: libc::pid_t) {
     unsafe { libc::waitpid(pid, &raw mut status, 0) };
 }
 
-fn inherited(fd: &impl AsFd, named: &str) -> Result<OwnedFd, String> {
-    let copy = fd
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(|error| format!("duplicating {named} for the new supervisor binary failed: {error}"))?;
-    if unsafe { libc::fcntl(copy.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
-        return Err(format!(
-            "keeping {named} open across the exec failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(copy)
-}
-
 fn ended(status: i32) -> String {
     if libc::WIFEXITED(status) {
         return format!("exit status {}", libc::WEXITSTATUS(status));
@@ -910,50 +896,16 @@ impl Machine for FirecrackerBox {
         Ok(())
     }
 
-    fn hand_over(mut self, guest: VsockGuest) -> Result<(SupervisorHandoverMachine, Vec<OwnedFd>), String> {
-        let process = self.process.take();
-        let handed = (|| {
-            let id = process
-                .as_ref()
-                .and_then(Process::id)
-                .and_then(std::num::NonZeroU32::new)
-                .ok_or_else(|| "the box has no running Firecracker process".to_string())?;
-            let stdout = self
-                .stdout
-                .as_ref()
-                .ok_or("the box has no standard output to hand over")?;
-            let stderr = self
-                .stderr
-                .as_ref()
-                .ok_or("the box has no standard error to hand over")?;
-            Ok::<_, String>((
-                id,
-                inherited(&guest.stream, "the guest connection")?,
-                inherited(stdout, "standard output")?,
-                inherited(stderr, "standard error")?,
-            ))
-        })();
-        let (process_id, guest_fd, stdout, stderr) = match handed {
-            Ok(handed) => handed,
-            Err(error) => {
-                drop(process);
-                return Err(error);
-            }
-        };
-        if let Some(process) = process {
-            process.keep();
-        }
+    fn hand_over(mut self, guest: VsockGuest) -> Result<SupervisorHandoverMachine, String> {
         let machine = SupervisorHandoverMachine {
-            api_socket: self.api_socket().display().to_string(),
             console_tail: STANDARD.encode(self.console_bytes()),
             guest_buffer: STANDARD.encode(guest.decoder.buffered()),
-            guest_fd: guest_fd.as_raw_fd(),
-            process_id,
-            stderr_fd: stderr.as_raw_fd(),
-            stdout_fd: stdout.as_raw_fd(),
-            vsock: self.vsock().display().to_string(),
+            ..self.record()?
         };
-        Ok((machine, vec![guest_fd, stdout, stderr]))
+        if let Some(process) = self.process.take() {
+            process.keep();
+        }
+        Ok(machine)
     }
 }
 

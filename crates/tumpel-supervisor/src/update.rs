@@ -700,16 +700,6 @@ fn swap(layout: &Layout, pending: &SupervisorUpdatePending) -> Result<(), String
     })
 }
 
-pub fn hand_over(layout: &Layout) -> Result<(), String> {
-    std::fs::rename(layout.pending(), layout.trial()).map_err(|error| {
-        format!(
-            "moving {} to {} failed: {error}",
-            layout.pending().display(),
-            layout.trial().display()
-        )
-    })
-}
-
 pub fn forget_handover(layout: &Layout) -> Result<(), String> {
     remove(&layout.handover())
 }

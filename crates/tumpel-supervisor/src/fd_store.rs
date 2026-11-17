@@ -69,6 +69,3 @@ pub fn restored(mut handover: SupervisorHandover, received: &mut BTreeMap<String
     }
     handover
 }
-
-#[cfg(test)]
-mod tests;

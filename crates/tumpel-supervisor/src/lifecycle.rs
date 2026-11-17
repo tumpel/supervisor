@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::io::BufWriter;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -131,7 +130,7 @@ pub trait Machine: Send + 'static {
     fn drive(&self) -> PathBuf;
     fn stop(self) -> impl Future<Output = ()> + Send;
     fn console_tail(&self) -> String;
-    fn hand_over(self, guest: Self::Guest) -> Result<(SupervisorHandoverMachine, Vec<OwnedFd>), String>;
+    fn hand_over(self, guest: Self::Guest) -> Result<SupervisorHandoverMachine, String>;
     fn record(&self) -> Result<SupervisorHandoverMachine, String>;
     fn reconnect(&mut self, guest: &mut Self::Guest) -> impl Future<Output = Result<(), String>> + Send;
 }
@@ -1748,14 +1747,9 @@ pub enum Taken {
     Crashed,
 }
 
-pub struct Handover {
-    pub record: SupervisorHandover,
-    pub descriptors: Vec<OwnedFd>,
-}
-
 pub enum Input {
     Command(Command),
-    HandOver(oneshot::Sender<Handover>),
+    HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>),
 }
 
@@ -1804,7 +1798,7 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     setup_tasks: HashMap<String, JoinHandle<()>>,
     mode: Mode,
     parking: watch::Sender<bool>,
-    handing: Option<(oneshot::Sender<Handover>, AbortHandle)>,
+    handing: Option<(oneshot::Sender<SupervisorHandover>, AbortHandle)>,
 }
 
 impl<V: Vmm, S: Store> Lifecycle<V, S> {
@@ -1942,7 +1936,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
     }
 
-    fn start_handover(&mut self, reply: oneshot::Sender<Handover>) {
+    fn start_handover(&mut self, reply: oneshot::Sender<SupervisorHandover>) {
         self.mode = Mode::HandingOver;
         self.parking.send_replace(true);
         let limit = self.handover_limit();
@@ -2099,7 +2093,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         };
         timer.abort();
         let mut boxes = Vec::new();
-        let mut descriptors = Vec::new();
         let sessions: Vec<String> = self.slots.keys().cloned().collect();
         for session in sessions {
             let Some(mut slot) = self.slots.remove(&session) else {
@@ -2146,8 +2139,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             } = live;
             let tap_index = i32::from(tap.index());
             match machine.hand_over(guest) {
-                Ok((machine, handed)) => {
-                    descriptors.extend(handed);
+                Ok(machine) => {
                     boxes.push(SupervisorHandoverBox {
                         box_id,
                         credential_file,
@@ -2178,12 +2170,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 }
             }
         }
-        let _ = reply.send(Handover {
-            record: SupervisorHandover {
-                boxes,
-                handed_at: now(),
-            },
-            descriptors,
+        let _ = reply.send(SupervisorHandover {
+            boxes,
+            handed_at: now(),
         });
     }
 

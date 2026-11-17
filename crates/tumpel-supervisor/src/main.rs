@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tumpel_api::types::SupervisorFailure;
@@ -52,6 +51,8 @@ enum Command {
     /// Check that this binary starts on this host the way `run` does and reaches the channel's Challenge, then print a `SupervisorCheckReport`.
     Check,
 }
+
+const RESTART_INTO_UPDATE: u8 = 75;
 
 fn exit_code(failure: SupervisorFailure) -> ExitCode {
     match failure {
@@ -118,15 +119,9 @@ fn main() -> ExitCode {
             };
             match runtime.block_on(run(telemetry, handover, received)) {
                 Ok(Stopped::Revoked | Stopped::Terminated) => ExitCode::SUCCESS,
-                Ok(Stopped::HandedOver { binary, handover }) => {
-                    let error = std::process::Command::new(&binary).args(["run", "--handover"]).exec();
-                    eprintln!(
-                        "tumpel-supervisor: {}: starting {} to take over {} descriptors of the running boxes failed: {error}; systemd starts the unit again, and its ExecStartPre puts the previous binary back",
-                        SupervisorFailure::UpdateNotOnline,
-                        binary.display(),
-                        handover.descriptors.len()
-                    );
-                    exit_code(SupervisorFailure::UpdateNotOnline)
+                Ok(Stopped::Updated) => {
+                    eprintln!("tumpel-supervisor: exiting so systemd starts the new binary, which takes the running boxes over");
+                    ExitCode::from(RESTART_INTO_UPDATE)
                 }
                 Err(failure) if on_trial(&supervisor_dir()) => {
                     eprintln!(
