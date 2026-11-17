@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand};
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tumpel_api::types::SupervisorFailure;
-use tumpel_supervisor::{check, enrol, install, install_telemetry, on_trial, run, supervisor_dir, Enrolment, Stopped};
+use tumpel_supervisor::{
+    check, enrol, install, install_telemetry, on_trial, received_descriptors, run, supervisor_dir, Enrolment, Stopped,
+};
 
 #[derive(Parser)]
 #[command(
@@ -51,6 +52,8 @@ enum Command {
     Check,
 }
 
+const RESTART_INTO_UPDATE: u8 = 75;
+
 fn exit_code(failure: SupervisorFailure) -> ExitCode {
     match failure {
         SupervisorFailure::NotEnrolled => ExitCode::from(3),
@@ -65,6 +68,13 @@ fn exit_code(failure: SupervisorFailure) -> ExitCode {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let received = match unsafe { received_descriptors() } {
+        Ok(received) => received,
+        Err(error) => {
+            eprintln!("tumpel-supervisor: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -107,17 +117,11 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match runtime.block_on(run(telemetry, handover)) {
-                Ok(Stopped::Revoked) => ExitCode::SUCCESS,
-                Ok(Stopped::HandedOver { binary, handover }) => {
-                    let error = std::process::Command::new(&binary).args(["run", "--handover"]).exec();
-                    eprintln!(
-                        "tumpel-supervisor: {}: starting {} to take over {} descriptors of the running boxes failed: {error}; systemd starts the unit again, and its ExecStartPre puts the previous binary back",
-                        SupervisorFailure::UpdateNotOnline,
-                        binary.display(),
-                        handover.descriptors.len()
-                    );
-                    exit_code(SupervisorFailure::UpdateNotOnline)
+            match runtime.block_on(run(telemetry, handover, received)) {
+                Ok(Stopped::Revoked | Stopped::Terminated) => ExitCode::SUCCESS,
+                Ok(Stopped::Updated) => {
+                    eprintln!("tumpel-supervisor: exiting so systemd starts the new binary, which takes the running boxes over");
+                    ExitCode::from(RESTART_INTO_UPDATE)
                 }
                 Err(failure) if on_trial(&supervisor_dir()) => {
                     eprintln!(

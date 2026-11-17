@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
 use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,6 +27,7 @@ use crate::repository;
 use crate::usage::{self, Spend, Tokens, Usage};
 
 const STATE_DIR: &str = "/var/lib/tumpel";
+const HANG_UP_POLL_MILLISECONDS: i32 = 200;
 const LINE_SEQ_FILE: &str = "/var/lib/tumpel/line-seq";
 const STARTED_FILE: &str = "/var/lib/tumpel/harness-started";
 const CODEX_THREAD_FILE: &str = "/var/lib/tumpel/codex-thread";
@@ -39,12 +42,48 @@ enum Output {
     Line(String),
     Closed,
     Exited(libc::pid_t),
+    HostGone(u64),
+}
+
+struct HangUp {
+    done: Arc<AtomicBool>,
+}
+
+impl HangUp {
+    fn watch(host: BorrowedFd<'_>, sender: mpsc::Sender<Output>, turn: u64) -> Result<Self, String> {
+        let host = host
+            .try_clone_to_owned()
+            .map_err(|error| format!("watching the host connection: {error}"))?;
+        let done = Arc::new(AtomicBool::new(false));
+        let watching = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let mut poll = libc::pollfd {
+                fd: host.as_raw_fd(),
+                events: libc::POLLRDHUP,
+                revents: 0,
+            };
+            while !watching.load(Ordering::Relaxed) {
+                if unsafe { libc::poll(&raw mut poll, 1, HANG_UP_POLL_MILLISECONDS) } > 0 && poll.revents != 0 {
+                    let _ = sender.send(Output::HostGone(turn));
+                    return;
+                }
+            }
+        });
+        Ok(Self { done })
+    }
+}
+
+impl Drop for HangUp {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+    }
 }
 
 struct Harness {
     child: Child,
     stdin: Box<dyn Write + Send>,
     output: Receiver<Output>,
+    sender: mpsc::Sender<Output>,
     stderr: Arc<Mutex<VecDeque<u8>>>,
     launch: Launch,
 }
@@ -196,9 +235,12 @@ impl Harness {
         }
     }
 
-    fn receive(&self, protocol: GuestHarnessProtocol) -> Result<Output, mpsc::RecvError> {
+    fn receive(&self, protocol: GuestHarnessProtocol, turn: u64) -> Result<Output, mpsc::RecvError> {
         loop {
             let output = self.output.recv()?;
+            if matches!(output, Output::HostGone(gone) if gone != turn) {
+                continue;
+            }
             if !matches!(&output, Output::Line(text) if answers_no_prompt(protocol, text)) {
                 return Ok(output);
             }
@@ -640,13 +682,14 @@ impl GuestState {
                 .map_err(|error| format!("{program} runs as process {} beyond pid_t: {error}", child.id()))?;
             spawn_waiter(pid, sender.clone());
         }
-        spawn_reader(stdout, sender);
+        spawn_reader(stdout, sender.clone());
         let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL)));
         spawn_tail(stderr, Arc::clone(&tail));
         Ok(Harness {
             child,
             stdin,
             output,
+            sender,
             stderr: tail,
             launch: launch(&self.keys, start),
         })
@@ -681,7 +724,7 @@ impl GuestState {
         Ok(self.harness.insert(setup))
     }
 
-    pub fn run(&mut self, start: &GuestTurnStart, host: &mut impl Write) -> Result<(), String> {
+    pub fn run(&mut self, start: &GuestTurnStart, host: &mut (impl Write + AsFd)) -> Result<(), String> {
         self.last_line_seq = start.last_line_seq.0;
         let first = self.last_line_seq;
         let ending = self.turn(start, host);
@@ -774,8 +817,9 @@ impl GuestState {
         self.harness_for(start)
     }
 
-    fn turn(&mut self, start: &GuestTurnStart, host: &mut impl Write) -> Result<Ending, String> {
+    fn turn(&mut self, start: &GuestTurnStart, host: &mut (impl Write + AsFd)) -> Result<Ending, String> {
         self.markers += 1;
+        let turn = self.markers;
         let marker = format!("tumpel-turn-end-{}-{}", std::process::id(), self.markers);
         let setup = start.prebuild_commit_sha.is_some();
         let protocol = if setup {
@@ -794,13 +838,8 @@ impl GuestState {
             Err(error) => return Ok(ended(GuestTurnEndReason::HarnessStartFailed, error)),
         };
         harness.discard_leftovers(&start.turn_id);
-        let input = match protocol {
-            _ if setup => String::new(),
-            GuestHarnessProtocol::ClaudeStreamJson => format!("{}\n", user_message(&start.prompt)),
-            GuestHarnessProtocol::PiRpc => pi_prompt(&start.prompt),
-            GuestHarnessProtocol::ShellLines => format!("{}\nprintf '%s\\n' '{marker}'\n", start.prompt.as_str()),
-            GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::CodexExecJson => start.prompt.to_string(),
-        };
+        let _hang_up = HangUp::watch(host.as_fd(), harness.sender.clone(), turn)?;
+        let input = prompt_input(protocol, setup, &start.prompt, &marker);
         let written = harness
             .stdin
             .write_all(input.as_bytes())
@@ -817,11 +856,15 @@ impl GuestState {
         let mut killed_tail = None;
         let mut spend = Spend::new(protocol);
         let ending = loop {
-            let text = match harness.receive(protocol) {
+            let text = match harness.receive(protocol, turn) {
                 Ok(Output::Line(text)) => text,
                 Ok(Output::Exited(pid)) => {
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
                     continue;
+                }
+                Ok(Output::HostGone(_)) => {
+                    self.last_line_seq = last_line_seq;
+                    return Err(format!("the host hung up during turn {}", *start.turn_id));
                 }
                 Ok(Output::Closed) | Err(_) => {
                     let waited = harness.child.wait();
@@ -883,6 +926,16 @@ impl GuestState {
             GuestTurnEndReason::HarnessOutOfMemory,
             self.memory.out_of_memory(&victim, &tail),
         ))
+    }
+}
+
+fn prompt_input(protocol: GuestHarnessProtocol, setup: bool, prompt: &str, marker: &str) -> String {
+    match protocol {
+        _ if setup => String::new(),
+        GuestHarnessProtocol::ClaudeStreamJson => format!("{}\n", user_message(prompt)),
+        GuestHarnessProtocol::PiRpc => pi_prompt(prompt),
+        GuestHarnessProtocol::ShellLines => format!("{prompt}\nprintf '%s\\n' '{marker}'\n"),
+        GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::CodexExecJson => prompt.to_string(),
     }
 }
 

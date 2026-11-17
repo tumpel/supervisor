@@ -19,8 +19,8 @@ use tokio::time::timeout;
 use tumpel_api::types::{
     ChannelHostMessage, ChannelSupervisorUpdateFailed, ChannelSupervisorUpdateFailedType, ChannelSupervisorUpdateStep,
     ChannelSupervisorUpdateStepReleaseVersion, ChannelSupervisorUpdateStepType, HostArchitecture,
-    ReleaseManifestReleaseVersion, Sha256Digest, SupervisorCheckReport, SupervisorHandover,
-    SupervisorUpdateFailureReason, SupervisorUpdatePending, SupervisorUpdatePhase, SupervisorUpdateRefusal,
+    ReleaseManifestReleaseVersion, Sha256Digest, SupervisorCheckReport, SupervisorUpdateFailureReason,
+    SupervisorUpdatePending, SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
 use tumpel_guest::setup_output::{redacted, strip_ansi};
 
@@ -33,6 +33,7 @@ pub const TRIAL_FILE: &str = "update-trial.json";
 pub const ROLLED_BACK_FILE: &str = "update-rolled-back.json";
 pub const REFUSAL_FILE: &str = "update-refusal.json";
 pub const HANDOVER_FILE: &str = "handover.json";
+pub const BOXES_FILE: &str = "boxes.json";
 pub const ROLLBACK_SCRIPT: &str = r#"state="${TUMPEL_SUPERVISOR_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tumpel-supervisor}"; if [ -e "$state/update-trial.json" ]; then cp "$1" "$0.part" && sync "$0.part" && mv "$0.part" "$0" && mv "$state/update-trial.json" "$state/update-rolled-back.json"; elif [ -e "$state/update-pending.json" ]; then mv "$state/update-pending.json" "$state/update-trial.json"; fi"#;
 const TAIL_LINES: usize = 20;
 const TAIL_LINE_CHARS: usize = 400;
@@ -105,6 +106,10 @@ impl Layout {
 
     pub(crate) fn handover(&self) -> PathBuf {
         self.state.join(HANDOVER_FILE)
+    }
+
+    pub(crate) fn boxes(&self) -> PathBuf {
+        self.state.join(BOXES_FILE)
     }
 }
 
@@ -691,17 +696,6 @@ fn swap(layout: &Layout, pending: &SupervisorUpdatePending) -> Result<(), String
             "moving {} over {} failed: {error}{undone}",
             layout.candidate.display(),
             layout.binary.display()
-        )
-    })
-}
-
-pub fn hand_over(layout: &Layout, handover: &SupervisorHandover) -> Result<(), String> {
-    dir::write_json(&layout.handover(), handover).map_err(|error| format!("{error:#}"))?;
-    std::fs::rename(layout.pending(), layout.trial()).map_err(|error| {
-        format!(
-            "moving {} to {} failed: {error}",
-            layout.pending().display(),
-            layout.trial().display()
         )
     })
 }
