@@ -8,7 +8,7 @@ use tumpel_api::types::GuestHarnessProtocol;
 
 use super::{
     answers_no_prompt, ends_turn, environment, home_path, launch, priced_by_anthropic, reuses, skips, turn_arguments,
-    turn_environment, without_list_price,
+    turn_environment, without_list_price, HangUp, Output,
 };
 
 fn start(model: &str, variables: &Value, files: &Value) -> GuestTurnStart {
@@ -325,4 +325,22 @@ fn a_later_codex_turn_resumes_the_recorded_thread() {
 fn a_codex_turn_whose_credential_names_no_provider_does_not_start() {
     let error = turn_arguments(CODEX, &codex_turn(&json!([])), false, None).expect_err("no Codex provider");
     assert!(error.contains("names no Codex model provider"), "{error}");
+}
+
+#[test]
+fn a_host_that_hangs_up_mid_turn_wakes_that_turn() {
+    use std::os::fd::AsFd;
+    use std::time::Duration;
+    let (host, peer) = std::os::unix::net::UnixStream::pair().expect("a host connection");
+    let (sender, output) = std::sync::mpsc::channel();
+    let _watching = HangUp::watch(host.as_fd(), sender, 7).expect("the host connection is watched");
+    assert!(
+        output.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a connected host wakes nothing"
+    );
+    drop(peer);
+    assert!(matches!(
+        output.recv_timeout(Duration::from_secs(2)),
+        Ok(Output::HostGone(7))
+    ));
 }
