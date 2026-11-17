@@ -68,7 +68,6 @@ pub fn protect(proc_root: &Path, cgroup_root: &Path, pid: u32) -> Result<Confine
     create(&harness)?;
     write(&agent.join("cgroup.procs"), &pid.to_string())?;
     write(&own.join("cgroup.subtree_control"), "+memory")?;
-    write(&harness.join("memory.oom.group"), "1")?;
     Ok(Confinement::Group {
         score,
         procs: c_path(&harness.join("cgroup.procs"))?,
@@ -197,7 +196,7 @@ impl Memory {
 
     pub fn out_of_memory(&self, victim: &Victim, stderr_tail: &str) -> String {
         format!(
-            "the box ran out of its {} MiB of memory and the kernel killed {} with the harness tree ({}); give the persona more boxMemoryMib or have it run lighter builds; {stderr_tail}",
+            "the box ran out of its {} MiB of memory and the kernel killed {} ({}), which stopped the harness; give the persona more boxMemoryMib or have it run lighter builds; {stderr_tail}",
             self.box_mib, victim.process, victim.line
         )
     }

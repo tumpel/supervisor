@@ -35,14 +35,14 @@ fn read(path: &Path) -> String {
 }
 
 #[test]
-fn the_agent_leaves_the_oom_killer_and_the_harness_gets_its_own_group_that_dies_whole() {
+fn the_agent_leaves_the_oom_killer_and_the_harness_gets_its_own_group_where_only_the_picked_process_dies() {
     let (proc_root, cgroup_root) = fake_roots("memory-group", &format!("0::/{SERVICE}\n"), "cpu memory pids\n");
     let confinement = protect(&proc_root, &cgroup_root, 4242).expect("the guest is protected");
     let own = cgroup_root.join(SERVICE);
     assert_eq!(read(&proc_root.join("self/oom_score_adj")), "-1000");
     assert_eq!(read(&own.join("agent/cgroup.procs")), "4242");
     assert_eq!(read(&own.join("cgroup.subtree_control")), "+memory");
-    assert_eq!(read(&own.join("harness/memory.oom.group")), "1");
+    assert!(!own.join("harness/memory.oom.group").exists());
     assert_eq!(
         confinement,
         Confinement::Group {

@@ -1322,6 +1322,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 )
             }
         };
+        live.dirty = true;
         match result {
             Ok(last_line_seq) => {
                 emit(
@@ -1334,7 +1335,6 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                         type_: ChannelTurnCompleteType::TurnComplete,
                     },
                 );
-                live.dirty = true;
                 self.pause(live).await
             }
             Err(failure) if failure.keeps_box => {
@@ -2604,7 +2604,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 &self.runner.out,
                 ChannelBoxTeardownFailed {
                     detail: format!(
-                        "box {} of session {} holds a completed turn that no snapshot holds yet, so the host keeps it; stop the session again to snapshot it first",
+                        "box {} of session {} holds a turn that no snapshot holds yet, so the host keeps it; stop the session again to snapshot it first",
                         *order.box_id, *order.session_id
                     ),
                     failed_at: now(),

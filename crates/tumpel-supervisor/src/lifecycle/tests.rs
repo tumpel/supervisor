@@ -1776,6 +1776,31 @@ async fn a_teardown_of_a_box_with_an_unsnapshotted_turn_fails_box_dirty_and_keep
 }
 
 #[tokio::test]
+async fn a_teardown_after_a_failed_turn_fails_box_dirty_and_keeps_the_box() {
+    let mut host = host("failed-dirty", 1, Harness::Echo, Boot::Works);
+    let prompt = "{\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 500\"}";
+    host.turn_speaking(GuestHarnessProtocol::ClaudeStreamJson, "turn-1", "session-1", prompt);
+    let seen = host.settle(SETTLE).await;
+    assert!(
+        seen.last()
+            .is_some_and(|last| last.starts_with(&format!("failed {}", TurnFailureReason::HarnessReportedError))),
+        "{seen:?}"
+    );
+    host.log();
+    host.teardown("session-1");
+    let seen = host.settle(SETTLE).await;
+    assert!(
+        seen.len() == 1
+            && seen[0].starts_with(&format!(
+                "teardown failed {}",
+                ChannelBoxTeardownFailureReason::BoxDirty
+            )),
+        "{seen:?}"
+    );
+    assert_eq!(host.log(), Vec::<String>::new());
+}
+
+#[tokio::test]
 async fn a_turn_for_another_box_of_the_session_stops_the_warm_box_and_boots_fresh() {
     let mut host = host("moved-back", 1, Harness::Echo, Boot::Works);
     host.turn("turn-1", "session-1", "one", Vec::new());
