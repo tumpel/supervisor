@@ -592,7 +592,7 @@ RestartPreventExitStatus=3 5
 NotifyAccess=main
 FileDescriptorStoreMax={descriptors}
 FileDescriptorStorePreserve=yes
-TimeoutStopSec=infinity
+TimeoutStopSec=10min
 
 [Install]
 WantedBy=default.target
