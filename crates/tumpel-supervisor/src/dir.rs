@@ -46,7 +46,7 @@ pub fn default_runtime() -> Result<SupervisorRuntime> {
         "memoryMib": BoxMemoryLimit::DEFAULT_MIB,
         "overlayMib": 8192,
         "layerCacheMib": 8192,
-        "budgets": { "bootSeconds": 30, "firstLineSeconds": 120, "turnSeconds": 1800, "snapshotSeconds": 60 },
+        "budgets": { "bootSeconds": 30, "firstLineSeconds": 120, "turnSeconds": 3600, "snapshotSeconds": 60 },
         "heartbeatIntervalSeconds": 10,
         "updateGraceSeconds": 600,
     }))
