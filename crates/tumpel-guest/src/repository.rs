@@ -11,6 +11,9 @@ use crate::harness::STDERR_TAIL;
 use crate::memory::Confinement;
 
 pub const TOKEN: &str = "GITHUB_TOKEN";
+pub const OWNER_TOKENS: &str = "TUMPEL_GITHUB_TOKENS";
+pub const GH_WRAPPER: &str = include_str!("repository/gh.sh");
+const OWNER_HELPER: &str = include_str!("repository/owner-helper.sh");
 const HELPER_KEY: &str = "credential.https://github.com.helper";
 const HELPER: &str =
     "!f() { test \"$1\" = get && printf 'username=x-access-token\\npassword=%s\\n' \"$GITHUB_TOKEN\"; }; f";
@@ -44,7 +47,12 @@ fn refused(log: &str) -> bool {
     operations.contains(&"get") && !operations.contains(&"store")
 }
 
-pub fn git_environment(author_name: &str, author_email: &str, token: Option<&str>) -> Vec<(String, String)> {
+pub fn git_environment(
+    author_name: &str,
+    author_email: &str,
+    token: Option<&str>,
+    owner_tokens: bool,
+) -> Vec<(String, String)> {
     let mut environment: Vec<(String, String)> = [
         ("GIT_TERMINAL_PROMPT", "0"),
         ("GIT_AUTHOR_NAME", author_name),
@@ -56,6 +64,21 @@ pub fn git_environment(author_name: &str, author_email: &str, token: Option<&str
     .map(|(name, value)| (name.to_string(), value.to_string()))
     .collect();
     if let Some(token) = token {
+        if owner_tokens {
+            environment.extend(
+                [
+                    ("GH_TOKEN", token),
+                    ("GIT_CONFIG_COUNT", "2"),
+                    ("GIT_CONFIG_KEY_0", HELPER_KEY),
+                    ("GIT_CONFIG_VALUE_0", OWNER_HELPER.trim_end()),
+                    ("GIT_CONFIG_KEY_1", "credential.https://github.com.useHttpPath"),
+                    ("GIT_CONFIG_VALUE_1", "true"),
+                ]
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+            );
+            return environment;
+        }
         environment.extend(
             [
                 ("GH_TOKEN", token),
