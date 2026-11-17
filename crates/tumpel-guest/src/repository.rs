@@ -3,7 +3,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tumpel_api::types::RepositoryCloneFailureCause;
 
@@ -18,6 +18,7 @@ const PRE_PUSH: &str = include_str!("repository/pre-push.sh");
 const ASKED: &str = "TUMPEL_CLONE_CREDENTIAL_LOG";
 const RECORDER: &str = "credential.helper=!f() { printf '%s\\n' \"$1\" >> \"$TUMPEL_CLONE_CREDENTIAL_LOG\"; }; f";
 const PREBUILT: &str = ".git/tumpel-prebuilt";
+const START_BUDGET: &str = "TUMPEL_PREBUILD_SECONDS";
 
 #[derive(Debug)]
 pub struct CloneFailure {
@@ -86,7 +87,9 @@ pub fn prepare(
     confinement: &Confinement,
     limit: Duration,
     prebuild_commit: Option<&str>,
+    start: &Path,
 ) -> Result<(), CloneFailure> {
+    let began = Instant::now();
     if !dir.join(".git").exists() {
         clone(dir, repository, environment, confinement, limit)?;
     }
@@ -103,6 +106,13 @@ pub fn prepare(
         std::fs::write(&marker, commit).map_err(|error| other(format!("writing {}: {error}", marker.display())))?;
     } else if marker.exists() {
         git(dir, &["pull", "--quiet", "--ff-only"], environment, confinement, limit)?;
+        run_start(
+            dir,
+            start,
+            environment,
+            confinement,
+            limit.saturating_sub(began.elapsed()),
+        )?;
         remove_file(&marker).map_err(other)?;
     }
     guard_pushes(dir)
@@ -115,9 +125,40 @@ fn git(
     confinement: &Confinement,
     limit: Duration,
 ) -> Result<(), CloneFailure> {
+    let fix = "check that the guest image has git on its PATH and that the repository host answers from the box";
+    run(dir, "git", args, fix, environment, confinement, limit)
+}
+
+fn run_start(
+    dir: &Path,
+    start: &Path,
+    environment: &[(String, String)],
+    confinement: &Confinement,
+    limit: Duration,
+) -> Result<(), CloneFailure> {
+    let program = start.display().to_string();
+    let fix = "make postStartCommand in devcontainer.json pass within cloneSeconds; the next turn runs it again";
+    let budget = limit.as_secs().saturating_sub(1).max(1).to_string();
+    let mut started = environment.to_vec();
+    started.push((START_BUDGET.to_string(), budget));
+    run(dir, &program, &["start"], fix, &started, confinement, limit).map_err(|failed| match failed.cause {
+        RepositoryCloneFailureCause::Other => failure(failed.cause, format!("PostStartFailed: {}", failed.detail)),
+        _ => failed,
+    })
+}
+
+fn run(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    fix: &str,
+    environment: &[(String, String)],
+    confinement: &Confinement,
+    limit: Duration,
+) -> Result<(), CloneFailure> {
     use RepositoryCloneFailureCause::{Other, TimedOut};
     let shown = args.join(" ");
-    let mut command = Command::new("git");
+    let mut command = Command::new(program);
     confinement.apply(&mut command);
     let child = command
         .args(args)
@@ -129,13 +170,9 @@ fn git(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| {
-            failure(
-                Other,
-                format!("starting git {shown}: {error}; the guest image needs git on its PATH"),
-            )
-        })?;
-    let group = i32::try_from(child.id()).map_err(|error| failure(Other, format!("git's process id: {error}")))?;
+        .map_err(|error| failure(Other, format!("starting {program} {shown}: {error}; {fix}")))?;
+    let group =
+        i32::try_from(child.id()).map_err(|error| failure(Other, format!("{program}'s process id: {error}")))?;
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = sender.send(child.wait_with_output());
@@ -146,13 +183,13 @@ fn git(
         return Err(failure(
             TimedOut,
             format!(
-                "git {shown} in {} did not finish within {} s (cloneSeconds of the harness), so git was stopped; check that the repository host answers from the box",
+                "{program} {shown} in {} did not finish within {} s (cloneSeconds of the harness), so {program} was stopped; {fix}",
                 dir.display(),
                 limit.as_secs()
             ),
         ));
     };
-    let output = output.map_err(|error| failure(Other, format!("waiting for git {shown}: {error}")))?;
+    let output = output.map_err(|error| failure(Other, format!("waiting for {program} {shown}: {error}")))?;
     if output.status.success() {
         return Ok(());
     }
@@ -160,7 +197,7 @@ fn git(
     Err(failure(
         Other,
         format!(
-            "git {shown} in {} failed ({}); git reported: {}",
+            "{program} {shown} in {} failed ({}); {program} reported: {}",
             dir.display(),
             output.status,
             tumpel_guest::tail(stderr.trim(), STDERR_TAIL)
