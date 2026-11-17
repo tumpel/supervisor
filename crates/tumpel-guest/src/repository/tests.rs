@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tumpel_api::types::RepositoryCloneFailureCause;
 
-use super::{git_environment, CloneFailure};
+use super::{git_environment, CloneFailure, GH_WRAPPER};
 use crate::memory::Confinement;
 
 const LIMIT: Duration = Duration::from_mins(1);
@@ -315,6 +315,135 @@ fn the_credential_helper_answers_each_owner_with_its_own_installation_token() {
         refused.contains("no GitHub App installation of this tenant covers github.com/acme"),
         "{refused}"
     );
+}
+
+fn wrapped_gh(name: &str, gh_repo: Option<&str>, in_checkout: bool, args: &[&str]) -> (String, bool) {
+    let root = scratch(name);
+    let wrapper = root.join("wrapper");
+    let real = root.join("real");
+    let checkout = root.join("checkout");
+    for dir in [&wrapper, &real, &checkout] {
+        std::fs::create_dir_all(dir).expect("a fixture directory is created");
+    }
+    std::fs::write(wrapper.join("gh"), GH_WRAPPER).expect("the wrapper is written");
+    std::fs::write(real.join("gh"), "#!/bin/sh\necho \"$GH_TOKEN $GITHUB_TOKEN\"\n").expect("a fake gh is written");
+    for gh in [wrapper.join("gh"), real.join("gh")] {
+        std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("gh is executable");
+    }
+    let environment = box_environment(&root, None);
+    git(&checkout, &environment, &["init", "--quiet"]);
+    git(
+        &checkout,
+        &environment,
+        &["remote", "add", "origin", "https://github.com/mvhenten/tumpel"],
+    );
+    let mut command = Command::new(wrapper.join("gh"));
+    command
+        .args(args)
+        .current_dir(if in_checkout { &checkout } else { &root })
+        .env_clear()
+        .env(
+            "PATH",
+            format!("{}:{}:/usr/bin:/bin", wrapper.display(), real.display()),
+        )
+        .env("HOME", &root)
+        .env(
+            "GIT_CEILING_DIRECTORIES",
+            root.parent().expect("the scratch directory has a parent"),
+        )
+        .env("GH_TOKEN", "ghs-session")
+        .env("GITHUB_TOKEN", "ghs-session")
+        .env("TUMPEL_GITHUB_TOKENS", "mvhenten=ghs-mine tumpel=ghs-org");
+    if let Some(repo) = gh_repo {
+        command.env("GH_REPO", repo);
+    }
+    let output = command.output().expect("the wrapper runs");
+    (
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        output.status.success(),
+    )
+}
+
+#[test]
+fn gh_in_a_clone_uses_the_token_of_its_origin_owner() {
+    let picked = wrapped_gh("gh-origin", None, true, &["pr", "list"]);
+    assert_eq!(picked, ("ghs-mine ghs-mine".to_string(), true));
+}
+
+#[test]
+fn gh_with_a_repo_flag_uses_the_token_of_that_owner() {
+    let picked = wrapped_gh("gh-repo-flag", None, true, &["pr", "list", "-R", "tumpel/protocol"]);
+    assert_eq!(picked, ("ghs-org ghs-org".to_string(), true));
+}
+
+#[test]
+fn gh_with_gh_repo_uses_the_token_of_that_owner() {
+    let picked = wrapped_gh("gh-gh-repo", Some("tumpel/protocol"), true, &["auth", "token"]);
+    assert_eq!(picked, ("ghs-org ghs-org".to_string(), true));
+}
+
+#[test]
+fn gh_repo_with_an_owner_and_name_argument_uses_the_token_of_that_owner() {
+    let picked = wrapped_gh("gh-repo-argument", None, true, &["repo", "view", "Tumpel/protocol"]);
+    assert_eq!(picked, ("ghs-org ghs-org".to_string(), true));
+}
+
+#[test]
+fn gh_with_a_github_url_argument_uses_the_token_of_that_owner() {
+    let picked = wrapped_gh(
+        "gh-url-argument",
+        None,
+        true,
+        &["pr", "view", "https://github.com/tumpel/protocol/pull/1"],
+    );
+    assert_eq!(picked, ("ghs-org ghs-org".to_string(), true));
+}
+
+#[test]
+fn gh_api_on_a_repository_path_beats_gh_repo() {
+    let picked = wrapped_gh(
+        "gh-api-path",
+        Some("mvhenten/tumpel"),
+        true,
+        &["api", "repos/tumpel/protocol/pulls"],
+    );
+    assert_eq!(picked, ("ghs-org ghs-org".to_string(), true));
+}
+
+#[test]
+fn gh_api_with_placeholders_uses_the_token_of_the_origin_owner() {
+    let picked = wrapped_gh("gh-api-placeholder", None, true, &["api", "repos/{owner}/{repo}/pulls"]);
+    assert_eq!(picked, ("ghs-mine ghs-mine".to_string(), true));
+}
+
+#[test]
+fn gh_reads_no_target_from_an_option_value() {
+    let picked = wrapped_gh(
+        "gh-option-value",
+        Some("tumpel/protocol"),
+        true,
+        &["repo", "create", "mine", "--source", "./app", "--private"],
+    );
+    assert_eq!(picked, ("ghs-org ghs-org".to_string(), true));
+    let picked = wrapped_gh(
+        "gh-body-url",
+        None,
+        true,
+        &["pr", "create", "--body", "https://github.com/tumpel/protocol/pull/3"],
+    );
+    assert_eq!(picked, ("ghs-mine ghs-mine".to_string(), true));
+}
+
+#[test]
+fn gh_without_an_owner_uses_the_session_token() {
+    let picked = wrapped_gh("gh-no-owner", None, false, &["api", "user/repos"]);
+    assert_eq!(picked, ("ghs-session ghs-session".to_string(), true));
+}
+
+#[test]
+fn gh_on_an_owner_without_an_installation_uses_the_session_token() {
+    let picked = wrapped_gh("gh-stranger", None, true, &["repo", "view", "cli/cli"]);
+    assert_eq!(picked, ("ghs-session ghs-session".to_string(), true));
 }
 
 fn refused_push(dir: &Path, environment: &[(String, String)], args: &[&str]) -> String {
