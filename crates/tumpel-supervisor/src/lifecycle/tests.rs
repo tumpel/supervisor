@@ -465,6 +465,7 @@ const SETTLE: Duration = Duration::from_millis(60);
 const SLOW_CLONE: Duration = Duration::from_millis(300);
 const SLOW_BOOT: Duration = Duration::from_millis(50);
 const LATE_CLAIM: Duration = Duration::from_millis(150);
+const STALLED_CLAIM: Duration = Duration::from_secs(600);
 
 fn settings() -> Settings {
     Settings {
@@ -645,15 +646,19 @@ fn control_plane(
                 ChannelHostMessage::TurnClaim(claim) => {
                     let turn_id = claim.turn_id.clone();
                     let _ = forward.send(ChannelHostMessage::TurnClaim(claim));
-                    if !turn_id.starts_with("late") {
+                    let delay = if turn_id.starts_with("late") {
+                        LATE_CLAIM
+                    } else if turn_id.starts_with("stalled") {
+                        STALLED_CLAIM
+                    } else {
                         answers.deliver(claim_answer(turn_id));
                         continue;
-                    }
+                    };
                     note(&log, format!("claim {}", *turn_id));
                     let answers = answers.clone();
                     let log = Arc::clone(&log);
                     tokio::spawn(async move {
-                        tokio::time::sleep(LATE_CLAIM).await;
+                        tokio::time::sleep(delay).await;
                         note(&log, format!("claimed {}", *turn_id));
                         answers.deliver(claim_answer(turn_id));
                     });
@@ -1013,6 +1018,16 @@ async fn the_claim_goes_out_before_the_boot_and_the_harness_starts_only_once_bot
             "start late-1",
             "pause session-1"
         ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_claim_the_control_plane_answers_ten_minutes_late_still_starts_the_harness() {
+    let mut host = host("claim-stalled", 1, Harness::Echo, Boot::Works);
+    host.turn("stalled-1", "session-1", "one", Vec::new());
+    assert_eq!(
+        host.settle(STALLED_CLAIM + SETTLE).await,
+        ["claim stalled-1", "line 1 one", "complete 1"]
     );
 }
 
