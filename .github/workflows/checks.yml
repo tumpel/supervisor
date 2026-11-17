@@ -22,20 +22,40 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Detect a docs-only pull request
+        id: changes
+        run: |
+          code=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            changed=$(git diff --name-only HEAD^1 HEAD)
+            grep -qvE '^(docs?/.*|.*\.md|LICENSE|\.github/ISSUE_TEMPLATE/.*)$' <<<"$changed" || code=false
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v7
         with:
           node-version: 24
 
-      - name: Install the pinned Rust toolchain
+      - if: steps.changes.outputs.code == 'true'
+        name: Install the pinned Rust toolchain
         run: rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v2
+      - if: steps.changes.outputs.code == 'true'
+        uses: Swatinem/rust-cache@v2
 
       - run: npm ci --no-audit --no-fund
 
-      - name: Run Biome, the comments and secrets checks, clippy and rustfmt
+      - if: steps.changes.outputs.code == 'false'
+        name: Run Biome and the comments and secrets checks
+        run: npm run lint && npm run comments:check && npm run secrets:check
+
+      - if: steps.changes.outputs.code == 'true'
+        name: Run Biome, the comments and secrets checks, clippy and rustfmt
         run: npm run check
 
-      - name: Run the unit and lifecycle tests
+      - if: steps.changes.outputs.code == 'true'
+        name: Run the unit and lifecycle tests
         run: npm test
