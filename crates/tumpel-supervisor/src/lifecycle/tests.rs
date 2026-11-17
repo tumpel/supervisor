@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::io::{Cursor, Read};
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,12 +12,12 @@ use tumpel_api::types::{
     ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld, ChannelSnapshotChunksHeldType,
     ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType,
     ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId,
-    GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover,
+    GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox,
     SupervisorHandoverMachine, TurnFailureReason,
 };
 
 use super::{
-    restore_budget, BoxTurn, Budgets, Command, Guest, Handover, Input, Lifecycle, Machine, Settings, SnapshotOrder,
+    restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SnapshotOrder, Taken,
     TeardownOrder, Vmm,
 };
 use crate::boot::BootOrder;
@@ -214,6 +213,20 @@ struct MemoryMachine {
     hands: Hands,
 }
 
+impl MemoryMachine {
+    fn guest(&self) -> MemoryGuest {
+        MemoryGuest {
+            harness: self.harness,
+            log: Arc::clone(&self.log),
+            drive: self.drive.clone(),
+            drives: Arc::clone(&self.drives),
+            lines: 0,
+            pending: VecDeque::new(),
+            ready_at: None,
+        }
+    }
+}
+
 impl Machine for MemoryMachine {
     type Guest = MemoryGuest;
 
@@ -247,18 +260,7 @@ impl Machine for MemoryMachine {
             "type": "GuestHello", "protocolVersion": match self.boot { Boot::OldImage => 1, Boot::NewImage => tumpel_api::types::GuestProtocol::VERSION + 1, _ => tumpel_api::types::GuestProtocol::VERSION }, "harness": "Shell", "harnessVersion": "1", "lastLineSeq": 0
         }))
         .expect("hello");
-        Ok((
-            MemoryGuest {
-                harness: self.harness,
-                log: Arc::clone(&self.log),
-                drive: self.drive.clone(),
-                drives: Arc::clone(&self.drives),
-                lines: 0,
-                pending: VecDeque::new(),
-                ready_at: None,
-            },
-            hello,
-        ))
+        Ok((self.guest(), hello))
     }
 
     fn pause(&mut self) -> impl Future<Output = Result<(), String>> + Send {
@@ -284,7 +286,7 @@ impl Machine for MemoryMachine {
         "[ console ]".to_string()
     }
 
-    fn hand_over(self, guest: MemoryGuest) -> Result<(SupervisorHandoverMachine, Vec<OwnedFd>), String> {
+    fn hand_over(self, guest: MemoryGuest) -> Result<SupervisorHandoverMachine, String> {
         let mut hands = self.hands.lock().expect("hands");
         let guest_fd = i32::try_from(hands.len()).expect("a descriptor") + 3;
         hands.insert(guest_fd, guest);
@@ -294,7 +296,21 @@ impl Machine for MemoryMachine {
             "guestBuffer": "", "stdoutFd": 0, "stderrFd": 0, "consoleTail": ""
         }))
         .expect("a handed machine");
-        Ok((machine, Vec::new()))
+        Ok(machine)
+    }
+
+    fn record(&self) -> Result<SupervisorHandoverMachine, String> {
+        Ok(serde_json::from_value(json!({
+            "processId": 99, "apiSocket": "api.sock", "vsock": "v.sock", "guestFd": -1,
+            "guestBuffer": "", "stdoutFd": -1, "stderrFd": -1, "consoleTail": ""
+        }))
+        .expect("a recorded machine"))
+    }
+
+    fn reconnect(&mut self, guest: &mut MemoryGuest) -> impl Future<Output = Result<(), String>> + Send {
+        note(&self.log, format!("reconnect {}", self.session));
+        *guest = self.guest();
+        std::future::ready(Ok(()))
     }
 }
 
@@ -349,6 +365,13 @@ impl Vmm for MemoryVmm {
     fn discard(&self, handed: &SupervisorHandoverMachine) {
         self.hands.lock().expect("hands").remove(&handed.guest_fd);
         note(&self.log, format!("discard {}", handed.process_id));
+    }
+
+    fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
+        if !claimed.is_empty() {
+            note(&self.log, format!("keep boxes {claimed:?} and stop the rest"));
+        }
+        Ok(())
     }
 
     fn open_upper(&self, drive: &Path) -> Result<Tree, String> {
@@ -677,6 +700,7 @@ fn host_on(
     clone_seconds: u32,
 ) -> Host {
     let staging = staging(name);
+    std::fs::create_dir_all(&staging).expect("the staging directory is created");
     let vmm = MemoryVmm {
         harness,
         boot,
@@ -694,7 +718,7 @@ fn start_host(
     capacity: u32,
     settings: Settings,
     clone_seconds: u32,
-    handover: Option<(SupervisorHandover, bool)>,
+    taken: Option<(SupervisorHandover, Taken)>,
 ) -> Host {
     let log = Arc::clone(&vmm.log);
     let images = vmm.staging.join("images");
@@ -705,11 +729,10 @@ fn start_host(
         settings,
         TapPool::new(capacity).expect("pool"),
         out,
+        vmm.staging.join("boxes.json"),
     );
     let received = control_plane(store.clone(), lifecycle.answers(), Arc::clone(&log), from_lifecycle);
-    if let Some((handover, adopt)) = handover {
-        lifecycle.reattach(handover, adopt);
-    }
+    lifecycle.start(taken).expect("the lifecycle starts");
     let (commands, from_host) = unbounded_channel();
     tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
     Host {
@@ -747,13 +770,13 @@ fn in_seconds(seconds: i64) -> chrono::DateTime<chrono::FixedOffset> {
 }
 
 impl Host {
-    fn ask_handover(&self) -> tokio::sync::oneshot::Receiver<Handover> {
+    fn ask_handover(&self) -> tokio::sync::oneshot::Receiver<SupervisorHandover> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         self.commands.send(Input::HandOver(reply)).expect("send");
         answer
     }
 
-    fn successor(self, handover: &SupervisorHandover, adopt: bool) -> Host {
+    fn successor(self, handover: &SupervisorHandover) -> Host {
         let text = serde_json::to_string(handover).expect("the handover is JSON");
         let record = serde_json::from_str(&text).expect("the handover reads back as a SupervisorHandover");
         let Host {
@@ -764,12 +787,53 @@ impl Host {
             clone_seconds,
             ..
         } = self;
-        start_host(vmm, store, capacity, settings, clone_seconds, Some((record, adopt)))
+        start_host(
+            vmm,
+            store,
+            capacity,
+            settings,
+            clone_seconds,
+            Some((record, Taken::Handed)),
+        )
+    }
+
+    fn standing(&self) -> SupervisorHandover {
+        let text = std::fs::read_to_string(self.vmm.staging.join("boxes.json")).expect("boxes.json is written");
+        serde_json::from_str(&text).expect("boxes.json is a SupervisorHandover")
+    }
+
+    fn keep_guest(&self, handed: &mut SupervisorHandoverBox, fd: i32) {
+        let tap = TapPool::new(self.capacity)
+            .expect("pool")
+            .claim_device(handed.tap_index)
+            .expect("tap");
+        let guest = self
+            .vmm
+            .machine(&handed.session_id, &tap, None)
+            .expect("machine")
+            .guest();
+        self.vmm.hands.lock().expect("hands").insert(fd, guest);
+        handed.machine.guest_fd = fd;
+    }
+
+    fn after_crash(&self, standing: SupervisorHandover) -> Host {
+        let vmm = MemoryVmm {
+            log: Arc::default(),
+            ..self.vmm.clone()
+        };
+        start_host(
+            vmm,
+            self.store.clone(),
+            self.capacity,
+            self.settings,
+            self.clone_seconds,
+            Some((standing, Taken::Crashed)),
+        )
     }
 
     async fn hand_over(self) -> Host {
         let handover = self.ask_handover().await.expect("the boxes are handed over");
-        self.successor(&handover.record, true)
+        self.successor(&handover)
     }
 
     fn send(&self, command: Command) {
@@ -1231,15 +1295,76 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
         TurnFailureReason::HostUpdating
     );
     assert_eq!(old.settle_until(&refused).await, [refused]);
-    let mut new = old.successor(&handover.record, true);
+    let mut new = old.successor(&handover);
     assert_eq!(new.settle_until("complete 1").await, ["line 1 one", "complete 1"]);
     assert_eq!(
         new.log(),
         [
             "hand over session-1",
             "reattach session-1 on tumpel0",
+            "keep boxes [0] and stop the rest",
             "pause session-1"
         ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_supervisor_started_after_a_crash_keeps_every_box_and_fails_only_the_cut_turn() {
+    let mut old = host("crash-keeps-boxes", 2, Harness::SlowClone, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    old.turn("turn-2", "session-2", "two", Vec::new());
+    old.settle_until("claim turn-2").await;
+    tokio::time::sleep(SLOW_CLONE / 2).await;
+    let mut standing = old.standing();
+    assert_eq!(standing.boxes.len(), 2, "both running boxes are on record");
+    old.keep_guest(&mut standing.boxes[0], 40);
+    old.keep_guest(&mut standing.boxes[1], 41);
+    let mut new = old.after_crash(standing);
+    let cut = format!(
+        "failed {}: the supervisor stopped unexpectedly during turn turn-2, so the turn ended; its box is kept, so send the turn again",
+        TurnFailureReason::HarnessExited
+    );
+    assert_eq!(new.settle_until(&cut).await, [cut.as_str()]);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(
+        new.log(),
+        [
+            "reattach session-1 on tumpel0",
+            "reattach session-2 on tumpel1",
+            "keep boxes [0, 1] and stop the rest",
+            "reconnect session-2",
+            "pause session-2"
+        ]
+    );
+    new.turn("turn-3", "session-2", "three", Vec::new());
+    assert_eq!(
+        new.settle_until("complete 1").await,
+        ["claim turn-3", "line 1 three", "complete 1"]
+    );
+    assert_eq!(
+        new.log(),
+        ["resume session-2", "pause session-2"],
+        "the kept box takes the next turn without a boot"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_box_on_record_that_cannot_be_reattached_after_a_crash_is_stopped_with_the_rest() {
+    let mut old = host("crash-stops-lost-box", 2, Harness::SlowClone, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    old.turn("turn-2", "session-2", "two", Vec::new());
+    old.settle_until("complete 1").await;
+    let mut standing = old.standing();
+    old.keep_guest(&mut standing.boxes[0], 40);
+    standing.boxes[1].machine.guest_fd = 41;
+    let new = old.after_crash(standing);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(
+        new.log(),
+        ["reattach session-1 on tumpel0", "keep boxes [0] and stop the rest"],
+        "the box of session-2 on tumpel1 is not kept, so its scope is stopped"
     );
 }
 
@@ -1251,7 +1376,7 @@ async fn a_handed_box_whose_process_ended_fails_its_turn_and_frees_its_tap() {
     tokio::time::sleep(SLOW_CLONE / 2).await;
     let handover = old.ask_handover().await.expect("the boxes are handed over");
     old.vmm.hands.lock().expect("hands").clear();
-    let mut new = old.successor(&handover.record, true);
+    let mut new = old.successor(&handover);
     let failed = format!(
         "failed {}: box box-session-1 of session session-1 was lost in the handover to this supervisor binary: its Firecracker process 103 ended during the handover; send the turn again",
         TurnFailureReason::HarnessExited
@@ -1265,23 +1390,6 @@ async fn a_handed_box_whose_process_ended_fails_its_turn_and_frees_its_tap() {
         "boot session-2 on tumpel0",
         "the only TAP device of the host is free again"
     );
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_handover_read_by_a_binary_started_without_handover_fails_its_turns_and_adopts_nothing() {
-    let mut old = host("handover-not-adopted", 1, Harness::SlowClone, Boot::Works);
-    old.turn("turn-1", "session-1", "one", Vec::new());
-    old.settle_until("claim turn-1").await;
-    tokio::time::sleep(SLOW_CLONE / 2).await;
-    let handover = old.ask_handover().await.expect("the boxes are handed over");
-    old.log();
-    let mut new = old.successor(&handover.record, false);
-    let failed = format!(
-        "failed {}: box box-session-1 of session session-1 was lost in the handover to this supervisor binary: this supervisor started without --handover, so the box ended with the binary that ran it; send the turn again",
-        TurnFailureReason::HarnessExited
-    );
-    assert_eq!(new.settle_until(&failed).await, [failed]);
-    assert!(new.log().is_empty(), "nothing is reattached or discarded");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1301,6 +1409,7 @@ async fn a_warm_box_handed_over_takes_the_next_turn_without_a_boot() {
         [
             "hand over session-1",
             "reattach session-1 on tumpel0",
+            "keep boxes [0] and stop the rest",
             "resume session-1",
             "pause session-1"
         ]

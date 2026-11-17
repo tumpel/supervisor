@@ -2,10 +2,13 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use ring::signature::Ed25519KeyPair;
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -22,10 +25,11 @@ use tumpel_channel::{ChannelError, Event, HostChannel, Phase, Port, Signer, HEAR
 use crate::boot::BootOrder;
 use crate::dir::{self, ChannelFile, CHANNEL_FILE, CONFIG_FILE, KEY_FILE, RUNTIME_FILE};
 use crate::exchange::{Answer, Answers};
+use crate::fd_store;
 use crate::firecracker::Firecracker;
 use crate::guest_drive;
 use crate::lifecycle::{
-    turn_failed, BoxTurn, Budgets, Command, Handover, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder,
+    turn_failed, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder, Taken,
     TeardownOrder,
 };
 use crate::pool::TapPool;
@@ -72,12 +76,14 @@ impl Port for Outbox {
 
 pub enum Stopped {
     Revoked,
-    HandedOver { binary: PathBuf, handover: Handover },
+    Updated,
+    Terminated,
 }
 
 enum Served {
     Revoked,
     Updated,
+    Terminated,
 }
 
 type HostUpdater = Updater<HttpSource, IdleGate>;
@@ -89,7 +95,6 @@ struct Updates {
     restart: UnboundedSender<()>,
     trial: Option<SupervisorUpdatePending>,
     confirmed: watch::Sender<bool>,
-    handover: bool,
     grace: Duration,
 }
 
@@ -115,11 +120,6 @@ impl Updates {
                 )
             })?;
             self.confirmed.send_replace(true);
-        }
-        if std::mem::take(&mut self.handover) {
-            if let Err(error) = update::forget_handover(&self.layout) {
-                eprintln!("tumpel-supervisor: {error}; delete it by hand");
-            }
         }
         self.announced();
         Ok(())
@@ -214,7 +214,7 @@ enum BoxCommand {
     Discard(ChannelBoxDiscard),
     Answer(Answer),
     Setup(SetupCommand),
-    HandOver(oneshot::Sender<Handover>),
+    HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>),
 }
 
@@ -301,6 +301,10 @@ async fn boxes(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "run hands the box runner each piece it built separately"
+)]
 fn start_boxes(
     runtime: &SupervisorRuntime,
     pool: TapPool,
@@ -308,18 +312,19 @@ fn start_boxes(
     received: UnboundedReceiver<BoxCommand>,
     out: UnboundedSender<ChannelHostMessage>,
     telemetry: Telemetry,
-    handover: Option<SupervisorHandover>,
-) -> (Usage, IdleGate) {
+    taken: Option<(SupervisorHandover, Taken)>,
+    standing: PathBuf,
+) -> Result<(Usage, IdleGate), Failure> {
     let settings = Settings {
         budgets: Budgets::from(&runtime.budgets),
         warm_window: Duration::from_secs(u64::from(runtime.warm_window_seconds.get())),
         layer_cache_mib: runtime.layer_cache_mib,
         overlay_bytes: u64::try_from(runtime.overlay_mib).unwrap_or(0) * 1024 * 1024,
     };
-    let mut lifecycle = Lifecycle::new(Firecracker::new(runtime), store, settings, pool, out);
-    if let Some(handover) = handover {
-        lifecycle.reattach(handover, true);
-    }
+    let mut lifecycle = Lifecycle::new(Firecracker::new(runtime), store, settings, pool, out, standing);
+    lifecycle
+        .start(taken)
+        .map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
     let usage = Usage {
         box_capacity: runtime.box_capacity,
         warm: lifecycle.warm(),
@@ -338,48 +343,48 @@ fn start_boxes(
         to_lifecycle,
         to_setups,
     ));
-    (usage, idle)
+    Ok((usage, idle))
 }
 
-async fn hand_over(
+async fn terminate(
     commands: &UnboundedSender<BoxCommand>,
     layout: &Layout,
     out: &UnboundedSender<ChannelHostMessage>,
-) -> Result<Stopped, Failure> {
-    let failed = |detail: String| {
-        fail(
-            SupervisorFailure::UpdateNotOnline,
-            format!("{detail}; systemd starts the unit again, and its ExecStartPre puts the previous binary back"),
-        )
-    };
+) -> Result<(), Failure> {
     let (reply, answer) = oneshot::channel();
     let _ = commands.send(BoxCommand::HandOver(reply));
-    let handover = answer
-        .await
-        .map_err(|_| failed("the box runner stopped before it handed its boxes over".to_string()))?;
-    if let Err(error) = update::hand_over(layout, &handover.record) {
-        for turn_id in handed_turns(&handover.record) {
+    let handover = answer.await.map_err(|_| {
+        fail(
+            SupervisorFailure::ChannelStateLost,
+            "the box runner stopped before it handed its boxes over",
+        )
+    })?;
+    if let Err(error) = dir::write_json(&layout.handover(), &handover) {
+        for turn_id in handed_turns(&handover) {
             turn_failed(
                 out,
                 &turn_id,
                 TurnFailureReason::HarnessExited,
                 format!(
-                    "the box of turn {} could not be handed to the new supervisor binary: {error}; send the turn again",
+                    "the box of turn {} could not be handed to the next supervisor: {error:#}; send the turn again",
                     *turn_id
                 ),
             );
         }
-        return Err(failed(error));
+        return Err(fail(
+            SupervisorFailure::ChannelStateLost,
+            format!("{error:#}; the next start takes the running boxes over from the record of running boxes"),
+        ));
     }
     eprintln!(
-        "tumpel-supervisor: handing {} boxes to {}",
-        handover.record.boxes.len(),
-        layout.binary.display()
+        "tumpel-supervisor: stopped and left {} boxes running; the next start of the unit takes them over",
+        handover.boxes.len()
     );
-    Ok(Stopped::HandedOver {
-        binary: layout.binary.clone(),
-        handover,
-    })
+    Ok(())
+}
+
+fn restarts(kind: SupervisorFailure) -> bool {
+    !matches!(kind, SupervisorFailure::NotEnrolled | SupervisorFailure::HostRevoked)
 }
 
 async fn abandon(commands: &UnboundedSender<BoxCommand>) {
@@ -454,7 +459,7 @@ fn read_handover(
             handover_lost(
                 layout,
                 out,
-                "this supervisor started without --handover, so the boxes ended with the binary that ran them",
+                "this supervisor started without the boxes' descriptors, so it cannot reach the boxes",
                 &handed_turns(&handover),
             );
             None
@@ -609,7 +614,37 @@ async fn online_deadline(deadline: Option<tokio::time::Instant>, mut confirmed: 
     }
 }
 
-pub async fn run(telemetry: Telemetry, handed: bool) -> Result<Stopped, Failure> {
+fn read_standing(layout: &Layout) -> Option<SupervisorHandover> {
+    dir::read_json(&layout.boxes(), "SupervisorHandover").unwrap_or_else(|error| {
+        eprintln!("tumpel-supervisor: {error:#}; the boxes it names are stopped");
+        None
+    })
+}
+
+fn taken(
+    layout: &Layout,
+    out: &UnboundedSender<ChannelHostMessage>,
+    handed: bool,
+    mut received: BTreeMap<String, OwnedFd>,
+) -> Result<Option<(SupervisorHandover, Taken)>, Failure> {
+    let taken = match read_handover(layout, out, handed || !received.is_empty()) {
+        Some(handover) if received.is_empty() => Some((handover, Taken::Handed)),
+        Some(handover) => Some((fd_store::restored(handover, &mut received), Taken::Handed)),
+        None => read_standing(layout).map(|standing| (fd_store::restored(standing, &mut received), Taken::Crashed)),
+    };
+    if taken.is_some() {
+        update::forget_handover(layout).map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
+    }
+    Ok(taken)
+}
+
+pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, OwnedFd>) -> Result<Stopped, Failure> {
+    let mut terminated = signal(SignalKind::terminate()).map_err(|error| {
+        fail(
+            SupervisorFailure::NotEnrolled,
+            format!("listening for SIGTERM failed: {error}"),
+        )
+    })?;
     let (out, mut from_box) = unbounded_channel();
     let started = start()?;
     let trial = match update::startup(&started.layout, &started.running, &out)
@@ -619,8 +654,7 @@ pub async fn run(telemetry: Telemetry, handed: bool) -> Result<Stopped, Failure>
         Startup::Trial(pending) => Some(pending),
     };
     let on_trial = trial.is_some();
-    let handover = read_handover(&started.layout, &out, handed);
-    let keep_handover = handover.is_some();
+    let taken = taken(&started.layout, &out, handed, received)?;
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
         .await
@@ -633,8 +667,9 @@ pub async fn run(telemetry: Telemetry, handed: bool) -> Result<Stopped, Failure>
         received,
         out.clone(),
         telemetry,
-        handover,
-    );
+        taken,
+        started.layout.boxes(),
+    )?;
     let url = started.url;
     let config = started.config;
     let heartbeat = Duration::from_secs(u64::from(started.runtime.heartbeat_interval_seconds.get()));
@@ -663,13 +698,13 @@ pub async fn run(telemetry: Telemetry, handed: bool) -> Result<Stopped, Failure>
         restart,
         trial,
         confirmed,
-        handover: keep_handover,
         grace,
     };
     let deadline = on_trial.then(|| tokio::time::Instant::now() + Limits::HOST.online);
     let served = tokio::select! {
         served = serve(&mut channel, &url, heartbeat, &usage, &commands, &mut from_box, &config, &dir, &mut updates) => served,
         Some(()) = restarted.recv() => Ok(Served::Updated),
+        Some(()) = terminated.recv() => Ok(Served::Terminated),
         () = online_deadline(deadline, online) => Err(fail(
             SupervisorFailure::UpdateNotOnline,
             format!("this supervisor did not reach Welcome on {url} within {} s of its start after its swap; systemd restarts the unit, and its ExecStartPre puts the previous binary back", Limits::HOST.online.as_secs()),
@@ -677,7 +712,16 @@ pub async fn run(telemetry: Telemetry, handed: bool) -> Result<Stopped, Failure>
     };
     let stopped = match served {
         Ok(Served::Revoked) => Ok(Stopped::Revoked),
-        Ok(Served::Updated) => hand_over(&commands, &updates.layout, &updates.out).await,
+        Ok(Served::Updated) => terminate(&commands, &updates.layout, &updates.out)
+            .await
+            .map(|()| Stopped::Updated),
+        Ok(Served::Terminated) => terminate(&commands, &updates.layout, &updates.out)
+            .await
+            .map(|()| Stopped::Terminated),
+        Err(failure) if restarts(failure.kind) => {
+            terminate(&commands, &updates.layout, &updates.out).await?;
+            Err(failure)
+        }
         Err(failure) => Err(failure),
     };
     if stopped.is_err() {

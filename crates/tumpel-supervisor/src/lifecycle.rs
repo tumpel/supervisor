@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::io::BufWriter;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -131,7 +130,9 @@ pub trait Machine: Send + 'static {
     fn drive(&self) -> PathBuf;
     fn stop(self) -> impl Future<Output = ()> + Send;
     fn console_tail(&self) -> String;
-    fn hand_over(self, guest: Self::Guest) -> Result<(SupervisorHandoverMachine, Vec<OwnedFd>), String>;
+    fn hand_over(self, guest: Self::Guest) -> Result<SupervisorHandoverMachine, String>;
+    fn record(&self) -> Result<SupervisorHandoverMachine, String>;
+    fn reconnect(&mut self, guest: &mut Self::Guest) -> impl Future<Output = Result<(), String>> + Send;
 }
 
 pub trait Vmm: Send + Sync + 'static {
@@ -145,6 +146,7 @@ pub trait Vmm: Send + Sync + 'static {
         handed: &SupervisorHandoverMachine,
     ) -> Result<(Self::Machine, <Self::Machine as Machine>::Guest), String>;
     fn discard(&self, handed: &SupervisorHandoverMachine);
+    fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
     fn staging(&self, session_id: &EntityId) -> Result<PathBuf, String>;
     fn chunk_cache(&self) -> PathBuf;
@@ -279,6 +281,94 @@ impl<M: Machine> LiveBox<M> {
             dirty: false,
             credential_file: None,
         }
+    }
+}
+
+impl<M: Machine> LiveBox<M> {
+    fn record(&self, turn_id: Option<&EntityId>) -> Result<SupervisorHandoverBox, String> {
+        Ok(SupervisorHandoverBox {
+            box_id: self.box_id.clone(),
+            credential_file: self.credential_file.clone(),
+            dirty: self.dirty || turn_id.is_some(),
+            image: self.image.record(),
+            machine: self.machine.record()?,
+            queued: Vec::new(),
+            session_id: self.session_id.clone(),
+            state: standing_state(turn_id.cloned()),
+            tap_index: i32::from(self.tap.index()),
+        })
+    }
+}
+
+fn standing_state(turn_id: Option<EntityId>) -> SupervisorHandoverBoxState {
+    match turn_id {
+        Some(turn_id) => SupervisorHandoverBoxState::Turn(SupervisorHandoverTurn {
+            first_line_milliseconds: 0,
+            turn_milliseconds: 0,
+            kind: SupervisorHandoverTurnKind::Turn,
+            repository_ready: false,
+            seen_line: false,
+            error: None,
+            turn_id,
+        }),
+        None => SupervisorHandoverBoxState::Warm(SupervisorHandoverWarm {
+            expired: false,
+            kind: SupervisorHandoverWarmKind::Warm,
+            warm_milliseconds: 0,
+        }),
+    }
+}
+
+fn standing_record(handed: &SupervisorHandoverBox) -> SupervisorHandoverBox {
+    let turn_id = match &handed.state {
+        SupervisorHandoverBoxState::Turn(turn) => Some(turn.turn_id.clone()),
+        SupervisorHandoverBoxState::Warm(_) => None,
+    };
+    SupervisorHandoverBox {
+        dirty: handed.dirty || turn_id.is_some(),
+        machine: SupervisorHandoverMachine {
+            console_tail: String::new(),
+            guest_buffer: String::new(),
+            guest_fd: -1,
+            stderr_fd: -1,
+            stdout_fd: -1,
+            ..handed.machine.clone()
+        },
+        queued: Vec::new(),
+        state: standing_state(turn_id),
+        ..handed.clone()
+    }
+}
+
+#[derive(Clone)]
+struct Standing {
+    path: PathBuf,
+    boxes: Arc<std::sync::Mutex<BTreeMap<i32, SupervisorHandoverBox>>>,
+}
+
+impl Standing {
+    fn write(&self, change: impl FnOnce(&mut BTreeMap<i32, SupervisorHandoverBox>)) -> Result<(), String> {
+        let mut boxes = self
+            .boxes
+            .lock()
+            .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?;
+        change(&mut boxes);
+        let record = SupervisorHandover {
+            boxes: boxes.values().cloned().collect(),
+            handed_at: now(),
+        };
+        let text = serde_json::to_string(&record).map_err(|error| format!("encoding the running boxes: {error}"))?;
+        let staged = self.path.with_extension("json.new");
+        std::fs::write(&staged, text)
+            .and_then(|()| std::fs::rename(&staged, &self.path))
+            .map_err(|error| format!("writing {}: {error}", self.path.display()))
+    }
+
+    fn put<M: Machine>(&self, live: &LiveBox<M>, turn_id: Option<&EntityId>) -> Result<(), String> {
+        let record = live.record(turn_id)?;
+        self.write(|boxes| {
+            boxes.insert(record.tap_index, record);
+        })
     }
 }
 
@@ -525,10 +615,18 @@ fn remove_file(path: &Path) -> Result<(), String> {
     }
 }
 
-async fn stop_box<M: Machine>(live: LiveBox<M>) -> (Tap, String) {
+async fn stop_box<M: Machine>(standing: &Standing, live: LiveBox<M>) -> (Tap, String) {
     let tail = live.machine.console_tail();
     let LiveBox { machine, tap, .. } = live;
     machine.stop().await;
+    let index = i32::from(tap.index());
+    if let Err(error) = standing.write(|boxes| {
+        boxes.remove(&index);
+    }) {
+        eprintln!(
+            "tumpel-supervisor: forgetting stopped box {index} in the record of running boxes failed: {error}; the next start finds it gone"
+        );
+    }
     (tap, tail)
 }
 
@@ -584,6 +682,7 @@ struct Runner<V: Vmm, S: Store> {
     layers: LayerCache,
     holds: Holds,
     parking: watch::Receiver<bool>,
+    standing: Standing,
 }
 
 impl<V: Vmm, S: Store> Clone for Runner<V, S> {
@@ -598,6 +697,7 @@ impl<V: Vmm, S: Store> Clone for Runner<V, S> {
             layers: self.layers.clone(),
             holds: self.holds.clone(),
             parking: self.parking.clone(),
+            standing: self.standing.clone(),
         }
     }
 }
@@ -674,20 +774,26 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             return Outcome::Kept(live);
         };
         let seconds = self.settings.budgets.boot.as_secs();
-        let failed = match timeout(
-            self.settings.budgets.boot,
-            telemetry::timed(Phase::Boot, live.machine.resume(), Result::is_ok),
-        )
-        .await
-        {
-            Ok(Ok(())) => return self.run_turn(live, turn, files, claiming).await,
-            Ok(Err(error)) => format!("resuming the paused box of session {} failed: {error}", *turn.session_id),
-            Err(_) => format!(
-                "the paused box of session {} did not resume within {seconds} s; raise budgets.bootSeconds in runtime.json",
+        let failed = match self.standing.put(&live, Some(&turn.turn_id)) {
+            Err(error) => format!(
+                "recording the box of session {} for a supervisor restart failed: {error}",
                 *turn.session_id
             ),
+            Ok(()) => match timeout(
+                self.settings.budgets.boot,
+                telemetry::timed(Phase::Boot, live.machine.resume(), Result::is_ok),
+            )
+            .await
+            {
+                Ok(Ok(())) => return self.run_turn(live, turn, files, claiming).await,
+                Ok(Err(error)) => format!("resuming the paused box of session {} failed: {error}", *turn.session_id),
+                Err(_) => format!(
+                    "the paused box of session {} did not resume within {seconds} s; raise budgets.bootSeconds in runtime.json",
+                    *turn.session_id
+                ),
+            },
         };
-        let (tap, tail) = stop_box(live).await;
+        let (tap, tail) = stop_box(&self.standing, live).await;
         turn_failed(
             &self.out,
             &turn.turn_id,
@@ -765,7 +871,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             (Ok(Ok((guest, hello))), Ok(())) => match mismatch(&hello, &image) {
                 None => {
                     let live = LiveBox::booted(turn, machine, guest, tap, base, image, hold);
-                    return self.run_turn(live, turn, files, claiming).await;
+                    return self.first_turn(live, turn, files, claiming).await;
                 }
                 Some(mismatch) => mismatch,
             },
@@ -784,6 +890,29 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             &turn.turn_id,
             TurnFailureReason::BoxBootFailed,
             format!("{failed}. Console: {tail}"),
+        );
+        Outcome::Gone(tap)
+    }
+
+    async fn first_turn(
+        &self,
+        live: LiveBox<V::Machine>,
+        turn: &BoxTurn,
+        files: Vec<GuestPersonaFile>,
+        claiming: Claiming,
+    ) -> Outcome<V::Machine> {
+        let Err(error) = self.standing.put(&live, Some(&turn.turn_id)) else {
+            return self.run_turn(live, turn, files, claiming).await;
+        };
+        let (tap, tail) = stop_box(&self.standing, live).await;
+        turn_failed(
+            &self.out,
+            &turn.turn_id,
+            TurnFailureReason::BoxBootFailed,
+            format!(
+                "box {} booted, then recording it for a supervisor restart failed: {error}. Console: {tail}",
+                *turn.box_id
+            ),
         );
         Outcome::Gone(tap)
     }
@@ -1213,7 +1342,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 self.pause(live).await
             }
             Err(failure) => {
-                let (tap, tail) = stop_box(live).await;
+                let (tap, tail) = stop_box(&self.standing, live).await;
                 report_failure(
                     &self.out,
                     turn_id,
@@ -1225,16 +1354,36 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
+    async fn recover(&self, mut live: LiveBox<V::Machine>) -> Outcome<V::Machine> {
+        let failed = match timeout(self.settings.budgets.boot, live.machine.reconnect(&mut live.guest)).await {
+            Ok(Ok(())) => return self.pause(live).await,
+            Ok(Err(error)) => error,
+            Err(_) => format!(
+                "the guest did not answer a new connection within {} s",
+                self.settings.budgets.boot.as_secs()
+            ),
+        };
+        let session = live.session_id.to_string();
+        let (tap, tail) = stop_box(&self.standing, live).await;
+        eprintln!(
+            "tumpel-supervisor: the box of session {session} could not be reached after the supervisor stopped unexpectedly and was stopped: {failed}. Console: {tail}"
+        );
+        Outcome::Gone(tap)
+    }
+
     async fn pause(&self, mut live: LiveBox<V::Machine>) -> Outcome<V::Machine> {
         let failed = match timeout(self.settings.budgets.boot, live.machine.pause()).await {
-            Ok(Ok(())) => return Outcome::Kept(live),
+            Ok(Ok(())) => match self.standing.put(&live, None) {
+                Ok(()) => return Outcome::Kept(live),
+                Err(error) => format!("recording it for a supervisor restart failed: {error}"),
+            },
             Ok(Err(error)) => error,
             Err(_) => format!(
                 "pausing did not finish within {} s",
                 self.settings.budgets.boot.as_secs()
             ),
         };
-        let (tap, tail) = stop_box(live).await;
+        let (tap, tail) = stop_box(&self.standing, live).await;
         eprintln!(
             "tumpel-supervisor: a box could not be paused after its turn and was stopped: {failed}. Console: {tail}"
         );
@@ -1592,14 +1741,15 @@ fn mismatch(hello: &GuestHello, boot: &Boot) -> Option<String> {
     ))
 }
 
-pub struct Handover {
-    pub record: SupervisorHandover,
-    pub descriptors: Vec<OwnedFd>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Taken {
+    Handed,
+    Crashed,
 }
 
 pub enum Input {
     Command(Command),
-    HandOver(oneshot::Sender<Handover>),
+    HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>),
 }
 
@@ -1648,11 +1798,18 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     setup_tasks: HashMap<String, JoinHandle<()>>,
     mode: Mode,
     parking: watch::Sender<bool>,
-    handing: Option<(oneshot::Sender<Handover>, AbortHandle)>,
+    handing: Option<(oneshot::Sender<SupervisorHandover>, AbortHandle)>,
 }
 
 impl<V: Vmm, S: Store> Lifecycle<V, S> {
-    pub fn new(vmm: V, store: S, settings: Settings, pool: TapPool, out: UnboundedSender<ChannelHostMessage>) -> Self {
+    pub fn new(
+        vmm: V,
+        store: S,
+        settings: Settings,
+        pool: TapPool,
+        out: UnboundedSender<ChannelHostMessage>,
+        standing: PathBuf,
+    ) -> Self {
         let (events, finished) = unbounded_channel();
         let layers = LayerCache::new(&vmm.image_cache(), settings.layer_cache_mib);
         let (parking, parked) = watch::channel(false);
@@ -1667,6 +1824,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 answers: Answers::default(),
                 fetching: Arc::default(),
                 parking: parked,
+                standing: Standing {
+                    path: standing,
+                    boxes: Arc::default(),
+                },
             },
             pool,
             slots: HashMap::new(),
@@ -1775,7 +1936,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
     }
 
-    fn start_handover(&mut self, reply: oneshot::Sender<Handover>) {
+    fn start_handover(&mut self, reply: oneshot::Sender<SupervisorHandover>) {
         self.mode = Mode::HandingOver;
         self.parking.send_replace(true);
         let limit = self.handover_limit();
@@ -1932,7 +2093,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         };
         timer.abort();
         let mut boxes = Vec::new();
-        let mut descriptors = Vec::new();
         let sessions: Vec<String> = self.slots.keys().cloned().collect();
         for session in sessions {
             let Some(mut slot) = self.slots.remove(&session) else {
@@ -1979,8 +2139,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             } = live;
             let tap_index = i32::from(tap.index());
             match machine.hand_over(guest) {
-                Ok((machine, handed)) => {
-                    descriptors.extend(handed);
+                Ok(machine) => {
                     boxes.push(SupervisorHandoverBox {
                         box_id,
                         credential_file,
@@ -2011,12 +2170,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 }
             }
         }
-        let _ = reply.send(Handover {
-            record: SupervisorHandover {
-                boxes,
-                handed_at: now(),
-            },
-            descriptors,
+        let _ = reply.send(SupervisorHandover {
+            boxes,
+            handed_at: now(),
         });
     }
 
@@ -2038,20 +2194,25 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         });
     }
 
-    pub fn reattach(&mut self, handover: SupervisorHandover, adopt: bool) {
-        let elapsed = (now() - handover.handed_at).to_std().unwrap_or(Duration::ZERO);
-        for handed in handover.boxes {
-            self.adopt(handed, elapsed, adopt);
+    /// # Errors
+    /// Fails when the record of running boxes cannot be written or a box this supervisor did not take over cannot be stopped.
+    pub fn start(&mut self, taken: Option<(SupervisorHandover, Taken)>) -> Result<(), String> {
+        let mut standing = BTreeMap::new();
+        if let Some((handover, taken)) = taken {
+            let elapsed = (now() - handover.handed_at).to_std().unwrap_or(Duration::ZERO);
+            for handed in handover.boxes {
+                if let Some(record) = self.adopt(handed, elapsed, taken) {
+                    standing.insert(record.tap_index, record);
+                }
+            }
         }
+        let claimed: Vec<u8> = standing.keys().filter_map(|index| u8::try_from(*index).ok()).collect();
+        self.runner.standing.write(|boxes| *boxes = standing)?;
         self.publish();
+        self.runner.vmm.end_unclaimed(&claimed)
     }
 
-    fn attach(&mut self, handed: &SupervisorHandoverBox, adopt: bool) -> Result<Attached<V::Machine>, String> {
-        if !adopt {
-            return Err(
-                "this supervisor started without --handover, so the box ended with the binary that ran it".to_string(),
-            );
-        }
+    fn attach(&mut self, handed: &SupervisorHandoverBox) -> Result<Attached<V::Machine>, String> {
         let tap = match self.pool.claim_device(handed.tap_index) {
             Ok(tap) => tap,
             Err(error) => {
@@ -2068,9 +2229,14 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    fn adopt(&mut self, handed: SupervisorHandoverBox, elapsed: Duration, adopt: bool) {
+    fn adopt(
+        &mut self,
+        handed: SupervisorHandoverBox,
+        elapsed: Duration,
+        taken: Taken,
+    ) -> Option<SupervisorHandoverBox> {
         let session = handed.session_id.to_string();
-        let (machine, guest, tap) = match self.attach(&handed, adopt) {
+        let (machine, guest, tap) = match self.attach(&handed) {
             Ok(attached) => attached,
             Err(error) => {
                 let detail = format!(
@@ -2086,9 +2252,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                         format!("{detail}; send the turn again"),
                     );
                 }
-                return;
+                return None;
             }
         };
+        let record = standing_record(&handed);
         let image = Boot::from_record(handed.image);
         let hold = self.runner.holds.hold_boot(&image);
         let queue = handed
@@ -2110,8 +2277,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             dirty: handed.dirty,
             credential_file: handed.credential_file,
         });
-        match handed.state {
-            SupervisorHandoverBoxState::Warm(warm) => {
+        match (handed.state, taken) {
+            (SupervisorHandoverBoxState::Warm(_), Taken::Crashed) => self.arm(&session),
+            (SupervisorHandoverBoxState::Warm(warm), Taken::Handed) => {
                 let window = if warm.expired {
                     Duration::ZERO
                 } else {
@@ -2119,7 +2287,24 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 };
                 self.arm_for(&session, window);
             }
-            SupervisorHandoverBoxState::Turn(turn) => {
+            (SupervisorHandoverBoxState::Turn(turn), Taken::Crashed) => {
+                turn_failed(
+                    &self.runner.out,
+                    &turn.turn_id,
+                    TurnFailureReason::HarnessExited,
+                    format!(
+                        "the supervisor stopped unexpectedly during turn {}, so the turn ended; its box is kept, so send the turn again",
+                        *turn.turn_id
+                    ),
+                );
+                let live = slot.live.take()?;
+                slot.busy = true;
+                let runner = self.runner.clone();
+                self.spawn(session, Work::Turn, Running::Turn(turn.turn_id), async move {
+                    runner.recover(live).await
+                });
+            }
+            (SupervisorHandoverBoxState::Turn(turn), Taken::Handed) => {
                 slot.parked = Some(Box::new(Parked {
                     turn_id: turn.turn_id,
                     left: Left {
@@ -2133,6 +2318,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 self.resume(session);
             }
         }
+        Some(record)
     }
 
     async fn command(&mut self, command: Command) {
@@ -2438,7 +2624,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let Some(live) = slot.live.take() else {
             return;
         };
-        let (tap, _) = stop_box(live).await;
+        let (tap, _) = stop_box(&self.runner.standing, live).await;
         self.pool.release(tap);
         self.prune(session);
     }

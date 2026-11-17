@@ -18,6 +18,7 @@ use tumpel_guest::setup_output::{redacted, strip_ansi};
 use tumpel_guest::{encode, Decoder, GUEST_CID, GUEST_PORT, READY_PORT};
 
 use crate::boot::Boot;
+use crate::fd_store;
 use crate::guest_drive;
 use crate::lifecycle::{Guest, Machine, Vmm};
 use crate::pool::Tap;
@@ -215,11 +216,50 @@ fn session_dir(data: &Path, session_id: &EntityId) -> Result<PathBuf, String> {
     Ok(data.join("sessions").join(&**session_id))
 }
 
-struct Adopted(libc::pid_t);
+fn scope_of(index: u8) -> String {
+    format!("tumpel-box{index}.scope")
+}
+
+fn stop_scopes(scopes: &[String]) -> Result<(), String> {
+    let stopped = std::process::Command::new("systemctl")
+        .args(["--user", "stop"])
+        .args(scopes)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("starting systemctl to stop {}: {error}", scopes.join(" ")))?;
+    if stopped.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "stopping {} failed with {}: {}; stop them with systemctl --user stop {}",
+        scopes.join(" "),
+        stopped.status,
+        String::from_utf8_lossy(&stopped.stderr).trim(),
+        scopes.join(" ")
+    ))
+}
+
+#[derive(Debug, PartialEq)]
+enum Owner {
+    Child,
+    Scope(String),
+}
+
+struct Adopted {
+    pid: libc::pid_t,
+    owner: Owner,
+}
 
 impl Drop for Adopted {
     fn drop(&mut self) {
-        end_child(self.0);
+        match &self.owner {
+            Owner::Child => end_child(self.pid),
+            Owner::Scope(scope) => {
+                if let Err(error) = stop_scopes(std::slice::from_ref(scope)) {
+                    eprintln!("tumpel-supervisor: ending a box: {error}");
+                }
+            }
+        }
     }
 }
 
@@ -232,7 +272,7 @@ impl Process {
     fn id(&self) -> Option<u32> {
         match self {
             Self::Spawned(child) => child.id(),
-            Self::Adopted(adopted) => u32::try_from(adopted.0).ok(),
+            Self::Adopted(adopted) => u32::try_from(adopted.pid).ok(),
         }
     }
 
@@ -261,20 +301,6 @@ fn end_child(pid: libc::pid_t) {
     unsafe { libc::waitpid(pid, &raw mut status, 0) };
 }
 
-fn inherited(fd: &impl AsFd, named: &str) -> Result<OwnedFd, String> {
-    let copy = fd
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(|error| format!("duplicating {named} for the new supervisor binary failed: {error}"))?;
-    if unsafe { libc::fcntl(copy.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
-        return Err(format!(
-            "keeping {named} open across the exec failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(copy)
-}
-
 fn ended(status: i32) -> String {
     if libc::WIFEXITED(status) {
         return format!("exit status {}", libc::WEXITSTATUS(status));
@@ -285,11 +311,16 @@ fn ended(status: i32) -> String {
     format!("wait status {status}")
 }
 
-fn alive(pid: libc::pid_t) -> Result<(), String> {
+fn in_scope(pid: libc::pid_t, scope: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .is_ok_and(|cgroups| cgroups.lines().any(|line| line.ends_with(&format!("/{scope}"))))
+}
+
+fn alive(pid: libc::pid_t, scope: &str) -> Result<Owner, String> {
     let mut status = 0;
     let waited = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
     if waited == 0 {
-        return Ok(());
+        return Ok(Owner::Child);
     }
     if waited == pid {
         return Err(format!(
@@ -297,9 +328,11 @@ fn alive(pid: libc::pid_t) -> Result<(), String> {
             ended(status)
         ));
     }
+    if in_scope(pid, scope) {
+        return Ok(Owner::Scope(scope.to_string()));
+    }
     Err(format!(
-        "its Firecracker process {pid} is no child of this supervisor ({}), so it ended with the binary that ran it",
-        std::io::Error::last_os_error()
+        "its Firecracker process {pid} is gone: it is no child of this supervisor and runs in no {scope}"
     ))
 }
 
@@ -398,7 +431,7 @@ impl Firecracker {
             ));
         }
         let pid = handed_pid(handed).ok_or_else(|| format!("process id {} is out of range", handed.process_id))?;
-        alive(pid)?;
+        let owner = alive(pid, &scope_of(tap.index()))?;
         let guest = adopt(taken.guest.take(), "the guest connection", true)?;
         let stdout = adopt(taken.stdout.take(), "the box's standard output", false)?;
         let stderr = adopt(taken.stderr.take(), "the box's standard error", false)?;
@@ -420,7 +453,7 @@ impl Firecracker {
         }
         machine.stdout = Some(stdout);
         machine.stderr = Some(stderr);
-        machine.process = Some(Process::Adopted(Adopted(pid)));
+        machine.process = Some(Process::Adopted(Adopted { pid, owner }));
         Ok((machine, VsockGuest { stream, decoder }))
     }
 }
@@ -434,6 +467,7 @@ impl Vmm for Firecracker {
             binary: self.binary.clone(),
             images: self.images.clone(),
             dir: self.data.join(format!("box{}", tap.index())),
+            index: tap.index(),
             session: session_dir(&self.data, session_id)?,
             device: tap.device(),
             mac: tap.guest_mac(),
@@ -473,6 +507,43 @@ impl Vmm for Firecracker {
         drop(taken);
     }
 
+    fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
+        let listed = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "list-units",
+                "--all",
+                "--plain",
+                "--no-legend",
+                "tumpel-box*.scope",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("starting systemctl to list the box scopes: {error}"))?;
+        if !listed.status.success() {
+            return Err(format!(
+                "listing the box scopes failed with {}: {}; run the supervisor from its systemd user unit",
+                listed.status,
+                String::from_utf8_lossy(&listed.stderr).trim()
+            ));
+        }
+        let kept: Vec<String> = claimed.iter().copied().map(scope_of).collect();
+        let unclaimed: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|scope| !kept.iter().any(|kept| kept == scope))
+            .map(str::to_string)
+            .collect();
+        if unclaimed.is_empty() {
+            return Ok(());
+        }
+        eprintln!(
+            "tumpel-supervisor: stopping {}, boxes this supervisor could not take over",
+            unclaimed.join(" ")
+        );
+        stop_scopes(&unclaimed)
+    }
+
     fn open_upper(&self, drive: &Path) -> Result<Ext4Upper, String> {
         Ext4Upper::load(drive)
     }
@@ -494,6 +565,7 @@ pub struct FirecrackerBox {
     binary: PathBuf,
     images: PathBuf,
     dir: PathBuf,
+    index: u8,
     session: PathBuf,
     device: String,
     mac: String,
@@ -539,7 +611,11 @@ impl FirecrackerBox {
     async fn spawn(&mut self) -> Result<(), String> {
         create_private_dir(&self.dir)?;
         self.clear_sockets()?;
-        let mut child = Command::new(&self.binary)
+        let mut child = Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
+            .arg(scope_of(self.index))
+            .arg("--")
+            .arg(&self.binary)
             .arg("--api-sock")
             .arg(self.api_socket())
             .args(["--level", "Warning"])
@@ -550,7 +626,7 @@ impl FirecrackerBox {
             .spawn()
             .map_err(|error| {
                 format!(
-                    "starting {}: {error}; set firecrackerPath in runtime.json",
+                    "starting {} in its own systemd user scope: {error}; install systemd-run and run the supervisor from its systemd user unit",
                     self.binary.display()
                 )
             })?;
@@ -559,6 +635,7 @@ impl FirecrackerBox {
                 .into_owned_fd()
                 .map_err(|error| format!("taking the box's standard output: {error}"))?;
             tail_of(&stdout, &self.console, "the box's standard output")?;
+            fd_store::keep(self.index, fd_store::STDOUT, stdout.as_fd())?;
             self.stdout = Some(stdout);
         }
         if let Some(stderr) = child.stderr.take() {
@@ -566,13 +643,14 @@ impl FirecrackerBox {
                 .into_owned_fd()
                 .map_err(|error| format!("taking the box's standard error: {error}"))?;
             tail_of(&stderr, &self.console, "the box's standard error")?;
+            fd_store::keep(self.index, fd_store::STDERR, stderr.as_fd())?;
             self.stderr = Some(stderr);
         }
         let socket = self.api_socket();
         while UnixStream::connect(&socket).await.is_err() {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(format!(
-                    "Firecracker exited with {status} before opening its API socket"
+                    "Firecracker exited with {status} before opening its API socket; check that firecrackerPath in runtime.json names it"
                 ));
             }
             tokio::time::sleep(API_WAIT_STEP).await;
@@ -747,7 +825,9 @@ impl Machine for FirecrackerBox {
         .await?;
         drop(ready);
         remove(&self.ready_socket())?;
-        self.connect().await
+        let (guest, hello) = self.connect().await?;
+        fd_store::keep(self.index, fd_store::GUEST, guest.stream.as_fd())?;
+        Ok((guest, hello))
     }
 
     async fn pause(&mut self) -> Result<(), String> {
@@ -766,8 +846,8 @@ impl Machine for FirecrackerBox {
         if let Some(process) = self.process.take() {
             process.kill().await;
         }
-        let cleared = self
-            .clear_sockets()
+        let cleared = fd_store::forget_box(self.index)
+            .and_then(|()| self.clear_sockets())
             .and_then(|()| match std::fs::remove_dir_all(&self.session) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                     Err(format!("deleting {}: {error}", self.session.display()))
@@ -783,50 +863,49 @@ impl Machine for FirecrackerBox {
         console_text(&self.console_bytes())
     }
 
-    fn hand_over(mut self, guest: VsockGuest) -> Result<(SupervisorHandoverMachine, Vec<OwnedFd>), String> {
-        let process = self.process.take();
-        let handed = (|| {
-            let id = process
-                .as_ref()
-                .and_then(Process::id)
-                .and_then(std::num::NonZeroU32::new)
-                .ok_or_else(|| "the box has no running Firecracker process".to_string())?;
-            let stdout = self
-                .stdout
-                .as_ref()
-                .ok_or("the box has no standard output to hand over")?;
-            let stderr = self
-                .stderr
-                .as_ref()
-                .ok_or("the box has no standard error to hand over")?;
-            Ok::<_, String>((
-                id,
-                inherited(&guest.stream, "the guest connection")?,
-                inherited(stdout, "standard output")?,
-                inherited(stderr, "standard error")?,
-            ))
-        })();
-        let (process_id, guest_fd, stdout, stderr) = match handed {
-            Ok(handed) => handed,
-            Err(error) => {
-                drop(process);
-                return Err(error);
-            }
-        };
-        if let Some(process) = process {
-            process.keep();
-        }
-        let machine = SupervisorHandoverMachine {
+    fn record(&self) -> Result<SupervisorHandoverMachine, String> {
+        let process_id = self
+            .process
+            .as_ref()
+            .and_then(Process::id)
+            .and_then(std::num::NonZeroU32::new)
+            .ok_or_else(|| "the box has no running Firecracker process".to_string())?;
+        Ok(SupervisorHandoverMachine {
             api_socket: self.api_socket().display().to_string(),
+            console_tail: String::new(),
+            guest_buffer: String::new(),
+            guest_fd: -1,
+            process_id,
+            stderr_fd: -1,
+            stdout_fd: -1,
+            vsock: self.vsock().display().to_string(),
+        })
+    }
+
+    async fn reconnect(&mut self, guest: &mut VsockGuest) -> Result<(), String> {
+        if unsafe { libc::shutdown(guest.stream.as_raw_fd(), libc::SHUT_RDWR) } < 0 {
+            return Err(format!(
+                "closing the guest connection the stopped supervisor left: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        fd_store::forget(self.index, fd_store::GUEST)?;
+        let (fresh, _) = self.connect().await?;
+        fd_store::keep(self.index, fd_store::GUEST, fresh.stream.as_fd())?;
+        *guest = fresh;
+        Ok(())
+    }
+
+    fn hand_over(mut self, guest: VsockGuest) -> Result<SupervisorHandoverMachine, String> {
+        let machine = SupervisorHandoverMachine {
             console_tail: STANDARD.encode(self.console_bytes()),
             guest_buffer: STANDARD.encode(guest.decoder.buffered()),
-            guest_fd: guest_fd.as_raw_fd(),
-            process_id,
-            stderr_fd: stderr.as_raw_fd(),
-            stdout_fd: stdout.as_raw_fd(),
-            vsock: self.vsock().display().to_string(),
+            ..self.record()?
         };
-        Ok((machine, vec![guest_fd, stdout, stderr]))
+        if let Some(process) = self.process.take() {
+            process.keep();
+        }
+        Ok(machine)
     }
 }
 
