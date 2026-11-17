@@ -27,7 +27,7 @@ tokio = { version = "1.54.1", features = ["rt", "macros", "time", "net", "signal
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["registry", "std"] }
-tumpel-api = "=0.1.1"
+tumpel-api = "=0.3.0"
 tumpel-channel = { path = "crates/tumpel-channel", version = "=0.1.0" }
 tumpel-guest = { path = "crates/tumpel-guest", version = "=0.1.0" }
 
