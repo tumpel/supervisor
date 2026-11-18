@@ -10,7 +10,7 @@ use serde_json::json;
 use tumpel_api::types::{GuestMessage, SupervisorHandoverMachine};
 use tumpel_guest::encode;
 
-use super::{adopt, alive, booted_memory, take, Firecracker, Owner};
+use super::{adopt, alive, booted_memory, take, Firecracker, Owner, Taken};
 use crate::lifecycle::{Guest, Machine, Vmm};
 use crate::pool::TapPool;
 
@@ -180,7 +180,7 @@ async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_bin
     let mut handed = handed(&vmm, pid, true);
     let session = "session-1".try_into().expect("session id");
     let (machine, mut guest) = vmm
-        .reattach(&session, &tap, &handed.machine)
+        .attach_box(&session, &tap, &handed.machine, &mut Taken::from(&handed.machine))
         .expect("the box is adopted");
     handed
         .peer

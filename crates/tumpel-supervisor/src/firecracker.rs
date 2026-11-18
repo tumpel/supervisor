@@ -499,17 +499,10 @@ impl Firecracker {
             ));
         }
         let pid = handed_pid(handed).ok_or_else(|| format!("process id {} is out of range", handed.process_id))?;
-        let scope = scope_of(tap.index());
-        let owner = alive(pid, &scope)?;
+        let owner = alive(pid, &scope_of(tap.index()))?;
         let guest = adopt(taken.guest.take(), "the guest connection", true)?;
         let stdout = adopt(taken.stdout.take(), "the box's standard output", false)?;
         let stderr = adopt(taken.stderr.take(), "the box's standard error", false)?;
-        if !in_scope(pid, &scope) {
-            move_into_scope(pid, &scope)?;
-            fd_store::keep(tap.index(), fd_store::GUEST, guest.as_fd())?;
-            fd_store::keep(tap.index(), fd_store::STDOUT, stdout.as_fd())?;
-            fd_store::keep(tap.index(), fd_store::STDERR, stderr.as_fd())?;
-        }
         let stream = std::os::unix::net::UnixStream::from(guest);
         stream
             .set_nonblocking(true)
@@ -564,7 +557,9 @@ impl Vmm for Firecracker {
         handed: &SupervisorHandoverMachine,
     ) -> Result<(FirecrackerBox, VsockGuest), String> {
         let mut taken = Taken::from(handed);
-        let attached = self.attach_box(session_id, tap, handed, &mut taken);
+        let attached = self
+            .attach_box(session_id, tap, handed, &mut taken)
+            .and_then(|(machine, guest)| machine.home(&guest).map(|()| (machine, guest)));
         if attached.is_err() {
             if let Some(pid) = handed_pid(handed) {
                 end_child(pid);
@@ -659,6 +654,27 @@ pub struct FirecrackerBox {
 }
 
 impl FirecrackerBox {
+    fn home(&self, guest: &VsockGuest) -> Result<(), String> {
+        let pid = self
+            .process
+            .as_ref()
+            .and_then(Process::id)
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+            .ok_or_else(|| "the box has no running Firecracker process".to_string())?;
+        let scope = scope_of(self.index);
+        if in_scope(pid, &scope) {
+            return Ok(());
+        }
+        move_into_scope(pid, &scope)?;
+        fd_store::keep(self.index, fd_store::GUEST, guest.stream.as_fd())?;
+        for (role, fd) in [(fd_store::STDOUT, &self.stdout), (fd_store::STDERR, &self.stderr)] {
+            if let Some(fd) = fd {
+                fd_store::keep(self.index, role, fd.as_fd())?;
+            }
+        }
+        Ok(())
+    }
+
     fn console_bytes(&self) -> Vec<u8> {
         self.console
             .lock()
