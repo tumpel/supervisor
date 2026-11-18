@@ -44,8 +44,8 @@ prebuild=$(argument tumpel.prebuild)
 restore=$(argument tumpel.restore)
 run scratch mount -t tmpfs -o mode=0755 tmpfs /run
 if ! mount -t ext4 -o noatime /dev/vdb /overlay 2>/dev/null; then
-  run overlay mkfs.ext4 -q -F -I 256 /dev/vdb
-  run overlay mount -t ext4 -o noatime /dev/vdb /overlay
+  run overlay mkfs.ext4 -q -F -I 256 -E lazy_itable_init=1,lazy_journal_init=1,nodiscard /dev/vdb
+  run overlay mount -t ext4 -o noatime,noinit_itable /dev/vdb /overlay
   mkdir -p /overlay/upper
   if [ -n "$restore" ]; then
     run restore tar -x -p --numeric-owner --xattrs --xattrs-include='trusted.overlay.*' -f "/dev/$restore" -C /overlay/upper

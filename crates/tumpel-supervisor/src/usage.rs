@@ -1,7 +1,12 @@
 use std::num::{NonZeroU32, NonZeroU64};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tumpel_api::types::{HostArchitecture, HostUsage};
+
+use crate::firecracker::OVERLAY_DRIVE;
+use crate::pool::Disk;
 
 const MEMINFO: &str = "/proc/meminfo";
 const LOADAVG: &str = "/proc/loadavg";
@@ -62,6 +67,38 @@ pub fn memory_total_and_available_mib() -> Result<(u64, u64)> {
         meminfo_kib(&meminfo, "MemTotal")? / 1024,
         meminfo_kib(&meminfo, "MemAvailable")? / 1024,
     ))
+}
+
+fn written_mib(sessions: &Path) -> Result<u64> {
+    let entries = match std::fs::read_dir(sessions) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        read => read.with_context(|| format!("listing {} for the box disks failed", sessions.display()))?,
+    };
+    let mut blocks = 0;
+    for entry in entries {
+        let drive = entry
+            .with_context(|| format!("listing {} for the box disks failed", sessions.display()))?
+            .path()
+            .join(OVERLAY_DRIVE);
+        match std::fs::metadata(&drive) {
+            Ok(metadata) => blocks += metadata.blocks(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading what the box disk {} holds failed", drive.display()))
+            }
+        }
+    }
+    Ok(blocks * 512 / (1024 * 1024))
+}
+
+pub fn disk(data_dir: &Path) -> Result<Disk> {
+    let space = tumpel_guest::disk::space(data_dir).map_err(|error| anyhow!(error))?;
+    Ok(Disk {
+        total_mib: space.total_mib,
+        free_mib: space.available_mib,
+        written_mib: written_mib(&data_dir.join("sessions"))?,
+    })
 }
 
 fn load_averages(loadavg: &str) -> Result<[f64; 3]> {
@@ -125,6 +162,8 @@ fn stats(boxes_warm: u32, meminfo: &str, loadavg: &str, stat: &str) -> Result<Ho
             boxes_warm: i32::try_from(boxes_warm).unwrap_or(i32::MAX),
             load_average: loads[0],
             memory_available_mib: i64::try_from(meminfo_kib(meminfo, "MemAvailable")? / 1024).unwrap_or(i64::MAX),
+            disk_budget_mib: None,
+            disk_held_mib: None,
         },
         memory_total_mib: meminfo_kib(meminfo, "MemTotal")? / 1024,
         loads,

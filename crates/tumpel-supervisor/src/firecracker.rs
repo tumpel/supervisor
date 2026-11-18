@@ -22,11 +22,12 @@ use crate::boot::Boot;
 use crate::fd_store;
 use crate::guest_drive;
 use crate::lifecycle::{Guest, Machine, Vmm};
-use crate::pool::Tap;
+use crate::pool::{Disk, Tap};
 use crate::snapshot::Ext4Upper;
 
 const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/sbin/tumpel-init";
 const CONSOLE_TAIL: usize = 4096;
+pub const OVERLAY_DRIVE: &str = "overlay.ext4";
 const API_WAIT_STEP: Duration = Duration::from_millis(5);
 const API_ANSWER: Duration = Duration::from_secs(5);
 
@@ -463,7 +464,6 @@ pub struct Firecracker {
     images: PathBuf,
     data: PathBuf,
     vcpus: u32,
-    overlay_bytes: u64,
 }
 
 impl Firecracker {
@@ -474,7 +474,6 @@ impl Firecracker {
             images: PathBuf::from(&*runtime.image_cache_dir),
             data: PathBuf::from(&*runtime.data_dir),
             vcpus: runtime.vcpu_count.get(),
-            overlay_bytes: u64::try_from(runtime.overlay_mib).unwrap_or(0) * 1024 * 1024,
         }
     }
 }
@@ -542,7 +541,7 @@ impl Vmm for Firecracker {
             boot_args: format!("{BOOT_ARGS} {}", tap.kernel_ip()),
             vcpus: self.vcpus,
             memory_mib: tap.memory_mib(),
-            overlay_bytes: self.overlay_bytes,
+            overlay_bytes: u64::from(tap.disk_mib().get()) * 1024 * 1024,
             process: None,
             stdout: None,
             stderr: None,
@@ -575,6 +574,26 @@ impl Vmm for Firecracker {
 
     fn available_memory_mib(&self) -> Result<u64, String> {
         crate::usage::memory_available_mib().map_err(|error| format!("{error:#}"))
+    }
+
+    fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String> {
+        let drive = session_dir(&self.data, session_id)?.join(OVERLAY_DRIVE);
+        let bytes = std::fs::metadata(&drive)
+            .map_err(|error| format!("reading the size of the box disk {}: {error}", drive.display()))?
+            .len();
+        u32::try_from(bytes / (1024 * 1024))
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| {
+                format!(
+                    "the box disk {} holds {bytes} bytes, not a size in whole MiB a box boots with",
+                    drive.display()
+                )
+            })
+    }
+
+    fn disk(&self) -> Result<Disk, String> {
+        crate::usage::disk(&self.data).map_err(|error| format!("{error:#}"))
     }
 
     fn discard(&self, handed: &SupervisorHandoverMachine) {
@@ -936,7 +955,7 @@ impl Machine for FirecrackerBox {
     }
 
     fn drive(&self) -> PathBuf {
-        self.session.join("overlay.ext4")
+        self.session.join(OVERLAY_DRIVE)
     }
 
     async fn stop(mut self) {

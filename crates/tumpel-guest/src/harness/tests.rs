@@ -4,7 +4,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 use tumpel_api::types::{GuestHarness, GuestTurnStart};
 
-use tumpel_api::types::GuestHarnessProtocol;
+use tumpel_api::types::{GuestHarnessProtocol, GuestTurnEndReason};
 
 use super::{
     answers_no_prompt, ends_turn, environment, home_path, launch, priced_by_anthropic, reuses, skips, turn_arguments,
@@ -426,5 +426,49 @@ fn a_cancel_kills_a_persistent_harness_and_every_process_it_started() {
     assert_eq!(
         status.and_then(|status| std::os::unix::process::ExitStatusExt::signal(&status)),
         Some(libc::SIGKILL)
+    );
+}
+
+#[test]
+fn a_turn_that_ends_with_the_box_disk_full_fails_box_disk_full_naming_its_size() {
+    let full = tumpel_guest::disk::Space {
+        total_mib: 32_096,
+        available_mib: 0,
+        free_mib: 12,
+    };
+    let reason = |ending: super::Ending| match ending {
+        super::Ending::Turn { reason, detail, .. } => (reason, detail),
+        super::Ending::Clone(_) => panic!("a turn ending"),
+    };
+    let (ended, detail) = reason(super::disk_full(
+        super::ended(GuestTurnEndReason::HarnessExited, "No space left on device"),
+        full,
+    ));
+    assert_eq!(ended, GuestTurnEndReason::BoxDiskFull);
+    assert_eq!(
+        detail,
+        "the box disk of 32096 MiB is full, 12 MiB free, so the turn ended HarnessExited; give the persona a larger boxDiskMib, up to 262144 MiB, or have it delete build output it no longer needs; No space left on device"
+    );
+    let (completed, _) = reason(super::disk_full(super::ended(GuestTurnEndReason::Completed, ""), full));
+    assert_eq!(completed, GuestTurnEndReason::BoxDiskFull);
+    let (cancelled, _) = reason(super::disk_full(super::ended(GuestTurnEndReason::Cancelled, ""), full));
+    assert_eq!(cancelled, GuestTurnEndReason::Cancelled);
+    let roomy = tumpel_guest::disk::Space { free_mib: 321, ..full };
+    let (kept, _) = reason(super::disk_full(
+        super::ended(GuestTurnEndReason::HarnessExited, ""),
+        roomy,
+    ));
+    assert_eq!(kept, GuestTurnEndReason::HarnessExited);
+}
+
+#[test]
+fn the_box_limits_note_names_the_memory_disk_cpus_and_turn_limit_the_box_got() {
+    assert_eq!(
+        super::constraints(4096, 32_096, 2, std::num::NonZeroU32::new(3600)),
+        "# Box limits\n\n- Memory: 4096 MiB\n- Disk: 32096 MiB\n- CPUs: 2\n- Turn time limit: 3600 seconds\n\nA turn ends BoxDiskFull when the disk fills, HarnessOutOfMemory when memory runs out and TurnTimedOut past its time limit.\n"
+    );
+    assert_eq!(
+        super::constraints(4096, 32_096, 2, None),
+        "# Box limits\n\n- Memory: 4096 MiB\n- Disk: 32096 MiB\n- CPUs: 2\n\nA turn ends BoxDiskFull when the disk fills, HarnessOutOfMemory when memory runs out and TurnTimedOut past its time limit.\n"
     );
 }

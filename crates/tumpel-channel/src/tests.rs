@@ -56,6 +56,8 @@ fn usage() -> HostUsage {
         boxes_warm: 1,
         load_average: 0.5,
         memory_available_mib: 4096,
+        disk_budget_mib: None,
+        disk_held_mib: None,
     }
 }
 

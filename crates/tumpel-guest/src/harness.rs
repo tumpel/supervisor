@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::hash::{BuildHasher, RandomState};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -21,6 +22,7 @@ use tumpel_api::types::{
     GuestTurnRepositoryCloneFailed, GuestTurnRepositoryCloneFailedType, GuestTurnRepositoryReady,
     GuestTurnRepositoryReadyType, GuestTurnStart, Sequence,
 };
+use tumpel_guest::disk::{self, Space};
 use tumpel_guest::{credential_file, encode, Decoder};
 
 use crate::memory::Memory;
@@ -37,6 +39,9 @@ const WRITTEN_FILE: &str = "/var/lib/tumpel/persona-files.json";
 const SETUP_PROGRAM: &str = "/opt/tumpel/prebuild.mjs";
 const GH_DIR: &str = "/var/lib/tumpel/bin";
 const GH_WRAPPER: &str = "/var/lib/tumpel/bin/gh";
+const BOX_DISK: &str = "/";
+const CONSTRAINTS_DIR: &str = "/etc/claude-code";
+const CONSTRAINTS_FILE: &str = "/etc/claude-code/CLAUDE.md";
 pub const STDERR_TAIL: usize = 4096;
 
 enum Output {
@@ -597,6 +602,49 @@ fn ended(reason: GuestTurnEndReason, detail: impl Into<String>) -> Ending {
     }
 }
 
+fn constraints(memory_mib: u64, disk_mib: u64, cpus: usize, turn_seconds: Option<NonZeroU32>) -> String {
+    let limit = turn_seconds.map_or_else(String::new, |seconds| format!("- Turn time limit: {seconds} seconds\n"));
+    format!(
+        "# Box limits\n\n- Memory: {memory_mib} MiB\n- Disk: {disk_mib} MiB\n- CPUs: {cpus}\n{limit}\nA turn ends BoxDiskFull when the disk fills, HarnessOutOfMemory when memory runs out and TurnTimedOut past its time limit.\n"
+    )
+}
+
+fn write_constraints(memory_mib: u64, turn_seconds: Option<NonZeroU32>) -> Result<(), String> {
+    let disk = disk::space(Path::new(BOX_DISK))?;
+    let cpus = std::thread::available_parallelism().map_err(|error| format!("counting the box's CPUs: {error}"))?;
+    let note = constraints(memory_mib, disk.total_mib, cpus.get(), turn_seconds);
+    match std::fs::read_to_string(CONSTRAINTS_FILE) {
+        Ok(written) if written == note => return Ok(()),
+        Err(error) if error.kind() != ErrorKind::NotFound => {
+            return Err(format!("reading {CONSTRAINTS_FILE}: {error}"));
+        }
+        _ => {}
+    }
+    std::fs::create_dir_all(CONSTRAINTS_DIR).map_err(|error| format!("creating {CONSTRAINTS_DIR}: {error}"))?;
+    std::fs::write(CONSTRAINTS_FILE, note).map_err(|error| format!("writing {CONSTRAINTS_FILE}: {error}"))
+}
+
+fn disk_full(ending: Ending, disk: Space) -> Ending {
+    let Ending::Turn { reason, detail, .. } = &ending else {
+        return ending;
+    };
+    if !disk.full()
+        || matches!(
+            reason,
+            GuestTurnEndReason::Cancelled | GuestTurnEndReason::HarnessOutOfMemory
+        )
+    {
+        return ending;
+    }
+    ended(
+        GuestTurnEndReason::BoxDiskFull,
+        format!(
+            "the box disk of {} MiB is full, {} MiB free, so the turn ended {reason}; give the persona a larger boxDiskMib, up to 262144 MiB, or have it delete build output it no longer needs; {detail}",
+            disk.total_mib, disk.free_mib
+        ),
+    )
+}
+
 fn with_spend(ending: Ending, spend: &Spend, protocol: GuestHarnessProtocol, priced: bool) -> Result<Ending, String> {
     let Some(read) = spend.usage() else {
         return Ok(ending);
@@ -858,6 +906,7 @@ impl GuestState {
         if setup {
             return self.setup_for(start);
         }
+        write_constraints(self.memory.box_mib, start.turn_seconds)?;
         self.write_credential(start)?;
         self.harness_for(start)
     }
@@ -961,7 +1010,12 @@ impl GuestState {
             }
         };
         self.last_line_seq = last_line_seq;
-        with_spend(self.killed_by_oom(ending, killed)?, &spend, protocol, priced)
+        with_spend(self.box_ending(ending, killed)?, &spend, protocol, priced)
+    }
+
+    fn box_ending(&mut self, ending: Ending, killed: Option<(u32, String)>) -> Result<Ending, String> {
+        let ending = self.killed_by_oom(ending, killed)?;
+        Ok(disk_full(ending, disk::space(Path::new(BOX_DISK))?))
     }
 
     fn killed_by_oom(&mut self, ending: Ending, killed: Option<(u32, String)>) -> Result<Ending, String> {

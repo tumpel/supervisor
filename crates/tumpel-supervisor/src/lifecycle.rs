@@ -37,7 +37,7 @@ use crate::exchange::{part_number, Answer, Answers, Ask, Cancels, Key, Waiting, 
 use crate::harness_result::{error_result, exit_result, turn_end};
 use crate::images;
 use crate::layers::LayerCache;
-use crate::pool::{Tap, TapPool};
+use crate::pool::{Disk, Size, Tap, TapPool};
 use crate::snapshot::{
     assemble, cut, decode, decode_root, draft_digests, fetches, fresh, lacking, restore_parts, stage, unpack,
     write_restore, Base, Births, ChunkCache, Cut, Fetch, Kind, Manifest, PackFile, Place, Places, Span,
@@ -63,6 +63,11 @@ fn restore_budget(floor: Duration, bytes: u64, entries: u64) -> Duration {
         + Duration::from_secs(entries.div_ceil(RESTORE_ENTRIES_PER_SECOND))
 }
 
+fn positive_mib(mib: Option<i32>) -> Result<Option<NonZeroU32>, i32> {
+    mib.map(|mib| u32::try_from(mib).ok().and_then(NonZeroU32::new).ok_or(mib))
+        .transpose()
+}
+
 fn restore_size(named: &str, manifest: &Manifest, overlay: u64) -> Result<(u64, u64), String> {
     let bytes = manifest
         .values()
@@ -73,14 +78,14 @@ fn restore_size(named: &str, manifest: &Manifest, overlay: u64) -> Result<(u64, 
         .fold(0, u64::saturating_add);
     if bytes > overlay {
         return Err(format!(
-            "{named} holds {bytes} bytes, more than the {overlay} bytes of the box's overlay drive; raise overlayMib in runtime.json or start a new session"
+            "{named} holds {bytes} bytes, more than the {overlay} bytes of the box's disk; raise the persona's boxDiskMib or start a new session"
         ));
     }
     let entries = manifest.len() as u64;
     let inodes = overlay / OVERLAY_BYTES_PER_INODE;
     if entries > inodes {
         return Err(format!(
-            "{named} holds {entries} entries, more than the {inodes} files the box's overlay drive of {overlay} bytes can hold; raise overlayMib in runtime.json or start a new session"
+            "{named} holds {entries} entries, more than the {inodes} files the box's disk of {overlay} bytes can hold; raise the persona's boxDiskMib or start a new session"
         ));
     }
     Ok((bytes, entries))
@@ -111,7 +116,6 @@ pub struct Settings {
     pub budgets: Budgets,
     pub warm_window: Duration,
     pub layer_cache_mib: NonZeroU32,
-    pub overlay_bytes: u64,
 }
 
 pub trait Guest: Send + 'static {
@@ -149,6 +153,8 @@ pub trait Vmm: Send + Sync + 'static {
     ) -> Result<(Self::Machine, <Self::Machine as Machine>::Guest), String>;
     fn booted_memory(&self, handed: &SupervisorHandoverMachine) -> Result<NonZeroU32, String>;
     fn available_memory_mib(&self) -> Result<u64, String>;
+    fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String>;
+    fn disk(&self) -> Result<Disk, String>;
     fn discard(&self, handed: &SupervisorHandoverMachine);
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
@@ -174,6 +180,7 @@ pub struct BoxTurn {
     pub files_cache: PathBuf,
     pub prebuild_commit_sha: Option<String>,
     pub box_memory_mib: Option<i32>,
+    pub box_disk_mib: Option<i32>,
 }
 
 pub struct SnapshotOrder {
@@ -522,9 +529,15 @@ impl<M: Machine> Slot<M> {
         self.expired = false;
     }
 
-    fn evictable(&self) -> Option<(Instant, NonZeroU32)> {
+    fn evictable(&self) -> Option<(Instant, Size)> {
         let live = self.live.as_ref().filter(|live| !live.dirty && !self.busy)?;
-        Some((self.paused_at?, live.tap.memory_mib()))
+        Some((
+            self.paused_at?,
+            Size {
+                memory_mib: live.tap.memory_mib(),
+                disk_mib: live.tap.disk_mib(),
+            },
+        ))
     }
 }
 
@@ -856,7 +869,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             );
             return Outcome::Gone(tap);
         }
-        let restored = match timeout_at(instant_at(turn.credential.expires_at), self.restore(turn)).await {
+        let restored = match timeout_at(instant_at(turn.credential.expires_at), self.restore(turn, &tap)).await {
             Ok(Ok(restored)) => restored,
             Ok(Err(detail)) => {
                 turn_failed(&self.out, &turn.turn_id, TurnFailureReason::SnapshotUnreadable, detail);
@@ -1134,14 +1147,14 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
-    async fn restore(&self, turn: &BoxTurn) -> Result<Option<(PathBuf, Base, u64)>, String> {
-        telemetry::timed(Phase::Restore, self.restore_snapshot(turn), |restored| {
+    async fn restore(&self, turn: &BoxTurn, tap: &Tap) -> Result<Option<(PathBuf, Base, u64)>, String> {
+        telemetry::timed(Phase::Restore, self.restore_snapshot(turn, tap), |restored| {
             matches!(restored, Ok(Some(_)))
         })
         .await
     }
 
-    async fn restore_snapshot(&self, turn: &BoxTurn) -> Result<Option<(PathBuf, Base, u64)>, String> {
+    async fn restore_snapshot(&self, turn: &BoxTurn, tap: &Tap) -> Result<Option<(PathBuf, Base, u64)>, String> {
         let Some(snapshot) = turn.snapshots.last() else {
             return Ok(None);
         };
@@ -1196,7 +1209,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         .await
         .map_err(|error| format!("reading the manifest of {named} stopped: {error}"))?;
         let (manifest, wanted) = read.map_err(damaged)?;
-        let overlay = self.settings.overlay_bytes;
+        let overlay = u64::from(tap.disk_mib().get()) * 1024 * 1024;
         let (bytes, entries) = restore_size(&named, &manifest, overlay)?;
         self.fetch_within(turn, wanted, &cache, &dir, &named, expires).await?;
         let target = dir.join("restore.tar");
@@ -1288,6 +1301,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 turn_id: turn.turn_id.clone(),
                 type_: GuestTurnStartType::TurnStart,
                 prebuild_commit_sha,
+                turn_seconds: NonZeroU32::new(u32::try_from(self.settings.budgets.turn.as_secs()).unwrap_or(u32::MAX)),
             })
             .map_err(|error| {
                 Failure::turn(
@@ -1855,6 +1869,7 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     boxes: watch::Sender<u32>,
     busy: watch::Sender<u32>,
     sessions: watch::Sender<Vec<EntityId>>,
+    disk_held: watch::Sender<u64>,
     setups: HashMap<String, UnboundedSender<SetupInput>>,
     setup_tasks: HashMap<String, JoinHandle<()>>,
     mode: Mode,
@@ -1899,6 +1914,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             boxes: watch::Sender::new(0),
             busy: watch::Sender::new(0),
             sessions: watch::Sender::new(Vec::new()),
+            disk_held: watch::Sender::new(0),
             setups: HashMap::new(),
             setup_tasks: HashMap::new(),
             mode: Mode::TakingTurns,
@@ -1928,6 +1944,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     #[must_use]
+    pub fn disk_held(&self) -> watch::Receiver<u64> {
+        self.disk_held.subscribe()
+    }
+
+    #[must_use]
     pub fn answers(&self) -> Answers {
         self.runner.answers.clone()
     }
@@ -1945,6 +1966,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.busy.send_replace(u32::try_from(boxes - warm).unwrap_or(u32::MAX));
         self.sessions
             .send_replace(self.slots.keys().map(|session| held_session(session)).collect());
+        self.disk_held.send_replace(self.pool.held_disk_mib());
     }
 
     pub async fn run(mut self, mut inputs: UnboundedReceiver<Input>, mut setups: UnboundedReceiver<SetupCommand>) {
@@ -2293,11 +2315,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     fn attach(&mut self, handed: &SupervisorHandoverBox) -> Result<Attached<V::Machine>, String> {
-        let claimed = self
-            .runner
-            .vmm
-            .booted_memory(&handed.machine)
-            .and_then(|memory_mib| self.pool.claim_device(handed.tap_index, memory_mib));
+        let claimed = self.runner.vmm.booted_memory(&handed.machine).and_then(|memory_mib| {
+            let disk_mib = self.runner.vmm.booted_disk(&handed.session_id)?;
+            self.pool.claim_device(handed.tap_index, Size { memory_mib, disk_mib })
+        });
         let tap = match claimed {
             Ok(tap) => tap,
             Err(error) => {
@@ -2478,7 +2499,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             );
             return;
         }
-        let tap = match self.claim(None).await {
+        let tap = match self.claim(None, None).await {
             Ok(tap) => tap,
             Err(full) => {
                 emit(
@@ -2557,11 +2578,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             );
             return;
         }
-        let parsed = turn
-            .box_memory_mib
-            .map(|mib| u32::try_from(mib).ok().and_then(NonZeroU32::new).ok_or(mib))
-            .transpose();
-        let memory_mib = match parsed {
+        let memory_mib = match positive_mib(turn.box_memory_mib) {
             Ok(memory_mib) => memory_mib,
             Err(mib) => {
                 let detail = format!(
@@ -2580,7 +2597,26 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 return;
             }
         };
-        let tap = match self.claim(memory_mib).await {
+        let disk_mib = match positive_mib(turn.box_disk_mib) {
+            Ok(disk_mib) => disk_mib,
+            Err(mib) => {
+                let detail = format!(
+                    "turn {} asks for a box disk of {mib} MiB, which is not a positive size; set the persona's boxDiskMib between 32768 and 262144 MiB",
+                    *turn.turn_id
+                );
+                root.in_scope(|| {
+                    turn_failed(
+                        &self.runner.out,
+                        &turn.turn_id,
+                        TurnFailureReason::BoxBootFailed,
+                        detail,
+                    );
+                });
+                self.prune(&session);
+                return;
+            }
+        };
+        let tap = match self.claim(memory_mib, disk_mib).await {
             Ok(tap) => tap,
             Err(refused) => {
                 root.in_scope(|| {
@@ -2691,30 +2727,42 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.box_gone(order);
     }
 
-    async fn claim(&mut self, memory_mib: Option<NonZeroU32>) -> Result<Tap, String> {
+    async fn claim(&mut self, memory_mib: Option<NonZeroU32>, disk_mib: Option<NonZeroU32>) -> Result<Tap, String> {
+        let size = self.pool.size(memory_mib, disk_mib);
         let mut victims: Vec<_> = self
             .slots
             .iter()
             .filter_map(|(session, slot)| {
                 slot.evictable()
-                    .map(|(paused_at, mib)| (paused_at, mib, session.clone()))
+                    .map(|(paused_at, freed)| (paused_at, freed, session.clone()))
             })
             .collect();
         victims.sort();
-        let freeing: Vec<_> = victims.iter().map(|(_, mib, _)| *mib).collect();
+        let freeing: Vec<_> = victims.iter().map(|(_, freed, _)| *freed).collect();
         self.pool
-            .admits(memory_mib, &freeing, self.available_memory_mib()?)
+            .admits(size, &freeing, self.available_memory_mib()?, self.disk()?)
             .map_err(|exhausted| exhausted.to_string())?;
         let mut victims = victims.into_iter();
-        while self.pool.admits(memory_mib, &[], self.available_memory_mib()?).is_err() {
+        while self
+            .pool
+            .admits(size, &[], self.available_memory_mib()?, self.disk()?)
+            .is_err()
+        {
             let Some((_, _, victim)) = victims.next() else {
                 break;
             };
             self.teardown(&victim).await;
         }
         self.pool
-            .claim(memory_mib, self.available_memory_mib()?)
+            .claim(size, self.available_memory_mib()?, self.disk()?)
             .map_err(|exhausted| exhausted.to_string())
+    }
+
+    fn disk(&self) -> Result<Disk, String> {
+        self.runner
+            .vmm
+            .disk()
+            .map_err(|error| format!("reading the disk this host has free failed: {error}"))
     }
 
     fn available_memory_mib(&self) -> Result<u64, String> {

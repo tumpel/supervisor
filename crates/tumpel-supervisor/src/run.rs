@@ -32,7 +32,7 @@ use crate::lifecycle::{
     turn_failed, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder, Taken,
     TeardownOrder,
 };
-use crate::pool::{headroom_mib, memory_budget_mib, TapPool};
+use crate::pool::{headroom_mib, memory_budget_mib, Size, TapPool};
 use crate::store::HttpStore;
 use crate::telemetry::{Telemetry, BATCH_POINTS};
 use crate::update::{self, HttpSource, Layout, Limits, Outcome, Startup, Updater};
@@ -171,15 +171,22 @@ struct Usage {
     warm: watch::Receiver<u32>,
     running: watch::Receiver<u32>,
     sessions: watch::Receiver<Vec<EntityId>>,
+    disk_held: watch::Receiver<u64>,
+    data_dir: PathBuf,
     telemetry: Telemetry,
 }
 
 impl Usage {
     fn sample(&self) -> Result<HostUsage, Failure> {
-        let stats = usage::sample(*self.warm.borrow())
-            .map_err(|error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}")))?;
+        let unreadable = |error: anyhow::Error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}"));
+        let stats = usage::sample(*self.warm.borrow()).map_err(unreadable)?;
+        let disk = usage::disk(&self.data_dir).map_err(unreadable)?;
         self.telemetry.host(&stats, *self.running.borrow());
-        Ok(stats.usage)
+        Ok(HostUsage {
+            disk_budget_mib: Some(i64::try_from(disk.budget_mib()).unwrap_or(i64::MAX)),
+            disk_held_mib: Some(i64::try_from(*self.disk_held.borrow()).unwrap_or(i64::MAX)),
+            ..stats.usage
+        })
     }
 }
 
@@ -260,6 +267,7 @@ fn command(files_cache: &Path, offer: ChannelTurnOffer) -> Command {
         files_cache: files_cache.to_path_buf(),
         prebuild_commit_sha: offer.prebuild_commit_sha.map(String::from),
         box_memory_mib: offer.box_memory_mib,
+        box_disk_mib: offer.box_disk_mib,
     }))
 }
 
@@ -320,7 +328,7 @@ async fn boxes(
 )]
 fn start_boxes(
     runtime: &SupervisorRuntime,
-    box_mib: NonZeroU32,
+    box_size: Size,
     store: HttpStore,
     received: UnboundedReceiver<BoxCommand>,
     out: UnboundedSender<ChannelHostMessage>,
@@ -339,13 +347,12 @@ fn start_boxes(
     let pool = TapPool::new(
         memory_budget_mib(total_mib, available_mib, handed_resident_mib),
         headroom_mib(total_mib),
-        box_mib,
+        box_size,
     );
     let settings = Settings {
         budgets: Budgets::from(&runtime.budgets),
         warm_window: Duration::from_secs(u64::from(runtime.warm_window_seconds.get())),
         layer_cache_mib: runtime.layer_cache_mib,
-        overlay_bytes: u64::try_from(runtime.overlay_mib).unwrap_or(0) * 1024 * 1024,
     };
     let box_capacity = pool.capacity();
     let mut lifecycle = Lifecycle::new(Firecracker::new(runtime), store, settings, pool, out, standing);
@@ -357,6 +364,8 @@ fn start_boxes(
         warm: lifecycle.warm(),
         running: lifecycle.boxes(),
         sessions: lifecycle.sessions(),
+        disk_held: lifecycle.disk_held(),
+        data_dir: PathBuf::from(&*runtime.data_dir),
         telemetry,
     };
     let answers = lifecycle.answers();
@@ -603,7 +612,7 @@ pub(crate) struct Started {
     layout: Layout,
     pub(crate) running: Sha256Digest,
     source: HttpSource,
-    box_mib: NonZeroU32,
+    box_size: Size,
     store: HttpStore,
 }
 
@@ -618,15 +627,17 @@ pub(crate) fn start() -> Result<Started, Failure> {
     let runtime = load_runtime(&dir)?;
     let url = channel_url(&config.endpoint, &config.host_id)?;
     let source = HttpSource::new(&config.endpoint).map_err(unusable)?;
-    let box_mib = u32::try_from(runtime.memory_mib)
-        .ok()
-        .and_then(NonZeroU32::new)
-        .ok_or_else(|| {
+    let positive = |mib: i32, named: &str, default: u32| {
+        u32::try_from(mib).ok().and_then(NonZeroU32::new).ok_or_else(|| {
             unusable(format!(
-                "memoryMib {} in runtime.json is not a positive number of MiB; set it to 4096",
-                runtime.memory_mib
+                "{named} {mib} in runtime.json is not a positive number of MiB; set it to {default}"
             ))
-        })?;
+        })
+    };
+    let box_size = Size {
+        memory_mib: positive(runtime.memory_mib, "memoryMib", 4096)?,
+        disk_mib: positive(runtime.overlay_mib, "overlayMib", 32_768)?,
+    };
     let store = HttpStore::new().map_err(unusable)?;
     Ok(Started {
         config,
@@ -637,7 +648,7 @@ pub(crate) fn start() -> Result<Started, Failure> {
         layout,
         running,
         source,
-        box_mib,
+        box_size,
         store,
     })
 }
@@ -706,7 +717,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     let (commands, received) = unbounded_channel();
     let (usage, idle) = start_boxes(
         &started.runtime,
-        started.box_mib,
+        started.box_size,
         started.store,
         received,
         out.clone(),
