@@ -614,13 +614,6 @@ fn install_unit(account: &Account) -> Result<()> {
     if !same {
         let bytes = std::fs::read(&current).with_context(|| format!("reading {}", current.display()))?;
         place(&binary, &bytes, 0o755)?;
-        std::fs::remove_file(&current).with_context(|| {
-            format!(
-                "deleting {} now that it is installed as {}",
-                current.display(),
-                binary.display()
-            )
-        })?;
     }
     let config_home = std::env::var_os("XDG_CONFIG_HOME").map_or_else(|| account.home.join(".config"), PathBuf::from);
     let unit_path = config_home.join("systemd").join("user").join(SUPERVISOR_UNIT);

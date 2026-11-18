@@ -15,8 +15,8 @@ The API types come from `tumpel-api`, generated in [tumpel/protocol](https://git
 Download `tumpel-supervisor-x86_64-linux` and its `.sha256` from the [latest release](https://github.com/tumpel/supervisor/releases/latest), then check and install it:
 
 ```sh
-sha256sum -c tumpel-supervisor-x86_64-linux.sha256 && rm tumpel-supervisor-x86_64-linux.sha256
-chmod 0755 tumpel-supervisor-x86_64-linux && mv tumpel-supervisor-x86_64-linux tumpel-supervisor
+sha256sum -c tumpel-supervisor-x86_64-linux.sha256
+install -m 0755 tumpel-supervisor-x86_64-linux ./tumpel-supervisor
 ```
 
 Mint an enrolment token on your own machine and pipe it to the installer on the host. Run the installer as the user that will own the boxes, never as root:
@@ -24,8 +24,6 @@ Mint an enrolment token on your own machine and pipe it to the installer on the 
 ```sh
 tumpel host mint-token --expires-in 600 | ssh <host> ./tumpel-supervisor install --endpoint <control plane url> --token-file -
 ```
-
-The installer copies itself to `~/.local/bin/tumpel-supervisor` and deletes the binary it ran from. After an update reaches the control plane, the supervisor deletes the binary it replaced.
 
 `cargo install tumpel-supervisor` builds the same binary, with the guest drive that ships inside the crate.
 

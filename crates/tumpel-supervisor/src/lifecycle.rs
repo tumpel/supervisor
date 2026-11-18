@@ -1777,7 +1777,7 @@ fn unexpected(key: &Key) -> String {
     format!("the control plane answered {key} with an answer of another kind; update the supervisor and the control plane together")
 }
 
-fn remove_dir(path: &Path) -> Result<(), String> {
+pub(crate) fn remove_dir(path: &Path) -> Result<(), String> {
     match std::fs::remove_dir_all(path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             Err(format!("removing {}: {error}", path.display()))
@@ -2300,7 +2300,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     /// # Errors
-    /// Fails when the record of running boxes cannot be written, a leftover file of an ended box cannot be deleted or a box this supervisor did not take over cannot be stopped.
+    /// Fails when the record of running boxes cannot be written, a box this supervisor did not take over cannot be stopped or the files of an ended box cannot be deleted.
     pub fn start(&mut self, taken: Option<(SupervisorHandover, Taken)>) -> Result<(), String> {
         let recorded = taken.is_some();
         let mut standing = BTreeMap::new();
@@ -2314,13 +2314,13 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         let claimed: Vec<u8> = standing.keys().filter_map(|index| u8::try_from(*index).ok()).collect();
         let sessions: Vec<EntityId> = standing.values().map(|record| record.session_id.clone()).collect();
-        self.runner.vmm.remove_leftovers(&claimed, &sessions)?;
         self.runner.standing.write(|boxes| *boxes = standing)?;
         self.publish();
         if !recorded {
             return Ok(());
         }
-        self.runner.vmm.end_unclaimed(&claimed)
+        self.runner.vmm.end_unclaimed(&claimed)?;
+        self.runner.vmm.remove_leftovers(&claimed, &sessions)
     }
 
     fn attach(&mut self, handed: &SupervisorHandoverBox) -> Result<Attached<V::Machine>, String> {

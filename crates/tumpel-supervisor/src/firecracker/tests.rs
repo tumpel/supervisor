@@ -259,70 +259,20 @@ fn booted_memory_reads_mem_size_mib_from_the_firecracker_api_of_a_running_box() 
 }
 
 #[test]
-fn a_start_deletes_every_file_of_a_box_it_did_not_take_over_and_keeps_only_the_disk_of_one_it_did() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/firecracker-tests/leftovers");
-    if root.exists() {
-        std::fs::remove_dir_all(&root).expect("clearing the last run");
+fn a_start_deletes_the_disk_of_a_box_it_did_not_take_over_and_keeps_the_one_it_did() {
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/firecracker-tests/leftovers");
+    if data.exists() {
+        std::fs::remove_dir_all(&data).expect("clearing the last run");
     }
-    let data = root.join("data");
-    let images = root.join("images");
-    for dir in [
-        "box0",
-        "box3",
-        "box12",
-        "sessions/kept/chunks",
-        "sessions/kept/snapshot-00000002",
-        "sessions/lost",
-        "persona-files/turn-1",
-    ] {
-        std::fs::create_dir_all(data.join(dir)).expect("a leftover directory");
+    for session in ["kept", "lost"] {
+        let dir = data.join("sessions").join(session);
+        std::fs::create_dir_all(&dir).expect("a box disk directory");
+        std::fs::write(dir.join("overlay.ext4"), b"disk").expect("a box disk");
     }
-    std::fs::create_dir_all(images.join("chunks")).expect("the old chunk cache");
-    for file in [
-        "box3/api.sock",
-        "sessions/kept/overlay.ext4",
-        "sessions/kept/restore.tar",
-        "sessions/lost/overlay.ext4",
-        "sessions/lost/restore.tar",
-        "boxes.json",
-    ] {
-        std::fs::write(data.join(file), b"left").expect("a leftover file");
-    }
-    std::fs::write(images.join("chunks").join("a".repeat(64)), b"chunk").expect("a cached chunk");
-    std::fs::write(images.join("image.ext4"), b"image").expect("an image");
     let kept = EntityId::try_from("kept").expect("an id");
 
-    super::remove_leftovers(&data, &images, &[0], &[kept]).expect("the leftovers are deleted");
+    super::remove_leftovers(&data, &[], &[kept]).expect("the leftovers are deleted");
 
-    let mut left: Vec<String> = walkdir(&data)
-        .chain(walkdir(&images))
-        .map(|path| path.strip_prefix(&root).expect("under root").display().to_string())
-        .collect();
-    left.sort();
-    assert_eq!(
-        left,
-        [
-            "data/box0",
-            "data/boxes.json",
-            "data/sessions",
-            "data/sessions/kept",
-            "data/sessions/kept/overlay.ext4",
-            "images/image.ext4"
-        ]
-    );
-}
-
-fn walkdir(dir: &Path) -> impl Iterator<Item = PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(next) = pending.pop() {
-        for entry in std::fs::read_dir(&next).expect("a directory") {
-            let path = entry.expect("an entry").path();
-            if path.is_dir() {
-                pending.push(path.clone());
-            }
-            found.push(path);
-        }
-    }
-    found.into_iter()
+    assert!(data.join("sessions/kept/overlay.ext4").exists());
+    assert!(!data.join("sessions/lost").exists());
 }

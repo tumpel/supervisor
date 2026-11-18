@@ -6,6 +6,7 @@ use ring::digest::{digest, SHA256};
 use tokio::time::timeout_at;
 use tumpel_api::types::{ChannelPersonaFileDownload, GuestPersonaFile};
 
+use crate::lifecycle::remove_dir;
 use crate::store::Store;
 
 pub const DIR: &str = "persona-files";
@@ -48,24 +49,6 @@ async fn blob(store: &impl Store, dir: &Path, file: &ChannelPersonaFileDownload)
     Ok(bytes)
 }
 
-async fn fetch_into(
-    store: &impl Store,
-    dir: &Path,
-    files: &[ChannelPersonaFileDownload],
-) -> Result<Vec<GuestPersonaFile>, String> {
-    std::fs::create_dir_all(dir).map_err(|error| format!("creating {}: {error}", dir.display()))?;
-    let mut fetched = Vec::with_capacity(files.len());
-    for file in files {
-        let bytes = blob(store, dir, file).await?;
-        fetched.push(GuestPersonaFile {
-            content: STANDARD.encode(bytes),
-            digest: file.digest.clone(),
-            path: file.path.clone(),
-        });
-    }
-    Ok(fetched)
-}
-
 pub async fn fetch(
     store: &impl Store,
     dir: &Path,
@@ -74,14 +57,24 @@ pub async fn fetch(
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let fetched = fetch_into(store, dir, files).await;
-    let removed = match std::fs::remove_dir_all(dir) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(format!(
-            "deleting the downloaded persona files {}: {error}",
-            dir.display()
-        )),
-        _ => Ok(()),
-    };
-    let fetched = fetched?;
-    removed.map(|()| fetched)
+    std::fs::create_dir_all(dir).map_err(|error| format!("creating {}: {error}", dir.display()))?;
+    let mut fetched = Vec::with_capacity(files.len());
+    for file in files {
+        let bytes = match blob(store, dir, file).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return Err(match remove_dir(dir) {
+                    Ok(()) => error,
+                    Err(removed) => format!("{error}; then {removed}"),
+                })
+            }
+        };
+        fetched.push(GuestPersonaFile {
+            content: STANDARD.encode(bytes),
+            digest: file.digest.clone(),
+            path: file.path.clone(),
+        });
+    }
+    remove_dir(dir)?;
+    Ok(fetched)
 }
