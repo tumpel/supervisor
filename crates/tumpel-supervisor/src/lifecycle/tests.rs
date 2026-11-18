@@ -25,7 +25,7 @@ use super::{
 use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
 use crate::images::ImageOrder;
-use crate::pool::{Disk, HeldDisk, Size, Tap, TapPool};
+use crate::pool::{Disk, Held, Size, Tap, TapPool};
 use crate::snapshot::{Born, Entry, Found, Kind, Scan, Stored, Upper};
 use crate::store::{Store, UploadError};
 
@@ -602,7 +602,7 @@ struct Host {
     capacity: u32,
     settings: Settings,
     sessions: tokio::sync::watch::Receiver<Vec<EntityId>>,
-    disk_held: tokio::sync::watch::Receiver<HeldDisk>,
+    holdings: tokio::sync::watch::Receiver<Held>,
     runner: tokio::task::JoinHandle<Result<(), String>>,
 }
 
@@ -797,7 +797,7 @@ fn start_host(
     let received = control_plane(store.clone(), lifecycle.answers(), Arc::clone(&log), from_lifecycle);
     lifecycle.start(taken).expect("the lifecycle starts");
     let sessions = lifecycle.sessions();
-    let disk_held = lifecycle.disk_held();
+    let holdings = lifecycle.holdings();
     let (commands, from_host) = unbounded_channel();
     let cancels = lifecycle.cancels();
     let runner = tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
@@ -814,7 +814,7 @@ fn start_host(
         capacity,
         settings,
         sessions,
-        disk_held,
+        holdings,
         runner,
     }
 }
@@ -2140,15 +2140,19 @@ async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_an_idle_box_fre
         "{refused:?}"
     );
     assert!(host.log().is_empty(), "a refused box never boots");
-    assert_eq!(host.disk_held.borrow().unevictable_mib, 65_536);
+    let held = host.holdings.borrow().clone();
+    assert_eq!(
+        (held.unevictable_disk_mib, held.memory_budget_mib, held.memory_held_mib),
+        (65_536, 3 * 4096, 2 * u64::from(BOX.memory_mib.get()))
+    );
     host.snapshot("session-1");
     host.settle(SETTLE).await;
     host.log();
-    let held = host.disk_held.borrow().clone();
+    let held = host.holdings.borrow().clone();
     let mut drives = held.drives.clone();
     drives.sort();
     assert_eq!(
-        (drives, held.unevictable_mib),
+        (drives, held.unevictable_disk_mib),
         (vec!["session-1".to_string(), "session-2".to_string()], 32_768),
         "the idle snapshotted box's disk is evictable, so the host does not report it held"
     );

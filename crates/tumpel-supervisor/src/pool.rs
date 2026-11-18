@@ -22,9 +22,11 @@ pub fn mib(value: i64) -> Option<NonZeroU32> {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct HeldDisk {
+pub struct Held {
     pub drives: Vec<String>,
-    pub unevictable_mib: u64,
+    pub unevictable_disk_mib: u64,
+    pub memory_budget_mib: u64,
+    pub memory_held_mib: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +187,16 @@ impl TapPool {
     #[must_use]
     pub fn held_disk_mib(&self) -> u64 {
         self.held_disk_mib
+    }
+
+    #[must_use]
+    pub fn budget_mib(&self) -> u64 {
+        self.budget_mib
+    }
+
+    #[must_use]
+    pub fn held_mib(&self) -> u64 {
+        self.held_mib
     }
 
     pub fn admits(&self, size: Size, freeing: &[Size], disk: Disk) -> Result<(), PoolExhausted> {

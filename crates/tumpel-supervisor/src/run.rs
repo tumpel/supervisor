@@ -33,7 +33,7 @@ use crate::lifecycle::{
     turn_failed, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder, Taken,
     TeardownOrder,
 };
-use crate::pool::{memory_budget_mib, mib, HeldDisk, Size, TapPool};
+use crate::pool::{memory_budget_mib, mib, Held, Size, TapPool};
 use crate::store::HttpStore;
 use crate::telemetry::{Telemetry, BATCH_POINTS};
 use crate::update::{self, HttpSource, Layout, Limits, Outcome, Startup, Updater};
@@ -175,14 +175,14 @@ struct Usage {
     warm: watch::Receiver<u32>,
     running: watch::Receiver<u32>,
     sessions: watch::Receiver<Vec<EntityId>>,
-    disk_held: watch::Receiver<HeldDisk>,
+    holdings: watch::Receiver<Held>,
     data_dir: PathBuf,
     telemetry: Telemetry,
 }
 
 impl Usage {
     fn sample(&self) -> Result<HostUsage, Failure> {
-        let held = self.disk_held.borrow().clone();
+        let held = self.holdings.borrow().clone();
         let stats = usage::sample(*self.warm.borrow(), &self.data_dir, &held)
             .map_err(|error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}")))?;
         self.telemetry.host(&stats, *self.running.borrow());
@@ -355,7 +355,7 @@ fn start_boxes(
         warm: lifecycle.warm(),
         running: lifecycle.boxes(),
         sessions: lifecycle.sessions(),
-        disk_held: lifecycle.disk_held(),
+        holdings: lifecycle.holdings(),
         data_dir: PathBuf::from(&*runtime.data_dir),
         telemetry,
     };
