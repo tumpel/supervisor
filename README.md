@@ -33,7 +33,7 @@ Each box runs in its own systemd user scope, `tumpel-box<k>.scope`, outside the 
 
 ## Releases
 
-A release is cut on purpose and ships everything merged since the last one. Push a `vX.Y.Z` tag, or run the release workflow on `main` to tag the next `vX.Y.Z`. The binary, the crates and the GitHub release carry the same version. A failed release reruns for the same version: it skips crates already on crates.io and finishes the GitHub release.
+Every push to `main` checks whether it needs a release. It releases only when a commit since the latest `vX.Y.Z` tag changed a shipped file: a crate source, a Cargo manifest, the toolchain or the guest drive build. Docs, tests and CI never release. The types of those commits pick the version: a breaking change bumps major, or minor while the version is 0.x, a `feat` bumps minor, and any other type bumps patch. The binary, the crates and the GitHub release carry the same version. A rerun of a failed release keeps the version, skips crates already on crates.io and finishes the GitHub release. The tag appears only when the GitHub release publishes.
 
 ## Development
 

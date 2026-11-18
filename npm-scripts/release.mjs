@@ -4,7 +4,6 @@ import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ChannelProtocol, GuestProtocol, SupervisorReleaseSchema } from "@tumpel/schemas";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CARGO = join(ROOT, "Cargo.toml");
@@ -22,29 +21,47 @@ const cargoVersion = (cargo) =>
 const tumpelApiPin = (cargo) =>
   cargo.match(/^tumpel-api = "=([^"]+)"$/m)?.[1] ?? die('Cargo.toml pins no tumpel-api = "=X.Y.Z"');
 
+const SHIPS = [
+  /^Cargo\.(toml|lock)$/,
+  /^rust-toolchain\.toml$/,
+  /^npm-scripts\/guest-drive\.mjs$/,
+  /^crates\/[^/]+\/(Cargo\.toml|build\.rs|release_version\.rs|src\/.+)$/,
+];
+
+export const ships = (path) => SHIPS.some((pattern) => pattern.test(path));
+
 const semver = (tag) => tag.slice(1).match(SEMVER)?.slice(1, 4).map(Number) ?? null;
 
-export const releaseVersion = (tags, headTags, bump, fallback) => {
-  const head = headTags.map(semver).filter(Boolean);
-  if (head.length > 1) die(`the commit carries ${headTags.join(" and ")}; delete all but one`);
-  if (head.length === 1) return head[0].join(".");
-  const latest = tags
-    .map(semver)
-    .filter(Boolean)
-    .sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2])
-    .at(-1);
-  if (!latest) return fallback;
-  const [major, minor, patch] = latest;
-  if (bump === "major") return `${major + 1}.0.0`;
-  if (bump === "minor") return `${major}.${minor + 1}.0`;
-  if (bump === "patch") return `${major}.${minor}.${patch + 1}`;
-  return die(`the bump is ${bump}; pass patch, minor or major`);
+export const latestTag = (tags) =>
+  tags
+    .filter(semver)
+    .sort((a, b) => {
+      const [x, y] = [semver(a), semver(b)];
+      return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
+    })
+    .at(-1) ?? die("the repository carries no vX.Y.Z tag to release after");
+
+const BREAKING = /^\w+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:/m;
+
+export const nextVersion = (latest, commits) => {
+  const shipping = commits.filter(({ files }) => files.some(ships)).map(({ message }) => message);
+  if (shipping.length === 0) return "";
+  const [major, minor, patch] = semver(latest);
+  if (shipping.some((message) => BREAKING.test(message))) return major === 0 ? `0.${minor + 1}.0` : `${major + 1}.0.0`;
+  if (shipping.some((message) => /^feat(\([^)]*\))?:/.test(message))) return `${major}.${minor + 1}.0`;
+  return `${major}.${minor}.${patch + 1}`;
 };
 
-const gitTags = (...args) =>
-  execFileSync("git", ["tag", "--list", "v*", ...args], { cwd: ROOT, encoding: "utf8" })
-    .split("\n")
-    .filter(Boolean);
+const git = (...args) => execFileSync("git", args, { cwd: ROOT, encoding: "utf8" });
+
+const commitsSince = (tag) =>
+  git("log", "--format=%x1e%B%x1f", "--name-only", `${tag}..HEAD`)
+    .split("\x1e")
+    .slice(1)
+    .map((commit) => {
+      const [message, files] = commit.split("\x1f");
+      return { message: message.trim(), files: files.split("\n").filter(Boolean) };
+    });
 
 export const unpublished = (version, indexes) =>
   CRATES.filter(
@@ -71,7 +88,8 @@ const stamp = (version) => {
 
 const sha256 = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
 
-const assets = (version, out) => {
+const assets = async (version, out) => {
+  const { ChannelProtocol, GuestProtocol, SupervisorReleaseSchema } = await import("@tumpel/schemas");
   const cargo = readFileSync(CARGO, "utf8");
   if (cargoVersion(cargo) !== version) die(`Cargo.toml names ${cargoVersion(cargo)}, not ${version}; stamp it first`);
   const api = tumpelApiPin(cargo);
@@ -107,13 +125,10 @@ const assets = (version, out) => {
 };
 
 const cli = async ([command, ...args]) => {
-  if (command === "version" && args.length === 1)
-    return releaseVersion(
-      gitTags(),
-      gitTags("--points-at", "HEAD"),
-      args[0],
-      cargoVersion(readFileSync(CARGO, "utf8")),
-    );
+  if (command === "plan" && args.length === 0) {
+    const latest = latestTag(git("tag", "--list", "v*").split("\n").filter(Boolean));
+    return nextVersion(latest, commitsSince(latest));
+  }
   if (command === "stamp" && args.length === 1) return stamp(args[0]);
   if (command === "assets" && args.length === 2) return assets(args[0], args[1]);
   if (command === "unpublished" && args.length === 1)
@@ -121,9 +136,7 @@ const cli = async ([command, ...args]) => {
       args[0],
       Object.fromEntries(await Promise.all(CRATES.map(async (c) => [c, await registryIndex(c)]))),
     ).join(" ");
-  return die(
-    "usage: release.mjs version <patch|minor|major> | stamp <X.Y.Z> | assets <X.Y.Z> <dir> | unpublished <X.Y.Z>",
-  );
+  return die("usage: release.mjs plan | stamp <X.Y.Z> | assets <X.Y.Z> <dir> | unpublished <X.Y.Z>");
 };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

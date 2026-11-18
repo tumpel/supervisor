@@ -15,4 +15,4 @@ Always follow `rules/errors.md` and `rules/coding-standards.md`.
 - `npm run check` runs every check. `npm run fix` formats.
 - `npm test` runs the Rust and release script tests. The `host-tests` feature needs KVM and runs by hand.
 - `npm run supervisor:build` builds the static guest, packs the guest drive and builds the release supervisor.
-- A release is cut on purpose: a pushed `vX.Y.Z` tag, or a manual run of the release workflow on `main` that tags the next patch, minor or major. A rerun releases the same version.
+- A push to `main` releases when a commit since the latest `vX.Y.Z` changed a shipped file; the conventional commit types pick the version. A rerun releases the same version.

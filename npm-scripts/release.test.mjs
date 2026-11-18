@@ -1,27 +1,57 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { releaseVersion, unpublished } from "./release.mjs";
+import { latestTag, nextVersion, ships, unpublished } from "./release.mjs";
 
-test("a rerun on a tagged commit releases its tag again instead of bumping", () => {
-  assert.equal(releaseVersion(["v0.1.18", "v0.1.19"], ["v0.1.19"], "minor", "0.1.0"), "0.1.19");
+test("crate sources, manifests and what builds the binary ship; docs, tests and CI do not", () => {
+  assert.equal(ships("crates/tumpel-guest/src/main.rs"), true);
+  assert.equal(ships("crates/tumpel-supervisor/src/turn/mod.rs"), true);
+  assert.equal(ships("crates/tumpel-supervisor/build.rs"), true);
+  assert.equal(ships("crates/tumpel-channel/Cargo.toml"), true);
+  assert.equal(ships("Cargo.lock"), true);
+  assert.equal(ships("npm-scripts/guest-drive.mjs"), true);
+  assert.equal(ships("crates/tumpel-supervisor/tests/lifecycle.rs"), false);
+  assert.equal(ships("README.md"), false);
+  assert.equal(ships(".github/workflows/release.yml"), false);
+  assert.equal(ships("npm-scripts/release.mjs"), false);
+  assert.equal(ships("package.json"), false);
 });
 
-test("an untagged commit bumps the latest release tag", () => {
-  const tags = ["v0.1.9", "v0.1.18", "v0.0.30", "vnext"];
-  assert.equal(releaseVersion(tags, [], "patch", "0.1.0"), "0.1.19");
-  assert.equal(releaseVersion(tags, [], "minor", "0.1.0"), "0.2.0");
-  assert.equal(releaseVersion(tags, [], "major", "0.1.0"), "1.0.0");
+test("commits that change nothing shipped cut no release, whatever their type", () => {
+  const commits = [
+    { message: "feat!: document the new protocol", files: ["README.md"] },
+    { message: "ci(release): cut releases on purpose", files: [".github/workflows/release.yml"] },
+    { message: "test(turn): cover a cancelled turn", files: ["crates/tumpel-supervisor/tests/turn.rs"] },
+  ];
+  assert.equal(nextVersion("v0.1.18", commits), "");
 });
 
-test("the first release takes the workspace version", () => {
-  assert.equal(releaseVersion([], [], "patch", "0.1.0"), "0.1.0");
+test("the commit types that changed shipped files pick the bump", () => {
+  const fix = { message: "fix(pool): adopt a box", files: ["crates/tumpel-supervisor/src/pool.rs"] };
+  const chore = { message: "chore(deps): bump tokio", files: ["Cargo.lock"] };
+  const feat = { message: "feat(turn): end a turn", files: ["crates/tumpel-guest/src/turn.rs"] };
+  const docsFeat = { message: "feat(docs): explain turns", files: ["README.md"] };
+  assert.equal(nextVersion("v0.1.18", [fix]), "0.1.19");
+  assert.equal(nextVersion("v0.1.18", [chore]), "0.1.19");
+  assert.equal(nextVersion("v0.1.18", [fix, docsFeat]), "0.1.19");
+  assert.equal(nextVersion("v0.1.18", [fix, feat]), "0.2.0");
+  assert.equal(nextVersion("v1.4.2", [feat]), "1.5.0");
 });
 
-test("a commit with two release tags refuses to pick one", () => {
-  assert.throws(
-    () => releaseVersion(["v0.1.19", "v0.1.20"], ["v0.1.19", "v0.1.20"], "patch", "0.1.0"),
-    /v0.1.19 and v0.1.20/,
-  );
+test("a breaking change bumps major, or minor while the version is 0.x", () => {
+  const bang = { message: "feat(channel)!: drop the v1 frame", files: ["crates/tumpel-channel/src/lib.rs"] };
+  const footer = {
+    message: "fix(guest): rename the socket\n\nBREAKING CHANGE: the guest listens on a new port",
+    files: ["crates/tumpel-guest/src/main.rs"],
+  };
+  assert.equal(nextVersion("v0.1.18", [bang]), "0.2.0");
+  assert.equal(nextVersion("v0.1.18", [footer]), "0.2.0");
+  assert.equal(nextVersion("v1.4.2", [bang]), "2.0.0");
+  assert.equal(nextVersion("v1.4.2", [footer]), "2.0.0");
+});
+
+test("the latest release is the highest vX.Y.Z tag", () => {
+  assert.equal(latestTag(["v0.1.9", "v0.1.18", "v0.0.30", "vnext"]), "v0.1.18");
+  assert.throws(() => latestTag(["vnext"]), /no vX.Y.Z tag/);
 });
 
 test("crates already on crates.io at the version are skipped, in publish order", () => {
