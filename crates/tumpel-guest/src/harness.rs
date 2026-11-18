@@ -321,6 +321,7 @@ pub struct GuestState {
     memory: Memory,
     forwarder: Forwarder,
     caches_masked: bool,
+    pi_config_mounted: bool,
 }
 
 fn read_line_seq() -> Result<i64, String> {
@@ -476,7 +477,7 @@ fn turn_arguments(
     thread: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let model = start.model.to_string();
-    let connectors = connectors::arguments(protocol, &start.credential.connectors)?;
+    let connectors = connectors::arguments(protocol, &start.credential.connectors);
     Ok(match protocol {
         GuestHarnessProtocol::ShellLines => Vec::new(),
         GuestHarnessProtocol::CodexExecJson => {
@@ -703,6 +704,7 @@ impl GuestState {
             memory,
             forwarder: Forwarder::start()?,
             caches_masked: false,
+            pi_config_mounted: false,
         })
     }
 
@@ -735,9 +737,15 @@ impl GuestState {
         credential_file::take_changed(&target, &written)
     }
 
-    fn spawn(&self, start: &GuestTurnStart) -> Result<Harness, String> {
+    fn spawn(&mut self, start: &GuestTurnStart) -> Result<Harness, String> {
         let written = write_files(&self.home, &start.files, &read_written()?)?;
-        connectors::refuse_reserved(self.config.protocol, &self.home, &start.credential.connectors)?;
+        let persona_files: Vec<&str> = start.files.iter().map(|file| file.path.as_str()).collect();
+        let connectors = &start.credential.connectors;
+        connectors::refuse_reserved(self.config.protocol, &self.home, &persona_files, connectors)?;
+        if self.config.protocol == GuestHarnessProtocol::PiRpc && !connectors.is_empty() {
+            connectors::write_pi_config(&self.home, connectors, self.pi_config_mounted)?;
+            self.pi_config_mounted = true;
+        }
         std::fs::create_dir_all(STATE_DIR).map_err(|error| format!("creating {STATE_DIR}: {error}"))?;
         std::fs::write(
             WRITTEN_FILE,
