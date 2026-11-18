@@ -22,7 +22,7 @@
     "prepare": "git config core.hooksPath .githooks"
   },
   "dependencies": {
-    "@tumpel/schemas": "https://github.com/tumpel/protocol/releases/download/v0.7.0/tumpel-schemas-0.7.0.tgz"
+    "@tumpel/schemas": "https://github.com/tumpel/protocol/releases/download/v0.8.0/tumpel-schemas-0.8.0.tgz"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.8"

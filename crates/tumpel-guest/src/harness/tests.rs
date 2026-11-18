@@ -21,6 +21,7 @@ fn start(model: &str, variables: &Value, files: &Value) -> GuestTurnStart {
             "credentialHandoverId": "grant-1",
             "expiresAt": "2026-11-14T12:00:00+01:00",
             "variables": variables,
+            "connectors": [],
         },
         "files": files,
         "repository": "https://github.com/acme/app.git",
@@ -56,6 +57,24 @@ fn a_changed_credential_restarts_the_harness_and_an_unchanged_one_does_not() {
         &launch(&keys, &start("claude-opus", &key("sk-first"), &json!([])))
     ));
     assert!(!reuses(None, &running));
+}
+
+#[test]
+fn a_changed_connector_set_restarts_the_harness_and_a_new_turn_token_does_not() {
+    let keys = RandomState::new();
+    let with = |connectors: Value| {
+        let mut turn = start("claude-sonnet", &key("sk"), &json!([]));
+        turn.credential.connectors = serde_json::from_value(connectors).expect("the connectors read");
+        launch(&keys, &turn)
+    };
+    let connector = |id: &str, token: char| json!({ "connectorId": id, "url": "https://mcp.example.com/mcp", "tokenUrl": "https://t.example.com/token", "tokenCredential": token.to_string().repeat(43) });
+    let running = with(json!([connector("A1", 'a')]));
+    assert!(reuses(Some(&running), &with(json!([connector("A1", 'b')]))));
+    assert!(!reuses(
+        Some(&running),
+        &with(json!([connector("A1", 'a'), connector("B2", 'a')]))
+    ));
+    assert!(!reuses(Some(&running), &with(json!([]))));
 }
 
 #[test]

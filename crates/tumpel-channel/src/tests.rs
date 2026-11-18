@@ -122,7 +122,8 @@ fn offer(seq: i64, credential: &str) -> String {
             "credential": {
                 "credentialHandoverId": credential,
                 "expiresAt": "2026-11-14T12:00:00+01:00",
-                "variables": [{"name": "API_KEY", "value": format!("secret-{credential}")}]
+                "variables": [{"name": "API_KEY", "value": format!("secret-{credential}")}],
+                "connectors": []
             },
             "lastLineSeq": 0,
             "snapshots": [],

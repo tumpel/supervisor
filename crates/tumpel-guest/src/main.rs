@@ -1,3 +1,5 @@
+mod connectors;
+mod forwarder;
 mod harness;
 mod memory;
 mod repository;
