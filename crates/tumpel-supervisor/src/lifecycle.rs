@@ -37,7 +37,7 @@ use crate::exchange::{part_number, Answer, Answers, Ask, Cancels, Key, Waiting, 
 use crate::harness_result::{error_result, exit_result, turn_end};
 use crate::images;
 use crate::layers::LayerCache;
-use crate::pool::{mib, Disk, HeldDisk, Size, Tap, TapPool};
+use crate::pool::{mib, Disk, Held, Size, Tap, TapPool};
 use crate::snapshot::{
     assemble, cut, decode, decode_root, draft_digests, fetches, fresh, lacking, restore_parts, stage, unpack,
     write_restore, Base, Births, ChunkCache, Cut, Fetch, Kind, Manifest, PackFile, Place, Places, Span,
@@ -1873,7 +1873,7 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     boxes: watch::Sender<u32>,
     busy: watch::Sender<u32>,
     sessions: watch::Sender<Vec<EntityId>>,
-    disk_held: watch::Sender<HeldDisk>,
+    holdings: watch::Sender<Held>,
     setups: HashMap<String, UnboundedSender<SetupInput>>,
     setup_tasks: HashMap<String, JoinHandle<()>>,
     mode: Mode,
@@ -1893,6 +1893,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let (events, finished) = unbounded_channel();
         let layers = LayerCache::new(&vmm.image_cache(), settings.layer_cache_mib);
         let (parking, parked) = watch::channel(false);
+        let holdings = watch::Sender::new(Held {
+            memory_budget_mib: pool.budget_mib(),
+            ..Held::default()
+        });
         Self {
             runner: Runner {
                 layers,
@@ -1918,7 +1922,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             boxes: watch::Sender::new(0),
             busy: watch::Sender::new(0),
             sessions: watch::Sender::new(Vec::new()),
-            disk_held: watch::Sender::new(HeldDisk::default()),
+            holdings,
             setups: HashMap::new(),
             setup_tasks: HashMap::new(),
             mode: Mode::TakingTurns,
@@ -1948,8 +1952,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     #[must_use]
-    pub fn disk_held(&self) -> watch::Receiver<HeldDisk> {
-        self.disk_held.subscribe()
+    pub fn holdings(&self) -> watch::Receiver<Held> {
+        self.holdings.subscribe()
     }
 
     #[must_use]
@@ -1970,7 +1974,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.busy.send_replace(u32::try_from(boxes - warm).unwrap_or(u32::MAX));
         self.sessions
             .send_replace(self.slots.keys().map(|session| held_session(session)).collect());
-        self.disk_held.send_replace(self.held_disk());
+        self.holdings.send_replace(self.current_holdings());
     }
 
     /// # Errors
@@ -2801,23 +2805,25 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .map_err(|exhausted| exhausted.to_string())
     }
 
-    fn held_disk(&self) -> HeldDisk {
+    fn current_holdings(&self) -> Held {
         let evictable = self
             .slots
             .values()
             .filter_map(Slot::evictable)
             .map(|(_, size)| u64::from(size.disk_mib.get()))
             .sum::<u64>();
-        HeldDisk {
+        Held {
             drives: self.slots.keys().chain(self.setups.keys()).cloned().collect(),
-            unevictable_mib: self.pool.held_disk_mib() - evictable,
+            unevictable_disk_mib: self.pool.held_disk_mib() - evictable,
+            memory_budget_mib: self.pool.budget_mib(),
+            memory_held_mib: self.pool.held_mib(),
         }
     }
 
     fn disk(&self) -> Result<Disk, String> {
         self.runner
             .vmm
-            .disk(&self.held_disk().drives)
+            .disk(&self.current_holdings().drives)
             .map_err(|error| format!("reading the disk this host has free failed: {error}"))
     }
 

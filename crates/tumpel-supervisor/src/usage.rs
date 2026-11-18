@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use tumpel_api::types::{HostArchitecture, HostUsage};
 
 use crate::firecracker::OVERLAY_DRIVE;
-use crate::pool::{Disk, HeldDisk};
+use crate::pool::{Disk, Held};
 
 const MEMINFO: &str = "/proc/meminfo";
 const LOADAVG: &str = "/proc/loadavg";
@@ -135,7 +135,7 @@ pub struct HostStats {
     pub cpu: CpuTimes,
 }
 
-fn stats(boxes_warm: u32, disk: Disk, held_mib: u64, procs: [&str; 3]) -> Result<HostStats> {
+fn stats(boxes_warm: u32, disk: Disk, held: &Held, procs: [&str; 3]) -> Result<HostStats> {
     let [meminfo, loadavg, stat] = procs;
     let loads = load_averages(loadavg)?;
     Ok(HostStats {
@@ -144,7 +144,9 @@ fn stats(boxes_warm: u32, disk: Disk, held_mib: u64, procs: [&str; 3]) -> Result
             load_average: loads[0],
             memory_available_mib: i64::try_from(meminfo_kib(meminfo, "MemAvailable")? / 1024).unwrap_or(i64::MAX),
             disk_budget_mib: Some(i64::try_from(disk.budget_mib()).unwrap_or(i64::MAX)),
-            disk_held_mib: Some(i64::try_from(held_mib).unwrap_or(i64::MAX)),
+            disk_held_mib: Some(i64::try_from(held.unevictable_disk_mib).unwrap_or(i64::MAX)),
+            memory_budget_mib: Some(i64::try_from(held.memory_budget_mib).unwrap_or(i64::MAX)),
+            memory_held_mib: Some(i64::try_from(held.memory_held_mib).unwrap_or(i64::MAX)),
         },
         memory_total_mib: meminfo_kib(meminfo, "MemTotal")? / 1024,
         loads,
@@ -152,18 +154,13 @@ fn stats(boxes_warm: u32, disk: Disk, held_mib: u64, procs: [&str; 3]) -> Result
     })
 }
 
-pub fn sample(boxes_warm: u32, data_dir: &Path, held: &HeldDisk) -> Result<HostStats> {
+pub fn sample(boxes_warm: u32, data_dir: &Path, held: &Held) -> Result<HostStats> {
     let loadavg =
         std::fs::read_to_string(LOADAVG).with_context(|| format!("reading {LOADAVG} for the host's load failed"))?;
     let stat =
         std::fs::read_to_string(STAT).with_context(|| format!("reading {STAT} for the host's CPU time failed"))?;
     let disk = disk(data_dir, &held.drives)?;
-    stats(
-        boxes_warm,
-        disk,
-        held.unevictable_mib,
-        [&read_meminfo()?, &loadavg, &stat],
-    )
+    stats(boxes_warm, disk, held, [&read_meminfo()?, &loadavg, &stat])
 }
 
 #[cfg(test)]
@@ -171,6 +168,7 @@ mod tests {
     use std::path::Path;
 
     use super::{cpu_times, disk, prepare_data_dir, stats, written_mib, Disk};
+    use crate::pool::Held;
 
     #[test]
     fn a_freshly_enrolled_host_without_a_data_directory_creates_it_and_reads_its_disk() {
@@ -218,16 +216,26 @@ mod tests {
             free_mib: 80_000,
             written_mib: 0,
         };
+        let held = Held {
+            drives: Vec::new(),
+            unevictable_disk_mib: 32_768,
+            memory_budget_mib: 33_792,
+            memory_held_mib: 6144,
+        };
         let sampled = stats(
             0,
             disk,
-            32_768,
+            &held,
             [include_str!("usage/meminfo"), include_str!("usage/loadavg"), STAT],
         )
         .expect("stats");
         assert_eq!(
             (sampled.usage.disk_budget_mib, sampled.usage.disk_held_mib),
             (Some(70_000), Some(32_768))
+        );
+        assert_eq!(
+            (sampled.usage.memory_budget_mib, sampled.usage.memory_held_mib),
+            (Some(33_792), Some(6144))
         );
         assert_eq!(sampled.usage.memory_available_mib, 12_973_128 / 1024);
         assert_eq!(sampled.memory_total_mib, 16_375_664 / 1024);
