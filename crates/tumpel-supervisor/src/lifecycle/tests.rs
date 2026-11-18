@@ -2217,6 +2217,11 @@ async fn a_stuck_reassembly_outlasts_the_boot_budget_then_fails_with_its_size() 
         "{seen:?}"
     );
     assert!(!host.vmm.staging.join("session-1").exists());
+    host.settle(Duration::from_millis(200)).await;
+    assert!(
+        !archive.with_file_name("restore.tar").exists(),
+        "a timed-out restore leaves no archive"
+    );
 }
 
 #[tokio::test]
