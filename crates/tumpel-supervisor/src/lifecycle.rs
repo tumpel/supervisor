@@ -3,6 +3,7 @@ use std::future::Future;
 use std::io::BufWriter;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -633,6 +634,26 @@ fn remove_file(path: &Path) -> Result<(), String> {
     }
 }
 
+fn rebuild_archive(
+    manifest: Manifest,
+    cache: &ChunkCache,
+    output: &Path,
+    chunks: &Path,
+    cancelled: &AtomicBool,
+) -> Result<(Manifest, u64), String> {
+    let out = std::fs::File::create(output).map_err(|error| format!("creating {}: {error}", output.display()))?;
+    let written = write_restore(&manifest, cache, BufWriter::new(out), cancelled);
+    if cancelled.load(Ordering::Relaxed) {
+        remove_file(output)?;
+    }
+    written?;
+    remove_dir(chunks)?;
+    let archived = std::fs::metadata(output)
+        .map_err(|error| format!("reading the size of {}: {error}", output.display()))?
+        .len();
+    Ok((manifest, archived))
+}
+
 fn console_during_turn(tail: &str) -> String {
     if tail.is_empty() {
         "The box's console printed nothing during the turn.".to_string()
@@ -1212,19 +1233,18 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let target = dir.join("restore.tar");
         let output = target.clone();
         let chunks = dir.join(CHUNKS);
-        let rebuild = tokio::task::spawn_blocking(move || -> Result<(Manifest, u64), String> {
-            let out =
-                std::fs::File::create(&output).map_err(|error| format!("creating {}: {error}", output.display()))?;
-            write_restore(&manifest, &cache, BufWriter::new(out))?;
-            remove_dir(&chunks)?;
-            let archived = std::fs::metadata(&output)
-                .map_err(|error| format!("reading the size of {}: {error}", output.display()))?
-                .len();
-            Ok((manifest, archived))
-        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::clone(&cancel);
+        let rebuild =
+            tokio::task::spawn_blocking(move || rebuild_archive(manifest, &cache, &output, &chunks, &cancelled));
         let budget = restore_budget(self.settings.budgets.boot, bytes, entries);
         let seconds = budget.as_secs();
-        match timeout(budget, rebuild).await {
+        let outcome = timeout(budget, rebuild).await;
+        if outcome.is_err() {
+            cancel.store(true, Ordering::Relaxed);
+            remove_file(&target)?;
+        }
+        match outcome {
             Ok(Ok(Ok((manifest, archived)))) => Ok(Some((
                 target,
                 Base {

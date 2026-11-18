@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ext4_view::{Ext4, FileType};
 use fastcdc::v2020::StreamCDC;
@@ -796,12 +797,13 @@ fn append<W: Write>(
     written.map_err(|error| format!("writing {} into the archive: {error}", shown(name)))
 }
 
-struct ChunkReader {
+struct ChunkReader<'a> {
     pending: VecDeque<PathBuf>,
     current: Option<File>,
+    cancel: &'a AtomicBool,
 }
 
-impl Read for ChunkReader {
+impl Read for ChunkReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         loop {
             if let Some(current) = self.current.as_mut() {
@@ -814,12 +816,21 @@ impl Read for ChunkReader {
             let Some(next) = self.pending.pop_front() else {
                 return Ok(0);
             };
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, CANCELLED));
+            }
             self.current = Some(File::open(next)?);
         }
     }
 }
 
-fn reassembled(path: &[u8], size: u64, chunks: &[Place], cache: &ChunkCache) -> Result<ChunkReader, String> {
+fn reassembled<'a>(
+    path: &[u8],
+    size: u64,
+    chunks: &[Place],
+    cache: &ChunkCache,
+    cancel: &'a AtomicBool,
+) -> Result<ChunkReader<'a>, String> {
     let mut total = 0u64;
     let mut pending = VecDeque::with_capacity(chunks.len());
     for place in chunks {
@@ -850,14 +861,28 @@ fn reassembled(path: &[u8], size: u64, chunks: &[Place], cache: &ChunkCache) -> 
             shown(path)
         ));
     }
-    Ok(ChunkReader { pending, current: None })
+    Ok(ChunkReader {
+        pending,
+        current: None,
+        cancel,
+    })
 }
 
-pub fn write_restore<W: Write>(manifest: &Manifest, cache: &ChunkCache, out: W) -> Result<(), String> {
+pub const CANCELLED: &str = "the restore was cancelled";
+
+pub fn write_restore<W: Write>(
+    manifest: &Manifest,
+    cache: &ChunkCache,
+    out: W,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     let mut builder = Builder::new(out);
     for (path, stored) in manifest {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLED.to_string());
+        }
         let mut content: Box<dyn Read> = match stored.entry.kind {
-            Kind::File { size } => Box::new(reassembled(path, size, &stored.chunks, cache)?),
+            Kind::File { size } => Box::new(reassembled(path, size, &stored.chunks, cache, cancel)?),
             _ => Box::new(std::io::empty()),
         };
         append(&mut builder, path, &stored.entry, &mut content)?;
