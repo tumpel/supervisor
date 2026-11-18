@@ -735,6 +735,7 @@ impl GuestState {
                 if let Some(harness) = self.harness.take() {
                     harness.stop();
                 }
+                unsafe { libc::sync() };
                 return Err(error);
             }
         };
@@ -853,7 +854,7 @@ impl GuestState {
                 format!("writing the prompt failed: {error}; {}", harness.stderr_tail()),
             ));
         }
-        let mut killed_tail = None;
+        let mut killed = None;
         let mut spend = Spend::new(protocol);
         let ending = loop {
             let text = match harness.receive(protocol, turn) {
@@ -871,8 +872,8 @@ impl GuestState {
                     if per_turn(protocol) && waited.as_ref().is_ok_and(std::process::ExitStatus::success) {
                         break ended(GuestTurnEndReason::Completed, "");
                     }
-                    killed_tail = (waited.as_ref().ok().and_then(ExitStatusExt::signal) == Some(libc::SIGKILL))
-                        .then(|| harness.stderr_tail());
+                    killed = (waited.as_ref().ok().and_then(ExitStatusExt::signal) == Some(libc::SIGKILL))
+                        .then(|| (harness.child.id(), harness.stderr_tail()));
                     let status = waited.map_or_else(|error| error.to_string(), |status| status.to_string());
                     break ended(
                         GuestTurnEndReason::HarnessExited,
@@ -912,14 +913,14 @@ impl GuestState {
             }
         };
         self.last_line_seq = last_line_seq;
-        with_spend(self.killed_by_oom(ending, killed_tail)?, &spend, protocol, priced)
+        with_spend(self.killed_by_oom(ending, killed)?, &spend, protocol, priced)
     }
 
-    fn killed_by_oom(&mut self, ending: Ending, killed_tail: Option<String>) -> Result<Ending, String> {
-        let Some(tail) = killed_tail else {
+    fn killed_by_oom(&mut self, ending: Ending, killed: Option<(u32, String)>) -> Result<Ending, String> {
+        let Some((pid, tail)) = killed else {
             return Ok(ending);
         };
-        let Some(victim) = crate::memory::victim(&self.memory.kernel.drain()?) else {
+        let Some(victim) = crate::memory::victim(&self.memory.kernel.drain()?, pid) else {
             return Ok(ending);
         };
         Ok(ended(

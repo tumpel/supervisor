@@ -534,14 +534,14 @@ enum Report {
 struct Failure {
     report: Report,
     detail: String,
-    keeps_box: bool,
 }
 
-fn stopping(reason: TurnFailureReason, detail: impl Into<String>) -> Failure {
-    Failure {
-        report: Report::Turn(reason),
-        detail: detail.into(),
-        keeps_box: false,
+impl Failure {
+    fn turn(reason: TurnFailureReason, detail: impl Into<String>) -> Self {
+        Self {
+            report: Report::Turn(reason),
+            detail: detail.into(),
+        }
     }
 }
 
@@ -1212,7 +1212,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     async fn start(&self, live: &mut LiveBox<V::Machine>, turn: &BoxTurn, start: GuestTurnStart) -> Followed {
         let started = Instant::now();
         if let Err(error) = live.guest.send(&GuestInput::TurnStart(start)).await {
-            return Followed::Ended(Err(stopping(
+            return Followed::Ended(Err(Failure::turn(
                 TurnFailureReason::BoxBootFailed,
                 format!("handing turn {} to the guest failed: {error}", *turn.turn_id),
             )));
@@ -1267,7 +1267,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 prebuild_commit_sha,
             })
             .map_err(|error| {
-                stopping(
+                Failure::turn(
                     TurnFailureReason::BoxBootFailed,
                     format!(
                         "turn {} names a prebuild commit the guest does not take: {error}",
@@ -1288,18 +1288,17 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 );
                 return self.pause(live).await;
             }
-            Some(_) => Followed::Ended(Err(stopping(
+            Some(_) => Followed::Ended(Err(Failure::turn(
                 TurnFailureReason::NotClaimed,
                 unexpected(&claiming.asking.key),
             ))),
-            None => Followed::Ended(Err(Failure {
-                report: Report::Turn(TurnFailureReason::NotClaimed),
-                detail: format!(
+            None => Followed::Ended(Err(Failure::turn(
+                TurnFailureReason::NotClaimed,
+                format!(
                     "this supervisor stopped waiting for the answer to the claim of turn {}, so its harness never started; the control plane offers the turn again",
                     *turn.turn_id
                 ),
-                keeps_box: true,
-            })),
+            ))),
         };
         self.end_turn(live, &turn.turn_id, followed).await
     }
@@ -1323,48 +1322,48 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             }
         };
         live.dirty = true;
-        match result {
-            Ok(last_line_seq) => {
-                emit(
-                    &self.out,
-                    ChannelTurnComplete {
-                        credential_file: live.credential_file.take().and_then(|file| file.try_into().ok()),
-                        completed_at: now(),
-                        last_line_seq,
-                        turn_id: turn_id.clone(),
-                        type_: ChannelTurnCompleteType::TurnComplete,
-                    },
-                );
-                self.pause(live).await
-            }
-            Err(failure) if failure.keeps_box => {
-                match (failure.report, live.credential_file.take()) {
-                    (Report::Turn(reason), Some(file)) => emit(
-                        &self.out,
-                        ChannelTurnFailed {
-                            credential_file: file.try_into().ok(),
-                            detail: failure.detail,
-                            failed_at: now(),
-                            reason,
-                            turn_id: turn_id.clone(),
-                            type_: ChannelTurnFailedType::TurnFailed,
-                        },
-                    ),
-                    (report, _) => report_failure(&self.out, turn_id, report, failure.detail),
-                }
-                self.pause(live).await
-            }
-            Err(failure) => {
-                let (tap, tail) = stop_box(&self.standing, live).await;
-                report_failure(
-                    &self.out,
-                    turn_id,
-                    failure.report,
-                    format!("{} {}", failure.detail, console_during_turn(&tail)),
-                );
-                Outcome::Gone(tap)
-            }
+        let result = result.map_err(|failure| match failure.report {
+            Report::Turn(_) => Failure {
+                detail: format!(
+                    "{} {}",
+                    failure.detail,
+                    console_during_turn(&live.machine.console_tail())
+                ),
+                ..failure
+            },
+            Report::Clone(_) => failure,
+        });
+        match (result, live.credential_file.take()) {
+            (Ok(last_line_seq), file) => emit(
+                &self.out,
+                ChannelTurnComplete {
+                    credential_file: file.and_then(|file| file.try_into().ok()),
+                    completed_at: now(),
+                    last_line_seq,
+                    turn_id: turn_id.clone(),
+                    type_: ChannelTurnCompleteType::TurnComplete,
+                },
+            ),
+            (
+                Err(Failure {
+                    report: Report::Turn(reason),
+                    detail,
+                }),
+                Some(file),
+            ) => emit(
+                &self.out,
+                ChannelTurnFailed {
+                    credential_file: file.try_into().ok(),
+                    detail,
+                    failed_at: now(),
+                    reason,
+                    turn_id: turn_id.clone(),
+                    type_: ChannelTurnFailedType::TurnFailed,
+                },
+            ),
+            (Err(failure), _) => report_failure(&self.out, turn_id, failure.report, failure.detail),
         }
+        self.recover(live).await
     }
 
     async fn recover(&self, mut live: LiveBox<V::Machine>) -> Outcome<V::Machine> {
@@ -1379,7 +1378,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let session = live.session_id.to_string();
         let (tap, tail) = stop_box(&self.standing, live).await;
         eprintln!(
-            "tumpel-supervisor: the box of session {session} could not be reached after the supervisor stopped unexpectedly and was stopped: {failed}. Console: {tail}"
+            "tumpel-supervisor: the box of session {session} did not take a new guest connection and was stopped: {failed}. Console: {tail}"
         );
         Outcome::Gone(tap)
     }
@@ -1407,20 +1406,20 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let first_line = self.settings.budgets.first_line;
         let detail = if repository_ready {
             format!(
-                "turn {} sent no line within {} s of its repository being ready (budgets.firstLineSeconds in runtime.json); the box was stopped.",
+                "turn {} sent no line within {} s of its repository being ready (budgets.firstLineSeconds in runtime.json).",
                 **turn_id,
                 first_line.as_secs()
             )
         } else {
             format!(
-                "turn {} had no repository ready and no line within {} s, the image's cloneSeconds {} plus budgets.firstLineSeconds {} in runtime.json; the box was stopped.",
+                "turn {} had no repository ready and no line within {} s, the image's cloneSeconds {} plus budgets.firstLineSeconds {} in runtime.json.",
                 **turn_id,
                 (clone + first_line).as_secs(),
                 clone.as_secs(),
                 first_line.as_secs()
             )
         };
-        stopping(TurnFailureReason::NoFirstOutput, detail)
+        Failure::turn(TurnFailureReason::NoFirstOutput, detail)
     }
 
     async fn follow(
@@ -1446,10 +1445,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 return Followed::Ended(Err(if waiting_for_first {
                     self.no_first_output(turn_id, clone, state.repository_ready)
                 } else {
-                    stopping(
+                    Failure::turn(
                         TurnFailureReason::TurnTimedOut,
                         format!(
-                            "turn {} ran past its {} s budget (budgets.turnSeconds in runtime.json); the box was stopped.",
+                            "turn {} ran past its {} s budget (budgets.turnSeconds in runtime.json).",
                             **turn_id,
                             self.settings.budgets.turn.as_secs()
                         ),
@@ -1458,7 +1457,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             };
             match received {
                 Err(error) => {
-                    return Followed::Ended(Err(stopping(
+                    return Followed::Ended(Err(Failure::turn(
                         TurnFailureReason::HarnessExited,
                         format!("the guest connection dropped mid-turn: {error}."),
                     )))
@@ -1499,26 +1498,20 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     live.credential_file = end.credential_file.as_deref().cloned();
                     telemetry::guest_metrics(&end.metrics);
                     let error = state.error.or_else(|| exit_result(protocol, &end));
-                    return Followed::Ended(turn_end(end, error).map_err(|(reason, detail)| Failure {
-                        report: Report::Turn(reason),
-                        detail,
-                        keeps_box: true,
-                    }));
+                    return Followed::Ended(
+                        turn_end(end, error).map_err(|(reason, detail)| Failure::turn(reason, detail)),
+                    );
                 }
                 Ok(GuestMessage::TurnRepositoryCloneFailed(failed)) if failed.turn_id == *turn_id => {
                     return Followed::Ended(Err(Failure {
                         report: Report::Clone(failed.cause),
                         detail: failed.detail,
-                        keeps_box: true,
                     }));
                 }
                 Ok(other) => {
-                    return Followed::Ended(Err(stopping(
+                    return Followed::Ended(Err(Failure::turn(
                         TurnFailureReason::HarnessExited,
-                        format!(
-                            "the guest sent {other:?} during turn {}; the box was stopped.",
-                            **turn_id
-                        ),
+                        format!("the guest sent {other:?} during turn {}.", **turn_id),
                     )))
                 }
             }

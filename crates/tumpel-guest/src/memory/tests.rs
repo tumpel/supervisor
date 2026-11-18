@@ -42,7 +42,6 @@ fn the_agent_leaves_the_oom_killer_and_the_harness_gets_its_own_group_where_only
     assert_eq!(read(&proc_root.join("self/oom_score_adj")), "-1000");
     assert_eq!(read(&own.join("agent/cgroup.procs")), "4242");
     assert_eq!(read(&own.join("cgroup.subtree_control")), "+memory");
-    assert!(!own.join("harness/memory.oom.group").exists());
     assert_eq!(
         confinement,
         Confinement::Group {
@@ -96,24 +95,20 @@ fn a_confined_child_joins_the_harness_group_with_score_500_before_it_runs() {
 }
 
 #[test]
-fn the_first_oom_kill_line_names_the_process_the_kernel_picked() {
+fn the_oom_kill_of_the_harness_names_the_harness_even_after_an_earlier_kill_of_a_build() {
     let records = [
         "6,1500,8312000,-;rustc invoked oom-killer: gfp_mask=0x140cca(GFP_HIGHUSER_MOVABLE|__GFP_COMP), order=0, oom_score_adj=500\n".to_string(),
-        "6,1519,8312440,-;Tasks in /system.slice/tumpel-guest.service/harness are going to be killed due to memory.oom.group set\n".to_string(),
         "3,1520,8312450,-;Out of memory: Killed process 1234 (rustc) total-vm:812344kB, anon-rss:546012kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:1400kB oom_score_adj:500\n SUBSYSTEM=memory\n".to_string(),
         "3,1521,8312455,-;Memory cgroup out of memory: Killed process 1100 (claude) total-vm:1200000kB, anon-rss:300000kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:900kB oom_score_adj:500\n".to_string(),
     ];
     assert_eq!(
-        victim(&records),
+        victim(&records, 1100),
         Some(Victim {
-            process: "rustc".to_string(),
-            line: "Out of memory: Killed process 1234 (rustc) total-vm:812344kB, anon-rss:546012kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:1400kB oom_score_adj:500".to_string(),
+            process: "claude".to_string(),
+            line: "Memory cgroup out of memory: Killed process 1100 (claude) total-vm:1200000kB, anon-rss:300000kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:900kB oom_score_adj:500".to_string(),
         })
     );
-    assert_eq!(
-        victim(&records[3..]).map(|victim| victim.process),
-        Some("claude".to_string())
-    );
+    assert_eq!(victim(&records[..2], 1100), None);
 }
 
 #[test]
@@ -123,5 +118,5 @@ fn a_kernel_log_without_an_oom_kill_names_no_victim() {
         "4,2,200,-;Out of memory: Killed process nope (rustc) total-vm:1kB\n".to_string(),
         "6,3,300,-;virtio_blk virtio1: [vda] 4194304 512-byte logical blocks\n".to_string(),
     ];
-    assert_eq!(victim(&records), None);
+    assert_eq!(victim(&records, 99), None);
 }

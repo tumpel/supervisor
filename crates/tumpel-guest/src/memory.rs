@@ -114,24 +114,27 @@ fn record_text(record: &str) -> &str {
     message.split_once('\n').map_or(message, |(line, _)| line).trim_end()
 }
 
-fn killed_process(line: &str) -> Option<&str> {
+fn killed_process(line: &str) -> Option<(u32, &str)> {
     let (cause, killed) = line.split_once(": Killed process ")?;
     if !cause.ends_with("out of memory") && !cause.ends_with("Out of memory") {
         return None;
     }
     let (pid, rest) = killed.split_once(" (")?;
-    pid.parse::<u32>().ok()?;
+    let pid = pid.parse::<u32>().ok()?;
     rest.split_once(") total-vm:")
         .map(|(process, _)| process)
         .or_else(|| rest.rsplit_once(')').map(|(process, _)| process))
+        .map(|process| (pid, process))
 }
 
-pub fn victim(records: &[String]) -> Option<Victim> {
+pub fn victim(records: &[String], harness_pid: u32) -> Option<Victim> {
     records.iter().map(|record| record_text(record)).find_map(|line| {
-        killed_process(line).map(|process| Victim {
-            process: process.to_string(),
-            line: line.to_string(),
-        })
+        killed_process(line)
+            .filter(|(pid, _)| *pid == harness_pid)
+            .map(|(_, process)| Victim {
+                process: process.to_string(),
+                line: line.to_string(),
+            })
     })
 }
 
@@ -196,7 +199,7 @@ impl Memory {
 
     pub fn out_of_memory(&self, victim: &Victim, stderr_tail: &str) -> String {
         format!(
-            "the box ran out of its {} MiB of memory and the kernel killed {} ({}), which stopped the harness; give the persona more boxMemoryMib or have it run lighter builds; {stderr_tail}",
+            "the box ran out of its {} MiB of memory and the kernel killed the harness {} ({}); give the persona more boxMemoryMib or have it run lighter builds; {stderr_tail}",
             self.box_mib, victim.process, victim.line
         )
     }

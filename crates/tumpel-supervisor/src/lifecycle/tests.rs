@@ -1074,8 +1074,10 @@ async fn a_turn_inside_the_warm_window_resumes_the_paused_box() {
         host.log(),
         [
             "boot session-1 on tumpel0",
+            "reconnect session-1",
             "pause session-1",
             "resume session-1",
+            "reconnect session-1",
             "pause session-1"
         ]
     );
@@ -1098,6 +1100,7 @@ async fn the_claim_goes_out_before_the_boot_and_the_harness_starts_only_once_bot
             "boot session-1 on tumpel0",
             "claimed late-1",
             "start late-1",
+            "reconnect session-1",
             "pause session-1"
         ]
     );
@@ -1170,6 +1173,7 @@ async fn an_expired_box_waits_for_its_snapshot_and_the_next_turn_restores_from_t
         [
             "restore session-1 root/turn-1,root/turn-2",
             "boot session-1 on tumpel0",
+            "reconnect session-1",
             "pause session-1"
         ]
     );
@@ -1311,7 +1315,12 @@ async fn a_claim_past_the_pool_is_refused_until_a_clean_paused_box_can_be_evicte
     );
     assert_eq!(
         host.log(),
-        ["stop session-1", "boot session-2 on tumpel0", "pause session-2"]
+        [
+            "stop session-1",
+            "boot session-2 on tumpel0",
+            "reconnect session-2",
+            "pause session-2"
+        ]
     );
 }
 
@@ -1354,6 +1363,7 @@ async fn a_box_that_does_not_fit_evicts_idle_snapshotted_boxes_only_when_that_ma
             "stop session-1",
             "stop session-2",
             "boot session-3 on tumpel0",
+            "reconnect session-3",
             "pause session-3"
         ]
     );
@@ -1402,6 +1412,7 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
             "hand over session-1",
             "reattach session-1 on tumpel0",
             "keep boxes [0] and stop the rest",
+            "reconnect session-1",
             "pause session-1"
         ]
     );
@@ -1443,7 +1454,7 @@ async fn a_supervisor_started_after_a_crash_keeps_every_box_and_fails_only_the_c
     );
     assert_eq!(
         new.log(),
-        ["resume session-2", "pause session-2"],
+        ["resume session-2", "reconnect session-2", "pause session-2"],
         "the kept box takes the next turn without a boot"
     );
 }
@@ -1530,6 +1541,7 @@ async fn a_warm_box_handed_over_takes_the_next_turn_without_a_boot() {
             "reattach session-1 on tumpel0",
             "keep boxes [0] and stop the rest",
             "resume session-1",
+            "reconnect session-1",
             "pause session-1"
         ]
     );
@@ -1596,42 +1608,65 @@ async fn a_guest_on_another_protocol_fails_the_boot_naming_both_versions_and_the
 }
 
 #[tokio::test]
-async fn each_phase_that_runs_out_names_its_failure_and_returns_the_tap() {
+async fn a_turn_that_runs_out_its_budget_names_its_failure_and_keeps_its_box_until_a_snapshot_holds_it() {
     let cases = [
         (
             Harness::Silent,
-            Boot::Works,
             TurnFailureReason::NoFirstOutput,
             "firstLineSeconds",
             "The box's console printed nothing during the turn.",
         ),
         (
             Harness::StallsAfterFirstLine,
-            Boot::Works,
             TurnFailureReason::TurnTimedOut,
             "turnSeconds",
             "The box's console printed nothing during the turn.",
         ),
-        (
-            Harness::Echo,
-            Boot::Hangs,
-            TurnFailureReason::BoxBootFailed,
-            "bootSeconds",
-            "Console: [ boot console ]",
-        ),
     ];
-    for (index, (harness, boot, reason, budget, console)) in cases.into_iter().enumerate() {
-        let mut host = host(&format!("budget-{index}"), 1, harness, boot);
+    for (index, (harness, reason, budget, console)) in cases.into_iter().enumerate() {
+        let mut host = host(&format!("budget-{index}"), 1, harness, Boot::Works);
         host.turn("turn-1", "session-1", "one\ntwo", Vec::new());
         let seen = host.settle(Duration::from_millis(600)).await;
         let last = seen.last().expect("a failure");
         assert!(last.starts_with(&format!("failed {reason}")), "{seen:?}");
         assert!(last.contains(budget) && last.ends_with(console), "{last}");
-        host.log();
-        host.turn_expiring("turn-2", "session-2", "three", Vec::new(), 300);
-        tokio::time::sleep(SETTLE).await;
-        assert_eq!(host.log()[0], "boot session-2 on tumpel0");
+        assert_eq!(
+            host.log(),
+            ["boot session-1 on tumpel0", "reconnect session-1", "pause session-1"]
+        );
+        host.teardown("session-1");
+        let seen = host.settle(SETTLE).await;
+        assert!(
+            seen.len() == 1
+                && seen[0].starts_with(&format!(
+                    "teardown failed {}",
+                    ChannelBoxTeardownFailureReason::BoxDirty
+                )),
+            "{seen:?}"
+        );
+        host.snapshot("session-1");
+        assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
     }
+}
+
+#[tokio::test]
+async fn a_boot_that_runs_out_its_budget_fails_box_boot_failed_and_returns_the_tap() {
+    let mut host = host("budget-boot", 1, Harness::Echo, Boot::Hangs);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    let seen = host.settle(Duration::from_millis(600)).await;
+    let last = seen.last().expect("a failure");
+    assert!(
+        last.starts_with(&format!("failed {}", TurnFailureReason::BoxBootFailed)),
+        "{seen:?}"
+    );
+    assert!(
+        last.contains("bootSeconds") && last.ends_with("Console: [ boot console ]"),
+        "{last}"
+    );
+    host.log();
+    host.turn_expiring("turn-2", "session-2", "three", Vec::new(), 300);
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(host.log()[0], "boot session-2 on tumpel0");
 }
 
 #[tokio::test]
@@ -1732,7 +1767,12 @@ async fn a_teardown_after_the_snapshot_stops_a_clean_box_inside_the_warm_window_
     );
     assert_eq!(
         host.log(),
-        ["boot session-1 on tumpel0", "pause session-1", "stop session-1"]
+        [
+            "boot session-1 on tumpel0",
+            "reconnect session-1",
+            "pause session-1",
+            "stop session-1"
+        ]
     );
 
     host.teardown("session-1");
@@ -1746,6 +1786,7 @@ async fn a_teardown_after_the_snapshot_stops_a_clean_box_inside_the_warm_window_
         [
             "restore session-1 root/turn-1",
             "boot session-1 on tumpel0",
+            "reconnect session-1",
             "pause session-1"
         ]
     );
@@ -1772,7 +1813,10 @@ async fn a_teardown_of_a_box_with_an_unsnapshotted_turn_fails_box_dirty_and_keep
 
     host.turn("turn-2", "session-1", "two", Vec::new());
     assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
-    assert_eq!(host.log(), ["resume session-1", "pause session-1"]);
+    assert_eq!(
+        host.log(),
+        ["resume session-1", "reconnect session-1", "pause session-1"]
+    );
 }
 
 #[tokio::test]
@@ -1810,7 +1854,12 @@ async fn a_turn_for_another_box_of_the_session_stops_the_warm_box_and_boots_fres
     assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
     assert_eq!(
         host.log(),
-        ["stop session-1", "boot session-1 on tumpel0", "pause session-1"]
+        [
+            "stop session-1",
+            "boot session-1 on tumpel0",
+            "reconnect session-1",
+            "pause session-1"
+        ]
     );
 }
 
@@ -1859,6 +1908,7 @@ async fn a_cold_turn_downloads_its_snapshot_before_a_fetch_that_outlasts_the_sna
         [
             "restore session-1 root/turn-1",
             "boot session-1 on tumpel0",
+            "reconnect session-1",
             "pause session-1"
         ]
     );
