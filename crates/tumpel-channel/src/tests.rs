@@ -58,6 +58,8 @@ fn usage() -> HostUsage {
         memory_available_mib: 4096,
         disk_budget_mib: None,
         disk_held_mib: None,
+        memory_budget_mib: None,
+        memory_held_mib: None,
     }
 }
 
