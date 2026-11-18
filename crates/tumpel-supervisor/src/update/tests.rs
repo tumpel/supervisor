@@ -48,6 +48,7 @@ impl Idle for &FakeIdle {
 struct FakeSource {
     bytes: Vec<u8>,
     sha256: String,
+    supervisor_version: Option<&'static str>,
     channel_protocol_version: u32,
     downloads: AtomicU32,
 }
@@ -57,6 +58,7 @@ impl FakeSource {
         Self {
             bytes: script.as_bytes().to_vec(),
             sha256: sha256_hex(script.as_bytes()),
+            supervisor_version: None,
             channel_protocol_version: u32::from(ChannelProtocol::VERSION),
             downloads: AtomicU32::new(0),
         }
@@ -68,7 +70,9 @@ impl Source for FakeSource {
         std::future::ready(Ok(Release {
             version: RELEASE_VERSION.parse().expect("a release version"),
             sha256: digest(&self.sha256),
-            supervisor_version: None,
+            supervisor_version: self
+                .supervisor_version
+                .map(|version| version.parse().expect("a supervisor version")),
             channel_protocol_version: self.channel_protocol_version,
         }))
     }
@@ -249,6 +253,31 @@ async fn a_failed_dry_run_keeps_the_running_binary_and_refuses_the_candidate() {
         "the refused candidate is skipped"
     );
     assert_eq!(seen(&mut run.events), vec![]);
+}
+
+#[tokio::test]
+async fn a_dry_run_killed_by_a_signal_names_the_version_and_the_signal() {
+    let layout = layout("dry-run-signal");
+    let idle = FakeIdle::default();
+    let script = "#!/bin/sh\nkill -FPE $$\n";
+    let source = FakeSource {
+        supervisor_version: Some("0.1.0"),
+        ..FakeSource::binary(script)
+    };
+    let short = source.sha256[..12].to_string();
+    let mut run = updater(&layout, source, &idle, limits());
+    assert_eq!(
+        run.updater.announced(Duration::ZERO).await,
+        Outcome::Failed(SupervisorUpdateFailureReason::SupervisorUpdateDryRunFailed)
+    );
+    let (detail, _) = failure(&mut run.events);
+    assert!(
+        detail.starts_with(&format!(
+            "the check of supervisor 0.1.0 ({short}) exited with signal: 8 (SIGFPE)"
+        )),
+        "{detail}"
+    );
+    assert_eq!(text(&layout.binary), OLD_BINARY, "the running binary is untouched");
 }
 
 #[tokio::test]
