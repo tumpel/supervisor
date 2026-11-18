@@ -3,21 +3,8 @@ name: release
 on:
   push:
     branches: [main]
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "npm-scripts/guest-drive.mjs"
-      - "package.json"
-      - "package-lock.json"
-  workflow_dispatch:
-    inputs:
-      bump:
-        description: "Which part of the latest vX.Y.Z to bump"
-        type: choice
-        options: [patch, minor, major]
-        default: patch
+  schedule:
+    - cron: "0 4 * * *"
 
 concurrency:
   group: release
@@ -31,14 +18,46 @@ env:
   TARGET: x86_64-unknown-linux-gnu
 
 jobs:
-  release:
-    if: github.ref == 'refs/heads/main'
+  plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      ref: ${{ steps.plan.outputs.ref }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - id: plan
+        name: Plan a dev build of main, or the daily stable release of the newest dev build
+        env:
+          BUILD: ${{ github.event_name == 'schedule' && 'stable' || 'dev' }}
+          GH_TOKEN: ${{ github.token }}
+        run: node npm-scripts/release.mjs plan "$BUILD" | tee -a "$GITHUB_OUTPUT"
+
+  release:
+    needs: plan
+    if: needs.plan.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      STABLE: ${{ github.event_name == 'schedule' }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: v${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+
+      - name: Take the release script from the workflow's commit
+        run: |
+          git fetch -q --depth 1 origin "$GITHUB_SHA"
+          git checkout FETCH_HEAD -- npm-scripts/release.mjs
 
       - uses: actions/setup-node@v7
         with:
@@ -52,50 +71,52 @@ jobs:
 
       - run: npm ci --no-audit --no-fund
 
-      - id: version
-        name: Number the release after the latest vX.Y.Z tag
-        env:
-          BUMP: ${{ inputs.bump || 'patch' }}
-        run: |
-          version=$(node npm-scripts/release.mjs version "$BUMP")
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tumpel-supervisor $version"
-
       - name: Stamp the version into the workspace
-        run: node npm-scripts/release.mjs stamp "${{ steps.version.outputs.version }}"
+        run: node npm-scripts/release.mjs stamp "$VERSION"
 
       - name: Build the static guest, the guest drive and the supervisor
         env:
-          TUMPEL_RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          TUMPEL_RELEASE_VERSION: ${{ env.VERSION }}
           TUMPEL_TARGET: ${{ env.TARGET }}
         run: npm run supervisor:build
 
       - name: Stage the binaries, their sha256, release.json and the crate's guest drive
-        run: node npm-scripts/release.mjs assets "${{ steps.version.outputs.version }}" .tmp/release
+        run: node npm-scripts/release.mjs assets "$VERSION" .tmp/release
 
-      - name: Package the crates before anything is published
+      - name: Package the crates
         run: cargo publish --dry-run --allow-dirty -p tumpel-channel -p tumpel-guest -p tumpel-supervisor
 
-      - name: Tag the release
-        env:
-          TAG: v${{ steps.version.outputs.version }}
+      - if: env.STABLE == 'true'
+        name: Tag the stable release before anything is published
         run: |
-          git tag "$TAG" "$GITHUB_SHA"
+          git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null && exit 0
+          git tag "$TAG" HEAD
           git push origin "refs/tags/$TAG"
 
-      - name: Create the GitHub release as a draft with the binaries
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: v${{ steps.version.outputs.version }}
-        run: gh release create "$TAG" .tmp/release/* --draft --verify-tag --title "$TAG" --generate-notes
+      - id: crates
+        if: env.STABLE == 'true'
+        name: List the crates crates.io lacks at this version
+        run: echo "unpublished=$(node npm-scripts/release.mjs unpublished "$VERSION")" >> "$GITHUB_OUTPUT"
 
-      - name: Publish the crates to crates.io
+      - if: steps.crates.outputs.unpublished != ''
+        name: Publish the crates crates.io lacks
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --allow-dirty -p tumpel-channel -p tumpel-guest -p tumpel-supervisor
+          CRATES: ${{ steps.crates.outputs.unpublished }}
+        run: cargo publish --allow-dirty $(printf -- '-p %s ' $CRATES)
 
-      - name: Publish the GitHub release
+      - name: Publish the GitHub release with the binaries
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v${{ steps.version.outputs.version }}
-        run: gh release edit "$TAG" --draft=false --latest
+        run: |
+          if [ "$STABLE" = true ]; then
+            create=(--verify-tag) kind=(--latest)
+          else
+            create=(--target "$(git rev-parse HEAD)") kind=(--prerelease --latest=false)
+          fi
+          draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          case "$draft" in
+            none) gh release create "$TAG" .tmp/release/* --title "$TAG" --generate-notes "${create[@]}" "${kind[@]}" ;;
+            true) gh release upload "$TAG" .tmp/release/* --clobber && gh release edit "$TAG" --draft=false "${kind[@]}" ;;
+            *) echo "release: $TAG is already published; its binaries stay as they are" >&2; exit 1 ;;
+          esac

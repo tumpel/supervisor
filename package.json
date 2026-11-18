@@ -14,14 +14,14 @@
     "clippy": "cargo clippy --workspace --all-targets -- -D warnings",
     "fmt:check": "cargo fmt --all --check",
     "check": "npm run lint && npm run comments:check && npm run secrets:check && npm run clippy && npm run fmt:check",
-    "test": "cargo test --workspace",
+    "test": "node --test npm-scripts/release.test.mjs && cargo test --workspace",
     "guest:build": "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p tumpel-guest --target ${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}",
     "guest:drive": "node npm-scripts/guest-drive.mjs",
     "supervisor:build": "npm run guest:build && npm run guest:drive && TUMPEL_GUEST_DRIVE=\"$PWD/.tmp/guest-drive/${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}.squashfs\" RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p tumpel-supervisor --target ${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}",
     "prepare": "git config core.hooksPath .githooks"
   },
   "dependencies": {
-    "@tumpel/schemas": "https://github.com/tumpel/protocol/releases/download/v0.6.0/tumpel-schemas-0.6.0.tgz"
+    "@tumpel/schemas": "https://github.com/tumpel/protocol/releases/download/v0.6.1/tumpel-schemas-0.6.1.tgz"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.8"
