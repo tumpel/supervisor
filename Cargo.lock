@@ -1871,6 +1871,7 @@ dependencies = [
  "reqwest",
  "ring",
  "sd-notify",
+ "sendfd",
  "serde",
  "serde_json",
  "tar",

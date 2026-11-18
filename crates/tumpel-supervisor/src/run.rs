@@ -141,7 +141,6 @@ pub(crate) async fn refresh_unit(layout: &Layout, fix: &str) -> Result<(), Failu
         UNIT_RELOAD,
         tokio::process::Command::new("systemctl")
             .args(["--user", "daemon-reload"])
-            .env_remove("NOTIFY_SOCKET")
             .kill_on_drop(true)
             .status(),
     )
