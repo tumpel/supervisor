@@ -1791,6 +1791,14 @@ impl Idle for IdleGate {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "every slot key is the to_string of the EntityId of the command, handover or event that made the slot"
+)]
+fn held_session(session: &str) -> EntityId {
+    EntityId::try_from(session).expect("a slot key is an EntityId")
+}
+
 pub struct Lifecycle<V: Vmm, S: Store> {
     runner: Runner<V, S>,
     pool: TapPool,
@@ -1800,6 +1808,7 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     warm: watch::Sender<u32>,
     boxes: watch::Sender<u32>,
     busy: watch::Sender<u32>,
+    sessions: watch::Sender<Vec<EntityId>>,
     setups: HashMap<String, UnboundedSender<SetupInput>>,
     setup_tasks: HashMap<String, JoinHandle<()>>,
     mode: Mode,
@@ -1842,6 +1851,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             warm: watch::Sender::new(0),
             boxes: watch::Sender::new(0),
             busy: watch::Sender::new(0),
+            sessions: watch::Sender::new(Vec::new()),
             setups: HashMap::new(),
             setup_tasks: HashMap::new(),
             mode: Mode::TakingTurns,
@@ -1866,6 +1876,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     #[must_use]
+    pub fn sessions(&self) -> watch::Receiver<Vec<EntityId>> {
+        self.sessions.subscribe()
+    }
+
+    #[must_use]
     pub fn answers(&self) -> Answers {
         self.runner.answers.clone()
     }
@@ -1876,6 +1891,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let boxes = self.slots.len() + self.setups.len();
         self.boxes.send_replace(u32::try_from(boxes).unwrap_or(u32::MAX));
         self.busy.send_replace(u32::try_from(boxes - warm).unwrap_or(u32::MAX));
+        self.sessions
+            .send_replace(self.slots.keys().map(|session| held_session(session)).collect());
     }
 
     pub async fn run(mut self, mut inputs: UnboundedReceiver<Input>, mut setups: UnboundedReceiver<SetupCommand>) {
@@ -2437,6 +2454,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         running: Running,
         task: impl Future<Output = Outcome<V::Machine>> + Send + 'static,
     ) {
+        self.slots.entry(session.clone()).or_default();
+        self.publish();
         let events = self.events.clone();
         let named = session.clone();
         let handle = tokio::spawn(async move {
