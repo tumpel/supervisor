@@ -171,6 +171,7 @@ struct Usage {
     box_capacity: NonZeroU32,
     warm: watch::Receiver<u32>,
     running: watch::Receiver<u32>,
+    sessions: watch::Receiver<Vec<EntityId>>,
     telemetry: Telemetry,
 }
 
@@ -189,9 +190,18 @@ fn hello(channel: &mut Channel, nonce: &str, usage: &Usage, outbox: &mut Outbox)
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
 }
 
-fn beat(channel: &mut Channel, usage: &Usage, outbox: &mut Outbox) -> Result<(), Failure> {
+fn beat(
+    channel: &mut Channel,
+    usage: &Usage,
+    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    outbox: &mut Outbox,
+) -> Result<(), Failure> {
+    let held = usage.sessions.borrow().clone();
+    while let Ok(message) = from_box.try_recv() {
+        channel.send(message, outbox).map_err(|error| store_lost(&error))?;
+    }
     channel
-        .heartbeat(chrono::Utc::now().fixed_offset(), usage.sample()?, outbox)
+        .heartbeat(chrono::Utc::now().fixed_offset(), usage.sample()?, held, outbox)
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))?;
     flush(channel, &usage.telemetry, outbox)
 }
@@ -340,6 +350,7 @@ fn start_boxes(
         box_capacity,
         warm: lifecycle.warm(),
         running: lifecycle.boxes(),
+        sessions: lifecycle.sessions(),
         telemetry,
     };
     let answers = lifecycle.answers();
@@ -925,7 +936,7 @@ async fn session(
                     Some(Ok(dropped(welcomed, format!("nothing arrived for {} seconds", HEARTBEAT_DEADLINE.as_secs()))))
                 } else if channel.phase() == Phase::Open && last_beat.elapsed() >= heartbeat {
                     last_beat = Instant::now();
-                    beat(channel, usage, &mut outbox).err().map(Err)
+                    beat(channel, usage, from_box, &mut outbox).err().map(Err)
                 } else if channel.phase() == Phase::Open && usage.telemetry.full(BATCH_POINTS) {
                     flush(channel, &usage.telemetry, &mut outbox).err().map(Err)
                 } else {
