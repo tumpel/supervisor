@@ -41,7 +41,6 @@ pub fn default_runtime() -> Result<SupervisorRuntime> {
         "imageCacheDir": xdg("XDG_CACHE_HOME", &[".cache"]).join("tumpel").join("images"),
         "dataDir": xdg("XDG_DATA_HOME", &[".local", "share"]).join("tumpel-supervisor"),
         "boxCapacity": 8,
-        "warmWindowSeconds": 900,
         "vcpuCount": 2,
         "memoryMib": BoxMemoryLimit::DEFAULT_MIB,
         "overlayMib": BoxDiskLimit::DEFAULT_MIB,

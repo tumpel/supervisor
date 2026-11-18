@@ -531,7 +531,6 @@ const BOX: Size = Size {
     disk_mib: NonZeroU32::new(32_768).expect("a positive size"),
 };
 
-const WARM: Duration = Duration::from_millis(400);
 const SETTLE: Duration = Duration::from_millis(60);
 const SLOW_CLONE: Duration = Duration::from_millis(300);
 const SLOW_BOOT: Duration = Duration::from_millis(50);
@@ -546,7 +545,6 @@ fn settings() -> Settings {
             turn: Duration::from_millis(400),
             snapshot: Duration::from_secs(5),
         },
-        warm_window: WARM,
         layer_cache_mib: std::num::NonZeroU32::MIN,
     }
 }
@@ -1111,7 +1109,7 @@ impl Host {
 }
 
 #[tokio::test]
-async fn a_turn_inside_the_warm_window_resumes_the_paused_box() {
+async fn a_turn_for_a_paused_box_resumes_it() {
     let mut host = host("resume", 2, Harness::Echo, Boot::Works);
     host.turn("turn-1", "session-1", "one\ntwo", Vec::new());
     assert_eq!(
@@ -1179,39 +1177,45 @@ async fn a_turn_the_control_plane_withdraws_at_its_claim_never_reaches_the_harne
     assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
 }
 
-#[tokio::test]
-async fn a_resume_cancels_the_expiry_armed_at_pause() {
-    let mut host = host("cancel", 2, Harness::Echo, Boot::Works);
+#[tokio::test(start_paused = true)]
+async fn a_paused_box_outlives_any_delay() {
+    let mut host = host("outlives", 1, Harness::Echo, Boot::Works);
     host.turn("turn-1", "session-1", "one", Vec::new());
     host.settle(SETTLE).await;
     host.snapshot("session-1");
-    host.settle(WARM / 2).await;
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    host.log();
+    host.settle(Duration::from_hours(720)).await;
+    assert_eq!(host.log(), Vec::<String>::new());
     host.turn("turn-2", "session-1", "two", Vec::new());
-    host.snapshot("session-1");
-    host.settle(WARM * 3 / 4).await;
-    assert!(!host.log().iter().any(|event| event.starts_with("stop")));
-    host.settle(WARM / 2).await;
-    assert_eq!(host.log(), ["stop session-1"]);
+    assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
+    assert_eq!(
+        host.log(),
+        ["resume session-1", "reconnect session-1", "pause session-1"]
+    );
 }
 
 fn pack_uploads(uploads: &[String]) -> usize {
     uploads.iter().filter(|url| url.contains("/packs/")).count()
 }
 
-#[tokio::test(start_paused = true)]
-async fn an_expired_box_waits_for_its_snapshot_and_the_next_turn_restores_from_the_latest() {
-    let mut host = host("expire", 2, Harness::Echo, Boot::Works);
+#[tokio::test]
+async fn a_torn_down_box_restores_its_next_turn_from_the_latest_snapshot() {
+    let mut host = host("restore-latest", 2, Harness::Echo, Boot::Works);
     host.turn("turn-1", "session-1", "one", Vec::new());
     host.settle(SETTLE).await;
     host.snapshot("session-1");
     assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
     assert_eq!(pack_uploads(&host.store.uploads()), 2);
     host.turn("turn-2", "session-1", "two", Vec::new());
-    host.settle(WARM + SETTLE).await;
-    assert!(!host.log().contains(&"stop session-1".to_string()));
-    let second = host.snapshot("session-1");
-    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
     host.settle(SETTLE).await;
+    host.log();
+    let second = host.snapshot("session-1");
+    host.teardown("session-1");
+    assert_eq!(
+        host.settle_until("box gone session-1").await,
+        ["snapshot done", "box gone session-1"]
+    );
     assert_eq!(host.log(), ["stop session-1"]);
     let uploads = host.store.uploads();
     assert_eq!(pack_uploads(&uploads), 2, "{uploads:?}");
@@ -1354,10 +1358,13 @@ async fn a_restore_missing_a_chunk_fails_the_turn_snapshot_unreadable() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_claim_past_the_pool_is_refused_until_a_clean_paused_box_can_be_evicted() {
+async fn a_full_pool_refuses_a_box_and_tears_down_no_other_box() {
     let mut host = host("pool", 1, Harness::Echo, Boot::Works);
     host.turn("turn-1", "session-1", "one", Vec::new());
     host.settle(SETTLE).await;
+    host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    host.log();
     host.turn("turn-2", "session-2", "two", Vec::new());
     let refused = host.settle(SETTLE).await;
     assert!(
@@ -1368,8 +1375,9 @@ async fn a_claim_past_the_pool_is_refused_until_a_clean_paused_box_can_be_evicte
             ),
         "{refused:?}"
     );
-    host.snapshot("session-1");
-    host.settle(SETTLE).await;
+    assert_eq!(host.log(), Vec::<String>::new(), "the clean paused box stays");
+    host.teardown("session-1");
+    assert_eq!(host.settle(SETTLE).await, ["box gone session-1"]);
     host.log();
     host.turn("turn-3", "session-2", "three", Vec::new());
     assert_eq!(
@@ -1378,57 +1386,7 @@ async fn a_claim_past_the_pool_is_refused_until_a_clean_paused_box_can_be_evicte
     );
     assert_eq!(
         host.log(),
-        [
-            "stop session-1",
-            "boot session-2 on tumpel0",
-            "reconnect session-2",
-            "pause session-2"
-        ]
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_box_that_does_not_fit_evicts_idle_snapshotted_boxes_only_when_that_makes_room() {
-    let mut host = host("memory", 3, Harness::Echo, Boot::Works);
-    host.turn("turn-1", "session-1", "one", Vec::new());
-    host.settle(SETTLE).await;
-    host.turn("turn-2", "session-2", "two", Vec::new());
-    host.settle(SETTLE).await;
-    host.snapshot("session-1");
-    host.settle(SETTLE).await;
-    host.log();
-    let mut large = host.box_turn("turn-3", "session-3", "three", Vec::new(), 300);
-    large.box_memory_mib = Some(12_288);
-    host.send(Command::Turn(Box::new(large)));
-    let refused = host.settle(SETTLE).await;
-    assert!(
-        refused.len() == 1
-            && refused[0].starts_with(&format!("failed {}", TurnFailureReason::PoolExhausted))
-            && refused[0].contains(
-                "this host's 2 boxes hold 8192 MiB of the 12288 MiB it gives boxes, so a box of 12288 MiB does not fit"
-            ),
-        "{refused:?}"
-    );
-    assert!(
-        host.log().is_empty(),
-        "the idle snapshotted box stays warm when evicting it cannot make room"
-    );
-    host.snapshot("session-2");
-    host.settle(SETTLE).await;
-    host.log();
-    let mut large = host.box_turn("turn-4", "session-3", "four", Vec::new(), 300);
-    large.box_memory_mib = Some(12_288);
-    host.send(Command::Turn(Box::new(large)));
-    assert_eq!(host.settle(SETTLE).await, ["claim turn-4", "line 1 four", "complete 1"]);
-    assert_eq!(
-        host.log(),
-        [
-            "stop session-1",
-            "stop session-2",
-            "boot session-3 on tumpel0",
-            "reconnect session-3",
-            "pause session-3"
-        ]
+        ["boot session-2 on tumpel0", "reconnect session-2", "pause session-2"]
     );
 }
 
@@ -1808,29 +1766,8 @@ async fn an_expired_grant_is_refused_before_any_box_boots() {
     assert_eq!(host.log(), Vec::<String>::new());
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_failed_snapshot_after_expiry_keeps_the_box_until_a_snapshot_holds_the_last_turn() {
-    let mut host = host("failed-expired", 1, Harness::Echo, Boot::Works);
-    host.turn("turn-1", "session-1", "one", Vec::new());
-    host.settle(WARM + SETTLE).await;
-    host.log();
-    host.snapshot_expiring("session-1", -1);
-    let seen = host.settle(SETTLE).await;
-    assert!(
-        seen[0].starts_with(&format!(
-            "snapshot failed {}",
-            ChannelSnapshotFailureReason::UploadExpired
-        )),
-        "{seen:?}"
-    );
-    assert_eq!(host.log(), Vec::<String>::new());
-    host.snapshot("session-1");
-    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
-    assert_eq!(host.log(), ["stop session-1"]);
-}
-
 #[tokio::test]
-async fn a_teardown_after_the_snapshot_stops_a_clean_box_inside_the_warm_window_and_the_next_turn_boots_cold() {
+async fn a_teardown_after_the_snapshot_stops_a_clean_box_and_the_next_turn_boots_cold() {
     let mut host = host("teardown-clean", 1, Harness::Echo, Boot::Works);
     host.turn("turn-1", "session-1", "one", Vec::new());
     host.settle(SETTLE).await;
@@ -2122,7 +2059,7 @@ fn a_snapshot_larger_than_the_box_disk_names_both_sizes_and_the_persona_setting(
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_an_idle_box_frees_its_disk() {
+async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_a_teardown_frees_disk() {
     let mut host = host("disk", 3, Harness::Echo, Boot::Works);
     host.vmm.free_disk_mib.store(80_000, Ordering::SeqCst);
     host.turn("turn-1", "session-1", "one", Vec::new());
@@ -2143,30 +2080,27 @@ async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_an_idle_box_fre
     assert!(host.log().is_empty(), "a refused box never boots");
     let held = host.holdings.borrow().clone();
     assert_eq!(
-        (held.unevictable_disk_mib, held.memory_budget_mib, held.memory_held_mib),
+        (held.disk_held_mib, held.memory_budget_mib, held.memory_held_mib),
         (65_536, 3 * 4096, 2 * u64::from(BOX.memory_mib.get()))
     );
     host.snapshot("session-1");
     host.settle(SETTLE).await;
-    host.log();
     let held = host.holdings.borrow().clone();
     let mut drives = held.drives.clone();
     drives.sort();
     assert_eq!(
-        (drives, held.unevictable_disk_mib),
-        (vec!["session-1".to_string(), "session-2".to_string()], 32_768),
-        "the idle snapshotted box's disk is evictable, so the host does not report it held"
+        (drives, held.disk_held_mib),
+        (vec!["session-1".to_string(), "session-2".to_string()], 65_536),
+        "a clean paused box still holds its disk"
     );
+    host.teardown("session-1");
+    host.settle(SETTLE).await;
+    host.log();
     host.turn("turn-4", "session-3", "four", Vec::new());
     assert_eq!(host.settle(SETTLE).await, ["claim turn-4", "line 1 four", "complete 1"]);
     assert_eq!(
         host.log(),
-        [
-            "stop session-1",
-            "boot session-3 on tumpel0",
-            "reconnect session-3",
-            "pause session-3"
-        ]
+        ["boot session-3 on tumpel0", "reconnect session-3", "pause session-3"]
     );
 }
 
@@ -2217,11 +2151,6 @@ async fn a_stuck_reassembly_outlasts_the_boot_budget_then_fails_with_its_size() 
         "{seen:?}"
     );
     assert!(!host.vmm.staging.join("session-1").exists());
-    host.settle(Duration::from_millis(200)).await;
-    assert!(
-        !archive.with_file_name("restore.tar").exists(),
-        "a timed-out restore leaves no archive"
-    );
 }
 
 #[tokio::test]

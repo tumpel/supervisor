@@ -115,7 +115,6 @@ impl From<&BoxBudgets> for Budgets {
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     pub budgets: Budgets,
-    pub warm_window: Duration,
     pub layer_cache_mib: NonZeroU32,
 }
 
@@ -453,10 +452,6 @@ fn milliseconds(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
-fn left(deadline: Instant) -> i64 {
-    milliseconds(deadline.saturating_duration_since(Instant::now()))
-}
-
 fn duration(milliseconds: i64) -> Duration {
     Duration::from_millis(u64::try_from(milliseconds).unwrap_or(0))
 }
@@ -471,10 +466,6 @@ enum Event<M: Machine> {
         session: String,
         work: Work,
         outcome: Outcome<M>,
-    },
-    Expired {
-        session: String,
-        generation: u64,
     },
     SetupFinished {
         claude_setup_id: String,
@@ -493,11 +484,7 @@ enum Mode {
 struct Slot<M: Machine> {
     live: Option<LiveBox<M>>,
     busy: bool,
-    paused_at: Option<Instant>,
-    warm_until: Option<Instant>,
-    expiry: Option<AbortHandle>,
-    generation: u64,
-    expired: bool,
+    paused: bool,
     parked: Option<Box<Parked>>,
     task: Option<(Running, JoinHandle<()>)>,
     queue: VecDeque<Command>,
@@ -508,37 +495,11 @@ impl<M: Machine> Default for Slot<M> {
         Self {
             live: None,
             busy: false,
-            paused_at: None,
-            warm_until: None,
-            expiry: None,
-            generation: 0,
-            expired: false,
+            paused: false,
             parked: None,
             task: None,
             queue: VecDeque::new(),
         }
-    }
-}
-
-impl<M: Machine> Slot<M> {
-    fn disarm(&mut self) {
-        if let Some(expiry) = self.expiry.take() {
-            expiry.abort();
-        }
-        self.paused_at = None;
-        self.warm_until = None;
-        self.expired = false;
-    }
-
-    fn evictable(&self) -> Option<(Instant, Size)> {
-        let live = self.live.as_ref().filter(|live| !live.dirty && !self.busy)?;
-        Some((
-            self.paused_at?,
-            Size {
-                memory_mib: live.tap.memory_mib(),
-                disk_mib: live.tap.disk_mib(),
-            },
-        ))
     }
 }
 
@@ -1987,7 +1948,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     fn publish(&self) {
-        let warm = self.slots.values().filter(|slot| slot.paused_at.is_some()).count();
+        let warm = self.slots.values().filter(|slot| slot.paused).count();
         self.warm.send_replace(u32::try_from(warm).unwrap_or(u32::MAX));
         let boxes = self.slots.len() + self.setups.len();
         self.boxes.send_replace(u32::try_from(boxes).unwrap_or(u32::MAX));
@@ -2015,7 +1976,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     Some(Input::Abandon(reply)) => self.abandon(reply).await,
                     None => break,
                 },
-                Some(setup) = setups.recv() => self.setup_command(setup).await,
+                Some(setup) = setups.recv() => self.setup_command(setup),
                 Some(event) = finished.recv() => self.event(event).await?,
             }
             self.settle_handover()?;
@@ -2240,9 +2201,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             let Some(mut slot) = self.slots.remove(&session) else {
                 continue;
             };
-            let warm = slot.warm_until.map_or(0, left);
-            let expired = slot.expired;
-            slot.disarm();
+            slot.paused = false;
             let queue = std::mem::take(&mut slot.queue);
             let Some(live) = slot.live.take() else {
                 self.answer_lost(&session, queue);
@@ -2263,9 +2222,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     turn_id: parked.turn_id,
                 }),
                 None => SupervisorHandoverBoxState::Warm(SupervisorHandoverWarm {
-                    expired,
+                    expired: false,
                     kind: SupervisorHandoverWarmKind::Warm,
-                    warm_milliseconds: warm,
+                    warm_milliseconds: 0,
                 }),
             };
             let queued = queue.into_iter().filter_map(Command::record).collect();
@@ -2345,9 +2304,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let recorded = taken.is_some();
         let mut standing = BTreeMap::new();
         if let Some((handover, taken)) = taken {
-            let elapsed = (now() - handover.handed_at).to_std().unwrap_or(Duration::ZERO);
             for handed in handover.boxes {
-                if let Some(record) = self.adopt(handed, elapsed, taken) {
+                if let Some(record) = self.adopt(handed, taken) {
                     standing.insert(record.tap_index, record);
                 }
             }
@@ -2384,12 +2342,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    fn adopt(
-        &mut self,
-        handed: SupervisorHandoverBox,
-        elapsed: Duration,
-        taken: Taken,
-    ) -> Option<SupervisorHandoverBox> {
+    fn adopt(&mut self, handed: SupervisorHandoverBox, taken: Taken) -> Option<SupervisorHandoverBox> {
         let session = handed.session_id.to_string();
         let (machine, guest, tap) = match self.attach(&handed) {
             Ok(attached) => attached,
@@ -2433,15 +2386,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             credential_file: handed.credential_file,
         });
         match (handed.state, taken) {
-            (SupervisorHandoverBoxState::Warm(_), Taken::Crashed) => self.arm(&session),
-            (SupervisorHandoverBoxState::Warm(warm), Taken::Handed) => {
-                let window = if warm.expired {
-                    Duration::ZERO
-                } else {
-                    duration(warm.warm_milliseconds).saturating_sub(elapsed)
-                };
-                self.arm_for(&session, window);
-            }
+            (SupervisorHandoverBoxState::Warm(_), _) => slot.paused = true,
             (SupervisorHandoverBoxState::Turn(turn), Taken::Crashed) => {
                 turn_failed(
                     &self.runner.out,
@@ -2515,9 +2460,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    async fn setup_command(&mut self, command: SetupCommand) {
+    fn setup_command(&mut self, command: SetupCommand) {
         match command {
-            SetupCommand::Start(order) => self.start_setup(*order).await,
+            SetupCommand::Start(order) => self.start_setup(*order),
             SetupCommand::Code {
                 claude_setup_id,
                 code,
@@ -2539,7 +2484,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    async fn start_setup(&mut self, order: SetupOrder) {
+    fn start_setup(&mut self, order: SetupOrder) {
         let id = order.claude_setup_id.to_string();
         if self.setups.contains_key(&id) {
             return;
@@ -2561,7 +2506,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             );
             return;
         }
-        let tap = match self.claim(None, None).await {
+        let tap = match self.claim(None, None) {
             Ok(tap) => tap,
             Err(full) => {
                 emit(
@@ -2625,7 +2570,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         let warm = self.slots.get_mut(&session).and_then(|slot| {
             let live = slot.live.take()?;
-            slot.disarm();
+            slot.paused = false;
             slot.busy = true;
             Some(live)
         });
@@ -2679,7 +2624,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 return Ok(());
             }
         };
-        let tap = match self.claim(memory_mib, disk_mib).await {
+        let tap = match self.claim(memory_mib, disk_mib) {
             Ok(tap) => tap,
             Err(refused) => {
                 root.in_scope(|| {
@@ -2798,43 +2743,17 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         Ok(())
     }
 
-    async fn claim(&mut self, memory_mib: Option<NonZeroU32>, disk_mib: Option<NonZeroU32>) -> Result<Tap, String> {
+    fn claim(&mut self, memory_mib: Option<NonZeroU32>, disk_mib: Option<NonZeroU32>) -> Result<Tap, String> {
         let size = self.pool.size(memory_mib, disk_mib);
-        let mut victims: Vec<_> = self
-            .slots
-            .iter()
-            .filter_map(|(session, slot)| {
-                slot.evictable()
-                    .map(|(paused_at, freed)| (paused_at, freed, session.clone()))
-            })
-            .collect();
-        victims.sort();
-        let freeing: Vec<_> = victims.iter().map(|(_, freed, _)| *freed).collect();
-        self.pool
-            .admits(size, &freeing, self.disk()?)
-            .map_err(|exhausted| exhausted.to_string())?;
-        let mut victims = victims.into_iter();
-        while self.pool.admits(size, &[], self.disk()?).is_err() {
-            let Some((_, _, victim)) = victims.next() else {
-                break;
-            };
-            self.teardown(&victim).await?;
-        }
         self.pool
             .claim(size, self.disk()?)
             .map_err(|exhausted| exhausted.to_string())
     }
 
     fn current_holdings(&self) -> Held {
-        let evictable = self
-            .slots
-            .values()
-            .filter_map(Slot::evictable)
-            .map(|(_, size)| u64::from(size.disk_mib.get()))
-            .sum::<u64>();
         Held {
             drives: self.slots.keys().chain(self.setups.keys()).cloned().collect(),
-            unevictable_disk_mib: self.pool.held_disk_mib() - evictable,
+            disk_held_mib: self.pool.held_disk_mib(),
             memory_budget_mib: self.pool.budget_mib(),
             memory_held_mib: self.pool.held_mib(),
         }
@@ -2845,30 +2764,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .vmm
             .disk(&self.current_holdings().drives)
             .map_err(|error| format!("reading the disk this host has free failed: {error}"))
-    }
-
-    fn arm(&mut self, session: &str) {
-        self.arm_for(session, self.runner.settings.warm_window);
-    }
-
-    fn arm_for(&mut self, session: &str, window: Duration) {
-        let Some(slot) = self.slots.get_mut(session) else {
-            return;
-        };
-        slot.generation += 1;
-        slot.paused_at = Some(Instant::now());
-        slot.warm_until = Some(Instant::now() + window);
-        slot.expired = false;
-        let events = self.events.clone();
-        let generation = slot.generation;
-        let session = session.to_string();
-        slot.expiry = Some(
-            tokio::spawn(async move {
-                tokio::time::sleep(window).await;
-                let _ = events.send(Event::Expired { session, generation });
-            })
-            .abort_handle(),
-        );
     }
 
     fn free_disk(&self, session: &str) -> Result<(), String> {
@@ -2883,7 +2778,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let Some(slot) = self.slots.get_mut(session) else {
             return Ok(());
         };
-        slot.disarm();
+        slot.paused = false;
         let Some(live) = slot.live.take() else {
             return Ok(());
         };
@@ -2908,7 +2803,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     async fn event(&mut self, event: Event<V::Machine>) -> Result<(), String> {
         match event {
             Event::Finished { session, work, outcome } => self.finished(session, work, outcome).await,
-            Event::Expired { session, generation } => self.expired(&session, generation).await,
             Event::SetupFinished {
                 claude_setup_id,
                 tap,
@@ -2929,8 +2823,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         slot.busy = false;
         slot.task = None;
         let mut freed = None;
-        let mut arm = false;
-        let mut tear_down = false;
         match outcome {
             Outcome::Parked(live, parked) => {
                 slot.live = Some(live);
@@ -2938,14 +2830,13 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 return Ok(());
             }
             Outcome::Kept(live) => {
-                match work {
-                    Work::Turn => arm = true,
-                    Work::Snapshot => tear_down = slot.expired && !live.dirty && slot.queue.is_empty(),
+                if matches!(work, Work::Turn) {
+                    slot.paused = true;
                 }
                 slot.live = Some(live);
             }
             Outcome::Gone(tap, stopped) => {
-                slot.disarm();
+                slot.paused = false;
                 freed = Some((tap, stopped));
             }
         }
@@ -2954,34 +2845,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             stopped?;
             self.free_disk(&session)?;
         }
-        if arm {
-            self.arm(&session);
-        }
-        if tear_down {
-            self.teardown(&session).await?;
-        }
         let next = self.slots.get_mut(&session).and_then(|slot| slot.queue.pop_front());
         if let Some(command) = next {
             return self.dispatch(session, command).await;
         }
         self.prune(&session);
         Ok(())
-    }
-
-    async fn expired(&mut self, session: &str, generation: u64) -> Result<(), String> {
-        let Some(slot) = self.slots.get_mut(session) else {
-            return Ok(());
-        };
-        if slot.generation != generation || slot.paused_at.is_none() {
-            return Ok(());
-        }
-        slot.expiry = None;
-        let clean = slot.live.as_ref().is_some_and(|live| !live.dirty);
-        if slot.busy || !clean {
-            slot.expired = true;
-            return Ok(());
-        }
-        self.teardown(session).await
     }
 }
 
