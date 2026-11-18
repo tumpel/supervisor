@@ -14,7 +14,11 @@ pub fn turn_end(
         (GuestTurnEndReason::HarnessOutOfMemory, _) => Err((TurnFailureReason::HarnessOutOfMemory, end.detail)),
         (GuestTurnEndReason::BoxDiskFull, _) => Err((TurnFailureReason::BoxDiskFull, end.detail)),
         (GuestTurnEndReason::Cancelled, _) => Err((TurnFailureReason::Cancelled, end.detail)),
-        (GuestTurnEndReason::Completed, Some(failure)) => Err(failure),
+        (GuestTurnEndReason::Completed, Some((reason, detail))) => Err((
+            reason,
+            end.warning
+                .map_or(detail.clone(), |warning| format!("{detail}; {}", *warning)),
+        )),
         (GuestTurnEndReason::HarnessExited, Some((reason, detail))) => Err((
             reason,
             format!("{detail}; the harness stopped ({}): {}", end.reason, end.detail),
@@ -183,6 +187,20 @@ mod tests {
         assert_eq!(
             completed,
             Ok((4, Some("the box disk of 32096 MiB is full".to_string())))
+        );
+        assert_eq!(
+            turn_end(
+                end("Completed", Some("the box disk of 32096 MiB is full")),
+                Some((
+                    TurnFailureReason::HarnessReportedError,
+                    "the model is not served".to_string()
+                ))
+            )
+            .map(|(seq, _)| seq.0),
+            Err((
+                TurnFailureReason::HarnessReportedError,
+                "the model is not served; the box disk of 32096 MiB is full".to_string()
+            ))
         );
         assert_eq!(
             turn_end(end("BoxDiskFull", None), None).map(|(seq, _)| seq.0),

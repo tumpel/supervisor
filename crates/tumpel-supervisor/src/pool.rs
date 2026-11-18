@@ -16,6 +16,17 @@ pub fn memory_budget_mib(total_mib: u64, available_mib: u64, boxes_resident_mib:
         .saturating_sub(headroom_mib(total_mib))
 }
 
+#[must_use]
+pub fn mib(value: i64) -> Option<NonZeroU32> {
+    u32::try_from(value).ok().and_then(NonZeroU32::new)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldDisk {
+    pub drives: Vec<String>,
+    pub unevictable_mib: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Disk {
     pub total_mib: u64,

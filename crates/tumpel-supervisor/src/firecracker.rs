@@ -592,8 +592,8 @@ impl Vmm for Firecracker {
             })
     }
 
-    fn disk(&self) -> Result<Disk, String> {
-        crate::usage::disk(&self.data).map_err(|error| format!("{error:#}"))
+    fn disk(&self, drives: &[String]) -> Result<Disk, String> {
+        crate::usage::disk(&self.data, drives).map_err(|error| format!("{error:#}"))
     }
 
     fn discard(&self, handed: &SupervisorHandoverMachine) {
@@ -971,7 +971,9 @@ impl Machine for FirecrackerBox {
                 _ => Ok(()),
             });
         if let Err(error) = cleared {
-            eprintln!("tumpel-supervisor: tearing down a box: {error}; delete it by hand");
+            eprintln!(
+                "tumpel-supervisor: tearing down a box: {error}; its files stay on the host's disk, shrinking the disk budget, until a box of the same session boots here again"
+            );
         }
     }
 

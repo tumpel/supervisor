@@ -15,10 +15,10 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
-    ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode, ChannelControlMessage,
-    ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, EntityId, HostUsage, Sha256Digest,
-    SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover, SupervisorHandoverBoxState,
-    SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
+    BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
+    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, EntityId, HostUsage,
+    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
 };
 use tumpel_channel::{ChannelError, Event, HostChannel, Phase, Port, Signer, HEARTBEAT_DEADLINE};
 
@@ -32,7 +32,7 @@ use crate::lifecycle::{
     turn_failed, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder, Taken,
     TeardownOrder,
 };
-use crate::pool::{headroom_mib, memory_budget_mib, Size, TapPool};
+use crate::pool::{headroom_mib, memory_budget_mib, mib, HeldDisk, Size, TapPool};
 use crate::store::HttpStore;
 use crate::telemetry::{Telemetry, BATCH_POINTS};
 use crate::update::{self, HttpSource, Layout, Limits, Outcome, Startup, Updater};
@@ -171,22 +171,18 @@ struct Usage {
     warm: watch::Receiver<u32>,
     running: watch::Receiver<u32>,
     sessions: watch::Receiver<Vec<EntityId>>,
-    disk_held: watch::Receiver<u64>,
+    disk_held: watch::Receiver<HeldDisk>,
     data_dir: PathBuf,
     telemetry: Telemetry,
 }
 
 impl Usage {
     fn sample(&self) -> Result<HostUsage, Failure> {
-        let unreadable = |error: anyhow::Error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}"));
-        let stats = usage::sample(*self.warm.borrow()).map_err(unreadable)?;
-        let disk = usage::disk(&self.data_dir).map_err(unreadable)?;
+        let held = self.disk_held.borrow().clone();
+        let stats = usage::sample(*self.warm.borrow(), &self.data_dir, &held)
+            .map_err(|error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}")))?;
         self.telemetry.host(&stats, *self.running.borrow());
-        Ok(HostUsage {
-            disk_budget_mib: Some(i64::try_from(disk.budget_mib()).unwrap_or(i64::MAX)),
-            disk_held_mib: Some(i64::try_from(*self.disk_held.borrow()).unwrap_or(i64::MAX)),
-            ..stats.usage
-        })
+        Ok(stats.usage)
     }
 }
 
@@ -627,16 +623,20 @@ pub(crate) fn start() -> Result<Started, Failure> {
     let runtime = load_runtime(&dir)?;
     let url = channel_url(&config.endpoint, &config.host_id)?;
     let source = HttpSource::new(&config.endpoint).map_err(unusable)?;
-    let positive = |mib: i32, named: &str, default: u32| {
-        u32::try_from(mib).ok().and_then(NonZeroU32::new).ok_or_else(|| {
-            unusable(format!(
-                "{named} {mib} in runtime.json is not a positive number of MiB; set it to {default}"
-            ))
-        })
-    };
     let box_size = Size {
-        memory_mib: positive(runtime.memory_mib, "memoryMib", 4096)?,
-        disk_mib: positive(runtime.overlay_mib, "overlayMib", 32_768)?,
+        memory_mib: mib(runtime.memory_mib.into()).ok_or_else(|| {
+            unusable(format!(
+                "memoryMib {} in runtime.json is not a positive number of MiB; set it to {}",
+                runtime.memory_mib,
+                BoxMemoryLimit::DEFAULT_MIB
+            ))
+        })?,
+        disk_mib: mib(BoxDiskLimit::DEFAULT_MIB).ok_or_else(|| {
+            unusable(format!(
+                "the protocol's default box disk of {} MiB is not a positive size",
+                BoxDiskLimit::DEFAULT_MIB
+            ))
+        })?,
     };
     let store = HttpStore::new().map_err(unusable)?;
     Ok(Started {

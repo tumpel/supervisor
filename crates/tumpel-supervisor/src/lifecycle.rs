@@ -37,7 +37,7 @@ use crate::exchange::{part_number, Answer, Answers, Ask, Cancels, Key, Waiting, 
 use crate::harness_result::{error_result, exit_result, turn_end};
 use crate::images;
 use crate::layers::LayerCache;
-use crate::pool::{Disk, Size, Tap, TapPool};
+use crate::pool::{mib, Disk, HeldDisk, Size, Tap, TapPool};
 use crate::snapshot::{
     assemble, cut, decode, decode_root, draft_digests, fetches, fresh, lacking, restore_parts, stage, unpack,
     write_restore, Base, Births, ChunkCache, Cut, Fetch, Kind, Manifest, PackFile, Place, Places, Span,
@@ -63,9 +63,8 @@ fn restore_budget(floor: Duration, bytes: u64, entries: u64) -> Duration {
         + Duration::from_secs(entries.div_ceil(RESTORE_ENTRIES_PER_SECOND))
 }
 
-fn positive_mib(mib: Option<i32>) -> Result<Option<NonZeroU32>, i32> {
-    mib.map(|mib| u32::try_from(mib).ok().and_then(NonZeroU32::new).ok_or(mib))
-        .transpose()
+fn positive_mib(value: Option<i32>) -> Result<Option<NonZeroU32>, i32> {
+    value.map(|value| mib(value.into()).ok_or(value)).transpose()
 }
 
 fn restore_size(named: &str, manifest: &Manifest, overlay: u64) -> Result<(u64, u64), String> {
@@ -154,7 +153,7 @@ pub trait Vmm: Send + Sync + 'static {
     fn booted_memory(&self, handed: &SupervisorHandoverMachine) -> Result<NonZeroU32, String>;
     fn available_memory_mib(&self) -> Result<u64, String>;
     fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String>;
-    fn disk(&self) -> Result<Disk, String>;
+    fn disk(&self, drives: &[String]) -> Result<Disk, String>;
     fn discard(&self, handed: &SupervisorHandoverMachine);
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
@@ -1870,7 +1869,7 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     boxes: watch::Sender<u32>,
     busy: watch::Sender<u32>,
     sessions: watch::Sender<Vec<EntityId>>,
-    disk_held: watch::Sender<u64>,
+    disk_held: watch::Sender<HeldDisk>,
     setups: HashMap<String, UnboundedSender<SetupInput>>,
     setup_tasks: HashMap<String, JoinHandle<()>>,
     mode: Mode,
@@ -1915,7 +1914,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             boxes: watch::Sender::new(0),
             busy: watch::Sender::new(0),
             sessions: watch::Sender::new(Vec::new()),
-            disk_held: watch::Sender::new(0),
+            disk_held: watch::Sender::new(HeldDisk::default()),
             setups: HashMap::new(),
             setup_tasks: HashMap::new(),
             mode: Mode::TakingTurns,
@@ -1945,7 +1944,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     #[must_use]
-    pub fn disk_held(&self) -> watch::Receiver<u64> {
+    pub fn disk_held(&self) -> watch::Receiver<HeldDisk> {
         self.disk_held.subscribe()
     }
 
@@ -1967,7 +1966,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.busy.send_replace(u32::try_from(boxes - warm).unwrap_or(u32::MAX));
         self.sessions
             .send_replace(self.slots.keys().map(|session| held_session(session)).collect());
-        self.disk_held.send_replace(self.pool.held_disk_mib());
+        self.disk_held.send_replace(self.held_disk());
     }
 
     pub async fn run(mut self, mut inputs: UnboundedReceiver<Input>, mut setups: UnboundedReceiver<SetupCommand>) {
@@ -2759,10 +2758,23 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .map_err(|exhausted| exhausted.to_string())
     }
 
+    fn held_disk(&self) -> HeldDisk {
+        let evictable = self
+            .slots
+            .values()
+            .filter_map(Slot::evictable)
+            .map(|(_, size)| u64::from(size.disk_mib.get()))
+            .sum::<u64>();
+        HeldDisk {
+            drives: self.slots.keys().chain(self.setups.keys()).cloned().collect(),
+            unevictable_mib: self.pool.held_disk_mib() - evictable,
+        }
+    }
+
     fn disk(&self) -> Result<Disk, String> {
         self.runner
             .vmm
-            .disk()
+            .disk(&self.held_disk().drives)
             .map_err(|error| format!("reading the disk this host has free failed: {error}"))
     }
 

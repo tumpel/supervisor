@@ -25,7 +25,7 @@ use super::{
 use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
 use crate::images::ImageOrder;
-use crate::pool::{Disk, Size, Tap, TapPool};
+use crate::pool::{Disk, HeldDisk, Size, Tap, TapPool};
 use crate::snapshot::{Born, Entry, Found, Kind, Scan, Stored, Upper};
 use crate::store::{Store, UploadError};
 
@@ -403,7 +403,7 @@ impl Vmm for MemoryVmm {
         Ok(BOX.disk_mib)
     }
 
-    fn disk(&self) -> Result<Disk, String> {
+    fn disk(&self, _: &[String]) -> Result<Disk, String> {
         Ok(Disk {
             total_mib: 100_000,
             free_mib: self.free_disk_mib.load(Ordering::SeqCst),
@@ -606,6 +606,7 @@ struct Host {
     capacity: u32,
     settings: Settings,
     sessions: tokio::sync::watch::Receiver<Vec<EntityId>>,
+    disk_held: tokio::sync::watch::Receiver<HeldDisk>,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -800,6 +801,7 @@ fn start_host(
     let received = control_plane(store.clone(), lifecycle.answers(), Arc::clone(&log), from_lifecycle);
     lifecycle.start(taken).expect("the lifecycle starts");
     let sessions = lifecycle.sessions();
+    let disk_held = lifecycle.disk_held();
     let (commands, from_host) = unbounded_channel();
     let cancels = lifecycle.cancels();
     tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
@@ -816,6 +818,7 @@ fn start_host(
         capacity,
         settings,
         sessions,
+        disk_held,
     }
 }
 
@@ -2148,9 +2151,18 @@ async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_an_idle_box_fre
         "{refused:?}"
     );
     assert!(host.log().is_empty(), "a refused box never boots");
+    assert_eq!(host.disk_held.borrow().unevictable_mib, 65_536);
     host.snapshot("session-1");
     host.settle(SETTLE).await;
     host.log();
+    let held = host.disk_held.borrow().clone();
+    let mut drives = held.drives.clone();
+    drives.sort();
+    assert_eq!(
+        (drives, held.unevictable_mib),
+        (vec!["session-1".to_string(), "session-2".to_string()], 32_768),
+        "the idle snapshotted box's disk is evictable, so the host does not report it held"
+    );
     host.turn("turn-4", "session-3", "four", Vec::new());
     assert_eq!(host.settle(SETTLE).await, ["claim turn-4", "line 1 four", "complete 1"]);
     assert_eq!(

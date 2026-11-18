@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use tumpel_api::types::{HostArchitecture, HostUsage};
 
 use crate::firecracker::OVERLAY_DRIVE;
-use crate::pool::Disk;
+use crate::pool::{Disk, HeldDisk};
 
 const MEMINFO: &str = "/proc/meminfo";
 const LOADAVG: &str = "/proc/loadavg";
@@ -69,17 +69,10 @@ pub fn memory_total_and_available_mib() -> Result<(u64, u64)> {
     ))
 }
 
-fn written_mib(sessions: &Path) -> Result<u64> {
-    let entries = match std::fs::read_dir(sessions) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        read => read.with_context(|| format!("listing {} for the box disks failed", sessions.display()))?,
-    };
+fn written_mib(sessions: &Path, drives: &[String]) -> Result<u64> {
     let mut blocks = 0;
-    for entry in entries {
-        let drive = entry
-            .with_context(|| format!("listing {} for the box disks failed", sessions.display()))?
-            .path()
-            .join(OVERLAY_DRIVE);
+    for drive in drives {
+        let drive = sessions.join(drive).join(OVERLAY_DRIVE);
         match std::fs::metadata(&drive) {
             Ok(metadata) => blocks += metadata.blocks(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -92,12 +85,12 @@ fn written_mib(sessions: &Path) -> Result<u64> {
     Ok(blocks * 512 / (1024 * 1024))
 }
 
-pub fn disk(data_dir: &Path) -> Result<Disk> {
+pub fn disk(data_dir: &Path, drives: &[String]) -> Result<Disk> {
     let space = tumpel_guest::disk::space(data_dir).map_err(|error| anyhow!(error))?;
     Ok(Disk {
         total_mib: space.total_mib,
         free_mib: space.available_mib,
-        written_mib: written_mib(&data_dir.join("sessions"))?,
+        written_mib: written_mib(&data_dir.join("sessions"), drives)?,
     })
 }
 
@@ -155,15 +148,16 @@ pub struct HostStats {
     pub cpu: CpuTimes,
 }
 
-fn stats(boxes_warm: u32, meminfo: &str, loadavg: &str, stat: &str) -> Result<HostStats> {
+fn stats(boxes_warm: u32, disk: Disk, held_mib: u64, procs: [&str; 3]) -> Result<HostStats> {
+    let [meminfo, loadavg, stat] = procs;
     let loads = load_averages(loadavg)?;
     Ok(HostStats {
         usage: HostUsage {
             boxes_warm: i32::try_from(boxes_warm).unwrap_or(i32::MAX),
             load_average: loads[0],
             memory_available_mib: i64::try_from(meminfo_kib(meminfo, "MemAvailable")? / 1024).unwrap_or(i64::MAX),
-            disk_budget_mib: None,
-            disk_held_mib: None,
+            disk_budget_mib: Some(i64::try_from(disk.budget_mib()).unwrap_or(i64::MAX)),
+            disk_held_mib: Some(i64::try_from(held_mib).unwrap_or(i64::MAX)),
         },
         memory_total_mib: meminfo_kib(meminfo, "MemTotal")? / 1024,
         loads,
@@ -171,24 +165,63 @@ fn stats(boxes_warm: u32, meminfo: &str, loadavg: &str, stat: &str) -> Result<Ho
     })
 }
 
-pub fn sample(boxes_warm: u32) -> Result<HostStats> {
+pub fn sample(boxes_warm: u32, data_dir: &Path, held: &HeldDisk) -> Result<HostStats> {
     let loadavg =
         std::fs::read_to_string(LOADAVG).with_context(|| format!("reading {LOADAVG} for the host's load failed"))?;
     let stat =
         std::fs::read_to_string(STAT).with_context(|| format!("reading {STAT} for the host's CPU time failed"))?;
-    stats(boxes_warm, &read_meminfo()?, &loadavg, &stat)
+    let disk = disk(data_dir, &held.drives)?;
+    stats(
+        boxes_warm,
+        disk,
+        held.unevictable_mib,
+        [&read_meminfo()?, &loadavg, &stat],
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cpu_times, resident_kib, stats};
+    use std::path::Path;
+
+    use super::{cpu_times, resident_kib, stats, written_mib, Disk};
+
+    #[test]
+    fn written_disk_counts_only_the_drives_of_boxes_the_pool_holds() {
+        let sessions = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/usage-tests/sessions");
+        if sessions.exists() {
+            std::fs::remove_dir_all(&sessions).expect("clearing the last run");
+        }
+        for session in ["held", "orphan"] {
+            std::fs::create_dir_all(sessions.join(session)).expect("a session directory");
+            std::fs::write(sessions.join(session).join("overlay.ext4"), vec![1u8; 3 * 1024 * 1024]).expect("a drive");
+        }
+        assert_eq!(
+            written_mib(&sessions, &["held".to_string(), "booting".to_string()]).expect("written"),
+            3
+        );
+    }
 
     const STAT: &str = "cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 100 0 50 800 50 0 0 0 0 0\n";
     const LATER: &str = "cpu  160 0 70 880 70 0 0 0 0 0\ncpu0 160 0 70 880 70 0 0 0 0 0\n";
 
     #[test]
     fn stats_read_memory_in_mib_and_the_load_averages_from_captured_proc_files() {
-        let sampled = stats(0, include_str!("usage/meminfo"), include_str!("usage/loadavg"), STAT).expect("stats");
+        let disk = Disk {
+            total_mib: 100_000,
+            free_mib: 80_000,
+            written_mib: 0,
+        };
+        let sampled = stats(
+            0,
+            disk,
+            32_768,
+            [include_str!("usage/meminfo"), include_str!("usage/loadavg"), STAT],
+        )
+        .expect("stats");
+        assert_eq!(
+            (sampled.usage.disk_budget_mib, sampled.usage.disk_held_mib),
+            (Some(70_000), Some(32_768))
+        );
         assert_eq!(sampled.usage.memory_available_mib, 12_973_128 / 1024);
         assert_eq!(sampled.memory_total_mib, 16_375_664 / 1024);
         assert!((sampled.usage.load_average - 10.01).abs() < f64::EPSILON);

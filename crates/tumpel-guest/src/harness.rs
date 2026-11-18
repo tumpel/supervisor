@@ -607,7 +607,7 @@ fn ended(reason: GuestTurnEndReason, detail: impl Into<String>) -> Ending {
 fn constraints(memory_mib: u64, disk_mib: u64, cpus: usize, turn_seconds: Option<NonZeroU32>) -> String {
     let limit = turn_seconds.map_or_else(String::new, |seconds| format!("- Turn time limit: {seconds} seconds\n"));
     format!(
-        "# Box limits\n\n- Memory: {memory_mib} MiB\n- Disk: {disk_mib} MiB\n- CPUs: {cpus}\n{limit}\nA turn ends BoxDiskFull when the disk fills, HarnessOutOfMemory when memory runs out and TurnTimedOut past its time limit.\n"
+        "# Box limits\n\n- Memory: {memory_mib} MiB\n- Disk: {disk_mib} MiB\n- CPUs: {cpus}\n{limit}\nA turn fails BoxDiskFull when the harness fails on a full disk and otherwise completes with a warning; it fails HarnessOutOfMemory when memory runs out and TurnTimedOut past its time limit.\n"
     )
 }
 
