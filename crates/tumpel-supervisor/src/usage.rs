@@ -29,44 +29,17 @@ fn read_meminfo() -> Result<String> {
     std::fs::read_to_string(MEMINFO).with_context(|| format!("reading {MEMINFO} for the host's memory failed"))
 }
 
-fn field_kib(text: &str, field: &str) -> Option<u64> {
-    text.lines()
+fn meminfo_kib(meminfo: &str, field: &str) -> Result<u64> {
+    meminfo
+        .lines()
         .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
         .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-}
-
-fn meminfo_kib(meminfo: &str, field: &str) -> Result<u64> {
-    field_kib(meminfo, field).ok_or_else(|| anyhow!("{MEMINFO} has no {field} line in kB"))
-}
-
-fn resident_kib(status: &str) -> u64 {
-    field_kib(status, "VmRSS").unwrap_or(0)
-}
-
-pub fn resident_mib(pid: std::num::NonZeroU32) -> Result<u64> {
-    let path = format!("/proc/{pid}/status");
-    match std::fs::read_to_string(&path) {
-        Ok(status) => Ok(resident_kib(&status) / 1024),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(error) => Err(error).with_context(|| format!("reading {path} for a box's resident memory failed")),
-    }
+        .ok_or_else(|| anyhow!("{MEMINFO} has no {field} line in kB"))
 }
 
 pub fn memory_bytes() -> Result<NonZeroU64> {
     NonZeroU64::new(meminfo_kib(&read_meminfo()?, "MemTotal")? * 1024)
         .ok_or_else(|| anyhow!("{MEMINFO} reports no memory"))
-}
-
-pub fn memory_available_mib() -> Result<u64> {
-    Ok(meminfo_kib(&read_meminfo()?, "MemAvailable")? / 1024)
-}
-
-pub fn memory_total_and_available_mib() -> Result<(u64, u64)> {
-    let meminfo = read_meminfo()?;
-    Ok((
-        meminfo_kib(&meminfo, "MemTotal")? / 1024,
-        meminfo_kib(&meminfo, "MemAvailable")? / 1024,
-    ))
 }
 
 fn written_mib(sessions: &Path, drives: &[String]) -> Result<u64> {
@@ -197,7 +170,7 @@ pub fn sample(boxes_warm: u32, data_dir: &Path, held: &HeldDisk) -> Result<HostS
 mod tests {
     use std::path::Path;
 
-    use super::{cpu_times, disk, prepare_data_dir, resident_kib, stats, written_mib, Disk};
+    use super::{cpu_times, disk, prepare_data_dir, stats, written_mib, Disk};
 
     #[test]
     fn a_freshly_enrolled_host_without_a_data_directory_creates_it_and_reads_its_disk() {
@@ -260,13 +233,6 @@ mod tests {
         assert_eq!(sampled.memory_total_mib, 16_375_664 / 1024);
         assert!((sampled.usage.load_average - 10.01).abs() < f64::EPSILON);
         assert_eq!(sampled.loads, [10.01, 6.83, 4.95]);
-    }
-
-    #[test]
-    fn resident_memory_is_vm_rss_and_a_zombie_without_memory_holds_none() {
-        let running = "Name:\tfirecracker\nState:\tS (sleeping)\nVmPeak:\t 4300000 kB\nVmRSS:\t 3670016 kB\nRssAnon:\t 3600000 kB\n";
-        assert_eq!(resident_kib(running), 3_670_016);
-        assert_eq!(resident_kib("Name:\tfirecracker\nState:\tZ (zombie)\nThreads:\t1\n"), 0);
     }
 
     #[test]

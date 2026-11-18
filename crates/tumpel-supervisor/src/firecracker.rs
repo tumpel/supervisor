@@ -601,10 +601,6 @@ impl Vmm for Firecracker {
         booted_memory(Path::new(&handed.api_socket))
     }
 
-    fn available_memory_mib(&self) -> Result<u64, String> {
-        crate::usage::memory_available_mib().map_err(|error| format!("{error:#}"))
-    }
-
     fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String> {
         let drive = session_dir(&self.data, session_id)?.join(OVERLAY_DRIVE);
         let bytes = std::fs::metadata(&drive)
