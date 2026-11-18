@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::io::{Cursor, Read};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,7 +70,7 @@ impl Upper for Tree {
 
 type Drives = Arc<Mutex<HashMap<PathBuf, Files>>>;
 type Log = Arc<Mutex<Vec<String>>>;
-type Hands = Arc<Mutex<HashMap<i32, MemoryGuest>>>;
+type Hands = Arc<Mutex<HashMap<i32, (MemoryGuest, NonZeroU32)>>>;
 
 fn note(log: &Log, event: String) {
     log.lock().expect("log").push(event);
@@ -211,6 +212,7 @@ struct MemoryMachine {
     drives: Drives,
     log: Log,
     hands: Hands,
+    memory_mib: NonZeroU32,
 }
 
 impl MemoryMachine {
@@ -289,7 +291,7 @@ impl Machine for MemoryMachine {
     fn hand_over(self, guest: MemoryGuest) -> Result<SupervisorHandoverMachine, String> {
         let mut hands = self.hands.lock().expect("hands");
         let guest_fd = i32::try_from(hands.len()).expect("a descriptor") + 3;
-        hands.insert(guest_fd, guest);
+        hands.insert(guest_fd, (guest, self.memory_mib));
         note(&self.log, format!("hand over {}", self.session));
         let machine = serde_json::from_value(json!({
             "processId": 100 + guest_fd, "apiSocket": "api.sock", "vsock": "v.sock", "guestFd": guest_fd,
@@ -328,7 +330,7 @@ impl Vmm for MemoryVmm {
     type Machine = MemoryMachine;
     type Upper = Tree;
 
-    fn machine(&self, session_id: &EntityId, tap: &Tap, _memory_mib: Option<i32>) -> Result<MemoryMachine, String> {
+    fn machine(&self, session_id: &EntityId, tap: &Tap) -> Result<MemoryMachine, String> {
         Ok(MemoryMachine {
             harness: self.harness,
             boot: self.boot,
@@ -338,6 +340,7 @@ impl Vmm for MemoryVmm {
             drives: Arc::clone(&self.drives),
             log: Arc::clone(&self.log),
             hands: Arc::clone(&self.hands),
+            memory_mib: tap.memory_mib(),
         })
     }
 
@@ -347,7 +350,7 @@ impl Vmm for MemoryVmm {
         tap: &Tap,
         handed: &SupervisorHandoverMachine,
     ) -> Result<(MemoryMachine, MemoryGuest), String> {
-        let guest = self
+        let (guest, _) = self
             .hands
             .lock()
             .expect("hands")
@@ -359,7 +362,21 @@ impl Vmm for MemoryVmm {
                 )
             })?;
         note(&self.log, format!("reattach {} on {}", **session_id, tap.device()));
-        Ok((self.machine(session_id, tap, None)?, guest))
+        Ok((self.machine(session_id, tap)?, guest))
+    }
+
+    fn booted_memory(&self, handed: &SupervisorHandoverMachine) -> Result<NonZeroU32, String> {
+        self.hands
+            .lock()
+            .expect("hands")
+            .get(&handed.guest_fd)
+            .map(|(_, memory_mib)| *memory_mib)
+            .ok_or_else(|| {
+                format!(
+                    "its Firecracker process {} ended during the handover",
+                    handed.process_id
+                )
+            })
     }
 
     fn discard(&self, handed: &SupervisorHandoverMachine) {
@@ -727,7 +744,7 @@ fn start_host(
         vmm.clone(),
         store.clone(),
         settings,
-        TapPool::new(capacity).expect("pool"),
+        TapPool::new(u64::from(capacity) * 4096, NonZeroU32::new(4096).expect("4096")),
         out,
         vmm.staging.join("boxes.json"),
     );
@@ -803,16 +820,12 @@ impl Host {
     }
 
     fn keep_guest(&self, handed: &mut SupervisorHandoverBox, fd: i32) {
-        let tap = TapPool::new(self.capacity)
-            .expect("pool")
-            .claim_device(handed.tap_index)
+        let memory_mib = NonZeroU32::new(4096).expect("4096");
+        let tap = TapPool::new(u64::from(self.capacity) * 4096, memory_mib)
+            .claim_device(handed.tap_index, memory_mib)
             .expect("tap");
-        let guest = self
-            .vmm
-            .machine(&handed.session_id, &tap, None)
-            .expect("machine")
-            .guest();
-        self.vmm.hands.lock().expect("hands").insert(fd, guest);
+        let guest = self.vmm.machine(&handed.session_id, &tap).expect("machine").guest();
+        self.vmm.hands.lock().expect("hands").insert(fd, (guest, memory_mib));
         handed.machine.guest_fd = fd;
     }
 
@@ -1263,7 +1276,9 @@ async fn a_claim_past_the_pool_is_refused_until_a_clean_paused_box_can_be_evicte
     assert!(
         refused.len() == 1
             && refused[0].starts_with(&format!("failed {}", TurnFailureReason::PoolExhausted))
-            && refused[0].contains("all 1 boxes held"),
+            && refused[0].contains(
+                "this host's 1 boxes hold 4096 MiB of the 4096 MiB it gives boxes, so a box of 4096 MiB does not fit"
+            ),
         "{refused:?}"
     );
     host.snapshot("session-1");
@@ -1277,6 +1292,70 @@ async fn a_claim_past_the_pool_is_refused_until_a_clean_paused_box_can_be_evicte
     assert_eq!(
         host.log(),
         ["stop session-1", "boot session-2 on tumpel0", "pause session-2"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_box_that_does_not_fit_evicts_idle_snapshotted_boxes_only_when_that_makes_room() {
+    let mut host = host("memory", 3, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.turn("turn-2", "session-2", "two", Vec::new());
+    host.settle(SETTLE).await;
+    host.snapshot("session-1");
+    host.settle(SETTLE).await;
+    host.log();
+    let mut large = host.box_turn("turn-3", "session-3", "three", Vec::new(), 300);
+    large.box_memory_mib = Some(12_288);
+    host.send(Command::Turn(Box::new(large)));
+    let refused = host.settle(SETTLE).await;
+    assert!(
+        refused.len() == 1
+            && refused[0].starts_with(&format!("failed {}", TurnFailureReason::PoolExhausted))
+            && refused[0].contains(
+                "this host's 2 boxes hold 8192 MiB of the 12288 MiB it gives boxes, so a box of 12288 MiB does not fit"
+            ),
+        "{refused:?}"
+    );
+    assert!(
+        host.log().is_empty(),
+        "the idle snapshotted box stays warm when evicting it cannot make room"
+    );
+    host.snapshot("session-2");
+    host.settle(SETTLE).await;
+    host.log();
+    let mut large = host.box_turn("turn-4", "session-3", "four", Vec::new(), 300);
+    large.box_memory_mib = Some(12_288);
+    host.send(Command::Turn(Box::new(large)));
+    assert_eq!(host.settle(SETTLE).await, ["claim turn-4", "line 1 four", "complete 1"]);
+    assert_eq!(
+        host.log(),
+        [
+            "stop session-1",
+            "stop session-2",
+            "boot session-3 on tumpel0",
+            "pause session-3"
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_box_handed_to_a_new_supervisor_is_charged_the_memory_it_booted_with() {
+    let mut old = host("handover-memory", 2, Harness::Echo, Boot::Works);
+    let mut large = old.box_turn("turn-1", "session-1", "one", Vec::new(), 300);
+    large.box_memory_mib = Some(8192);
+    old.send(Command::Turn(Box::new(large)));
+    old.settle_until("complete 1").await;
+    let mut new = old.hand_over().await;
+    new.log();
+    new.turn("turn-2", "session-2", "two", Vec::new());
+    let refused = new.settle(SETTLE).await;
+    assert!(
+        refused.len() == 1
+            && refused[0].contains(
+                "this host's 1 boxes hold 8192 MiB of the 8192 MiB it gives boxes, so a box of 4096 MiB does not fit"
+            ),
+        "{refused:?}"
     );
 }
 
@@ -1363,7 +1442,11 @@ async fn a_box_on_record_that_cannot_be_reattached_after_a_crash_is_stopped_with
     tokio::time::sleep(Duration::from_millis(1)).await;
     assert_eq!(
         new.log(),
-        ["reattach session-1 on tumpel0", "keep boxes [0] and stop the rest"],
+        [
+            "reattach session-1 on tumpel0",
+            "discard 99",
+            "keep boxes [0] and stop the rest"
+        ],
         "the box of session-2 on tumpel1 is not kept, so its scope is stopped"
     );
 }

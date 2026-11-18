@@ -24,17 +24,40 @@ fn read_meminfo() -> Result<String> {
     std::fs::read_to_string(MEMINFO).with_context(|| format!("reading {MEMINFO} for the host's memory failed"))
 }
 
-fn meminfo_kib(meminfo: &str, field: &str) -> Result<u64> {
-    meminfo
-        .lines()
+fn field_kib(text: &str, field: &str) -> Option<u64> {
+    text.lines()
         .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
         .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-        .ok_or_else(|| anyhow!("{MEMINFO} has no {field} line in kB"))
+}
+
+fn meminfo_kib(meminfo: &str, field: &str) -> Result<u64> {
+    field_kib(meminfo, field).ok_or_else(|| anyhow!("{MEMINFO} has no {field} line in kB"))
+}
+
+fn resident_kib(status: &str) -> u64 {
+    field_kib(status, "VmRSS").unwrap_or(0)
+}
+
+pub fn resident_mib(pid: std::num::NonZeroU32) -> Result<u64> {
+    let path = format!("/proc/{pid}/status");
+    match std::fs::read_to_string(&path) {
+        Ok(status) => Ok(resident_kib(&status) / 1024),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error).with_context(|| format!("reading {path} for a box's resident memory failed")),
+    }
 }
 
 pub fn memory_bytes() -> Result<NonZeroU64> {
     NonZeroU64::new(meminfo_kib(&read_meminfo()?, "MemTotal")? * 1024)
         .ok_or_else(|| anyhow!("{MEMINFO} reports no memory"))
+}
+
+pub fn memory_total_and_available_mib() -> Result<(u64, u64)> {
+    let meminfo = read_meminfo()?;
+    Ok((
+        meminfo_kib(&meminfo, "MemTotal")? / 1024,
+        meminfo_kib(&meminfo, "MemAvailable")? / 1024,
+    ))
 }
 
 fn load_averages(loadavg: &str) -> Result<[f64; 3]> {
@@ -115,7 +138,7 @@ pub fn sample(boxes_warm: u32) -> Result<HostStats> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cpu_times, stats};
+    use super::{cpu_times, resident_kib, stats};
 
     const STAT: &str = "cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 100 0 50 800 50 0 0 0 0 0\n";
     const LATER: &str = "cpu  160 0 70 880 70 0 0 0 0 0\ncpu0 160 0 70 880 70 0 0 0 0 0\n";
@@ -127,6 +150,13 @@ mod tests {
         assert_eq!(sampled.memory_total_mib, 16_375_664 / 1024);
         assert!((sampled.usage.load_average - 10.01).abs() < f64::EPSILON);
         assert_eq!(sampled.loads, [10.01, 6.83, 4.95]);
+    }
+
+    #[test]
+    fn resident_memory_is_vm_rss_and_a_zombie_without_memory_holds_none() {
+        let running = "Name:\tfirecracker\nState:\tS (sleeping)\nVmPeak:\t 4300000 kB\nVmRSS:\t 3670016 kB\nRssAnon:\t 3600000 kB\n";
+        assert_eq!(resident_kib(running), 3_670_016);
+        assert_eq!(resident_kib("Name:\tfirecracker\nState:\tZ (zombie)\nThreads:\t1\n"), 0);
     }
 
     #[test]

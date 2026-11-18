@@ -9,6 +9,7 @@ use tumpel_api::types::SupervisorRuntime;
 
 use crate::dir::{self, CONFIG_FILE, RUNTIME_FILE, SUPERVISOR_UNIT};
 use crate::enrol;
+use crate::pool::TAP_POOL;
 use crate::update::{Layout, ROLLBACK_SCRIPT};
 
 const FIRECRACKER_ARCHIVE_URL: &str =
@@ -25,8 +26,6 @@ const TAP_UNIT: &str = "tumpel-tap-pool.service";
 const NETWORK_MANAGER_CONF: &str = "/etc/NetworkManager/conf.d/90-tumpel-unmanaged.conf";
 const NETWORK_MANAGER_TEXT: &str = "[keyfile]\nunmanaged-devices=interface-name:tumpel*\n";
 const WAIT_ONLINE: &str = "/usr/lib/systemd/systemd-networkd-wait-online";
-const MAX_BOXES: u32 = 256;
-const TAP_POOL: u32 = 64;
 
 pub struct Enrolment {
     pub endpoint: String,
@@ -242,7 +241,7 @@ fn load_runtime() -> Result<SupervisorRuntime> {
     dir::ensure_dir(&dir)?;
     dir::write_json(&dir.join(RUNTIME_FILE), &runtime)?;
     eprintln!(
-        "wrote the default {}; edit boxCapacity there and restart {SUPERVISOR_UNIT} to change the box limit",
+        "wrote the default {}; the supervisor runs as many boxes as this host's memory holds",
         dir.join(RUNTIME_FILE).display()
     );
     Ok(runtime)
@@ -396,10 +395,6 @@ fn probe_host_network() -> Result<HostNetwork> {
         .context("starting systemctl is-active systemd-networkd")?
         .success();
     Ok(host_network(Path::new("/"), networkd))
-}
-
-fn tap_pool_size(boxes: u32) -> u32 {
-    boxes.max(TAP_POOL)
 }
 
 fn tap_unit_text(boxes: u32, user: &str) -> String {
@@ -605,7 +600,7 @@ WantedBy=default.target
         rollback = ROLLBACK_SCRIPT.replace('$', "$$"),
         previous = previous.display(),
         binary = binary.display(),
-        descriptors = 3 * MAX_BOXES
+        descriptors = 3 * u32::from(TAP_POOL)
     )
 }
 
@@ -668,15 +663,11 @@ pub async fn install(enrolment: Option<Enrolment>) -> Result<()> {
         .map(|enrolment| enrol::read_token(&enrolment.token_file))
         .transpose()?;
     let runtime = load_runtime()?;
-    let boxes = runtime.box_capacity.get();
-    if boxes > MAX_BOXES {
-        bail!("boxCapacity {boxes} in runtime.json is above {MAX_BOXES}, the number of /30s 172.16.<k>.0 offers");
-    }
     let staging = dir::supervisor_dir().join("install");
     dir::ensure_dir(&staging)?;
     install_firecracker(&runtime, &staging).await?;
     install_filter(&staging)?;
-    install_tap_pool(tap_pool_size(boxes), &account, &staging)?;
+    install_tap_pool(u32::from(TAP_POOL), &account, &staging)?;
     install_unit(&account)?;
     std::fs::remove_dir(&staging).with_context(|| format!("removing {}", staging.display()))?;
     if let (Some(enrolment), Some(token)) = (enrolment, token) {
