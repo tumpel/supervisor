@@ -109,7 +109,7 @@ async fn exec_handed_supervisor() {
         overlay_bytes: 0,
     };
     let mib = NonZeroU32::new(512).expect("512");
-    let mut pool = TapPool::new(1024, mib);
+    let mut pool = TapPool::new(1024, 4096, mib);
     let old_tap = pool.claim_device(63, mib).expect("tap 63");
     let old_session = "restart-test-old".try_into().expect("session id");
     let _old = vmm

@@ -573,6 +573,10 @@ impl Vmm for Firecracker {
         booted_memory(Path::new(&handed.api_socket))
     }
 
+    fn available_memory_mib(&self) -> Result<u64, String> {
+        crate::usage::memory_available_mib().map_err(|error| format!("{error:#}"))
+    }
+
     fn discard(&self, handed: &SupervisorHandoverMachine) {
         let taken = Taken::from(handed);
         if let Some(pid) = handed_pid(handed) {

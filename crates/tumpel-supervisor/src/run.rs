@@ -32,7 +32,7 @@ use crate::lifecycle::{
     turn_failed, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder, Taken,
     TeardownOrder,
 };
-use crate::pool::{memory_budget_mib, TapPool};
+use crate::pool::{headroom_mib, memory_budget_mib, TapPool};
 use crate::store::HttpStore;
 use crate::telemetry::{Telemetry, BATCH_POINTS};
 use crate::update::{self, HttpSource, Layout, Limits, Outcome, Startup, Updater};
@@ -338,6 +338,7 @@ fn start_boxes(
     let (total_mib, available_mib) = usage::memory_total_and_available_mib().map_err(unreadable)?;
     let pool = TapPool::new(
         memory_budget_mib(total_mib, available_mib, handed_resident_mib),
+        headroom_mib(total_mib),
         box_mib,
     );
     let settings = Settings {

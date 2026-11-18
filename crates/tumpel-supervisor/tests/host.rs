@@ -130,7 +130,7 @@ async fn a_shell_box_runs_a_turn_pauses_resumes_warm_and_its_drive_reads_back() 
         Firecracker::new(&runtime),
         HttpStore::new().expect("store"),
         settings,
-        TapPool::new(4096, std::num::NonZeroU32::new(4096).expect("4096")),
+        TapPool::new(4096, 4096, std::num::NonZeroU32::new(4096).expect("4096")),
         out,
         data.join("boxes.json"),
     );
@@ -268,7 +268,7 @@ async fn crashing_supervisor() {
         Firecracker::new(&runtime),
         HttpStore::new().expect("store"),
         settings,
-        TapPool::new(4096, std::num::NonZeroU32::new(4096).expect("4096")),
+        TapPool::new(4096, 4096, std::num::NonZeroU32::new(4096).expect("4096")),
         out,
         data.join("boxes.json"),
     );
@@ -336,7 +336,7 @@ async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_i
         Firecracker::new(&runtime),
         HttpStore::new().expect("store"),
         settings,
-        TapPool::new(4096, std::num::NonZeroU32::new(4096).expect("4096")),
+        TapPool::new(4096, 4096, std::num::NonZeroU32::new(4096).expect("4096")),
         out,
         standing.clone(),
     );
