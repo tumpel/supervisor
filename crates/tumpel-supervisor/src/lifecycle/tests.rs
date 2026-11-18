@@ -25,8 +25,8 @@ use super::{
 use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
 use crate::images::ImageOrder;
-use crate::pool::{Tap, TapPool};
-use crate::snapshot::{Born, Entry, Found, Kind, Scan, Upper};
+use crate::pool::{Disk, HeldDisk, Size, Tap, TapPool};
+use crate::snapshot::{Born, Entry, Found, Kind, Scan, Stored, Upper};
 use crate::store::{Store, UploadError};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -338,6 +338,7 @@ struct MemoryVmm {
     log: Log,
     hands: Hands,
     available_mib: Arc<AtomicU64>,
+    free_disk_mib: Arc<AtomicU64>,
 }
 
 impl Vmm for MemoryVmm {
@@ -396,6 +397,18 @@ impl Vmm for MemoryVmm {
 
     fn available_memory_mib(&self) -> Result<u64, String> {
         Ok(self.available_mib.load(Ordering::SeqCst))
+    }
+
+    fn booted_disk(&self, _: &EntityId) -> Result<NonZeroU32, String> {
+        Ok(BOX.disk_mib)
+    }
+
+    fn disk(&self, _: &[String]) -> Result<Disk, String> {
+        Ok(Disk {
+            total_mib: 100_000,
+            free_mib: self.free_disk_mib.load(Ordering::SeqCst),
+            written_mib: 0,
+        })
     }
 
     fn discard(&self, handed: &SupervisorHandoverMachine) {
@@ -517,6 +530,11 @@ impl Store for MemoryStore {
     }
 }
 
+const BOX: Size = Size {
+    memory_mib: NonZeroU32::new(4096).expect("a positive size"),
+    disk_mib: NonZeroU32::new(32_768).expect("a positive size"),
+};
+
 const WARM: Duration = Duration::from_millis(400);
 const SETTLE: Duration = Duration::from_millis(60);
 const SLOW_CLONE: Duration = Duration::from_millis(300);
@@ -534,7 +552,6 @@ fn settings() -> Settings {
         },
         warm_window: WARM,
         layer_cache_mib: std::num::NonZeroU32::MIN,
-        overlay_bytes: 1024 * 1024 * 1024,
     }
 }
 
@@ -589,6 +606,7 @@ struct Host {
     capacity: u32,
     settings: Settings,
     sessions: tokio::sync::watch::Receiver<Vec<EntityId>>,
+    disk_held: tokio::sync::watch::Receiver<HeldDisk>,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -756,6 +774,7 @@ fn host_on(
         log: Arc::default(),
         hands: Arc::default(),
         available_mib: Arc::new(AtomicU64::new(1 << 30)),
+        free_disk_mib: Arc::new(AtomicU64::new(1 << 30)),
     };
     start_host(vmm, store, capacity, settings, clone_seconds, None)
 }
@@ -775,13 +794,14 @@ fn start_host(
         vmm.clone(),
         store.clone(),
         settings,
-        TapPool::new(u64::from(capacity) * 4096, 4096, NonZeroU32::new(4096).expect("4096")),
+        TapPool::new(u64::from(capacity) * 4096, 4096, BOX),
         out,
         vmm.staging.join("boxes.json"),
     );
     let received = control_plane(store.clone(), lifecycle.answers(), Arc::clone(&log), from_lifecycle);
     lifecycle.start(taken).expect("the lifecycle starts");
     let sessions = lifecycle.sessions();
+    let disk_held = lifecycle.disk_held();
     let (commands, from_host) = unbounded_channel();
     let cancels = lifecycle.cancels();
     tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
@@ -798,6 +818,7 @@ fn start_host(
         capacity,
         settings,
         sessions,
+        disk_held,
     }
 }
 
@@ -856,8 +877,12 @@ impl Host {
 
     fn keep_guest(&self, handed: &mut SupervisorHandoverBox, fd: i32) {
         let memory_mib = NonZeroU32::new(4096).expect("4096");
-        let tap = TapPool::new(u64::from(self.capacity) * 4096, 4096, memory_mib)
-            .claim_device(handed.tap_index, memory_mib)
+        let size = Size {
+            memory_mib,
+            disk_mib: BOX.disk_mib,
+        };
+        let tap = TapPool::new(u64::from(self.capacity) * 4096, 4096, size)
+            .claim_device(handed.tap_index, size)
             .expect("tap");
         let guest = self.vmm.machine(&handed.session_id, &tap).expect("machine").guest();
         self.vmm.hands.lock().expect("hands").insert(fd, (guest, memory_mib));
@@ -1005,6 +1030,7 @@ impl Host {
             files_cache: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/lifecycle-tests/persona-files"),
             prebuild_commit_sha: None,
             box_memory_mib: None,
+            box_disk_mib: None,
         }
     }
 
@@ -2085,19 +2111,68 @@ async fn restoring(name: &str, settings: Settings) -> (Host, ChannelSnapshotDown
     (second, snapshot)
 }
 
-#[tokio::test]
-async fn a_snapshot_larger_than_the_overlay_drive_fails_snapshot_unreadable_naming_both_sizes() {
-    let mut settings = settings();
-    settings.overlay_bytes = 1;
-    let (mut host, snapshot) = restoring("overlay-too-small", settings).await;
-    host.turn("turn-2", "session-1", "two", vec![snapshot]);
-    let seen = host.settle(SETTLE).await;
+#[test]
+fn a_snapshot_larger_than_the_box_disk_names_both_sizes_and_the_persona_setting() {
+    let file = Stored {
+        entry: Entry {
+            kind: Kind::File { size: 2 * 1024 * 1024 },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 1,
+            mtime_nanos: 0,
+        },
+        chunks: Vec::new(),
+    };
+    let manifest = BTreeMap::from([(b"root/target".to_vec(), file)]);
+    assert_eq!(
+        super::restore_size("snapshot 1", &manifest, 1024 * 1024),
+        Err("snapshot 1 holds 2097152 bytes, more than the 1048576 bytes of the box's disk; raise the persona's boxDiskMib or start a new session".to_string())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_an_idle_box_frees_its_disk() {
+    let mut host = host("disk", 3, Harness::Echo, Boot::Works);
+    host.vmm.free_disk_mib.store(80_000, Ordering::SeqCst);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.turn("turn-2", "session-2", "two", Vec::new());
+    host.settle(SETTLE).await;
+    host.log();
+    host.turn("turn-3", "session-3", "three", Vec::new());
+    let refused = host.settle(SETTLE).await;
     assert!(
-        seen.len() == 2
-            && seen[1].starts_with(&format!("failed {}", TurnFailureReason::SnapshotUnreadable))
-            && seen[1].contains("more than the 1 bytes of the box's overlay drive")
-            && seen[1].contains("overlayMib"),
-        "{seen:?}"
+        refused.len() == 1
+            && refused[0].starts_with(&format!("failed {}", TurnFailureReason::PoolExhausted))
+            && refused[0].contains(
+                "this host gives box disks 70000 MiB, its 80000 MiB of free disk and the 0 MiB its boxes wrote less the 10000 MiB it keeps free; its 2 boxes hold 65536 MiB of it, so a box disk of 32768 MiB does not fit"
+            ),
+        "{refused:?}"
+    );
+    assert!(host.log().is_empty(), "a refused box never boots");
+    assert_eq!(host.disk_held.borrow().unevictable_mib, 65_536);
+    host.snapshot("session-1");
+    host.settle(SETTLE).await;
+    host.log();
+    let held = host.disk_held.borrow().clone();
+    let mut drives = held.drives.clone();
+    drives.sort();
+    assert_eq!(
+        (drives, held.unevictable_mib),
+        (vec!["session-1".to_string(), "session-2".to_string()], 32_768),
+        "the idle snapshotted box's disk is evictable, so the host does not report it held"
+    );
+    host.turn("turn-4", "session-3", "four", Vec::new());
+    assert_eq!(host.settle(SETTLE).await, ["claim turn-4", "line 1 four", "complete 1"]);
+    assert_eq!(
+        host.log(),
+        [
+            "stop session-1",
+            "boot session-3 on tumpel0",
+            "reconnect session-3",
+            "pause session-3"
+        ]
     );
 }
 

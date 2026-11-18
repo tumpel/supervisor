@@ -4,7 +4,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 use tumpel_api::types::{GuestHarness, GuestTurnStart};
 
-use tumpel_api::types::GuestHarnessProtocol;
+use tumpel_api::types::{GuestHarnessProtocol, GuestTurnEndReason};
 
 use super::{
     answers_no_prompt, ends_turn, environment, home_path, launch, priced_by_anthropic, reuses, skips, turn_arguments,
@@ -426,5 +426,67 @@ fn a_cancel_kills_a_persistent_harness_and_every_process_it_started() {
     assert_eq!(
         status.and_then(|status| std::os::unix::process::ExitStatusExt::signal(&status)),
         Some(libc::SIGKILL)
+    );
+}
+
+#[test]
+fn a_harness_that_fails_on_a_full_box_disk_fails_box_disk_full_and_a_completed_turn_only_warns() {
+    let full = tumpel_guest::disk::Space {
+        total_mib: 32_096,
+        available_mib: 0,
+        free_mib: 12,
+    };
+    let parts = |ending: super::Ending| match ending {
+        super::Ending::Turn {
+            reason,
+            detail,
+            warning,
+            ..
+        } => (reason, detail, warning),
+        super::Ending::Clone(_) => panic!("a turn ending"),
+    };
+    let advice = "the box disk of 32096 MiB is full, 12 MiB free; give the persona a larger boxDiskMib, up to 262144 MiB, or have it delete build output it no longer needs";
+    assert_eq!(
+        parts(super::disk_full(
+            super::ended(GuestTurnEndReason::HarnessExited, "No space left on device"),
+            full,
+        )),
+        (
+            GuestTurnEndReason::BoxDiskFull,
+            format!("{advice}; the harness stopped (HarnessExited): No space left on device"),
+            None
+        )
+    );
+    assert_eq!(
+        parts(super::disk_full(super::ended(GuestTurnEndReason::Completed, ""), full)),
+        (GuestTurnEndReason::Completed, String::new(), Some(advice.to_string()))
+    );
+    assert_eq!(
+        parts(super::disk_full(super::ended(GuestTurnEndReason::Cancelled, ""), full)).0,
+        GuestTurnEndReason::Cancelled
+    );
+    let roomy = tumpel_guest::disk::Space { free_mib: 321, ..full };
+    assert_eq!(
+        parts(super::disk_full(
+            super::ended(GuestTurnEndReason::HarnessExited, ""),
+            roomy
+        )),
+        (GuestTurnEndReason::HarnessExited, String::new(), None)
+    );
+    assert_eq!(
+        parts(super::disk_full(super::ended(GuestTurnEndReason::Completed, ""), roomy)).2,
+        None
+    );
+}
+
+#[test]
+fn the_box_limits_note_names_the_memory_disk_cpus_and_turn_limit_the_box_got() {
+    assert_eq!(
+        super::constraints(4096, 32_096, 2, std::num::NonZeroU32::new(3600)),
+        "# Box limits\n\n- Memory: 4096 MiB\n- Disk: 32096 MiB\n- CPUs: 2\n- Turn time limit: 3600 seconds\n\nA turn fails BoxDiskFull when the harness fails on a full disk and otherwise completes with a warning; it fails HarnessOutOfMemory when memory runs out and TurnTimedOut past its time limit.\n"
+    );
+    assert_eq!(
+        super::constraints(4096, 32_096, 2, None),
+        "# Box limits\n\n- Memory: 4096 MiB\n- Disk: 32096 MiB\n- CPUs: 2\n\nA turn fails BoxDiskFull when the harness fails on a full disk and otherwise completes with a warning; it fails HarnessOutOfMemory when memory runs out and TurnTimedOut past its time limit.\n"
     );
 }

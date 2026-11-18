@@ -12,7 +12,18 @@ use tumpel_guest::encode;
 
 use super::{adopt, alive, booted_memory, take, Firecracker, Owner, Taken};
 use crate::lifecycle::{Guest, Machine, Vmm};
-use crate::pool::TapPool;
+use crate::pool::{Disk, Size, TapPool};
+
+const BOX: Size = Size {
+    memory_mib: NonZeroU32::new(4096).expect("a positive size"),
+    disk_mib: NonZeroU32::new(32_768).expect("a positive size"),
+};
+
+const ROOMY: Disk = Disk {
+    total_mib: 1 << 30,
+    free_mib: 1 << 29,
+    written_mib: 0,
+};
 
 fn sleeper() -> libc::pid_t {
     let id = std::process::Command::new("sleep")
@@ -117,7 +128,6 @@ fn firecracker(name: &str) -> Firecracker {
         images: data.join("images"),
         data,
         vcpus: 1,
-        overlay_bytes: 0,
     }
 }
 
@@ -173,9 +183,7 @@ fn closed(handed: &mut Handed) -> bool {
 #[tokio::test]
 async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_binary_left_off() {
     let vmm = firecracker("reattach-live");
-    let tap = TapPool::new(4096, 4096, NonZeroU32::new(4096).expect("4096"))
-        .claim(None, 0)
-        .expect("tap");
+    let tap = TapPool::new(4096, 4096, BOX).claim(BOX, 0, ROOMY).expect("tap");
     let pid = sleeper();
     let mut handed = handed(&vmm, pid, true);
     let session = "session-1".try_into().expect("session id");
@@ -198,9 +206,7 @@ async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_bin
 #[tokio::test]
 async fn reattach_of_a_box_whose_process_ended_closes_every_handed_descriptor() {
     let vmm = firecracker("reattach-ended");
-    let tap = TapPool::new(4096, 4096, NonZeroU32::new(4096).expect("4096"))
-        .claim(None, 0)
-        .expect("tap");
+    let tap = TapPool::new(4096, 4096, BOX).claim(BOX, 0, ROOMY).expect("tap");
     let pid = sleeper();
     zombie(pid);
     let mut handed = handed(&vmm, pid, true);
@@ -216,9 +222,7 @@ async fn reattach_of_a_box_whose_process_ended_closes_every_handed_descriptor() 
 #[tokio::test]
 async fn reattach_with_the_wrong_descriptor_kills_and_reaps_the_live_child_and_closes_the_rest() {
     let vmm = firecracker("reattach-wrong");
-    let tap = TapPool::new(4096, 4096, NonZeroU32::new(4096).expect("4096"))
-        .claim(None, 0)
-        .expect("tap");
+    let tap = TapPool::new(4096, 4096, BOX).claim(BOX, 0, ROOMY).expect("tap");
     let pid = sleeper();
     let mut handed = handed(&vmm, pid, false);
     let session = "session-1".try_into().expect("session id");

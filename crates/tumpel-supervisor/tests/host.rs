@@ -8,7 +8,12 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tumpel_api::types::{ChannelHostMessage, GuestImageManifest, Sequence, SupervisorRuntime};
 use tumpel_supervisor::{
     restored_descriptors, take_notify_socket, BootOrder, BoxTurn, Budgets, Command, Ext4Upper, Firecracker, HttpStore,
-    ImageOrder, Input, Lifecycle, Settings, Taken, TapPool, Upper,
+    ImageOrder, Input, Lifecycle, Settings, Size, Taken, TapPool, Upper,
+};
+
+const BOX: Size = Size {
+    memory_mib: std::num::NonZeroU32::new(4096).expect("a positive size"),
+    disk_mib: std::num::NonZeroU32::new(1024).expect("a positive size"),
 };
 
 #[cfg(test)]
@@ -58,6 +63,7 @@ fn turn(image: &GuestImageManifest, turn_id: &str, prompt: &str, last_line_seq: 
         files_cache: home().join(".cache/tumpel-host-test/persona-files"),
         prebuild_commit_sha: None,
         box_memory_mib: None,
+        box_disk_mib: None,
     })))
 }
 
@@ -123,14 +129,13 @@ async fn a_shell_box_runs_a_turn_pauses_resumes_warm_and_its_drive_reads_back() 
         budgets: Budgets::from(&runtime.budgets),
         warm_window: Duration::from_mins(15),
         layer_cache_mib: runtime.layer_cache_mib,
-        overlay_bytes: u64::try_from(runtime.overlay_mib).unwrap_or(0) * 1024 * 1024,
     };
     let (out, mut received) = unbounded_channel();
     let lifecycle = Lifecycle::new(
         Firecracker::new(&runtime),
         HttpStore::new().expect("store"),
         settings,
-        TapPool::new(4096, 4096, std::num::NonZeroU32::new(4096).expect("4096")),
+        TapPool::new(4096, 4096, BOX),
         out,
         data.join("boxes.json"),
     );
@@ -239,7 +244,6 @@ fn crash_runtime(data: &std::path::Path, manifest_path: &std::path::Path) -> (Su
         budgets: Budgets::from(&runtime.budgets),
         warm_window: Duration::from_mins(15),
         layer_cache_mib: runtime.layer_cache_mib,
-        overlay_bytes: u64::try_from(runtime.overlay_mib).unwrap_or(0) * 1024 * 1024,
     };
     (runtime, settings)
 }
@@ -268,7 +272,7 @@ async fn crashing_supervisor() {
         Firecracker::new(&runtime),
         HttpStore::new().expect("store"),
         settings,
-        TapPool::new(4096, 4096, std::num::NonZeroU32::new(4096).expect("4096")),
+        TapPool::new(4096, 4096, BOX),
         out,
         data.join("boxes.json"),
     );
@@ -336,7 +340,7 @@ async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_i
         Firecracker::new(&runtime),
         HttpStore::new().expect("store"),
         settings,
-        TapPool::new(4096, 4096, std::num::NonZeroU32::new(4096).expect("4096")),
+        TapPool::new(4096, 4096, BOX),
         out,
         standing.clone(),
     );

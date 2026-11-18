@@ -1,5 +1,6 @@
 pub mod codex_login;
 pub mod credential_file;
+pub mod disk;
 pub mod setup_output;
 
 use std::fmt;
