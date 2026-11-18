@@ -9,6 +9,8 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CARGO = join(ROOT, "Cargo.toml");
 const TARGET = "x86_64-unknown-linux-gnu";
 const SEMVER = /^(\d+)\.(\d+)\.(\d+)$/;
+const DEV = /^v(\d+\.\d+\.\d+)-main\.(\d+)$/;
+const VERSION = /^\d+\.\d+\.\d+(-main\.\d+)?$/;
 const CRATES = ["tumpel-channel", "tumpel-guest", "tumpel-supervisor"];
 
 const die = (message) => {
@@ -30,15 +32,16 @@ const SHIPS = [
 
 export const ships = (path) => SHIPS.some((pattern) => pattern.test(path));
 
-const semver = (tag) => tag.slice(1).match(SEMVER)?.slice(1, 4).map(Number) ?? null;
+const parts = (version) => version.match(SEMVER)?.slice(1, 4).map(Number) ?? null;
+
+const semver = (tag) => parts(tag.slice(1));
+
+const order = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
 
 export const latestTag = (tags) =>
   tags
     .filter(semver)
-    .sort((a, b) => {
-      const [x, y] = [semver(a), semver(b)];
-      return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
-    })
+    .sort((a, b) => order(semver(a), semver(b)))
     .at(-1) ?? die("the repository carries no vX.Y.Z tag to release after");
 
 const BREAKING = /^\w+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:/m;
@@ -52,16 +55,40 @@ export const nextVersion = (latest, commits) => {
   return `${major}.${minor}.${patch + 1}`;
 };
 
+export const devVersion = (latest, sinceLatest, pushed) => {
+  const next = nextVersion(latest, sinceLatest);
+  if (!next || !pushed.some(({ files }) => files.some(ships))) return "";
+  return `${next}-main.${sinceLatest.length}`;
+};
+
+export const promotion = (tags) => {
+  const latest = semver(latestTag(tags));
+  const dev = tags
+    .map((tag) => tag.match(DEV))
+    .filter((match) => match && order(parts(match[1]), latest) > 0)
+    .sort((a, b) => order(parts(a[1]), parts(b[1])) || a[2] - b[2])
+    .at(-1);
+  return dev ? { version: dev[1], ref: dev[0] } : { version: "", ref: "" };
+};
+
 const git = (...args) => execFileSync("git", args, { cwd: ROOT, encoding: "utf8" });
 
-const commitsSince = (tag) =>
-  git("log", "--format=%x1e%B%x1f", "--name-only", `${tag}..HEAD`)
+const commitsIn = (range) =>
+  git("log", "--format=%x1e%B%x1f", "--name-only", range)
     .split("\x1e")
     .slice(1)
     .map((commit) => {
       const [message, files] = commit.split("\x1f");
       return { message: message.trim(), files: files.split("\n").filter(Boolean) };
     });
+
+const plan = (build, before) => {
+  const tags = git("tag", "--list", "v*").split("\n").filter(Boolean);
+  if (build === "stable") return promotion(tags);
+  const latest = latestTag(tags);
+  const version = devVersion(latest, commitsIn(`${latest}..HEAD`), commitsIn(`${before}..HEAD`));
+  return { version, ref: version && git("rev-parse", "HEAD").trim() };
+};
 
 export const unpublished = (version, indexes) =>
   CRATES.filter(
@@ -76,7 +103,7 @@ const registryIndex = async (crate) => {
 };
 
 const stamp = (version) => {
-  if (!SEMVER.test(version)) die(`the version is ${version}; pass X.Y.Z`);
+  if (!VERSION.test(version)) die(`the version is ${version}; pass X.Y.Z or X.Y.Z-main.N`);
   const cargo = readFileSync(CARGO, "utf8");
   const current = cargoVersion(cargo);
   const stamped = cargo
@@ -125,9 +152,9 @@ const assets = async (version, out) => {
 };
 
 const cli = async ([command, ...args]) => {
-  if (command === "plan" && args.length === 0) {
-    const latest = latestTag(git("tag", "--list", "v*").split("\n").filter(Boolean));
-    return nextVersion(latest, commitsSince(latest));
+  if (command === "plan" && (args[0] === "stable" ? args.length === 1 : args[0] === "dev" && args.length === 2)) {
+    const { version, ref } = plan(args[0], args[1]);
+    return `version=${version}\nref=${ref}`;
   }
   if (command === "stamp" && args.length === 1) return stamp(args[0]);
   if (command === "assets" && args.length === 2) return assets(args[0], args[1]);
@@ -136,7 +163,9 @@ const cli = async ([command, ...args]) => {
       args[0],
       Object.fromEntries(await Promise.all(CRATES.map(async (c) => [c, await registryIndex(c)]))),
     ).join(" ");
-  return die("usage: release.mjs plan | stamp <X.Y.Z> | assets <X.Y.Z> <dir> | unpublished <X.Y.Z>");
+  return die(
+    "usage: release.mjs plan stable | plan dev <before> | stamp <X.Y.Z> | assets <X.Y.Z> <dir> | unpublished <X.Y.Z>",
+  );
 };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

@@ -33,7 +33,16 @@ Each box runs in its own systemd user scope, `tumpel-box<k>.scope`, outside the 
 
 ## Releases
 
-Every push to `main` checks whether it needs a release. It releases only when a commit since the latest `vX.Y.Z` tag changed a shipped file: a crate source, a Cargo manifest, the toolchain or the guest drive build. Docs, tests and CI never release. The types of those commits pick the version: a breaking change bumps major, or minor while the version is 0.x, a `feat` bumps minor, and any other type bumps patch. The binary, the crates and the GitHub release carry the same version. A rerun of a failed release keeps the version, skips crates already on crates.io and finishes the GitHub release. The tag appears only when the GitHub release publishes.
+The supervisor ships two builds, and neither needs a person to cut it.
+
+- Dev build: every push to `main` that changes a shipped file publishes a GitHub pre-release `vX.Y.Z-main.N`. A shipped file is a crate source, a Cargo manifest, the toolchain or the guest drive build. `X.Y.Z` is the next stable version and `N` counts the commits since the latest stable release, so semver orders every dev build after the latest stable release and before the next one. A dev build never touches crates.io.
+- Stable build: once a day at 04:00 UTC, the newest dev build without a stable release is promoted. The run builds that dev build's commit as `X.Y.Z`, publishes the crates to crates.io, and publishes the GitHub release as Latest. A day with no new dev build releases nothing.
+
+The conventional commit types since the latest stable release pick `X.Y.Z`: a breaking change bumps major, or minor while the version is 0.x, a `feat` bumps minor, and any other type bumps patch. Docs, tests and CI changes never build.
+
+Every release, dev or stable, attaches the same assets under the same names: `tumpel-supervisor-x86_64-linux`, `tumpel-guest-x86_64-linux`, their `.sha256` files and `release.json`. Fetch one by tag from `https://github.com/tumpel/supervisor/releases/download/v<version>/<asset>`. `release.json` names the version, the protocol windows and the sha256 of the supervisor.
+
+The tag appears only when the GitHub release publishes. A rerun of a failed release keeps its version, skips crates already on crates.io and finishes the GitHub release, and the next day's promotion retries a failed stable release on its own.
 
 ## Development
 

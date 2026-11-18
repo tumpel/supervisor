@@ -3,6 +3,8 @@ name: release
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "0 4 * * *"
 
 concurrency:
   group: release
@@ -21,6 +23,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.plan.outputs.version }}
+      ref: ${{ steps.plan.outputs.ref }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -31,11 +34,12 @@ jobs:
           node-version: 24
 
       - id: plan
-        name: Version the shipped changes since the latest release, or skip the release
+        name: Plan a dev build of this push, or the daily promotion of the newest dev build to stable
+        env:
+          BUILD: ${{ github.event_name == 'schedule' && 'stable' || 'dev' }}
+          BEFORE: ${{ github.event.before }}
         run: |
-          version=$(node npm-scripts/release.mjs plan)
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tumpel-supervisor ${version:-has no shipped change to release}"
+          node npm-scripts/release.mjs plan "$BUILD" ${BEFORE:+"$BEFORE"} | tee -a "$GITHUB_OUTPUT"
 
   release:
     needs: plan
@@ -43,10 +47,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
+      STABLE: ${{ github.event_name == 'schedule' }}
       VERSION: ${{ needs.plan.outputs.version }}
       TAG: v${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
 
       - uses: actions/setup-node@v7
         with:
@@ -73,6 +80,7 @@ jobs:
         run: node npm-scripts/release.mjs assets "$VERSION" .tmp/release
 
       - id: crates
+        if: env.STABLE == 'true'
         name: List the crates crates.io lacks at this version
         run: echo "unpublished=$(node npm-scripts/release.mjs unpublished "$VERSION")" >> "$GITHUB_OUTPUT"
 
@@ -93,9 +101,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ "$STABLE" = true ]; then kind=(--latest); else kind=(--prerelease --latest=false); fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" .tmp/release/* --clobber
-            gh release edit "$TAG" --draft=false --latest
+            gh release edit "$TAG" --draft=false "${kind[@]}"
           else
-            gh release create "$TAG" .tmp/release/* --target "$GITHUB_SHA" --title "$TAG" --generate-notes --latest
+            gh release create "$TAG" .tmp/release/* --target "$(git rev-parse HEAD)" --title "$TAG" --generate-notes "${kind[@]}"
           fi

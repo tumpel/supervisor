@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { latestTag, nextVersion, ships, unpublished } from "./release.mjs";
+import { devVersion, latestTag, nextVersion, promotion, ships, unpublished } from "./release.mjs";
 
 test("crate sources, manifests and what builds the binary ship; docs, tests and CI do not", () => {
   assert.equal(ships("crates/tumpel-guest/src/main.rs"), true);
@@ -49,9 +49,40 @@ test("a breaking change bumps major, or minor while the version is 0.x", () => {
   assert.equal(nextVersion("v1.4.2", [footer]), "2.0.0");
 });
 
-test("the latest release is the highest vX.Y.Z tag", () => {
-  assert.equal(latestTag(["v0.1.9", "v0.1.18", "v0.0.30", "vnext"]), "v0.1.18");
+test("the latest stable release is the highest vX.Y.Z tag, never a dev build", () => {
+  assert.equal(latestTag(["v0.1.9", "v0.1.18", "v0.0.30", "v0.1.19-main.4", "vnext"]), "v0.1.18");
   assert.throws(() => latestTag(["vnext"]), /no vX.Y.Z tag/);
+});
+
+test("a push that changes shipped files builds a dev version of the next stable release", () => {
+  const fix = { message: "fix(pool): adopt a box", files: ["crates/tumpel-supervisor/src/pool.rs"] };
+  const docs = { message: "docs: explain pools", files: ["README.md"] };
+  const feat = { message: "feat(turn): end a turn", files: ["crates/tumpel-guest/src/turn.rs"] };
+  assert.equal(devVersion("v0.1.18", [docs, fix], [docs, fix]), "0.1.19-main.2");
+  assert.equal(devVersion("v0.1.18", [feat, docs, fix], [feat]), "0.2.0-main.3");
+});
+
+test("a push that changes no shipped file builds nothing, even after shipped changes", () => {
+  const fix = { message: "fix(pool): adopt a box", files: ["crates/tumpel-supervisor/src/pool.rs"] };
+  const docs = { message: "docs: explain pools", files: ["README.md"] };
+  assert.equal(devVersion("v0.1.18", [docs, fix], [docs]), "");
+  assert.equal(devVersion("v0.1.18", [docs], [docs]), "");
+});
+
+test("the newest dev build after the latest stable release is promoted to its stable version", () => {
+  assert.deepEqual(promotion(["v0.1.18", "v0.1.19-main.2", "v0.1.19-main.10", "v0.1.19-main.9"]), {
+    version: "0.1.19",
+    ref: "v0.1.19-main.10",
+  });
+  assert.deepEqual(promotion(["v0.1.18", "v0.1.19-main.2", "v0.2.0-main.5"]), {
+    version: "0.2.0",
+    ref: "v0.2.0-main.5",
+  });
+});
+
+test("nothing is promoted once the newest dev build has its stable release", () => {
+  assert.deepEqual(promotion(["v0.1.18", "v0.1.19-main.4", "v0.1.19"]), { version: "", ref: "" });
+  assert.deepEqual(promotion(["v0.1.18", "v0.1.18-main.3"]), { version: "", ref: "" });
 });
 
 test("crates already on crates.io at the version are skipped, in publish order", () => {
