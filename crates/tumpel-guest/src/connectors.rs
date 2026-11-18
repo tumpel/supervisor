@@ -22,14 +22,44 @@ pub const OPENCODE_CONFIG: &str = "OPENCODE_CONFIG_CONTENT";
 const PI_CONFIG: &str = ".pi/agent/mcp.json";
 const PI_GENERATED: &str = "/run/tumpel/connectors/pi-mcp.json";
 
-fn servers(connectors: &[ChannelDispatchConnector]) -> Vec<(String, String)> {
-    let mut servers: Vec<(String, String)> = connectors
+const KEY_LENGTH: usize = 32;
+
+fn key(name: &str) -> String {
+    let mut key = String::new();
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            key.push(character.to_ascii_lowercase());
+        } else if !key.is_empty() && !key.ends_with('-') {
+            key.push('-');
+        }
+    }
+    key.truncate(KEY_LENGTH);
+    let key = key.trim_end_matches('-');
+    if key.is_empty() { "connector" } else { key }.to_string()
+}
+
+pub fn servers(connectors: &[ChannelDispatchConnector]) -> Vec<(String, String)> {
+    let mut named: Vec<(String, &str)> = connectors
         .iter()
         .map(|connector| {
-            (
-                format!("tumpel-{}", *connector.connector_id),
-                forwarder::route(&connector.connector_id),
-            )
+            let name = connector
+                .name
+                .as_ref()
+                .map_or(connector.connector_id.as_str(), |name| name.as_str());
+            (key(name), connector.connector_id.as_str())
+        })
+        .collect();
+    named.sort_unstable();
+    let mut taken = std::collections::HashSet::new();
+    let mut servers: Vec<(String, String)> = named
+        .into_iter()
+        .map(|(base, id)| {
+            let (mut key, mut n) = (base.clone(), 1);
+            while !taken.insert(key.clone()) {
+                n += 1;
+                key = format!("{base}-{n}");
+            }
+            (key, forwarder::route(id))
         })
         .collect();
     servers.sort_unstable();
@@ -118,10 +148,6 @@ pub fn variables(protocol: GuestHarnessProtocol, connectors: &[ChannelDispatchCo
     vec![(OPENCODE_CONFIG.to_string(), json!({ "mcp": mcp }).to_string())]
 }
 
-pub fn ids(connectors: &[ChannelDispatchConnector]) -> Vec<String> {
-    servers(connectors).into_iter().map(|(key, _)| key).collect()
-}
-
 fn bind(source: &Path, target: &Path) -> Result<(), String> {
     let path = |path: &Path| {
         CString::new(path.as_os_str().as_bytes())
@@ -202,7 +228,7 @@ pub fn refuse_reserved(
     persona_files: &[&str],
     connectors: &[ChannelDispatchConnector],
 ) -> Result<(), String> {
-    let keys = ids(connectors);
+    let servers = servers(connectors);
     for relative in harness_configs(protocol)
         .iter()
         .filter(|relative| persona_files.contains(relative))
@@ -218,7 +244,15 @@ pub fn refuse_reserved(
                 ))
             }
         };
-        if let Some(key) = keys.iter().find(|key| text.contains(key.as_str())) {
+        if let Some((key, _)) = servers.iter().find(|(key, _)| {
+            [
+                format!("\"{key}\""),
+                format!("mcp_servers.{key}]"),
+                format!("mcp_servers.{key}."),
+            ]
+            .iter()
+            .any(|named| text.contains(named.as_str()))
+        }) {
             return Err(format!(
                 "{relative} in the persona already names {key}, the name this session's connector takes; rename that MCP server in the persona"
             ));
