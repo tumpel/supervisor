@@ -8,14 +8,19 @@ use tumpel_api::types::{ChannelDispatchConnector, GuestHarnessProtocol};
 use crate::forwarder;
 
 const CACHES: &str = "/run/tumpel/connectors/caches";
-const OAUTH_FILES: [&str; 4] = [
-    ".claude/.credentials.json",
-    ".claude/mcp-needs-auth-cache.json",
-    ".codex/.credentials.json",
-    ".local/share/opencode/mcp-auth.json",
+const OAUTH_FILES: [(&str, &[u8]); 7] = [
+    (".claude/.credentials.json", b"{}"),
+    (".claude/mcp-needs-auth-cache.json", b"{}"),
+    (".codex/.credentials.json", b"{}"),
+    (".local/share/opencode/mcp-auth.json", b"{}"),
+    (".pi/agent/mcp-auth.json", b"{}"),
+    (".pi/agent/mcp.log", b""),
+    (".pi/agent/mcp.log.1", b""),
 ];
 const OAUTH_DIRECTORIES: [&str; 1] = [".codex/secrets"];
 pub const OPENCODE_CONFIG: &str = "OPENCODE_CONFIG_CONTENT";
+const PI_CONFIG: &str = ".pi/agent/mcp.json";
+const PI_GENERATED: &str = "/run/tumpel/connectors/pi-mcp.json";
 
 fn servers(connectors: &[ChannelDispatchConnector]) -> Vec<(String, String)> {
     let mut servers: Vec<(String, String)> = connectors
@@ -40,15 +45,12 @@ fn object(servers: &[(String, String)], entry: impl Fn(&str) -> Value) -> Value 
     )
 }
 
-pub fn arguments(
-    protocol: GuestHarnessProtocol,
-    connectors: &[ChannelDispatchConnector],
-) -> Result<Vec<String>, String> {
+pub fn arguments(protocol: GuestHarnessProtocol, connectors: &[ChannelDispatchConnector]) -> Vec<String> {
     let servers = servers(connectors);
     if servers.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
-    Ok(match protocol {
+    match protocol {
         GuestHarnessProtocol::ClaudeStreamJson => vec![
             "--mcp-config".to_string(),
             json!({ "mcpServers": object(&servers, |url| json!({ "type": "http", "url": url })) }).to_string(),
@@ -57,14 +59,54 @@ pub fn arguments(
             .iter()
             .flat_map(|(key, url)| ["-c".to_string(), format!("mcp_servers.{key}.url={}", json!(url))])
             .collect(),
-        GuestHarnessProtocol::PiRpc => {
-            return Err(format!(
-                "Pi takes no connectors, and this session's persona lists {}; choose a persona without connectors for a Pi session",
-                servers.len()
-            ))
+        GuestHarnessProtocol::PiRpc | GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::ShellLines => {
+            Vec::new()
         }
-        GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::ShellLines => Vec::new(),
-    })
+    }
+}
+
+fn pi_config(base: Option<&str>, connectors: &[ChannelDispatchConnector]) -> Result<String, String> {
+    let mut config = match base.map(str::trim).filter(|text| !text.is_empty()) {
+        None => json!({}),
+        Some(text) => serde_json::from_str::<Value>(text).map_err(|error| {
+            format!("{PI_CONFIG} is not JSON, so the connectors cannot join its MCP servers: {error}")
+        })?,
+    };
+    let root = config
+        .as_object_mut()
+        .ok_or_else(|| format!("{PI_CONFIG} is not a JSON object"))?;
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("mcpServers in {PI_CONFIG} is not an object"))?;
+    for (key, url) in self::servers(connectors) {
+        servers.insert(key, json!({ "url": url }));
+    }
+    serde_json::to_string_pretty(&config).map_err(|error| format!("writing {PI_CONFIG}: {error}"))
+}
+
+pub fn write_pi_config(home: &Path, connectors: &[ChannelDispatchConnector], mounted: bool) -> Result<(), String> {
+    let target = home.join(PI_CONFIG);
+    let base = match std::fs::read_to_string(&target) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("reading {}: {error}", target.display())),
+    };
+    let config = pi_config(base.as_deref(), connectors)?;
+    if mounted {
+        return std::fs::write(&target, config).map_err(|error| format!("writing {}: {error}", target.display()));
+    }
+    let generated = Path::new(PI_GENERATED);
+    let parent = generated.parent().ok_or("the generated Pi config has no directory")?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("creating {}: {error}", parent.display()))?;
+    std::fs::write(generated, config).map_err(|error| format!("writing {PI_GENERATED}: {error}"))?;
+    if base.is_none() {
+        let directory = target.parent().ok_or("the Pi config has no directory")?;
+        std::fs::create_dir_all(directory).map_err(|error| format!("creating {}: {error}", directory.display()))?;
+        std::fs::write(&target, b"{}").map_err(|error| format!("creating {}: {error}", target.display()))?;
+    }
+    bind(generated, &target)
 }
 
 pub fn variables(protocol: GuestHarnessProtocol, connectors: &[ChannelDispatchConnector]) -> Vec<(String, String)> {
@@ -107,7 +149,7 @@ fn bind(source: &Path, target: &Path) -> Result<(), String> {
 }
 
 fn masked(path: &str) -> bool {
-    OAUTH_FILES.contains(&path)
+    OAUTH_FILES.iter().any(|(file, _)| *file == path)
         || OAUTH_DIRECTORIES
             .iter()
             .any(|directory| Path::new(path).starts_with(directory))
@@ -120,16 +162,16 @@ pub fn mask_oauth_caches(home: &Path, credential_file: Option<&str>) -> Result<(
         ));
     }
     std::fs::create_dir_all(CACHES).map_err(|error| format!("creating {CACHES}: {error}"))?;
-    for relative in OAUTH_FILES {
+    for (relative, empty) in OAUTH_FILES {
         let target = home.join(relative);
         let source = Path::new(CACHES).join(relative.replace('/', "_"));
         let parent = target
             .parent()
             .ok_or_else(|| format!("{} has no parent", target.display()))?;
         std::fs::create_dir_all(parent).map_err(|error| format!("creating {}: {error}", parent.display()))?;
-        std::fs::write(&source, b"{}").map_err(|error| format!("creating {}: {error}", source.display()))?;
+        std::fs::write(&source, empty).map_err(|error| format!("creating {}: {error}", source.display()))?;
         if !target.exists() {
-            std::fs::write(&target, b"{}").map_err(|error| format!("creating {}: {error}", target.display()))?;
+            std::fs::write(&target, empty).map_err(|error| format!("creating {}: {error}", target.display()))?;
         }
         bind(&source, &target)?;
     }
@@ -149,17 +191,22 @@ fn harness_configs(protocol: GuestHarnessProtocol) -> &'static [&'static str] {
         GuestHarnessProtocol::ClaudeStreamJson => &[".claude.json"],
         GuestHarnessProtocol::CodexExecJson => &[".codex/config.toml"],
         GuestHarnessProtocol::PromptOnStdin => &[".config/opencode/opencode.json", ".config/opencode/opencode.jsonc"],
-        GuestHarnessProtocol::PiRpc | GuestHarnessProtocol::ShellLines => &[],
+        GuestHarnessProtocol::PiRpc => &[PI_CONFIG],
+        GuestHarnessProtocol::ShellLines => &[],
     }
 }
 
 pub fn refuse_reserved(
     protocol: GuestHarnessProtocol,
     home: &Path,
+    persona_files: &[&str],
     connectors: &[ChannelDispatchConnector],
 ) -> Result<(), String> {
     let keys = ids(connectors);
-    for relative in harness_configs(protocol) {
+    for relative in harness_configs(protocol)
+        .iter()
+        .filter(|relative| persona_files.contains(relative))
+    {
         let path = home.join(relative);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
