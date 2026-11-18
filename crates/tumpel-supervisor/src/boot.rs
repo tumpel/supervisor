@@ -136,7 +136,7 @@ pub struct Hold {
 }
 
 impl Holds {
-    fn hold(&self, digests: Vec<String>) -> Hold {
+    pub(crate) fn hold(&self, digests: Vec<String>) -> Hold {
         let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         for digest in &digests {
             *held.entry(digest.clone()).or_default() += 1;
@@ -214,14 +214,9 @@ pub async fn resolve<S: Store>(
         BootOrder::Full(image) => {
             let digest = image.download.image_digest.clone();
             let hold = caches.holds.hold(vec![digest.to_string()]);
-            let manifest = images::resolve(
-                caches.store,
-                caches.images,
-                image,
-                caches.holds.held(),
-                caches.lock,
-                || fetching(digest),
-            )
+            let manifest = images::resolve(caches.store, caches.images, image, caches.holds, caches.lock, || {
+                fetching(digest);
+            })
             .await?;
             Ok((Boot::Full(manifest), hold))
         }
@@ -264,7 +259,7 @@ async fn resolve_layered<S: Store>(
                 caches.store,
                 caches.images,
                 &order.base,
-                caches.holds.held(),
+                caches.holds,
                 caches.lock,
                 deadline,
             )
@@ -278,7 +273,7 @@ async fn resolve_layered<S: Store>(
                 caches.store,
                 caches.layers,
                 &order.layer,
-                caches.holds.held(),
+                caches.holds,
                 caches.lock,
                 deadline,
             )

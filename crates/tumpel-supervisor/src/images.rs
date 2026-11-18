@@ -11,6 +11,7 @@ use tumpel_api::types::{
     BaseImageManifest, ChannelBaseImageDownload, ChannelGuestImageDownload, GuestImageManifest, TurnFailureReason,
 };
 
+use crate::boot::Holds;
 use crate::snapshot::hex;
 use crate::store::Store;
 
@@ -336,12 +337,7 @@ fn sweep<'a>(cache: &Path, digests: impl Iterator<Item = (&'a str, &'a str)>) ->
     Ok(())
 }
 
-fn place(
-    cache: &Path,
-    order: &ImageOrder,
-    staged: &Staged,
-    held: &BTreeSet<String>,
-) -> Result<GuestImageManifest, String> {
+fn place(cache: &Path, order: &ImageOrder, staged: &Staged, holds: &Holds) -> Result<GuestImageManifest, String> {
     let download = &order.download;
     verify(&staged.image, "image", &download.image_digest)?;
     if let Some(kernel) = &staged.kernel {
@@ -355,19 +351,14 @@ fn place(
         rename(kernel, &cache.join(format!("{}.vmlinux", *download.kernel_digest)))?;
     }
     rename(&staged.manifest, &cache.join(format!("{digest}.json")))?;
-    let mut kept = held.clone();
+    let mut kept = holds.held();
     kept.insert(digest.to_string());
     supersede(cache, &manifest.harness.harness, &kept)?;
     Ok(manifest)
 }
 
-pub fn adopt(
-    cache: &Path,
-    order: &ImageOrder,
-    staged: &Staged,
-    held: &BTreeSet<String>,
-) -> Result<GuestImageManifest, Refusal> {
-    place(cache, order, staged, held).map_err(|detail| {
+pub fn adopt(cache: &Path, order: &ImageOrder, staged: &Staged, holds: &Holds) -> Result<GuestImageManifest, Refusal> {
+    place(cache, order, staged, holds).map_err(|detail| {
         staged.remove();
         order.failed(detail)
     })
@@ -410,7 +401,7 @@ async fn fetch(
     store: &impl Store,
     cache: &Path,
     order: &ImageOrder,
-    held: BTreeSet<String>,
+    holds: &Holds,
     deadline: Instant,
 ) -> Result<GuestImageManifest, Refusal> {
     let staged = stage(cache, order)?;
@@ -432,9 +423,10 @@ async fn fetch(
     }
     let cache = cache.to_path_buf();
     let adopting = order.clone();
+    let holds = holds.clone();
     match timeout_at(
         deadline,
-        tokio::task::spawn_blocking(move || adopt(&cache, &adopting, &staged, &held)),
+        tokio::task::spawn_blocking(move || adopt(&cache, &adopting, &staged, &holds)),
     )
     .await
     {
@@ -451,7 +443,7 @@ pub async fn resolve(
     store: &impl Store,
     cache: &Path,
     order: &ImageOrder,
-    held: BTreeSet<String>,
+    holds: &Holds,
     lock: &Mutex<()>,
     fetching: impl FnOnce(),
 ) -> Result<GuestImageManifest, Refusal> {
@@ -466,7 +458,7 @@ pub async fn resolve(
     if let Some(manifest) = cached(cache, order.digest())? {
         return Ok(manifest);
     }
-    fetch(store, cache, order, held, deadline).await
+    fetch(store, cache, order, holds, deadline).await
 }
 
 pub fn cached_base(cache: &Path, image_digest: &str) -> Result<Option<BaseImageManifest>, Refusal> {
@@ -519,12 +511,7 @@ fn read_base_manifest(order: &BaseOrder, staged: &Staged) -> Result<BaseImageMan
     ))
 }
 
-fn place_base(
-    cache: &Path,
-    order: &BaseOrder,
-    staged: &Staged,
-    held: &BTreeSet<String>,
-) -> Result<BaseImageManifest, String> {
+fn place_base(cache: &Path, order: &BaseOrder, staged: &Staged, holds: &Holds) -> Result<BaseImageManifest, String> {
     let download = &order.download;
     verify(&staged.image, "base image", &download.image_digest)?;
     if let Some(kernel) = &staged.kernel {
@@ -539,7 +526,7 @@ fn place_base(
         rename(kernel, &cache.join(format!("{}.vmlinux", *download.kernel_digest)))?;
     }
     rename(&staged.manifest, &cache.join(format!("{digest}.json")))?;
-    prune_bases(cache, &manifest, others, held)?;
+    prune_bases(cache, &manifest, others, &holds.held())?;
     Ok(manifest)
 }
 
@@ -547,9 +534,9 @@ pub fn adopt_base(
     cache: &Path,
     order: &BaseOrder,
     staged: &Staged,
-    held: &BTreeSet<String>,
+    holds: &Holds,
 ) -> Result<BaseImageManifest, Refusal> {
-    place_base(cache, order, staged, held).map_err(|detail| {
+    place_base(cache, order, staged, holds).map_err(|detail| {
         staged.remove();
         order.failed(detail)
     })
@@ -563,7 +550,7 @@ async fn fetch_base(
     store: &impl Store,
     cache: &Path,
     order: &BaseOrder,
-    held: BTreeSet<String>,
+    holds: &Holds,
     deadline: Instant,
 ) -> Result<BaseImageManifest, Refusal> {
     let staged = stage_base(cache, order)?;
@@ -583,12 +570,12 @@ async fn fetch_base(
             return Err(order.timed_out());
         }
     }
-    let adopting = (cache.to_path_buf(), order.clone(), held);
+    let adopting = (cache.to_path_buf(), order.clone(), holds.clone());
     match timeout_at(
         deadline,
         tokio::task::spawn_blocking(move || {
-            let (cache, order, held) = adopting;
-            adopt_base(&cache, &order, &staged, &held)
+            let (cache, order, holds) = adopting;
+            adopt_base(&cache, &order, &staged, &holds)
         }),
     )
     .await
@@ -603,7 +590,7 @@ pub async fn resolve_base(
     store: &impl Store,
     cache: &Path,
     order: &BaseOrder,
-    held: BTreeSet<String>,
+    holds: &Holds,
     lock: &Mutex<()>,
     deadline: Instant,
 ) -> Result<BaseImageManifest, Refusal> {
@@ -616,7 +603,7 @@ pub async fn resolve_base(
     if let Some(manifest) = cached_base(cache, order.digest())? {
         return Ok(manifest);
     }
-    fetch_base(store, cache, order, held, deadline).await
+    fetch_base(store, cache, order, holds, deadline).await
 }
 
 #[cfg(test)]

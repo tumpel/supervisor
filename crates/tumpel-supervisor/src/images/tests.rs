@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
@@ -7,6 +7,7 @@ use serde_json::json;
 use tumpel_api::types::TurnFailureReason;
 
 use super::{adopt, cached, resolve, stage, ImageOrder};
+use crate::boot::Holds;
 use crate::snapshot::hex;
 use crate::store::{Store, UploadError};
 
@@ -111,7 +112,7 @@ fn a_fetched_image_whose_bytes_miss_the_digest_leaves_the_cache_untouched() {
     }
     std::fs::write(&staged.manifest, &new.manifest).expect("manifest");
 
-    let refusal = adopt(&cache, &order, &staged, &BTreeSet::new()).expect_err("a wrong digest is refused");
+    let refusal = adopt(&cache, &order, &staged, &Holds::default()).expect_err("a wrong digest is refused");
 
     assert_eq!(refusal.reason, TurnFailureReason::ImageFetchFailed);
     assert!(
@@ -171,8 +172,9 @@ fn a_verified_image_replaces_every_unheld_image_of_its_harness_and_whatever_no_v
     std::fs::write(kernel, KERNEL).expect("kernel");
     std::fs::write(&staged.manifest, &new.manifest).expect("manifest");
 
-    let held = BTreeSet::from([running.digest.clone()]);
-    let manifest = adopt(&cache, &order, &staged, &held).expect("a verified image is adopted");
+    let holds = Holds::default();
+    let _running = holds.hold(vec![running.digest.clone()]);
+    let manifest = adopt(&cache, &order, &staged, &holds).expect("a verified image is adopted");
 
     assert_eq!(*manifest.image_digest, new.digest);
     let names: Vec<String> = listing(&cache).into_keys().collect();
@@ -226,7 +228,7 @@ async fn the_fetch_budget_counts_the_wait_for_another_image_from_turn_image_fetc
     let started = tokio::time::Instant::now();
     let mut sent = None;
 
-    let refusal = resolve(&Unreachable, &cache, &order, BTreeSet::new(), &lock, || {
+    let refusal = resolve(&Unreachable, &cache, &order, &Holds::default(), &lock, || {
         sent = Some(tokio::time::Instant::now());
     })
     .await
