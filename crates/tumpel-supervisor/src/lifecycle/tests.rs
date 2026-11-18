@@ -1198,7 +1198,7 @@ fn pack_uploads(uploads: &[String]) -> usize {
     uploads.iter().filter(|url| url.contains("/packs/")).count()
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_expired_box_waits_for_its_snapshot_and_the_next_turn_restores_from_the_latest() {
     let mut host = host("expire", 2, Harness::Echo, Boot::Works);
     host.turn("turn-1", "session-1", "one", Vec::new());
@@ -1211,6 +1211,7 @@ async fn an_expired_box_waits_for_its_snapshot_and_the_next_turn_restores_from_t
     assert!(!host.log().contains(&"stop session-1".to_string()));
     let second = host.snapshot("session-1");
     assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    host.settle(SETTLE).await;
     assert_eq!(host.log(), ["stop session-1"]);
     let uploads = host.store.uploads();
     assert_eq!(pack_uploads(&uploads), 2, "{uploads:?}");
