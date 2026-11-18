@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tumpel_api::types::{
     ChannelRestoreDownloads, ChannelSnapshotChunksHeld, ChannelSnapshotPackUploads, ChannelTurnClaimed,
     ChannelTurnWithdrawn, ChunkExchange, EntityId,
@@ -118,5 +118,32 @@ impl Answers {
         if !delivered {
             eprintln!("tumpel-supervisor: the answer to {key} arrived with nothing waiting for it; dropped it");
         }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct Cancels(Arc<watch::Sender<HashSet<EntityId>>>);
+
+impl Cancels {
+    pub fn cancel(&self, turn_id: EntityId) {
+        self.0.send_modify(|cancelled| {
+            cancelled.insert(turn_id);
+        });
+    }
+
+    pub async fn cancelled(&self, turn_id: &EntityId) {
+        let _ = self
+            .0
+            .subscribe()
+            .wait_for(|cancelled| cancelled.contains(turn_id))
+            .await;
+    }
+
+    pub fn contains(&self, turn_id: &EntityId) -> bool {
+        self.0.borrow().contains(turn_id)
+    }
+
+    pub fn forget(&self, turn_id: &EntityId) {
+        self.0.send_if_modified(|cancelled| cancelled.remove(turn_id));
     }
 }

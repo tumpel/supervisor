@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fs::File;
 use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -15,19 +16,19 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde_json::{json, Value};
 use tumpel_api::types::{
-    GuestHarness, GuestHarnessProtocol, GuestMessage, GuestMetric, GuestPersonaFile, GuestTurnEnd, GuestTurnEndReason,
-    GuestTurnEndType, GuestTurnLine, GuestTurnLineType, GuestTurnRepositoryCloneFailed,
-    GuestTurnRepositoryCloneFailedType, GuestTurnRepositoryReady, GuestTurnRepositoryReadyType, GuestTurnStart,
-    Sequence,
+    EntityId, GuestHarness, GuestHarnessProtocol, GuestInput, GuestMessage, GuestMetric, GuestPersonaFile,
+    GuestTurnEnd, GuestTurnEndReason, GuestTurnEndType, GuestTurnLine, GuestTurnLineType,
+    GuestTurnRepositoryCloneFailed, GuestTurnRepositoryCloneFailedType, GuestTurnRepositoryReady,
+    GuestTurnRepositoryReadyType, GuestTurnStart, Sequence,
 };
-use tumpel_guest::{credential_file, encode};
+use tumpel_guest::{credential_file, encode, Decoder};
 
 use crate::memory::Memory;
 use crate::repository;
 use crate::usage::{self, Spend, Tokens, Usage};
 
 const STATE_DIR: &str = "/var/lib/tumpel";
-const HANG_UP_POLL_MILLISECONDS: i32 = 200;
+const HOST_POLL_MILLISECONDS: i32 = 200;
 const LINE_SEQ_FILE: &str = "/var/lib/tumpel/line-seq";
 const STARTED_FILE: &str = "/var/lib/tumpel/harness-started";
 const CODEX_THREAD_FILE: &str = "/var/lib/tumpel/codex-thread";
@@ -42,40 +43,78 @@ enum Output {
     Line(String),
     Closed,
     Exited(libc::pid_t),
-    HostGone(u64),
+    HostGone(u64, String),
+    Cancelled(u64),
 }
 
-struct HangUp {
+struct HostWatch {
     done: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl HangUp {
-    fn watch(host: BorrowedFd<'_>, sender: mpsc::Sender<Output>, turn: u64) -> Result<Self, String> {
-        let host = host
-            .try_clone_to_owned()
-            .map_err(|error| format!("watching the host connection: {error}"))?;
+impl HostWatch {
+    fn watch(host: BorrowedFd<'_>, sender: mpsc::Sender<Output>, turn: u64, turn_id: EntityId) -> Result<Self, String> {
+        let host = File::from(
+            host.try_clone_to_owned()
+                .map_err(|error| format!("watching the host connection: {error}"))?,
+        );
         let done = Arc::new(AtomicBool::new(false));
         let watching = Arc::clone(&done);
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             let mut poll = libc::pollfd {
                 fd: host.as_raw_fd(),
-                events: libc::POLLRDHUP,
+                events: libc::POLLIN | libc::POLLRDHUP,
                 revents: 0,
             };
+            let mut decoder = Decoder::default();
+            let mut buffer = [0u8; 4096];
             while !watching.load(Ordering::Relaxed) {
-                if unsafe { libc::poll(&raw mut poll, 1, HANG_UP_POLL_MILLISECONDS) } > 0 && poll.revents != 0 {
-                    let _ = sender.send(Output::HostGone(turn));
+                if unsafe { libc::poll(&raw mut poll, 1, HOST_POLL_MILLISECONDS) } <= 0 || poll.revents == 0 {
+                    continue;
+                }
+                if watching.load(Ordering::Relaxed) {
                     return;
+                }
+                let read = match (&host).read(&mut buffer) {
+                    Ok(0) => {
+                        let _ = sender.send(Output::HostGone(turn, "the host hung up".to_string()));
+                        return;
+                    }
+                    Ok(read) => read,
+                    Err(error) => {
+                        let _ = sender.send(Output::HostGone(turn, format!("reading from the host failed: {error}")));
+                        return;
+                    }
+                };
+                decoder.push(&buffer[..read]);
+                loop {
+                    match decoder.take::<GuestInput>() {
+                        Ok(None) => break,
+                        Ok(Some(GuestInput::TurnCancel(cancel))) if cancel.turn_id == turn_id => {
+                            let _ = sender.send(Output::Cancelled(turn));
+                        }
+                        Ok(Some(_)) => {}
+                        Err(error) => {
+                            let _ = sender.send(Output::HostGone(turn, format!("the host sent {error}")));
+                            return;
+                        }
+                    }
                 }
             }
         });
-        Ok(Self { done })
+        Ok(Self {
+            done,
+            thread: Some(thread),
+        })
     }
 }
 
-impl Drop for HangUp {
+impl Drop for HostWatch {
     fn drop(&mut self) {
         self.done.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -219,6 +258,13 @@ fn reuses(running: Option<&Launch>, wanted: &Launch) -> bool {
 }
 
 impl Harness {
+    fn kill_group(&self) -> Result<(), String> {
+        let pid = libc::pid_t::try_from(self.child.id())
+            .map_err(|error| format!("the harness runs as process {} beyond pid_t: {error}", self.child.id()))?;
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        Ok(())
+    }
+
     fn stderr_tail(&self) -> String {
         let tail = self.stderr.lock().map(|tail| tail.iter().copied().collect::<Vec<u8>>());
         String::from_utf8_lossy(&tail.unwrap_or_default()).trim().to_string()
@@ -238,7 +284,7 @@ impl Harness {
     fn receive(&self, protocol: GuestHarnessProtocol, turn: u64) -> Result<Output, mpsc::RecvError> {
         loop {
             let output = self.output.recv()?;
-            if matches!(output, Output::HostGone(gone) if gone != turn) {
+            if matches!(output, Output::HostGone(of, _) | Output::Cancelled(of) if of != turn) {
                 continue;
             }
             if !matches!(&output, Output::Line(text) if answers_no_prompt(protocol, text)) {
@@ -249,7 +295,7 @@ impl Harness {
     }
 
     fn stop(mut self) {
-        let _ = self.child.kill();
+        let _ = self.kill_group();
         let _ = self.child.wait();
     }
 }
@@ -660,9 +706,7 @@ impl GuestState {
         start: &GuestTurnStart,
     ) -> Result<Harness, String> {
         let program = command.get_program().to_string_lossy().into_owned();
-        if per_turn {
-            command.process_group(0);
-        }
+        command.process_group(0);
         self.memory.confinement.apply(&mut command);
         let mut child = command
             .env_clear()
@@ -839,7 +883,7 @@ impl GuestState {
             Err(error) => return Ok(ended(GuestTurnEndReason::HarnessStartFailed, error)),
         };
         harness.discard_leftovers(&start.turn_id);
-        let _hang_up = HangUp::watch(host.as_fd(), harness.sender.clone(), turn)?;
+        let _host = HostWatch::watch(host.as_fd(), harness.sender.clone(), turn, start.turn_id.clone())?;
         let input = prompt_input(protocol, setup, &start.prompt, &marker);
         let written = harness
             .stdin
@@ -863,9 +907,13 @@ impl GuestState {
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
                     continue;
                 }
-                Ok(Output::HostGone(_)) => {
+                Ok(Output::HostGone(_, why)) => {
                     self.last_line_seq = last_line_seq;
-                    return Err(format!("the host hung up during turn {}", *start.turn_id));
+                    return Err(format!("{why} during turn {}", *start.turn_id));
+                }
+                Ok(Output::Cancelled(_)) => {
+                    harness.kill_group()?;
+                    break ended(GuestTurnEndReason::Cancelled, "the host cancelled the turn");
                 }
                 Ok(Output::Closed) | Err(_) => {
                     let waited = harness.child.wait();
