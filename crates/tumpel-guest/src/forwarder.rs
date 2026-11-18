@@ -551,7 +551,18 @@ async fn write_refusal(stream: &mut TcpStream, refusal: &Refusal) -> std::io::Re
     );
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(&body).await?;
-    stream.flush().await
+    stream.flush().await?;
+    stream.shutdown().await?;
+    let mut unread = [0u8; 8192];
+    let drained = tokio::time::timeout(DRAIN_BUDGET, async {
+        while stream.read(&mut unread).await? > 0 {}
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+    match drained {
+        Ok(read) => read,
+        Err(_) => Ok(()),
+    }
 }
 
 async fn serve(mut stream: TcpStream, turn: Turn, client: reqwest::Client, port: u16, budget: Duration) {
