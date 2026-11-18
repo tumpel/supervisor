@@ -636,7 +636,10 @@ async fn online_deadline(deadline: Option<tokio::time::Instant>, mut confirmed: 
 fn read_standing(layout: &Layout) -> Option<SupervisorHandover> {
     dir::read_json(&layout.boxes(), "SupervisorHandover").unwrap_or_else(|error| {
         eprintln!("tumpel-supervisor: {error:#}; the boxes it names are stopped");
-        None
+        Some(SupervisorHandover {
+            boxes: Vec::new(),
+            handed_at: chrono::Utc::now().fixed_offset(),
+        })
     })
 }
 
