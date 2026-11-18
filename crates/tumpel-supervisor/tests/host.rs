@@ -49,7 +49,8 @@ fn turn(image: &GuestImageManifest, turn_id: &str, prompt: &str, last_line_seq: 
         credential: serde_json::from_value(json!({
             "credentialHandoverId": "host-test-credential",
             "expiresAt": expires_at,
-            "variables": [{ "name": "TUMPEL_PROBE", "value": "in-box-memory" }]
+            "variables": [{ "name": "TUMPEL_PROBE", "value": "in-box-memory" }],
+            "connectors": []
         }))
         .expect("grant"),
         last_line_seq: Sequence(last_line_seq),

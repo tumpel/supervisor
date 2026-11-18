@@ -25,6 +25,8 @@ use tumpel_api::types::{
 use tumpel_guest::disk::{self, Space};
 use tumpel_guest::{credential_file, encode, Decoder};
 
+use crate::connectors;
+use crate::forwarder::Forwarder;
 use crate::memory::Memory;
 use crate::repository;
 use crate::usage::{self, Spend, Tokens, Usage};
@@ -137,6 +139,7 @@ struct Launch {
     model: String,
     variables: u64,
     files: u64,
+    connectors: Vec<String>,
 }
 
 fn launch(keys: &RandomState, start: &GuestTurnStart) -> Launch {
@@ -152,6 +155,7 @@ fn launch(keys: &RandomState, start: &GuestTurnStart) -> Launch {
         model: start.model.to_string(),
         variables: keys.hash_one(&variables),
         files: keys.hash_one(&files),
+        connectors: connectors::ids(&start.credential.connectors),
     }
 }
 
@@ -186,6 +190,7 @@ fn environment(config: &GuestHarness, start: &GuestTurnStart) -> Vec<(String, St
                 .map(|variable| (variable.name.to_string(), variable.value.to_string())),
         )
         .chain(turn_environment(start))
+        .chain(connectors::variables(config.protocol, &start.credential.connectors))
         .collect()
 }
 
@@ -314,6 +319,8 @@ pub struct GuestState {
     last_line_seq: i64,
     markers: u64,
     memory: Memory,
+    forwarder: Forwarder,
+    caches_masked: bool,
 }
 
 fn read_line_seq() -> Result<i64, String> {
@@ -469,6 +476,7 @@ fn turn_arguments(
     thread: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let model = start.model.to_string();
+    let connectors = connectors::arguments(protocol, &start.credential.connectors)?;
     Ok(match protocol {
         GuestHarnessProtocol::ShellLines => Vec::new(),
         GuestHarnessProtocol::CodexExecJson => {
@@ -477,6 +485,7 @@ fn turn_arguments(
             }
             let mut arguments = vec!["--model".to_string(), model];
             arguments.extend(start.credential.arguments.iter().cloned());
+            arguments.extend(connectors);
             if let Some(thread) = thread {
                 arguments.extend(["resume".to_string(), thread.to_string()]);
             }
@@ -487,6 +496,7 @@ fn turn_arguments(
             if started {
                 arguments.push("--continue".to_string());
             }
+            arguments.extend(connectors);
             arguments
         }
     })
@@ -691,6 +701,8 @@ impl GuestState {
             last_line_seq: read_line_seq()?,
             markers: 0,
             memory,
+            forwarder: Forwarder::start()?,
+            caches_masked: false,
         })
     }
 
@@ -725,6 +737,7 @@ impl GuestState {
 
     fn spawn(&self, start: &GuestTurnStart) -> Result<Harness, String> {
         let written = write_files(&self.home, &start.files, &read_written()?)?;
+        connectors::refuse_reserved(self.config.protocol, &self.home, &start.credential.connectors)?;
         std::fs::create_dir_all(STATE_DIR).map_err(|error| format!("creating {STATE_DIR}: {error}"))?;
         std::fs::write(
             WRITTEN_FILE,
@@ -834,7 +847,11 @@ impl GuestState {
     pub fn run(&mut self, start: &GuestTurnStart, host: &mut (impl Write + AsFd)) -> Result<(), String> {
         self.last_line_seq = start.last_line_seq.0;
         let first = self.last_line_seq;
-        let ending = self.turn(start, host);
+        let ending = match self.forwarder.begin(&start.credential.connectors) {
+            Ok(()) => self.turn(start, host),
+            Err(error) => Ok(ended(GuestTurnEndReason::HarnessStartFailed, error)),
+        };
+        self.forwarder.end()?;
         let credential_file = self.take_credential()?;
         let ending = match ending {
             Ok(ending) => ending,
@@ -928,6 +945,11 @@ impl GuestState {
         }
         write_constraints(self.memory.box_mib, start.turn_seconds)?;
         self.write_credential(start)?;
+        if !self.caches_masked && !start.credential.connectors.is_empty() {
+            let credential_file = start.credential.credential_file.as_ref().map(|file| file.path.as_str());
+            connectors::mask_oauth_caches(&self.home, credential_file)?;
+            self.caches_masked = true;
+        }
         self.harness_for(start)
     }
 

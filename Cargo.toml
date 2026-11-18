@@ -17,6 +17,7 @@ ext4-view = { version = "1.0.0", features = ["std"] }
 fastcdc = "5.0.0"
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
 hostname = "0.4.2"
+httparse = "1.10.1"
 libc = "0.2.191"
 reqwest = { version = "0.13.4", features = ["json"] }
 ring = "0.17.14"
@@ -29,7 +30,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["registry", "std"] }
 sd-notify = { version = "0.5.0", features = ["fdstore"] }
 sendfd = "0.4.5"
-tumpel-api = "=0.7.0"
+tumpel-api = "=0.8.0"
 tumpel-channel = { path = "crates/tumpel-channel", version = "=0.1.0" }
 tumpel-guest = { path = "crates/tumpel-guest", version = "=0.1.0" }
 
