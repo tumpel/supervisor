@@ -1015,7 +1015,8 @@ impl Host {
             credential: serde_json::from_value(json!({
                 "credentialHandoverId": "credential-1",
                 "expiresAt": in_seconds(expires_in).to_rfc3339(),
-                "variables": [{ "name": "ANTHROPIC_API_KEY", "value": "in-memory" }]
+                "variables": [{ "name": "ANTHROPIC_API_KEY", "value": "in-memory" }],
+                "connectors": []
             }))
             .expect("grant"),
             last_line_seq: Sequence(0),
