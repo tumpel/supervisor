@@ -37,7 +37,7 @@ use crate::exchange::{part_number, Answer, Answers, Ask, Cancels, Key, Waiting, 
 use crate::harness_result::{error_result, exit_result, turn_end};
 use crate::images;
 use crate::layers::LayerCache;
-use crate::pool::{PoolExhausted, Tap, TapPool};
+use crate::pool::{Tap, TapPool};
 use crate::snapshot::{
     assemble, cut, decode, decode_root, draft_digests, fetches, fresh, lacking, restore_parts, stage, unpack,
     write_restore, Base, Births, ChunkCache, Cut, Fetch, Kind, Manifest, PackFile, Place, Places, Span,
@@ -148,6 +148,7 @@ pub trait Vmm: Send + Sync + 'static {
         handed: &SupervisorHandoverMachine,
     ) -> Result<(Self::Machine, <Self::Machine as Machine>::Guest), String>;
     fn booted_memory(&self, handed: &SupervisorHandoverMachine) -> Result<NonZeroU32, String>;
+    fn available_memory_mib(&self) -> Result<u64, String>;
     fn discard(&self, handed: &SupervisorHandoverMachine);
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
@@ -818,9 +819,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             .await
             {
                 Ok(Ok(())) => return self.run_turn(live, turn, files, claiming).await,
-                Ok(Err(error)) => format!("resuming the paused box of session {} failed: {error}", *turn.session_id),
+                Ok(Err(error)) => format!(
+                    "resuming the paused box of session {} failed: {error}",
+                    *turn.session_id
+                ),
                 Err(_) => format!(
-                    "the paused box of session {} did not resume within {seconds} s; raise budgets.bootSeconds in runtime.json",
+                    "the paused box of session {} did not resume within {seconds} s; send the turn again",
                     *turn.session_id
                 ),
             },
@@ -910,7 +914,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             (Ok(Ok(_)), Err(error)) => format!("box {} booted, then {error}", *turn.box_id),
             (Ok(Err(error)), _) => format!("booting box {} failed: {error}", *turn.box_id),
             (Err(_), _) => format!(
-                "box {} did not say GuestHello within {} s of booting with a restore archive of {archived} bytes in {entries} entries; raise budgets.bootSeconds in runtime.json",
+                "box {} did not say GuestHello within {} s of booting with a restore archive of {archived} bytes in {entries} entries; send the turn again",
                 *turn.box_id,
                 budget.as_secs()
             ),
@@ -1223,7 +1227,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             )),
             Ok(Err(error)) => Err(format!("reassembling the files of {named} stopped: {error}")),
             Err(_) => Err(format!(
-                "reassembling the files of {named} took longer than {seconds} s for {bytes} bytes in {entries} entries; raise budgets.bootSeconds in runtime.json"
+                "reassembling the files of {named} took longer than {seconds} s for {bytes} bytes in {entries} entries; send the turn again"
             )),
         }
     }
@@ -2476,10 +2480,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         let tap = match self.claim(None).await {
             Ok(tap) => tap,
-            Err(exhausted) => {
+            Err(full) => {
                 emit(
                     &self.runner.out,
-                    refused(format!("{exhausted}; the setup box found no free slot, so start the Claude setup again once a box is free")),
+                    refused(format!(
+                        "{full}; the setup box found no free slot, so start the Claude setup again once a box is free"
+                    )),
                 );
                 return;
             }
@@ -2576,13 +2582,13 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         };
         let tap = match self.claim(memory_mib).await {
             Ok(tap) => tap,
-            Err(exhausted) => {
+            Err(refused) => {
                 root.in_scope(|| {
                     turn_failed(
                         &self.runner.out,
                         &turn.turn_id,
                         TurnFailureReason::PoolExhausted,
-                        exhausted.to_string(),
+                        format!("{refused}; the control plane offers the turn again"),
                     );
                 });
                 self.prune(&session);
@@ -2685,7 +2691,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.box_gone(order);
     }
 
-    async fn claim(&mut self, memory_mib: Option<NonZeroU32>) -> Result<Tap, PoolExhausted> {
+    async fn claim(&mut self, memory_mib: Option<NonZeroU32>) -> Result<Tap, String> {
         let mut victims: Vec<_> = self
             .slots
             .iter()
@@ -2696,15 +2702,26 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .collect();
         victims.sort();
         let freeing: Vec<_> = victims.iter().map(|(_, mib, _)| *mib).collect();
-        self.pool.admits(memory_mib, &freeing)?;
+        self.pool
+            .admits(memory_mib, &freeing, self.available_memory_mib()?)
+            .map_err(|exhausted| exhausted.to_string())?;
         let mut victims = victims.into_iter();
-        while self.pool.admits(memory_mib, &[]).is_err() {
+        while self.pool.admits(memory_mib, &[], self.available_memory_mib()?).is_err() {
             let Some((_, _, victim)) = victims.next() else {
                 break;
             };
             self.teardown(&victim).await;
         }
-        self.pool.claim(memory_mib)
+        self.pool
+            .claim(memory_mib, self.available_memory_mib()?)
+            .map_err(|exhausted| exhausted.to_string())
+    }
+
+    fn available_memory_mib(&self) -> Result<u64, String> {
+        self.runner
+            .vmm
+            .available_memory_mib()
+            .map_err(|error| format!("reading the memory this host has available failed: {error}"))
     }
 
     fn arm(&mut self, session: &str) {

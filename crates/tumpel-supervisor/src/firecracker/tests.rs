@@ -173,8 +173,8 @@ fn closed(handed: &mut Handed) -> bool {
 #[tokio::test]
 async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_binary_left_off() {
     let vmm = firecracker("reattach-live");
-    let tap = TapPool::new(4096, NonZeroU32::new(4096).expect("4096"))
-        .claim(None)
+    let tap = TapPool::new(4096, 4096, NonZeroU32::new(4096).expect("4096"))
+        .claim(None, 0)
         .expect("tap");
     let pid = sleeper();
     let mut handed = handed(&vmm, pid, true);
@@ -198,8 +198,8 @@ async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_bin
 #[tokio::test]
 async fn reattach_of_a_box_whose_process_ended_closes_every_handed_descriptor() {
     let vmm = firecracker("reattach-ended");
-    let tap = TapPool::new(4096, NonZeroU32::new(4096).expect("4096"))
-        .claim(None)
+    let tap = TapPool::new(4096, 4096, NonZeroU32::new(4096).expect("4096"))
+        .claim(None, 0)
         .expect("tap");
     let pid = sleeper();
     zombie(pid);
@@ -216,8 +216,8 @@ async fn reattach_of_a_box_whose_process_ended_closes_every_handed_descriptor() 
 #[tokio::test]
 async fn reattach_with_the_wrong_descriptor_kills_and_reaps_the_live_child_and_closes_the_rest() {
     let vmm = firecracker("reattach-wrong");
-    let tap = TapPool::new(4096, NonZeroU32::new(4096).expect("4096"))
-        .claim(None)
+    let tap = TapPool::new(4096, 4096, NonZeroU32::new(4096).expect("4096"))
+        .claim(None, 0)
         .expect("tap");
     let pid = sleeper();
     let mut handed = handed(&vmm, pid, false);
