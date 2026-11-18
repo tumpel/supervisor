@@ -33,7 +33,16 @@ Each box runs in its own systemd user scope, `tumpel-box<k>.scope`, outside the 
 
 ## Releases
 
-A push to `main` that changes the supervisor, or a manual run of the release workflow, releases the next `vX.Y.Z`. The binary, the crates and the GitHub release carry the same version.
+The supervisor ships two builds, and neither needs a person to cut it.
+
+- Dev build: a push to `main` publishes a GitHub pre-release `vX.Y.Z-main.N` when a commit since the newest release tag changed a shipped file, so a skipped or failed run is built by the next push. A shipped file is a crate source, a Cargo manifest, `package.json`, the toolchain or the guest drive build. `X.Y.Z` is the next stable version and `N` counts the commits since the latest stable release, so semver orders every dev build after the latest stable release and before the next one. A dev build never touches crates.io.
+- Stable build: once a day at 04:00 UTC, the newest dev build without a stable release is promoted. The run tags that dev build's commit `vX.Y.Z`, publishes the crates to crates.io, and publishes the GitHub release as Latest. A day with no new dev build releases nothing.
+
+The conventional commit types since the latest stable release pick `X.Y.Z`: a breaking change bumps major, or minor while the version is 0.x, a `feat` bumps minor, and any other type bumps patch. Docs, tests and CI changes never build.
+
+Every release, dev or stable, attaches the same assets under the same names: `tumpel-supervisor-x86_64-linux`, `tumpel-guest-x86_64-linux`, their `.sha256` files and `release.json`. Fetch one by tag from `https://github.com/tumpel/supervisor/releases/download/v<version>/<asset>`. `release.json` names the version, the protocol windows and the sha256 of the supervisor.
+
+Every build packages all three crates before it publishes anything. A stable tag is pushed before the crates publish, and the next daily run finishes a stable tag that has no published release before it promotes anything newer, so one version always comes from one commit. That run skips crates already on crates.io. A dev tag appears only when its GitHub release publishes. A published release is never overwritten: a rerun of a published version fails and names it.
 
 ## Development
 
