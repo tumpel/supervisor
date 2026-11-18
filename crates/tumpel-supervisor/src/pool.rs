@@ -198,9 +198,6 @@ impl TapPool {
             .sum::<u64>();
         let freed_disk_mib = freeing.iter().map(|freed| u64::from(freed.disk_mib.get())).sum::<u64>();
         let held_mib = self.held_mib - freed_mib;
-        if held_mib == 0 {
-            return Ok(());
-        }
         if held_mib + u64::from(memory_mib.get()) > self.budget_mib {
             return Err(PoolExhausted::Memory {
                 boxes: self.held.len(),
@@ -208,6 +205,9 @@ impl TapPool {
                 budget_mib: self.budget_mib,
                 requested_mib: memory_mib,
             });
+        }
+        if held_mib == 0 {
+            return Ok(());
         }
         if self.held_disk_mib - freed_disk_mib + u64::from(size.disk_mib.get()) > disk.budget_mib() {
             return Err(PoolExhausted::Disk {
@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn boxes_are_admitted_while_their_memory_fits_and_an_empty_host_admits_any_box() {
+    fn boxes_are_admitted_while_their_memory_fits_the_budget_and_the_first_box_too() {
         let mut pool = TapPool::new(12_288, BOX);
         let first = pool.claim(BOX, ROOMY).expect("first default box");
         let second = pool.claim(memory(8192), ROOMY).expect("a box asking for 8 GiB");
@@ -364,14 +364,12 @@ mod tests {
         assert_eq!(pool.admits(memory(8192), &[memory(8192)], ROOMY), Ok(()));
         pool.release(second);
         pool.release(first);
-        let large = pool
-            .claim(memory(65_536), ROOMY)
-            .expect("an empty host admits a box larger than its budget");
+        let mut small = TapPool::new(memory_budget_mib(8192), BOX);
         assert_eq!(
-            (large.device(), large.memory_mib().get()),
-            ("tumpel0".to_string(), 65_536)
+            small.claim(memory(65_536), ROOMY).map_err(|refused| refused.to_string()),
+            Err("this host's 0 boxes hold 0 MiB of the 4096 MiB it gives boxes, so a box of 65536 MiB does not fit; they run a turn or wait for a snapshot of their last turn".to_string())
         );
-        assert!(pool.claim(memory(128), ROOMY).is_err());
+        assert!(small.claim(BOX, ROOMY).is_ok());
     }
 
     #[test]
