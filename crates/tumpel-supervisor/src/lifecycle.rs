@@ -20,14 +20,14 @@ use tumpel_api::types::{
     ChannelSnapshotDone, ChannelSnapshotDoneType, ChannelSnapshotDownload, ChannelSnapshotFailed,
     ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPacks, ChannelSnapshotPacksType,
     ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete, ChannelTurnCompleteType,
-    ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLine,
-    ChannelTurnLineType, ChannelTurnRepositoryCloneFailed, ChannelTurnRepositoryCloneFailedType,
-    ChannelTurnRepositoryReady, ChannelTurnRepositoryReadyType, DisplayName, EmailAddress, EntityId, GuestHello,
-    GuestInput, GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnStart,
-    GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl,
-    Sequence, Sha256Digest, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
-    SupervisorHandoverCommand, SupervisorHandoverDiscard, SupervisorHandoverDiscardKind, SupervisorHandoverMachine,
-    SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown,
+    ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnImageFetching,
+    ChannelTurnImageFetchingType, ChannelTurnLine, ChannelTurnLineType, ChannelTurnRepositoryCloneFailed,
+    ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady, ChannelTurnRepositoryReadyType, DisplayName,
+    EmailAddress, EntityId, GuestHello, GuestInput, GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel,
+    GuestTurnCancelType, GuestTurnStart, GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName, Prompt,
+    RepositoryCloneFailureCause, RepositoryUrl, Sequence, Sha256Digest, SupervisorHandover, SupervisorHandoverBox,
+    SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverDiscard, SupervisorHandoverDiscardKind,
+    SupervisorHandoverMachine, SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown,
     SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
     SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
 };
@@ -399,7 +399,7 @@ struct Follow {
 }
 
 enum Followed {
-    Ended(Result<Sequence, Failure>),
+    Ended(Result<(Sequence, Option<ChannelTurnCompleteWarning>), Failure>),
     Parked(Left),
 }
 
@@ -1372,12 +1372,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Report::Clone(_) => failure,
         });
         match (result, live.credential_file.take()) {
-            (Ok(last_line_seq), file) => emit(
+            (Ok((last_line_seq, warning)), file) => emit(
                 &self.out,
                 ChannelTurnComplete {
                     credential_file: file.and_then(|file| file.try_into().ok()),
                     completed_at: now(),
                     last_line_seq,
+                    warning,
                     turn_id: turn_id.clone(),
                     type_: ChannelTurnCompleteType::TurnComplete,
                 },

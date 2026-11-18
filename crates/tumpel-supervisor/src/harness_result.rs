@@ -1,5 +1,7 @@
 use serde_json::Value;
-use tumpel_api::types::{GuestHarnessProtocol, GuestTurnEnd, GuestTurnEndReason, Sequence, TurnFailureReason};
+use tumpel_api::types::{
+    ChannelTurnCompleteWarning, GuestHarnessProtocol, GuestTurnEnd, GuestTurnEndReason, Sequence, TurnFailureReason,
+};
 use tumpel_guest::tail;
 
 const HARNESS_TEXT_LIMIT: usize = 2048;
@@ -7,7 +9,7 @@ const HARNESS_TEXT_LIMIT: usize = 2048;
 pub fn turn_end(
     end: GuestTurnEnd,
     error: Option<(TurnFailureReason, String)>,
-) -> Result<Sequence, (TurnFailureReason, String)> {
+) -> Result<(Sequence, Option<ChannelTurnCompleteWarning>), (TurnFailureReason, String)> {
     match (end.reason, error) {
         (GuestTurnEndReason::HarnessOutOfMemory, _) => Err((TurnFailureReason::HarnessOutOfMemory, end.detail)),
         (GuestTurnEndReason::BoxDiskFull, _) => Err((TurnFailureReason::BoxDiskFull, end.detail)),
@@ -17,7 +19,18 @@ pub fn turn_end(
             reason,
             format!("{detail}; the harness stopped ({}): {}", end.reason, end.detail),
         )),
-        (GuestTurnEndReason::Completed, None) => Ok(end.last_line_seq),
+        (GuestTurnEndReason::Completed, None) => Ok((
+            end.last_line_seq,
+            end.warning
+                .map(|warning| ChannelTurnCompleteWarning::try_from(String::from(warning)))
+                .transpose()
+                .map_err(|error| {
+                    (
+                        TurnFailureReason::HarnessExited,
+                        format!("the guest's warning: {error}"),
+                    )
+                })?,
+        )),
         (GuestTurnEndReason::HarnessExited | GuestTurnEndReason::HarnessStartFailed, _) => Err((
             TurnFailureReason::HarnessExited,
             format!("the harness stopped ({}): {}", end.reason, end.detail),
@@ -155,6 +168,30 @@ mod tests {
     use super::*;
 
     const STREAM: GuestHarnessProtocol = GuestHarnessProtocol::ClaudeStreamJson;
+
+    #[test]
+    fn a_completed_turn_keeps_completing_and_carries_the_guest_warning_while_a_full_disk_failure_fails_box_disk_full() {
+        let end = |reason: &str, warning: Option<&str>| -> GuestTurnEnd {
+            serde_json::from_value(serde_json::json!({
+                "type": "TurnEnd", "turnId": "turn-1", "reason": reason, "lastLineSeq": 4,
+                "detail": "the box disk of 32096 MiB is full", "warning": warning,
+            }))
+            .expect("a TurnEnd")
+        };
+        let completed = turn_end(end("Completed", Some("the box disk of 32096 MiB is full")), None)
+            .map(|(seq, warning)| (seq.0, warning.map(String::from)));
+        assert_eq!(
+            completed,
+            Ok((4, Some("the box disk of 32096 MiB is full".to_string())))
+        );
+        assert_eq!(
+            turn_end(end("BoxDiskFull", None), None).map(|(seq, _)| seq.0),
+            Err((
+                TurnFailureReason::BoxDiskFull,
+                "the box disk of 32096 MiB is full".to_string()
+            ))
+        );
+    }
 
     fn reason_of(protocol: GuestHarnessProtocol, line: &str) -> Option<TurnFailureReason> {
         error_result(protocol, line).map(|(reason, _)| reason)

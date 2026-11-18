@@ -430,35 +430,53 @@ fn a_cancel_kills_a_persistent_harness_and_every_process_it_started() {
 }
 
 #[test]
-fn a_turn_that_ends_with_the_box_disk_full_fails_box_disk_full_naming_its_size() {
+fn a_harness_that_fails_on_a_full_box_disk_fails_box_disk_full_and_a_completed_turn_only_warns() {
     let full = tumpel_guest::disk::Space {
         total_mib: 32_096,
         available_mib: 0,
         free_mib: 12,
     };
-    let reason = |ending: super::Ending| match ending {
-        super::Ending::Turn { reason, detail, .. } => (reason, detail),
+    let parts = |ending: super::Ending| match ending {
+        super::Ending::Turn {
+            reason,
+            detail,
+            warning,
+            ..
+        } => (reason, detail, warning),
         super::Ending::Clone(_) => panic!("a turn ending"),
     };
-    let (ended, detail) = reason(super::disk_full(
-        super::ended(GuestTurnEndReason::HarnessExited, "No space left on device"),
-        full,
-    ));
-    assert_eq!(ended, GuestTurnEndReason::BoxDiskFull);
+    let advice = "the box disk of 32096 MiB is full, 12 MiB free; give the persona a larger boxDiskMib, up to 262144 MiB, or have it delete build output it no longer needs";
     assert_eq!(
-        detail,
-        "the box disk of 32096 MiB is full, 12 MiB free, so the turn ended HarnessExited; give the persona a larger boxDiskMib, up to 262144 MiB, or have it delete build output it no longer needs; No space left on device"
+        parts(super::disk_full(
+            super::ended(GuestTurnEndReason::HarnessExited, "No space left on device"),
+            full,
+        )),
+        (
+            GuestTurnEndReason::BoxDiskFull,
+            format!("{advice}; the harness stopped (HarnessExited): No space left on device"),
+            None
+        )
     );
-    let (completed, _) = reason(super::disk_full(super::ended(GuestTurnEndReason::Completed, ""), full));
-    assert_eq!(completed, GuestTurnEndReason::BoxDiskFull);
-    let (cancelled, _) = reason(super::disk_full(super::ended(GuestTurnEndReason::Cancelled, ""), full));
-    assert_eq!(cancelled, GuestTurnEndReason::Cancelled);
+    assert_eq!(
+        parts(super::disk_full(super::ended(GuestTurnEndReason::Completed, ""), full)),
+        (GuestTurnEndReason::Completed, String::new(), Some(advice.to_string()))
+    );
+    assert_eq!(
+        parts(super::disk_full(super::ended(GuestTurnEndReason::Cancelled, ""), full)).0,
+        GuestTurnEndReason::Cancelled
+    );
     let roomy = tumpel_guest::disk::Space { free_mib: 321, ..full };
-    let (kept, _) = reason(super::disk_full(
-        super::ended(GuestTurnEndReason::HarnessExited, ""),
-        roomy,
-    ));
-    assert_eq!(kept, GuestTurnEndReason::HarnessExited);
+    assert_eq!(
+        parts(super::disk_full(
+            super::ended(GuestTurnEndReason::HarnessExited, ""),
+            roomy
+        )),
+        (GuestTurnEndReason::HarnessExited, String::new(), None)
+    );
+    assert_eq!(
+        parts(super::disk_full(super::ended(GuestTurnEndReason::Completed, ""), roomy)).2,
+        None
+    );
 }
 
 #[test]

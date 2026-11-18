@@ -590,6 +590,7 @@ enum Ending {
         reason: GuestTurnEndReason,
         detail: String,
         metrics: Vec<GuestMetric>,
+        warning: Option<String>,
     },
     Clone(repository::CloneFailure),
 }
@@ -599,6 +600,7 @@ fn ended(reason: GuestTurnEndReason, detail: impl Into<String>) -> Ending {
         reason,
         detail: detail.into(),
         metrics: Vec::new(),
+        warning: None,
     }
 }
 
@@ -624,25 +626,32 @@ fn write_constraints(memory_mib: u64, turn_seconds: Option<NonZeroU32>) -> Resul
     std::fs::write(CONSTRAINTS_FILE, note).map_err(|error| format!("writing {CONSTRAINTS_FILE}: {error}"))
 }
 
-fn disk_full(ending: Ending, disk: Space) -> Ending {
-    let Ending::Turn { reason, detail, .. } = &ending else {
-        return ending;
-    };
-    if !disk.full()
-        || matches!(
-            reason,
-            GuestTurnEndReason::Cancelled | GuestTurnEndReason::HarnessOutOfMemory
-        )
-    {
+fn disk_full(mut ending: Ending, disk: Space) -> Ending {
+    if !disk.full() {
         return ending;
     }
-    ended(
-        GuestTurnEndReason::BoxDiskFull,
-        format!(
-            "the box disk of {} MiB is full, {} MiB free, so the turn ended {reason}; give the persona a larger boxDiskMib, up to 262144 MiB, or have it delete build output it no longer needs; {detail}",
-            disk.total_mib, disk.free_mib
-        ),
-    )
+    let Ending::Turn {
+        reason,
+        detail,
+        warning,
+        ..
+    } = &mut ending
+    else {
+        return ending;
+    };
+    let full = format!(
+        "the box disk of {} MiB is full, {} MiB free; give the persona a larger boxDiskMib, up to 262144 MiB, or have it delete build output it no longer needs",
+        disk.total_mib, disk.free_mib
+    );
+    match reason {
+        GuestTurnEndReason::Completed => *warning = Some(full),
+        GuestTurnEndReason::HarnessExited | GuestTurnEndReason::HarnessStartFailed => {
+            *detail = format!("{full}; the harness stopped ({reason}): {detail}");
+            *reason = GuestTurnEndReason::BoxDiskFull;
+        }
+        _ => {}
+    }
+    ending
 }
 
 fn with_spend(ending: Ending, spend: &Spend, protocol: GuestHarnessProtocol, priced: bool) -> Result<Ending, String> {
@@ -655,10 +664,16 @@ fn with_spend(ending: Ending, spend: &Spend, protocol: GuestHarnessProtocol, pri
         read
     };
     Ok(match ending {
-        Ending::Turn { reason, detail, .. } => Ending::Turn {
+        Ending::Turn {
+            reason,
+            detail,
+            warning,
+            ..
+        } => Ending::Turn {
             reason,
             detail,
             metrics: usage::metrics(used, priced)?,
+            warning,
         },
         clone @ Ending::Clone(_) => clone,
     })
@@ -853,6 +868,7 @@ impl GuestState {
                 reason,
                 detail,
                 metrics,
+                warning,
             } => GuestTurnEnd {
                 credential_file: credential_file
                     .map(TryInto::try_into)
@@ -864,6 +880,10 @@ impl GuestState {
                 reason,
                 turn_id: start.turn_id.clone(),
                 type_: GuestTurnEndType::TurnEnd,
+                warning: warning
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .map_err(|error| format!("the box disk warning: {error}"))?,
             }
             .into(),
             Ending::Clone(failure) => GuestTurnRepositoryCloneFailed {

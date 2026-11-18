@@ -676,6 +676,7 @@ mod tests {
                     last_line_seq: Sequence(1),
                     turn_id: "turn-1".try_into().expect("turn id"),
                     type_: ChannelTurnCompleteType::TurnComplete,
+                    warning: None,
                 }
                 .into(),
             );
