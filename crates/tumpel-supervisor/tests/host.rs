@@ -266,7 +266,7 @@ async fn crashing_supervisor() {
         Firecracker::new(&runtime),
         HttpStore::new().expect("store"),
         settings,
-        TapPool::new(1).expect("pool"),
+        TapPool::new(4096, std::num::NonZeroU32::new(4096).expect("4096")),
         out,
         data.join("boxes.json"),
     );
@@ -333,7 +333,7 @@ async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_i
         Firecracker::new(&runtime),
         HttpStore::new().expect("store"),
         settings,
-        TapPool::new(1).expect("pool"),
+        TapPool::new(4096, std::num::NonZeroU32::new(4096).expect("4096")),
         out,
         standing.clone(),
     );

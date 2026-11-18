@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use tumpel_api::types::SupervisorFailure;
 use tumpel_supervisor::{
-    check, enrol, install, install_telemetry, on_trial, received_descriptors, run, supervisor_dir, Enrolment, Stopped,
+    check, enrol, install, install_telemetry, on_trial, reach_user_manager, received_descriptors, run, supervisor_dir,
+    Enrolment, Stopped,
 };
 
 #[derive(Parser)]
@@ -75,6 +76,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Command::Run { handover: true, .. } = cli.command {
+        if let Err(error) = unsafe { reach_user_manager() } {
+            eprintln!("tumpel-supervisor: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
