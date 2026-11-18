@@ -286,8 +286,7 @@ fn local_host(value: &str, port: u16) -> bool {
 }
 
 fn connector_id(path: &str) -> Option<&str> {
-    path.strip_prefix(PREFIX)
-        .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    path.strip_prefix(PREFIX).filter(|id| !id.is_empty())
 }
 
 fn forwarded(name: &str, dropped: &[&str]) -> bool {
