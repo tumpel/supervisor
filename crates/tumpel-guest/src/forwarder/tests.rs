@@ -7,7 +7,7 @@ use chrono::{TimeDelta, Utc};
 use serde_json::json;
 use tumpel_api::types::ChannelDispatchConnector;
 
-use super::{destination, fresh, Forwarder, Token};
+use super::{destination, fresh, parse_head, route, Forwarder, Token, PORT};
 
 const CONNECTOR: &str = "01HZY8Q6V0M1C2D3E4F5G6H7J8";
 
@@ -353,4 +353,16 @@ fn a_turn_end_cancels_its_calls_and_a_late_token_never_reaches_the_next_turn() {
     assert!(turn_b.starts_with("HTTP/1.1 200"), "{turn_b}");
     let seen = seen.lock().expect("the record lock");
     assert!(seen[0].contains("authorization: Bearer access-B"), "{seen:?}");
+}
+
+#[test]
+fn the_route_written_for_a_uuid_connector_parses_back_to_its_id() {
+    let id = "3f2b8c1e-9d4a-4e7b-a1c6-5f0e2d9b7a84";
+    let url = route(id);
+    let path = url
+        .strip_prefix(&format!("http://127.0.0.1:{PORT}"))
+        .expect("the route is on the forwarder's port");
+    let request = format!("POST {path} HTTP/1.1\r\nhost: 127.0.0.1:{PORT}\r\n\r\n");
+    let parsed = parse_head(request.as_bytes(), PORT).ok().map(|head| head.connector_id);
+    assert_eq!(parsed.as_deref(), Some(id));
 }
