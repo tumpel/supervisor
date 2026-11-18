@@ -13,6 +13,6 @@ Always follow `rules/errors.md` and `rules/coding-standards.md`.
 
 - `npm install` installs dependencies and enables the pre-commit hook.
 - `npm run check` runs every check. `npm run fix` formats.
-- `npm test` runs the Rust tests. The `host-tests` feature needs KVM and runs by hand.
+- `npm test` runs the Rust and release script tests. The `host-tests` feature needs KVM and runs by hand.
 - `npm run supervisor:build` builds the static guest, packs the guest drive and builds the release supervisor.
-- A push to `main` that changes the supervisor releases the next `vX.Y.Z`; a manual run of the release workflow can bump minor or major.
+- A release is cut on purpose: a pushed `vX.Y.Z` tag, or a manual run of the release workflow on `main` that tags the next patch, minor or major. A rerun releases the same version.

@@ -10,10 +10,10 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CARGO = join(ROOT, "Cargo.toml");
 const TARGET = "x86_64-unknown-linux-gnu";
 const SEMVER = /^(\d+)\.(\d+)\.(\d+)$/;
+const CRATES = ["tumpel-channel", "tumpel-guest", "tumpel-supervisor"];
 
 const die = (message) => {
-  console.error(`release: ${message}`);
-  process.exit(1);
+  throw new Error(`release: ${message}`);
 };
 
 const cargoVersion = (cargo) =>
@@ -22,20 +22,40 @@ const cargoVersion = (cargo) =>
 const tumpelApiPin = (cargo) =>
   cargo.match(/^tumpel-api = "=([^"]+)"$/m)?.[1] ?? die('Cargo.toml pins no tumpel-api = "=X.Y.Z"');
 
-const nextVersion = (bump) => {
-  const tags = execFileSync("git", ["tag", "--list", "v*"], { cwd: ROOT, encoding: "utf8" })
-    .split("\n")
-    .map((tag) => tag.slice(1).match(SEMVER))
+const semver = (tag) => tag.slice(1).match(SEMVER)?.slice(1, 4).map(Number) ?? null;
+
+export const releaseVersion = (tags, headTags, bump, fallback) => {
+  const head = headTags.map(semver).filter(Boolean);
+  if (head.length > 1) die(`the commit carries ${headTags.join(" and ")}; delete all but one`);
+  if (head.length === 1) return head[0].join(".");
+  const latest = tags
+    .map(semver)
     .filter(Boolean)
-    .map((match) => match.slice(1, 4).map(Number))
-    .sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
-  const latest = tags.at(-1);
-  if (!latest) return cargoVersion(readFileSync(CARGO, "utf8"));
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2])
+    .at(-1);
+  if (!latest) return fallback;
   const [major, minor, patch] = latest;
   if (bump === "major") return `${major + 1}.0.0`;
   if (bump === "minor") return `${major}.${minor + 1}.0`;
   if (bump === "patch") return `${major}.${minor}.${patch + 1}`;
   return die(`the bump is ${bump}; pass patch, minor or major`);
+};
+
+const gitTags = (...args) =>
+  execFileSync("git", ["tag", "--list", "v*", ...args], { cwd: ROOT, encoding: "utf8" })
+    .split("\n")
+    .filter(Boolean);
+
+export const unpublished = (version, indexes) =>
+  CRATES.filter(
+    (crate) => !(indexes[crate] ?? "").split("\n").some((line) => line && JSON.parse(line).vers === version),
+  );
+
+const registryIndex = async (crate) => {
+  const response = await fetch(`https://index.crates.io/${crate.slice(0, 2)}/${crate.slice(2, 4)}/${crate}`);
+  if (response.status === 404) return "";
+  if (!response.ok) die(`the crates.io index answered ${response.status} for ${crate}`);
+  return response.text();
 };
 
 const stamp = (version) => {
@@ -86,8 +106,27 @@ const assets = (version, out) => {
   for (const asset of [...binaries, join(out, "release.json")]) console.log(`staged ${basename(asset)}`);
 };
 
-const [command, ...args] = process.argv.slice(2);
-if (command === "version" && args.length === 1) console.log(nextVersion(args[0]));
-else if (command === "stamp" && args.length === 1) stamp(args[0]);
-else if (command === "assets" && args.length === 2) assets(args[0], args[1]);
-else die("usage: release.mjs version <patch|minor|major> | stamp <X.Y.Z> | assets <X.Y.Z> <dir>");
+const cli = async ([command, ...args]) => {
+  if (command === "version" && args.length === 1)
+    return releaseVersion(
+      gitTags(),
+      gitTags("--points-at", "HEAD"),
+      args[0],
+      cargoVersion(readFileSync(CARGO, "utf8")),
+    );
+  if (command === "stamp" && args.length === 1) return stamp(args[0]);
+  if (command === "assets" && args.length === 2) return assets(args[0], args[1]);
+  if (command === "unpublished" && args.length === 1)
+    return unpublished(
+      args[0],
+      Object.fromEntries(await Promise.all(CRATES.map(async (c) => [c, await registryIndex(c)]))),
+    ).join(" ");
+  return die(
+    "usage: release.mjs version <patch|minor|major> | stamp <X.Y.Z> | assets <X.Y.Z> <dir> | unpublished <X.Y.Z>",
+  );
+};
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const output = await cli(process.argv.slice(2));
+  if (output !== undefined) console.log(output);
+}

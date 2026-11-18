@@ -33,7 +33,7 @@ Each box runs in its own systemd user scope, `tumpel-box<k>.scope`, outside the 
 
 ## Releases
 
-A push to `main` that changes the supervisor, or a manual run of the release workflow, releases the next `vX.Y.Z`. The binary, the crates and the GitHub release carry the same version.
+A release is cut on purpose and ships everything merged since the last one. Push a `vX.Y.Z` tag, or run the release workflow on `main` to tag the next `vX.Y.Z`. The binary, the crates and the GitHub release carry the same version. A failed release reruns for the same version: it skips crates already on crates.io and finishes the GitHub release.
 
 ## Development
 
