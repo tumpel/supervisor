@@ -33,7 +33,7 @@ use crate::lifecycle::{
     turn_failed, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder, Taken,
     TeardownOrder,
 };
-use crate::pool::{headroom_mib, memory_budget_mib, mib, HeldDisk, Size, TapPool};
+use crate::pool::{memory_budget_mib, mib, HeldDisk, Size, TapPool};
 use crate::store::HttpStore;
 use crate::telemetry::{Telemetry, BATCH_POINTS};
 use crate::update::{self, HttpSource, Layout, Limits, Outcome, Startup, Updater};
@@ -337,19 +337,9 @@ fn start_boxes(
     standing: PathBuf,
 ) -> Result<(Usage, IdleGate, BoxRunner), Failure> {
     let unreadable = |error: anyhow::Error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}"));
-    let handed_resident_mib = taken
-        .iter()
-        .flat_map(|(handover, _)| &handover.boxes)
-        .map(|handed| usage::resident_mib(handed.machine.process_id))
-        .sum::<anyhow::Result<u64>>()
-        .map_err(unreadable)?;
     usage::prepare_data_dir(Path::new(&*runtime.data_dir)).map_err(unreadable)?;
-    let (total_mib, available_mib) = usage::memory_total_and_available_mib().map_err(unreadable)?;
-    let pool = TapPool::new(
-        memory_budget_mib(total_mib, available_mib, handed_resident_mib),
-        headroom_mib(total_mib),
-        box_size,
-    );
+    let total_mib = usage::memory_bytes().map_err(unreadable)?.get() / (1024 * 1024);
+    let pool = TapPool::new(memory_budget_mib(total_mib), box_size);
     let settings = Settings {
         budgets: Budgets::from(&runtime.budgets),
         warm_window: Duration::from_secs(u64::from(runtime.warm_window_seconds.get())),

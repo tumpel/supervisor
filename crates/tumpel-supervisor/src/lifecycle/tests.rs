@@ -338,7 +338,6 @@ struct MemoryVmm {
     drives: Drives,
     log: Log,
     hands: Hands,
-    available_mib: Arc<AtomicU64>,
     free_disk_mib: Arc<AtomicU64>,
 }
 
@@ -394,10 +393,6 @@ impl Vmm for MemoryVmm {
                     handed.process_id
                 )
             })
-    }
-
-    fn available_memory_mib(&self) -> Result<u64, String> {
-        Ok(self.available_mib.load(Ordering::SeqCst))
     }
 
     fn booted_disk(&self, _: &EntityId) -> Result<NonZeroU32, String> {
@@ -775,7 +770,6 @@ fn host_on(
         drives: Arc::default(),
         log: Arc::default(),
         hands: Arc::default(),
-        available_mib: Arc::new(AtomicU64::new(1 << 30)),
         free_disk_mib: Arc::new(AtomicU64::new(1 << 30)),
     };
     start_host(vmm, store, capacity, settings, clone_seconds, None)
@@ -796,7 +790,7 @@ fn start_host(
         vmm.clone(),
         store.clone(),
         settings,
-        TapPool::new(u64::from(capacity) * 4096, 4096, BOX),
+        TapPool::new(u64::from(capacity) * 4096, BOX),
         out,
         vmm.staging.join("boxes.json"),
     );
@@ -884,7 +878,7 @@ impl Host {
             memory_mib,
             disk_mib: BOX.disk_mib,
         };
-        let tap = TapPool::new(u64::from(self.capacity) * 4096, 4096, size)
+        let tap = TapPool::new(u64::from(self.capacity) * 4096, size)
             .claim_device(handed.tap_index, size)
             .expect("tap");
         let guest = self.vmm.machine(&handed.session_id, &tap).expect("machine").guest();
@@ -1389,27 +1383,6 @@ async fn a_claim_past_the_pool_is_refused_until_a_clean_paused_box_can_be_evicte
             "pause session-2"
         ]
     );
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_host_short_of_memory_refuses_a_new_box_before_it_boots_and_takes_it_once_memory_frees() {
-    let mut host = host("pressure", 3, Harness::Echo, Boot::Works);
-    host.turn("turn-1", "session-1", "one", Vec::new());
-    host.settle(SETTLE).await;
-    host.log();
-    host.vmm.available_mib.store(2048, Ordering::SeqCst);
-    host.turn("turn-2", "session-2", "two", Vec::new());
-    assert_eq!(
-        host.settle(SETTLE).await,
-        [format!(
-            "failed {}: this host has 2048 MiB of memory available and keeps 4096 MiB of it free, so a box of 4096 MiB does not fit now; the control plane offers the turn again",
-            TurnFailureReason::PoolExhausted
-        )]
-    );
-    assert!(host.log().is_empty(), "the refused box never boots");
-    host.vmm.available_mib.store(8192, Ordering::SeqCst);
-    host.turn("turn-3", "session-2", "two", Vec::new());
-    assert_eq!(host.settle(SETTLE).await, ["claim turn-3", "line 1 two", "complete 1"]);
 }
 
 #[tokio::test(start_paused = true)]

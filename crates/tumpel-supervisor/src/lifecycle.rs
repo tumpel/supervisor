@@ -152,7 +152,6 @@ pub trait Vmm: Send + Sync + 'static {
         handed: &SupervisorHandoverMachine,
     ) -> Result<(Self::Machine, <Self::Machine as Machine>::Guest), String>;
     fn booted_memory(&self, handed: &SupervisorHandoverMachine) -> Result<NonZeroU32, String>;
-    fn available_memory_mib(&self) -> Result<u64, String>;
     fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String>;
     fn disk(&self, drives: &[String]) -> Result<Disk, String>;
     fn discard(&self, handed: &SupervisorHandoverMachine);
@@ -2788,21 +2787,17 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         victims.sort();
         let freeing: Vec<_> = victims.iter().map(|(_, freed, _)| *freed).collect();
         self.pool
-            .admits(size, &freeing, self.available_memory_mib()?, self.disk()?)
+            .admits(size, &freeing, self.disk()?)
             .map_err(|exhausted| exhausted.to_string())?;
         let mut victims = victims.into_iter();
-        while self
-            .pool
-            .admits(size, &[], self.available_memory_mib()?, self.disk()?)
-            .is_err()
-        {
+        while self.pool.admits(size, &[], self.disk()?).is_err() {
             let Some((_, _, victim)) = victims.next() else {
                 break;
             };
             self.teardown(&victim).await?;
         }
         self.pool
-            .claim(size, self.available_memory_mib()?, self.disk()?)
+            .claim(size, self.disk()?)
             .map_err(|exhausted| exhausted.to_string())
     }
 
@@ -2824,13 +2819,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .vmm
             .disk(&self.held_disk().drives)
             .map_err(|error| format!("reading the disk this host has free failed: {error}"))
-    }
-
-    fn available_memory_mib(&self) -> Result<u64, String> {
-        self.runner
-            .vmm
-            .available_memory_mib()
-            .map_err(|error| format!("reading the memory this host has available failed: {error}"))
     }
 
     fn arm(&mut self, session: &str) {
