@@ -19,8 +19,8 @@ use tokio::time::timeout;
 use tumpel_api::types::{
     ChannelHostMessage, ChannelSupervisorUpdateFailed, ChannelSupervisorUpdateFailedType, ChannelSupervisorUpdateStep,
     ChannelSupervisorUpdateStepReleaseVersion, ChannelSupervisorUpdateStepType, HostArchitecture,
-    ReleaseManifestReleaseVersion, Sha256Digest, SupervisorCheckReport, SupervisorUpdateFailureReason,
-    SupervisorUpdatePending, SupervisorUpdatePhase, SupervisorUpdateRefusal,
+    ReleaseManifestReleaseVersion, ReleaseSupervisorSupervisorVersion, Sha256Digest, SupervisorCheckReport,
+    SupervisorUpdateFailureReason, SupervisorUpdatePending, SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
 use tumpel_guest::setup_output::{redacted, strip_ansi};
 
@@ -122,6 +122,7 @@ pub trait Idle: Send + Sync {
 pub struct Release {
     pub version: ChannelSupervisorUpdateStepReleaseVersion,
     pub sha256: Sha256Digest,
+    pub supervisor_version: Option<ReleaseSupervisorSupervisorVersion>,
     pub channel_protocol_version: u32,
 }
 
@@ -209,6 +210,8 @@ struct AnnouncedRelease {
 struct AnnouncedSupervisor {
     architecture: HostArchitecture,
     sha256: Sha256Digest,
+    #[serde(rename = "supervisorVersion")]
+    supervisor_version: Option<ReleaseSupervisorSupervisorVersion>,
 }
 
 fn announced_release(body: &[u8], url: &str, architecture: HostArchitecture) -> Result<Release, String> {
@@ -231,6 +234,7 @@ fn announced_release(body: &[u8], url: &str, architecture: HostArchitecture) -> 
             .parse()
             .map_err(|error| format!("{url} names an empty release version: {error}"))?,
         sha256: supervisor.sha256,
+        supervisor_version: supervisor.supervisor_version,
         channel_protocol_version: manifest.channel_protocol_version.get(),
     })
 }
@@ -257,6 +261,13 @@ fn digest_of(hex: &str) -> Result<Sha256Digest, String> {
 
 fn short(sha256: &Sha256Digest) -> &str {
     sha256.get(..12).unwrap_or(sha256)
+}
+
+fn named(release: &Release) -> String {
+    match &release.supervisor_version {
+        Some(version) => format!("{} ({})", **version, short(&release.sha256)),
+        None => short(&release.sha256).to_string(),
+    }
 }
 
 fn read<T: DeserializeOwned>(path: &Path, schema: &str) -> Result<Option<T>, String> {
@@ -378,9 +389,8 @@ impl<S: Source, I: Idle> Updater<S, I> {
         };
         if self.idle.busy() > 0 {
             eprintln!(
-                "tumpel-supervisor: supervisor {} ({}) is out and {} boxes run a turn; updating once they finish or in {} s, whichever comes first",
-                *release.version,
-                short(&release.sha256),
+                "tumpel-supervisor: supervisor {} is out and {} boxes run a turn; updating once they finish or in {} s, whichever comes first",
+                named(&release),
                 self.idle.busy(),
                 grace.as_secs()
             );
@@ -429,9 +439,10 @@ impl<S: Source, I: Idle> Updater<S, I> {
             return Outcome::Failed(reason);
         }
         eprintln!(
-            "tumpel-supervisor: swapping to supervisor {} ({}) and handing its boxes over",
-            *release.version,
-            short(&release.sha256)
+            "tumpel-supervisor: swapping supervisor {} ({}) for {} and handing its boxes over",
+            env!("TUMPEL_RELEASE_VERSION"),
+            short(&self.running),
+            named(release)
         );
         self.step(release, SupervisorUpdatePhase::Restarting, self.idle.boxes());
         match self.swap(&release.sha256).await {
