@@ -645,7 +645,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
             detail,
             tail: tail_of(&stderr, &stdout),
         };
-        let name = format!("the check of supervisor {}", short(&release.sha256));
+        let name = format!("the check of supervisor {}", named(release));
         let status = match waited {
             Err(_) => return Err(failed(format!("{name} ran past {} s", self.limits.dry_run.as_secs()))),
             Ok(Err(error)) => return Err(failed(format!("waiting for {name} failed: {error}"))),
