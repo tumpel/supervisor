@@ -51,7 +51,7 @@ mod setup;
 pub use setup::{SetupCommand, SetupInput, SetupOrder};
 
 const TRANSFERS: usize = 16;
-const CLAIM_ANSWER: Duration = Duration::from_secs(60);
+const HANDOVER_CLAIM_ALLOWANCE: Duration = Duration::from_secs(60);
 const RESTORE_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
 const RESTORE_ENTRIES_PER_SECOND: u64 = 2_000;
 const OVERLAY_BYTES_PER_INODE: u64 = 16 * 1024;
@@ -644,17 +644,20 @@ struct Asking {
     answers: Answers,
     key: Key,
     waiting: Option<oneshot::Receiver<Answer>>,
-    deadline: Instant,
+    deadline: Option<Instant>,
 }
 
 impl Asking {
     async fn answer(&mut self) -> Option<Answer> {
         let waiting = self.waiting.take()?;
-        if let Ok(Ok(answer)) = timeout_at(self.deadline, waiting).await {
-            return Some(answer);
+        let answer = match self.deadline {
+            Some(deadline) => timeout_at(deadline, waiting).await.ok().and_then(Result::ok),
+            None => waiting.await.ok(),
+        };
+        if answer.is_none() {
+            self.answers.forget(&self.key);
         }
-        self.answers.forget(&self.key);
-        None
+        answer
     }
 }
 
@@ -773,7 +776,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 turn_id: turn.turn_id.clone(),
                 type_: ChannelTurnClaimType::TurnClaim,
             },
-            Instant::now() + CLAIM_ANSWER,
+            None,
         );
         Claiming { asking, phase }
     }
@@ -931,7 +934,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         Arc::new(ChunkCache::new(self.vmm.chunk_cache()))
     }
 
-    fn send(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Instant) -> Asking {
+    fn send(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Option<Instant>) -> Asking {
         let Waiting { key, answer } = self.answers.expect(key);
         emit(&self.out, message);
         Asking {
@@ -943,7 +946,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     async fn ask(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Instant) -> Result<Answer, String> {
-        let mut asking = self.send(key, message, deadline);
+        let mut asking = self.send(key, message, Some(deadline));
         asking.answer().await.ok_or_else(|| {
             format!(
                 "the control plane did not answer {} before its URLs would expire; check the channel to the control plane",
@@ -1292,9 +1295,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             None => Followed::Ended(Err(Failure {
                 report: Report::Turn(TurnFailureReason::NotClaimed),
                 detail: format!(
-                    "the control plane did not answer the claim of turn {} within {} s, so its harness never started; check the channel to the control plane, then send the turn again",
-                    *turn.turn_id,
-                    CLAIM_ANSWER.as_secs()
+                    "this supervisor stopped waiting for the answer to the claim of turn {}, so its harness never started; the control plane offers the turn again",
+                    *turn.turn_id
                 ),
                 keeps_box: true,
             })),
@@ -1925,7 +1927,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
 
     fn handover_limit(&self) -> Duration {
         let budgets = self.runner.settings.budgets;
-        CLAIM_ANSWER + budgets.boot + budgets.snapshot
+        HANDOVER_CLAIM_ALLOWANCE + budgets.boot + budgets.snapshot
     }
 
     fn refusal(&self) -> Option<&'static str> {
