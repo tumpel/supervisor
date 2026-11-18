@@ -213,6 +213,7 @@ struct MemoryMachine {
     log: Log,
     hands: Hands,
     memory_mib: NonZeroU32,
+    console: String,
 }
 
 impl MemoryMachine {
@@ -254,6 +255,7 @@ impl Machine for MemoryMachine {
             tokio::time::sleep(SLOW_BOOT).await;
         }
         note(&self.log, format!("boot {} on {}", self.session, self.tap));
+        self.console = "[ boot console ]".to_string();
         if self.boot == Boot::Hangs {
             std::future::pending::<()>().await;
         }
@@ -285,7 +287,11 @@ impl Machine for MemoryMachine {
     }
 
     fn console_tail(&self) -> String {
-        "[ console ]".to_string()
+        self.console.clone()
+    }
+
+    fn clear_console(&mut self) {
+        self.console.clear();
     }
 
     fn hand_over(self, guest: MemoryGuest) -> Result<SupervisorHandoverMachine, String> {
@@ -341,6 +347,7 @@ impl Vmm for MemoryVmm {
             log: Arc::clone(&self.log),
             hands: Arc::clone(&self.hands),
             memory_mib: tap.memory_mib(),
+            console: String::new(),
         })
     }
 
@@ -1567,27 +1574,30 @@ async fn each_phase_that_runs_out_names_its_failure_and_returns_the_tap() {
             Boot::Works,
             TurnFailureReason::NoFirstOutput,
             "firstLineSeconds",
+            "The box's console printed nothing during the turn.",
         ),
         (
             Harness::StallsAfterFirstLine,
             Boot::Works,
             TurnFailureReason::TurnTimedOut,
             "turnSeconds",
+            "The box's console printed nothing during the turn.",
         ),
         (
             Harness::Echo,
             Boot::Hangs,
             TurnFailureReason::BoxBootFailed,
             "bootSeconds",
+            "Console: [ boot console ]",
         ),
     ];
-    for (index, (harness, boot, reason, budget)) in cases.into_iter().enumerate() {
+    for (index, (harness, boot, reason, budget, console)) in cases.into_iter().enumerate() {
         let mut host = host(&format!("budget-{index}"), 1, harness, boot);
         host.turn("turn-1", "session-1", "one\ntwo", Vec::new());
         let seen = host.settle(Duration::from_millis(600)).await;
         let last = seen.last().expect("a failure");
         assert!(last.starts_with(&format!("failed {reason}")), "{seen:?}");
-        assert!(last.contains(budget) && last.contains("[ console ]"), "{last}");
+        assert!(last.contains(budget) && last.ends_with(console), "{last}");
         host.log();
         host.turn_expiring("turn-2", "session-2", "three", Vec::new(), 300);
         tokio::time::sleep(SETTLE).await;
