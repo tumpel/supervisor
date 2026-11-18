@@ -260,7 +260,15 @@ fn clone(
     let mut command = Command::new("git");
     confinement.apply(&mut command);
     let child = command
-        .args(["-c", RECORDER, "clone", "--quiet", "--", repository])
+        .args([
+            "-c",
+            RECORDER,
+            "clone",
+            "--quiet",
+            "--filter=blob:none",
+            "--",
+            repository,
+        ])
         .arg(dir)
         .env_clear()
         .envs(environment.iter().map(|(name, value)| (name, value)))
