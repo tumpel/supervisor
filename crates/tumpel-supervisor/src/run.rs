@@ -908,6 +908,7 @@ async fn session(
                                 ChannelControlMessage::ClaudeSetupBoxOffer(offer) => Some(BoxCommand::Setup(setup_order(offer))),
                                 ChannelControlMessage::ClaudeSetupBoxCode(code) => Some(BoxCommand::Setup(SetupCommand::Code { claude_setup_id: code.claude_setup_id, code: code.code, mint_budget_seconds: code.mint_budget_seconds })),
                                 ChannelControlMessage::ClaudeSetupBoxDiscard(discard) => Some(BoxCommand::Setup(SetupCommand::Discard { claude_setup_id: discard.claude_setup_id })),
+                                ChannelControlMessage::TurnCancel(_) => None,
                             };
                             command.and_then(|command| commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))))
                         }
