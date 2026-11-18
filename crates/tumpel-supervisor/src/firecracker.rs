@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,7 @@ use crate::snapshot::Ext4Upper;
 const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/sbin/tumpel-init";
 const CONSOLE_TAIL: usize = 4096;
 const API_WAIT_STEP: Duration = Duration::from_millis(5);
+const API_ANSWER: Duration = Duration::from_secs(5);
 
 struct Layout {
     rootfs: PathBuf,
@@ -172,6 +174,10 @@ async fn api(socket: &Path, method: &str, path: &str, body: &Value) -> Result<()
         .read_exact(&mut answer)
         .await
         .map_err(|error| format!("{method} {path}: {error}"))?;
+    answered(method, path, &status, &answer)
+}
+
+fn answered(method: &str, path: &str, status: &str, answer: &[u8]) -> Result<(), String> {
     if status
         .split_whitespace()
         .nth(1)
@@ -182,8 +188,49 @@ async fn api(socket: &Path, method: &str, path: &str, body: &Value) -> Result<()
     Err(format!(
         "Firecracker refused {method} {path}: {} {}",
         status.trim(),
-        String::from_utf8_lossy(&answer)
+        String::from_utf8_lossy(answer)
     ))
+}
+
+#[derive(serde::Deserialize)]
+struct MachineConfig {
+    mem_size_mib: NonZeroU32,
+}
+
+fn booted_memory(socket: &Path) -> Result<NonZeroU32, String> {
+    use std::io::{BufRead, Read, Write};
+    let failed = |error: std::io::Error| {
+        format!(
+            "Firecracker did not answer GET /machine-config on {} within {} s: {error}",
+            socket.display(),
+            API_ANSWER.as_secs()
+        )
+    };
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(failed)?;
+    stream.set_read_timeout(Some(API_ANSWER)).map_err(failed)?;
+    stream
+        .write_all(b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n")
+        .map_err(failed)?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut status = String::new();
+    reader.read_line(&mut status).map_err(failed)?;
+    let mut length = 0usize;
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header).map_err(failed)?;
+        if header == "\r\n" || header.is_empty() {
+            break;
+        }
+        if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut answer = vec![0u8; length];
+    reader.read_exact(&mut answer).map_err(failed)?;
+    answered("GET", "/machine-config", &status, &answer)?;
+    serde_json::from_slice::<MachineConfig>(&answer)
+        .map(|config| config.mem_size_mib)
+        .map_err(|error| format!("Firecracker answered GET /machine-config without a positive mem_size_mib: {error}"))
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), String> {
@@ -393,7 +440,6 @@ pub struct Firecracker {
     images: PathBuf,
     data: PathBuf,
     vcpus: u32,
-    memory_mib: i32,
     overlay_bytes: u64,
 }
 
@@ -405,7 +451,6 @@ impl Firecracker {
             images: PathBuf::from(&*runtime.image_cache_dir),
             data: PathBuf::from(&*runtime.data_dir),
             vcpus: runtime.vcpu_count.get(),
-            memory_mib: runtime.memory_mib,
             overlay_bytes: u64::try_from(runtime.overlay_mib).unwrap_or(0) * 1024 * 1024,
         }
     }
@@ -419,7 +464,7 @@ impl Firecracker {
         handed: &SupervisorHandoverMachine,
         taken: &mut Taken,
     ) -> Result<(FirecrackerBox, VsockGuest), String> {
-        let mut machine = self.machine(session_id, tap, None)?;
+        let mut machine = self.machine(session_id, tap)?;
         if Path::new(&handed.api_socket) != machine.api_socket() || Path::new(&handed.vsock) != machine.vsock() {
             return Err(format!(
                 "it was handed over with API socket {} and vsock {}, and this supervisor runs box {} at {} and {}; set dataDir in runtime.json back to what the previous binary used",
@@ -462,7 +507,7 @@ impl Vmm for Firecracker {
     type Machine = FirecrackerBox;
     type Upper = Ext4Upper;
 
-    fn machine(&self, session_id: &EntityId, tap: &Tap, memory_mib: Option<i32>) -> Result<FirecrackerBox, String> {
+    fn machine(&self, session_id: &EntityId, tap: &Tap) -> Result<FirecrackerBox, String> {
         Ok(FirecrackerBox {
             binary: self.binary.clone(),
             images: self.images.clone(),
@@ -473,7 +518,7 @@ impl Vmm for Firecracker {
             mac: tap.guest_mac(),
             boot_args: format!("{BOOT_ARGS} {}", tap.kernel_ip()),
             vcpus: self.vcpus,
-            memory_mib: memory_mib.unwrap_or(self.memory_mib),
+            memory_mib: tap.memory_mib(),
             overlay_bytes: self.overlay_bytes,
             process: None,
             stdout: None,
@@ -497,6 +542,10 @@ impl Vmm for Firecracker {
         }
         drop(taken);
         attached
+    }
+
+    fn booted_memory(&self, handed: &SupervisorHandoverMachine) -> Result<NonZeroU32, String> {
+        booted_memory(Path::new(&handed.api_socket))
     }
 
     fn discard(&self, handed: &SupervisorHandoverMachine) {
@@ -571,7 +620,7 @@ pub struct FirecrackerBox {
     mac: String,
     boot_args: String,
     vcpus: u32,
-    memory_mib: i32,
+    memory_mib: NonZeroU32,
     overlay_bytes: u64,
     process: Option<Process>,
     stdout: Option<OwnedFd>,

@@ -129,7 +129,7 @@ async fn a_shell_box_runs_a_turn_pauses_resumes_warm_and_its_drive_reads_back() 
         Firecracker::new(&runtime),
         HttpStore::new().expect("store"),
         settings,
-        TapPool::new(1).expect("pool"),
+        TapPool::new(4096, std::num::NonZeroU32::new(4096).expect("4096")),
         out,
         data.join("boxes.json"),
     );

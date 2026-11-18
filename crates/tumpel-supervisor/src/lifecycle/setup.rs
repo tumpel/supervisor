@@ -126,7 +126,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             .map_err(|refusal| missing(refusal.detail))?;
         let mut machine = self
             .vmm
-            .machine(&order.claude_setup_id, tap, None)
+            .machine(&order.claude_setup_id, tap)
             .map_err(|error| missing(format!("preparing setup box {}: {error}", *order.box_id)))?;
         let seconds = self.settings.budgets.boot.as_secs();
         let failed = match timeout(self.settings.budgets.boot, machine.start(&image, None)).await {

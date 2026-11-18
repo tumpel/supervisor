@@ -138,13 +138,14 @@ pub trait Machine: Send + 'static {
 pub trait Vmm: Send + Sync + 'static {
     type Machine: Machine;
     type Upper: crate::snapshot::Upper;
-    fn machine(&self, session_id: &EntityId, tap: &Tap, memory_mib: Option<i32>) -> Result<Self::Machine, String>;
+    fn machine(&self, session_id: &EntityId, tap: &Tap) -> Result<Self::Machine, String>;
     fn reattach(
         &self,
         session_id: &EntityId,
         tap: &Tap,
         handed: &SupervisorHandoverMachine,
     ) -> Result<(Self::Machine, <Self::Machine as Machine>::Guest), String>;
+    fn booted_memory(&self, handed: &SupervisorHandoverMachine) -> Result<NonZeroU32, String>;
     fn discard(&self, handed: &SupervisorHandoverMachine);
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
@@ -517,9 +518,9 @@ impl<M: Machine> Slot<M> {
         self.expired = false;
     }
 
-    fn evictable(&self) -> Option<Instant> {
-        let clean = self.live.as_ref().is_some_and(|live| !live.dirty);
-        self.paused_at.filter(|_| clean && !self.busy)
+    fn evictable(&self) -> Option<(Instant, NonZeroU32)> {
+        let live = self.live.as_ref().filter(|live| !live.dirty && !self.busy)?;
+        Some((self.paused_at?, live.tap.memory_mib()))
     }
 }
 
@@ -847,7 +848,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 return Outcome::Gone(tap);
             }
         };
-        let mut machine = match self.vmm.machine(&turn.session_id, &tap, turn.box_memory_mib) {
+        let mut machine = match self.vmm.machine(&turn.session_id, &tap) {
             Ok(machine) => machine,
             Err(error) => {
                 turn_failed(
@@ -2213,7 +2214,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     fn attach(&mut self, handed: &SupervisorHandoverBox) -> Result<Attached<V::Machine>, String> {
-        let tap = match self.pool.claim_device(handed.tap_index) {
+        let claimed = self
+            .runner
+            .vmm
+            .booted_memory(&handed.machine)
+            .and_then(|memory_mib| self.pool.claim_device(handed.tap_index, memory_mib));
+        let tap = match claimed {
             Ok(tap) => tap,
             Err(error) => {
                 self.runner.vmm.discard(&handed.machine);
@@ -2390,7 +2396,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             );
             return;
         }
-        let tap = match self.claim().await {
+        let tap = match self.claim(None).await {
             Ok(tap) => tap,
             Err(exhausted) => {
                 emit(
@@ -2465,7 +2471,30 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             );
             return;
         }
-        let tap = match self.claim().await {
+        let parsed = turn
+            .box_memory_mib
+            .map(|mib| u32::try_from(mib).ok().and_then(NonZeroU32::new).ok_or(mib))
+            .transpose();
+        let memory_mib = match parsed {
+            Ok(memory_mib) => memory_mib,
+            Err(mib) => {
+                let detail = format!(
+                    "turn {} asks for a box of {mib} MiB, which is not a positive size; set the persona's box memory between 128 and 65536 MiB",
+                    *turn.turn_id
+                );
+                root.in_scope(|| {
+                    turn_failed(
+                        &self.runner.out,
+                        &turn.turn_id,
+                        TurnFailureReason::BoxBootFailed,
+                        detail,
+                    );
+                });
+                self.prune(&session);
+                return;
+            }
+        };
+        let tap = match self.claim(memory_mib).await {
             Ok(tap) => tap,
             Err(exhausted) => {
                 root.in_scope(|| {
@@ -2576,20 +2605,26 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.box_gone(order);
     }
 
-    async fn claim(&mut self) -> Result<Tap, PoolExhausted> {
-        if let Ok(tap) = self.pool.claim() {
-            return Ok(tap);
-        }
-        let victim = self
+    async fn claim(&mut self, memory_mib: Option<NonZeroU32>) -> Result<Tap, PoolExhausted> {
+        let mut victims: Vec<_> = self
             .slots
             .iter()
-            .filter_map(|(session, slot)| slot.evictable().map(|paused_at| (paused_at, session.clone())))
-            .min()
-            .map(|(_, session)| session);
-        if let Some(victim) = victim {
+            .filter_map(|(session, slot)| {
+                slot.evictable()
+                    .map(|(paused_at, mib)| (paused_at, mib, session.clone()))
+            })
+            .collect();
+        victims.sort();
+        let freeing: Vec<_> = victims.iter().map(|(_, mib, _)| *mib).collect();
+        self.pool.admits(memory_mib, &freeing)?;
+        let mut victims = victims.into_iter();
+        while self.pool.admits(memory_mib, &[]).is_err() {
+            let Some((_, _, victim)) = victims.next() else {
+                break;
+            };
             self.teardown(&victim).await;
         }
-        self.pool.claim()
+        self.pool.claim(memory_mib)
     }
 
     fn arm(&mut self, session: &str) {

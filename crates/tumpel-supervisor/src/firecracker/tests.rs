@@ -10,7 +10,7 @@ use serde_json::json;
 use tumpel_api::types::{GuestMessage, SupervisorHandoverMachine};
 use tumpel_guest::encode;
 
-use super::{adopt, alive, take, Firecracker, Owner};
+use super::{adopt, alive, booted_memory, take, Firecracker, Owner};
 use crate::lifecycle::{Guest, Machine, Vmm};
 use crate::pool::TapPool;
 
@@ -117,7 +117,6 @@ fn firecracker(name: &str) -> Firecracker {
         images: data.join("images"),
         data,
         vcpus: 1,
-        memory_mib: 128,
         overlay_bytes: 0,
     }
 }
@@ -174,7 +173,9 @@ fn closed(handed: &mut Handed) -> bool {
 #[tokio::test]
 async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_binary_left_off() {
     let vmm = firecracker("reattach-live");
-    let tap = TapPool::new(1).expect("pool").claim().expect("tap");
+    let tap = TapPool::new(4096, NonZeroU32::new(4096).expect("4096"))
+        .claim(None)
+        .expect("tap");
     let pid = sleeper();
     let mut handed = handed(&vmm, pid, true);
     let session = "session-1".try_into().expect("session id");
@@ -197,7 +198,9 @@ async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_bin
 #[tokio::test]
 async fn reattach_of_a_box_whose_process_ended_closes_every_handed_descriptor() {
     let vmm = firecracker("reattach-ended");
-    let tap = TapPool::new(1).expect("pool").claim().expect("tap");
+    let tap = TapPool::new(4096, NonZeroU32::new(4096).expect("4096"))
+        .claim(None)
+        .expect("tap");
     let pid = sleeper();
     zombie(pid);
     let mut handed = handed(&vmm, pid, true);
@@ -213,7 +216,9 @@ async fn reattach_of_a_box_whose_process_ended_closes_every_handed_descriptor() 
 #[tokio::test]
 async fn reattach_with_the_wrong_descriptor_kills_and_reaps_the_live_child_and_closes_the_rest() {
     let vmm = firecracker("reattach-wrong");
-    let tap = TapPool::new(1).expect("pool").claim().expect("tap");
+    let tap = TapPool::new(4096, NonZeroU32::new(4096).expect("4096"))
+        .claim(None)
+        .expect("tap");
     let pid = sleeper();
     let mut handed = handed(&vmm, pid, false);
     let session = "session-1".try_into().expect("session id");
@@ -224,4 +229,27 @@ async fn reattach_with_the_wrong_descriptor_kills_and_reaps_the_live_child_and_c
     assert!(reaped(pid), "the live child is killed and reaped");
     let pipes = released(&mut handed.stdout) && released(&mut handed.stderr);
     assert!(pipes, "the console pipes are closed");
+}
+
+#[test]
+fn booted_memory_reads_mem_size_mib_from_the_firecracker_api_of_a_running_box() {
+    let socket = std::env::temp_dir().join(format!("tumpel-machine-config-{}.sock", std::process::id()));
+    if socket.exists() {
+        std::fs::remove_file(&socket).expect("clearing the last run");
+    }
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("the API socket");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("a connection");
+        let mut request = [0u8; 256];
+        let read = stream.read(&mut request).expect("the request");
+        let body = r#"{"vcpu_count":2,"mem_size_mib":8192,"smt":false}"#;
+        write!(stream, "HTTP/1.1 200 \r\nServer: Firecracker API\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+            .expect("the answer");
+        String::from_utf8_lossy(&request[..read]).into_owned()
+    });
+    assert_eq!(booted_memory(&socket), Ok(NonZeroU32::new(8192).expect("8192")));
+    assert!(server
+        .join()
+        .expect("the server")
+        .starts_with("GET /machine-config HTTP/1.1\r\n"));
 }

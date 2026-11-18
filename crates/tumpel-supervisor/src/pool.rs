@@ -1,11 +1,20 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroU32;
 
-pub const MAX_POOL_SIZE: u32 = 256;
+pub const TAP_POOL: u8 = 64;
+
+#[must_use]
+pub fn memory_budget_mib(total_mib: u64, available_mib: u64, boxes_resident_mib: u64) -> u64 {
+    (available_mib + boxes_resident_mib)
+        .min(total_mib)
+        .saturating_sub((total_mib / 4).max(4096))
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Tap {
     index: u8,
+    memory_mib: NonZeroU32,
 }
 
 impl Tap {
@@ -14,8 +23,13 @@ impl Tap {
         self.index
     }
 
-    fn into_index(self) -> u8 {
-        self.index
+    #[must_use]
+    pub fn memory_mib(&self) -> NonZeroU32 {
+        self.memory_mib
+    }
+
+    fn into_parts(self) -> (u8, NonZeroU32) {
+        (self.index, self.memory_mib)
     }
 
     #[must_use]
@@ -45,94 +59,246 @@ impl Tap {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct PoolExhausted {
-    pub size: u32,
+pub enum PoolExhausted {
+    Devices,
+    Memory {
+        boxes: usize,
+        held_mib: u64,
+        budget_mib: u64,
+        requested_mib: NonZeroU32,
+    },
 }
 
 impl fmt::Display for PoolExhausted {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "all {} boxes held (TAP devices tumpel0 to tumpel{}) by running boxes or by paused boxes whose last turn is not in a snapshot yet; wait for a box to finish, or raise boxCapacity in runtime.json and restart tumpel-supervisor",
-            self.size,
-            self.size.saturating_sub(1)
-        )
+        match self {
+            Self::Devices => write!(
+                formatter,
+                "all {TAP_POOL} TAP devices of this host are held by boxes that run a turn or wait for a snapshot of their last turn; send the turn again once one of them is done"
+            ),
+            Self::Memory {
+                boxes,
+                held_mib,
+                budget_mib,
+                requested_mib,
+            } => write!(
+                formatter,
+                "this host's {boxes} boxes hold {held_mib} MiB of the {budget_mib} MiB it gives boxes, so a box of {requested_mib} MiB does not fit; they run a turn or wait for a snapshot of their last turn, so send the turn again once one of them is done"
+            ),
+        }
     }
 }
 
 pub struct TapPool {
-    size: u32,
     free: BTreeSet<u8>,
+    budget_mib: u64,
+    box_mib: NonZeroU32,
+    held_mib: u64,
 }
 
 impl TapPool {
-    pub fn new(size: u32) -> Result<Self, String> {
-        if size == 0 || size > MAX_POOL_SIZE {
-            return Err(format!(
-                "boxCapacity {size} is outside 1 to {MAX_POOL_SIZE}: device tumpel<k> routes 172.16.<k>.0/30, so k stays below {MAX_POOL_SIZE}; set boxCapacity in runtime.json and restart tumpel-supervisor"
-            ));
+    #[must_use]
+    pub fn new(budget_mib: u64, box_mib: NonZeroU32) -> Self {
+        Self {
+            free: (0..TAP_POOL).collect(),
+            budget_mib,
+            box_mib,
+            held_mib: 0,
         }
-        let free = (0..size).filter_map(|index| u8::try_from(index).ok()).collect();
-        Ok(Self { size, free })
     }
 
-    pub fn claim(&mut self) -> Result<Tap, PoolExhausted> {
-        self.free
-            .pop_first()
-            .map(|index| Tap { index })
-            .ok_or(PoolExhausted { size: self.size })
+    pub fn admits(&self, requested_mib: Option<NonZeroU32>, freeing: &[NonZeroU32]) -> Result<(), PoolExhausted> {
+        if self.free.len() + freeing.len() == 0 {
+            return Err(PoolExhausted::Devices);
+        }
+        let memory_mib = requested_mib.unwrap_or(self.box_mib);
+        let held_mib = self.held_mib - freeing.iter().map(|mib| u64::from(mib.get())).sum::<u64>();
+        if held_mib == 0 || held_mib + u64::from(memory_mib.get()) <= self.budget_mib {
+            return Ok(());
+        }
+        Err(PoolExhausted::Memory {
+            boxes: usize::from(TAP_POOL) - self.free.len(),
+            held_mib: self.held_mib,
+            budget_mib: self.budget_mib,
+            requested_mib: memory_mib,
+        })
     }
 
-    pub fn claim_device(&mut self, index: i32) -> Result<Tap, String> {
-        u8::try_from(index)
+    pub fn claim(&mut self, requested_mib: Option<NonZeroU32>) -> Result<Tap, PoolExhausted> {
+        self.admits(requested_mib, &[])?;
+        let index = self.free.pop_first().ok_or(PoolExhausted::Devices)?;
+        let memory_mib = requested_mib.unwrap_or(self.box_mib);
+        self.held_mib += u64::from(memory_mib.get());
+        Ok(Tap { index, memory_mib })
+    }
+
+    pub fn claim_device(&mut self, index: i32, memory_mib: NonZeroU32) -> Result<Tap, String> {
+        let index = u8::try_from(index)
             .ok()
             .filter(|index| self.free.remove(index))
-            .map(|index| Tap { index })
             .ok_or_else(|| {
-                format!(
-                    "TAP device tumpel{index} is outside this host's {} boxes or held by another box",
-                    self.size
-                )
-            })
+                format!("TAP device tumpel{index} is outside this host's {TAP_POOL} devices or held by another box")
+            })?;
+        self.held_mib += u64::from(memory_mib.get());
+        Ok(Tap { index, memory_mib })
     }
 
     pub fn release(&mut self, tap: Tap) {
-        self.free.insert(tap.into_index());
+        let (index, memory_mib) = tap.into_parts();
+        self.held_mib -= u64::from(memory_mib.get());
+        self.free.insert(index);
     }
 
     #[must_use]
     pub fn free(&self) -> usize {
         self.free.len()
     }
+
+    #[must_use]
+    pub fn capacity(&self) -> NonZeroU32 {
+        let boxes =
+            u8::try_from(self.budget_mib / u64::from(self.box_mib.get())).map_or(TAP_POOL, |boxes| boxes.min(TAP_POOL));
+        NonZeroU32::MIN.saturating_add(u32::from(boxes.saturating_sub(1)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PoolExhausted, TapPool};
+    use std::num::NonZeroU32;
+
+    use super::{memory_budget_mib, PoolExhausted, TapPool};
+
+    fn mib(memory_mib: u32) -> Option<NonZeroU32> {
+        NonZeroU32::new(memory_mib)
+    }
+
+    const DEFAULT: NonZeroU32 = NonZeroU32::new(4096).expect("a positive size");
 
     #[test]
-    fn claims_hand_out_the_lowest_free_device_and_refuse_past_the_pool() {
-        let mut pool = TapPool::new(2).expect("pool");
-        let first = pool.claim().expect("first");
-        let second = pool.claim().expect("second");
+    fn the_58_gib_host_admits_ten_default_boxes_and_leaves_a_quarter_of_its_memory_free() {
+        let budget = memory_budget_mib(59_392, 59_392, 0);
+        assert_eq!(budget, 44_544);
+        let mut pool = TapPool::new(budget, DEFAULT);
+        assert_eq!(pool.capacity().get(), 10);
+        let taps: Vec<_> = (0..10).map(|_| pool.claim(None).expect("a default box")).collect();
         assert_eq!(
-            (first.device(), second.device()),
-            ("tumpel0".to_string(), "tumpel1".to_string())
+            pool.claim(None),
+            Err(PoolExhausted::Memory {
+                boxes: 10,
+                held_mib: 40_960,
+                budget_mib: 44_544,
+                requested_mib: DEFAULT
+            })
         );
-        assert_eq!(pool.claim(), Err(PoolExhausted { size: 2 }));
-        pool.release(first);
-        let again = pool.claim().expect("returned device");
-        assert_eq!(again.device(), "tumpel0");
-        assert_eq!(pool.free(), 0);
-        pool.release(again);
+        assert_eq!(taps[9].device(), "tumpel9");
+    }
+
+    #[test]
+    fn the_budget_counts_only_memory_other_programs_leave_available() {
+        assert_eq!(memory_budget_mib(59_392, 40_000, 0), 25_152);
+        assert_eq!(memory_budget_mib(8192, 6000, 0), 1904);
+        assert_eq!(memory_budget_mib(8192, 2048, 0), 0);
+    }
+
+    #[test]
+    fn a_handover_with_running_boxes_admits_by_the_memory_other_programs_leave_free() {
+        let fresh = memory_budget_mib(59_392, 42_032, 0);
+        assert_eq!(fresh, 27_184);
+        assert_eq!(TapPool::new(fresh, DEFAULT).capacity().get(), 6);
+        let handed_resident = 5 * 3584;
+        let after = memory_budget_mib(59_392, 42_032 - handed_resident, handed_resident);
+        assert_eq!(after, fresh);
+        let mut pool = TapPool::new(after, DEFAULT);
+        assert_eq!(pool.capacity().get(), 6);
+        let handed: Vec<_> = (0..5)
+            .map(|index| pool.claim_device(index, DEFAULT).expect("a handed box"))
+            .collect();
+        let sixth = pool
+            .claim(None)
+            .expect("the sixth box fits beside the five handed ones");
+        assert_eq!(sixth.device(), "tumpel5");
+        assert_eq!(
+            pool.claim(None),
+            Err(PoolExhausted::Memory {
+                boxes: 6,
+                held_mib: 24_576,
+                budget_mib: 27_184,
+                requested_mib: DEFAULT
+            })
+        );
+        assert_eq!(handed.len(), 5);
+    }
+
+    #[test]
+    fn boxes_are_admitted_while_their_memory_fits_and_an_empty_host_admits_any_box() {
+        let mut pool = TapPool::new(12_288, DEFAULT);
+        let first = pool.claim(None).expect("first default box");
+        let second = pool.claim(mib(8192)).expect("a box asking for 8 GiB");
+        assert_eq!(
+            pool.claim(mib(128)),
+            Err(PoolExhausted::Memory {
+                boxes: 2,
+                held_mib: 12_288,
+                budget_mib: 12_288,
+                requested_mib: NonZeroU32::new(128).expect("128")
+            })
+        );
+        assert_eq!(
+            pool.admits(mib(8192), &[DEFAULT]),
+            Err(PoolExhausted::Memory {
+                boxes: 2,
+                held_mib: 12_288,
+                budget_mib: 12_288,
+                requested_mib: NonZeroU32::new(8192).expect("8192")
+            })
+        );
+        assert_eq!(pool.admits(mib(8192), &[NonZeroU32::new(8192).expect("8192")]), Ok(()));
         pool.release(second);
-        assert_eq!(pool.free(), 2);
+        pool.release(first);
+        let large = pool
+            .claim(mib(65_536))
+            .expect("an empty host admits a box larger than its budget");
+        assert_eq!(
+            (large.device(), large.memory_mib().get()),
+            ("tumpel0".to_string(), 65_536)
+        );
+        assert!(pool.claim(mib(128)).is_err());
+    }
+
+    #[test]
+    fn a_host_out_of_devices_says_so_and_a_freed_device_admits_the_next_box() {
+        let mut pool = TapPool::new(1_048_576, DEFAULT);
+        let taps: Vec<_> = (0..64).map(|_| pool.claim(None).expect("a device")).collect();
+        assert_eq!(pool.claim(None), Err(PoolExhausted::Devices));
+        assert_eq!(
+            PoolExhausted::Devices.to_string(),
+            "all 64 TAP devices of this host are held by boxes that run a turn or wait for a snapshot of their last turn; send the turn again once one of them is done"
+        );
+        assert_eq!(pool.admits(None, &[DEFAULT]), Ok(()));
+        assert_eq!(pool.capacity().get(), 64);
+        let mut taps = taps.into_iter();
+        pool.release(taps.next().expect("the first device"));
+        assert_eq!(pool.claim(None).expect("the returned device").device(), "tumpel0");
+        assert_eq!(pool.free(), 0);
+    }
+
+    #[test]
+    fn a_reattached_box_is_charged_the_memory_it_booted_with() {
+        let mut pool = TapPool::new(12_288, DEFAULT);
+        let handed = pool
+            .claim_device(5, NonZeroU32::new(8192).expect("8192"))
+            .expect("device 5");
+        assert_eq!(handed.device(), "tumpel5");
+        assert!(pool.claim_device(5, DEFAULT).is_err());
+        assert!(pool.claim(mib(8192)).is_err());
+        pool.release(handed);
+        assert!(pool.claim(mib(8192)).is_ok());
     }
 
     #[test]
     fn each_device_carries_its_own_slash_30() {
-        let mut pool = TapPool::new(12).expect("pool");
-        let taps: Vec<_> = (0..12).map(|_| pool.claim().expect("tap")).collect();
+        let mut pool = TapPool::new(1_048_576, DEFAULT);
+        let taps: Vec<_> = (0..12).map(|_| pool.claim(None).expect("tap")).collect();
         let last = &taps[11];
         assert_eq!(last.device(), "tumpel11");
         assert_eq!(last.gateway(), "172.16.11.1");
@@ -141,12 +307,5 @@ mod tests {
             last.kernel_ip(),
             "ip=172.16.11.2::172.16.11.1:255.255.255.252::eth0:off"
         );
-    }
-
-    #[test]
-    fn a_pool_outside_the_172_16_range_is_refused() {
-        assert!(TapPool::new(0).is_err());
-        assert!(TapPool::new(257).is_err());
-        assert_eq!(TapPool::new(256).expect("full range").free(), 256);
     }
 }
