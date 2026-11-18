@@ -43,6 +43,8 @@ const LAST_BACKOFF: Duration = Duration::from_secs(30);
 const TICK: Duration = Duration::from_millis(500);
 const UNIT_RELOAD: Duration = Duration::from_secs(30);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
+const ROLLED_BACK: &str = "the next start puts the previous binary back";
+const RESTARTED: &str = "this supervisor stops, and systemd starts it again, which rewrites the unit once more";
 
 pub struct Failure {
     pub kind: SupervisorFailure,
@@ -112,7 +114,7 @@ impl Updates {
 
     async fn welcomed(&mut self) -> Result<(), Failure> {
         if let Some(trial) = self.trial.take() {
-            refresh_unit(&self.layout).await?;
+            refresh_unit(&self.layout, ROLLED_BACK).await?;
             update::confirm(&self.layout, &trial, &self.out).map_err(|error| {
                 fail(
                     SupervisorFailure::UpdateNotOnline,
@@ -126,13 +128,8 @@ impl Updates {
     }
 }
 
-async fn refresh_unit(layout: &Layout) -> Result<(), Failure> {
-    let failed = |detail: String| {
-        fail(
-            SupervisorFailure::UpdateNotOnline,
-            format!("{detail}; the next start puts the previous binary back"),
-        )
-    };
+pub(crate) async fn refresh_unit(layout: &Layout, fix: &str) -> Result<(), Failure> {
+    let failed = |detail: String| fail(SupervisorFailure::UpdateNotOnline, format!("{detail}; {fix}"));
     if !update::refresh_unit(layout).map_err(failed)? {
         return Ok(());
     }
@@ -144,6 +141,7 @@ async fn refresh_unit(layout: &Layout) -> Result<(), Failure> {
         UNIT_RELOAD,
         tokio::process::Command::new("systemctl")
             .args(["--user", "daemon-reload"])
+            .env_remove("NOTIFY_SOCKET")
             .kill_on_drop(true)
             .status(),
     )
@@ -159,18 +157,6 @@ async fn refresh_unit(layout: &Layout) -> Result<(), Failure> {
             UNIT_RELOAD.as_secs()
         ))),
     }
-}
-
-/// # Errors
-/// Fails when rewriting the unit, reloading systemd or reaching the systemd user manager fails.
-pub async fn take_over_unit(layout: &Layout) -> Result<(), Failure> {
-    refresh_unit(layout).await?;
-    fd_store::reach_user_manager().map_err(|error| {
-        fail(
-            SupervisorFailure::UpdateNotOnline,
-            format!("{error}; the next start puts the previous binary back"),
-        )
-    })
 }
 
 enum Ended {
@@ -688,7 +674,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     };
     let on_trial = trial.is_some();
     if handed {
-        take_over_unit(&started.layout).await?;
+        refresh_unit(&started.layout, RESTARTED).await?;
     }
     let taken = taken(&started.layout, &out, handed, received)?;
     let dir = dir::supervisor_dir();

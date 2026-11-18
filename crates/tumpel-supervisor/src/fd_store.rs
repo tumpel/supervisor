@@ -20,7 +20,12 @@ fn systemd() -> Result<(), String> {
     Err("NOTIFY_SOCKET is unset, so systemd cannot hold the box's descriptors across a restart; run the supervisor from its systemd user unit".to_string())
 }
 
-pub fn reach_user_manager() -> Result<(), String> {
+/// # Errors
+/// Fails when `XDG_RUNTIME_DIR` is unset.
+///
+/// # Safety
+/// Call it before any other thread starts: it sets `NOTIFY_SOCKET` in the environment.
+pub unsafe fn reach_user_manager() -> Result<(), String> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
         "XDG_RUNTIME_DIR is unset, so this supervisor cannot reach the systemd user manager that holds the boxes' descriptors; run the supervisor from its systemd user unit".to_string()
     })?;

@@ -589,7 +589,7 @@ ExecStopPost=/bin/sh -c 'if [ \"$$EXIT_CODE\" = exited ] && [ \"$$EXIT_STATUS\" 
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=3 5
-NotifyAccess=all
+NotifyAccess=main
 FileDescriptorStoreMax={descriptors}
 FileDescriptorStorePreserve=yes
 TimeoutStopSec=10min

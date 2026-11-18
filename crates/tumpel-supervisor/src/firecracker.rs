@@ -373,6 +373,7 @@ fn move_into_scope(pid: libc::pid_t, scope: &str) -> Result<(), String> {
             "sh",
         ])
         .arg(pid.to_string())
+        .env_remove("NOTIFY_SOCKET")
         .stdin(Stdio::null())
         .output()
         .map_err(|error| format!("starting systemd-run to move Firecracker process {pid} into {scope}: {error}"))?;
@@ -709,6 +710,7 @@ impl FirecrackerBox {
         let mut child = Command::new("systemd-run")
             .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
             .arg(scope_of(self.index))
+            .env_remove("NOTIFY_SOCKET")
             .arg("--")
             .arg(&self.binary)
             .arg("--api-sock")
@@ -1006,3 +1008,6 @@ impl Machine for FirecrackerBox {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "host-tests"))]
+mod host_tests;
