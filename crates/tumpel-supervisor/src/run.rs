@@ -24,7 +24,7 @@ use tumpel_channel::{ChannelError, Event, HostChannel, Phase, Port, Signer, HEAR
 
 use crate::boot::BootOrder;
 use crate::dir::{self, ChannelFile, CHANNEL_FILE, CONFIG_FILE, KEY_FILE, RUNTIME_FILE};
-use crate::exchange::{Answer, Answers};
+use crate::exchange::{Answer, Answers, Cancels};
 use crate::fd_store;
 use crate::firecracker::Firecracker;
 use crate::guest_drive;
@@ -221,6 +221,7 @@ enum BoxCommand {
     Teardown(ChannelBoxTeardown),
     Discard(ChannelBoxDiscard),
     Answer(Answer),
+    Cancel(EntityId),
     Setup(SetupCommand),
     HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>),
@@ -266,6 +267,7 @@ fn command(files_cache: &Path, offer: ChannelTurnOffer) -> Command {
 async fn boxes(
     files_cache: PathBuf,
     answers: Answers,
+    cancels: Cancels,
     mut commands: UnboundedReceiver<BoxCommand>,
     lifecycle: UnboundedSender<Input>,
     setups: UnboundedSender<SetupCommand>,
@@ -291,6 +293,10 @@ async fn boxes(
             }
             BoxCommand::Answer(answer) => {
                 answers.deliver(answer);
+                continue;
+            }
+            BoxCommand::Cancel(turn_id) => {
+                cancels.cancel(turn_id);
                 continue;
             }
             BoxCommand::HandOver(reply) => {
@@ -354,6 +360,7 @@ fn start_boxes(
         telemetry,
     };
     let answers = lifecycle.answers();
+    let cancels = lifecycle.cancels();
     let (to_lifecycle, from_boxes) = unbounded_channel();
     let idle = IdleGate::new(lifecycle.boxes(), lifecycle.busy());
     let (to_setups, from_setups) = unbounded_channel();
@@ -361,6 +368,7 @@ fn start_boxes(
     tokio::spawn(boxes(
         Path::new(&*runtime.data_dir).join("persona-files"),
         answers,
+        cancels,
         received,
         to_lifecycle,
         to_setups,
@@ -905,10 +913,10 @@ async fn session(
                                 ChannelControlMessage::RestoreDownloads(downloads) => Some(BoxCommand::Answer(Answer::Downloads(downloads))),
                                 ChannelControlMessage::TurnWithdrawn(withdrawn) => Some(BoxCommand::Answer(Answer::Withdrawn(withdrawn))),
                                 ChannelControlMessage::TurnClaimed(claimed) => Some(BoxCommand::Answer(Answer::Claimed(claimed))),
+                                ChannelControlMessage::TurnCancel(cancel) => Some(BoxCommand::Cancel(cancel.turn_id)),
                                 ChannelControlMessage::ClaudeSetupBoxOffer(offer) => Some(BoxCommand::Setup(setup_order(offer))),
                                 ChannelControlMessage::ClaudeSetupBoxCode(code) => Some(BoxCommand::Setup(SetupCommand::Code { claude_setup_id: code.claude_setup_id, code: code.code, mint_budget_seconds: code.mint_budget_seconds })),
                                 ChannelControlMessage::ClaudeSetupBoxDiscard(discard) => Some(BoxCommand::Setup(SetupCommand::Discard { claude_setup_id: discard.claude_setup_id })),
-                                ChannelControlMessage::TurnCancel(_) => None,
                             };
                             command.and_then(|command| commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))))
                         }
