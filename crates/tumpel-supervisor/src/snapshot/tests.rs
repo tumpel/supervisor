@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 use tar::Archive;
 
@@ -224,7 +225,13 @@ fn a_restore_reassembles_each_file_from_its_chunks() {
     let (staged, _) = snapshot(&tree, &Base::default(), &host);
     let mut archive = Vec::new();
 
-    write_restore(&staged.base.manifest, &host.cache, &mut archive).expect("restore");
+    write_restore(
+        &staged.base.manifest,
+        &host.cache,
+        &mut archive,
+        &AtomicBool::new(false),
+    )
+    .expect("restore");
 
     let file = |bytes: &[u8]| format!("file {} {}", bytes.len(), sha256(bytes));
     assert_eq!(
@@ -339,8 +346,14 @@ fn packed_chunks_read_back_by_offset_whole_or_by_range() {
     assert_eq!(manifest, staged.base.manifest);
     let mut from_first = Vec::new();
     let mut from_second = Vec::new();
-    write_restore(&staged.base.manifest, &first.cache, &mut from_first).expect("first restore");
-    write_restore(&manifest, &second.cache, &mut from_second).expect("second restore");
+    write_restore(
+        &staged.base.manifest,
+        &first.cache,
+        &mut from_first,
+        &AtomicBool::new(false),
+    )
+    .expect("first restore");
+    write_restore(&manifest, &second.cache, &mut from_second, &AtomicBool::new(false)).expect("second restore");
     assert_eq!(listing(from_second), listing(from_first));
 }
 
@@ -392,4 +405,17 @@ fn an_opaque_directory_on_the_drive_reaches_the_manifest_as_opaque() {
             ("etc/plain".to_string(), Kind::Dir),
         ])
     );
+}
+
+#[test]
+fn a_cancelled_restore_stops_before_it_archives_an_entry() {
+    let host = host("cancelled-restore");
+    let tree = workspace();
+    let (staged, _) = snapshot(&tree, &Base::default(), &host);
+    let mut archive = Vec::new();
+
+    let restored = write_restore(&staged.base.manifest, &host.cache, &mut archive, &AtomicBool::new(true));
+
+    assert_eq!(restored, Err(super::CANCELLED.to_string()));
+    assert_eq!(listing(archive), BTreeMap::new());
 }
