@@ -6,7 +6,11 @@ use ring::digest::{digest, SHA256};
 use tokio::time::timeout_at;
 use tumpel_api::types::{ChannelPersonaFileDownload, GuestPersonaFile};
 
+use crate::lifecycle::remove_dir;
+use crate::lifecycle::setup::then;
 use crate::store::Store;
+
+pub const DIR: &str = "persona-files";
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
@@ -20,22 +24,9 @@ fn sha256(bytes: &[u8]) -> String {
     hex(digest(&SHA256, bytes).as_ref())
 }
 
-fn cached(file: &Path, wanted: &str) -> Result<Option<Vec<u8>>, String> {
-    match std::fs::read(file) {
-        Ok(bytes) if sha256(&bytes) == wanted => Ok(Some(bytes)),
-        Ok(_) => Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("reading {}: {error}", file.display())),
-    }
-}
-
-async fn blob(store: &impl Store, cache: &Path, file: &ChannelPersonaFileDownload) -> Result<Vec<u8>, String> {
+async fn blob(store: &impl Store, dir: &Path, file: &ChannelPersonaFileDownload) -> Result<Vec<u8>, String> {
     let wanted: &str = &file.digest;
-    let target = cache.join(wanted);
-    if let Some(bytes) = cached(&target, wanted)? {
-        return Ok(bytes);
-    }
-    let staged = cache.join(format!("{wanted}.part"));
+    let staged = dir.join(wanted);
     let deadline = crate::lifecycle::instant_at(file.download_expires_at);
     match timeout_at(deadline, store.download(&file.download_url, &staged)).await {
         Ok(Ok(())) => {}
@@ -51,34 +42,35 @@ async fn blob(store: &impl Store, cache: &Path, file: &ChannelPersonaFileDownloa
     let bytes = std::fs::read(&staged).map_err(|error| format!("reading {}: {error}", staged.display()))?;
     let actual = sha256(&bytes);
     if actual != wanted {
-        let _ = std::fs::remove_file(&staged);
         return Err(format!(
             "persona file {} downloaded with digest {actual}, and the offer names {wanted}; upload the file again and register it by its own digest",
             *file.path
         ));
     }
-    std::fs::rename(&staged, &target)
-        .map_err(|error| format!("moving {} to {}: {error}", staged.display(), target.display()))?;
     Ok(bytes)
 }
 
 pub async fn fetch(
     store: &impl Store,
-    cache: &Path,
+    dir: &Path,
     files: &[ChannelPersonaFileDownload],
 ) -> Result<Vec<GuestPersonaFile>, String> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    std::fs::create_dir_all(cache).map_err(|error| format!("creating {}: {error}", cache.display()))?;
+    std::fs::create_dir_all(dir).map_err(|error| format!("creating {}: {error}", dir.display()))?;
     let mut fetched = Vec::with_capacity(files.len());
     for file in files {
-        let bytes = blob(store, cache, file).await?;
+        let bytes = match blob(store, dir, file).await {
+            Ok(bytes) => bytes,
+            Err(error) => return Err(then(error, remove_dir(dir))),
+        };
         fetched.push(GuestPersonaFile {
             content: STANDARD.encode(bytes),
             digest: file.digest.clone(),
             path: file.path.clone(),
         });
     }
+    remove_dir(dir)?;
     Ok(fetched)
 }

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch};
+use tokio::task::{JoinError, JoinHandle};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
@@ -86,9 +87,12 @@ enum Served {
     Revoked,
     Updated,
     Terminated,
+    BoxesStopped(Failure),
 }
 
 type HostUpdater = Updater<HttpSource, IdleGate>;
+
+type BoxRunner = JoinHandle<Result<(), String>>;
 
 struct Updates {
     updater: Arc<HostUpdater>,
@@ -241,7 +245,7 @@ fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> SetupCommand {
     }))
 }
 
-fn command(files_cache: &Path, offer: ChannelTurnOffer) -> Command {
+fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Command {
     Command::Turn(Box::new(BoxTurn {
         turn_id: offer.turn_id,
         session_id: offer.session_id,
@@ -260,7 +264,7 @@ fn command(files_cache: &Path, offer: ChannelTurnOffer) -> Command {
         repository: offer.repository,
         git_author_name: offer.git_author_name,
         git_author_email: offer.git_author_email,
-        files_cache: files_cache.to_path_buf(),
+        files_dir: files_dir.to_path_buf(),
         prebuild_commit_sha: offer.prebuild_commit_sha.map(String::from),
         box_memory_mib: offer.box_memory_mib,
         box_disk_mib: offer.box_disk_mib,
@@ -268,7 +272,7 @@ fn command(files_cache: &Path, offer: ChannelTurnOffer) -> Command {
 }
 
 async fn boxes(
-    files_cache: PathBuf,
+    files_dir: PathBuf,
     answers: Answers,
     cancels: Cancels,
     mut commands: UnboundedReceiver<BoxCommand>,
@@ -277,7 +281,7 @@ async fn boxes(
 ) {
     while let Some(command) = commands.recv().await {
         let next = match command {
-            BoxCommand::Turn(offer) => self::command(&files_cache, *offer),
+            BoxCommand::Turn(offer) => self::command(&files_dir, *offer),
             BoxCommand::Snapshot(request) => Command::Snapshot(request.into()),
             BoxCommand::Teardown(teardown) => Command::Teardown(TeardownOrder {
                 session_id: teardown.session_id,
@@ -331,7 +335,7 @@ fn start_boxes(
     telemetry: Telemetry,
     taken: Option<(SupervisorHandover, Taken)>,
     standing: PathBuf,
-) -> Result<(Usage, IdleGate), Failure> {
+) -> Result<(Usage, IdleGate, BoxRunner), Failure> {
     let unreadable = |error: anyhow::Error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}"));
     let handed_resident_mib = taken
         .iter()
@@ -370,16 +374,30 @@ fn start_boxes(
     let (to_lifecycle, from_boxes) = unbounded_channel();
     let idle = IdleGate::new(lifecycle.boxes(), lifecycle.busy());
     let (to_setups, from_setups) = unbounded_channel();
-    tokio::spawn(lifecycle.run(from_boxes, from_setups));
+    let runner = tokio::spawn(lifecycle.run(from_boxes, from_setups));
     tokio::spawn(boxes(
-        Path::new(&*runtime.data_dir).join("persona-files"),
+        Path::new(&*runtime.data_dir).join(crate::persona_files::DIR),
         answers,
         cancels,
         received,
         to_lifecycle,
         to_setups,
     ));
-    Ok((usage, idle))
+    Ok((usage, idle, runner))
+}
+
+fn boxes_stopped(ended: Result<Result<(), String>, JoinError>) -> Failure {
+    let detail = match ended {
+        Ok(Ok(())) => "it took no more commands".to_string(),
+        Ok(Err(error)) => error,
+        Err(error) => error.to_string(),
+    };
+    fail(
+        SupervisorFailure::ChannelStateLost,
+        format!(
+            "the box runner stopped: {detail}; systemd restarts the supervisor, which takes the running boxes over"
+        ),
+    )
 }
 
 async fn terminate(
@@ -716,7 +734,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         .await
         .map_err(|error| fail(SupervisorFailure::GuestDriveUnwritable, error))?;
     let (commands, received) = unbounded_channel();
-    let (usage, idle) = start_boxes(
+    let (usage, idle, mut runner) = start_boxes(
         &started.runtime,
         started.box_size,
         started.store,
@@ -761,6 +779,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         served = serve(&mut channel, &url, heartbeat, &usage, &commands, &mut from_box, &config, &dir, &mut updates) => served,
         Some(()) = restarted.recv() => Ok(Served::Updated),
         Some(()) = terminated.recv() => Ok(Served::Terminated),
+        ended = &mut runner => Ok(Served::BoxesStopped(boxes_stopped(ended))),
         () = online_deadline(deadline, online) => Err(fail(
             SupervisorFailure::UpdateNotOnline,
             format!("this supervisor did not reach Welcome on {url} within {} s of its start after its swap; systemd restarts the unit, and its ExecStartPre puts the previous binary back", Limits::HOST.online.as_secs()),
@@ -778,7 +797,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
             terminate(&commands, &updates.layout, &updates.out).await?;
             Err(failure)
         }
-        Err(failure) => Err(failure),
+        Ok(Served::BoxesStopped(failure)) | Err(failure) => Err(failure),
     };
     if stopped.is_err() {
         abandon(&commands).await;

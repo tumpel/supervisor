@@ -288,9 +288,10 @@ impl Machine for MemoryMachine {
         self.drive.clone()
     }
 
-    async fn stop(self) {
+    fn stop(self) -> impl Future<Output = Result<(), String>> + Send {
         self.drives.lock().expect("drives").remove(&self.drive);
         note(&self.log, format!("stop {}", self.session));
+        std::future::ready(Ok(()))
     }
 
     fn console_tail(&self) -> String {
@@ -421,6 +422,10 @@ impl Vmm for MemoryVmm {
         Ok(())
     }
 
+    fn remove_leftovers(&self, _: &[u8], _: &[EntityId]) -> Result<(), String> {
+        Ok(())
+    }
+
     fn open_upper(&self, drive: &Path) -> Result<Tree, String> {
         self.drives
             .lock()
@@ -433,10 +438,6 @@ impl Vmm for MemoryVmm {
 
     fn staging(&self, session_id: &EntityId) -> Result<PathBuf, String> {
         Ok(self.staging.join(&**session_id))
-    }
-
-    fn chunk_cache(&self) -> PathBuf {
-        self.staging.join("chunks")
     }
 
     fn image_cache(&self) -> PathBuf {
@@ -607,6 +608,7 @@ struct Host {
     settings: Settings,
     sessions: tokio::sync::watch::Receiver<Vec<EntityId>>,
     disk_held: tokio::sync::watch::Receiver<HeldDisk>,
+    runner: tokio::task::JoinHandle<Result<(), String>>,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -804,7 +806,7 @@ fn start_host(
     let disk_held = lifecycle.disk_held();
     let (commands, from_host) = unbounded_channel();
     let cancels = lifecycle.cancels();
-    tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
+    let runner = tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
     Host {
         commands,
         cancels,
@@ -819,6 +821,7 @@ fn start_host(
         settings,
         sessions,
         disk_held,
+        runner,
     }
 }
 
@@ -1027,7 +1030,7 @@ impl Host {
             repository: "https://github.com/acme/app.git".try_into().expect("repository"),
             git_author_name: "Tumpel Agent".try_into().expect("author name"),
             git_author_email: "agent@tumpel.invalid".try_into().expect("author email"),
-            files_cache: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/lifecycle-tests/persona-files"),
+            files_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/lifecycle-tests/persona-files"),
             prebuild_commit_sha: None,
             box_memory_mib: None,
             box_disk_mib: None,
@@ -1280,6 +1283,14 @@ async fn a_box_on_another_host_downloads_the_chunks_its_cache_lacks() {
         ["claim turn-2", "line 1 two", "complete 1"]
     );
     assert_eq!(second.log()[0], "restore session-1 root/turn-1");
+    let left: Vec<_> = std::fs::read_dir(second.vmm.staging.join("session-1"))
+        .expect("the box disk directory")
+        .map(|entry| entry.expect("an entry").file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the restore archive and its chunks outlived the boot: {left:?}"
+    );
 }
 
 #[tokio::test]
@@ -1343,6 +1354,7 @@ async fn a_restore_missing_a_chunk_fails_the_turn_snapshot_unreadable() {
             && seen[1].contains("snapshot-1 (seq 1) of session session-1"),
         "{seen:?}"
     );
+    assert!(!second.vmm.staging.join("session-1").exists());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1862,10 +1874,13 @@ async fn a_teardown_after_the_snapshot_stops_a_clean_box_inside_the_warm_window_
             "stop session-1"
         ]
     );
+    assert!(!host.vmm.staging.join("session-1").exists());
+    std::fs::create_dir_all(host.vmm.staging.join("session-1")).expect("a disk a lost box left");
 
     host.teardown("session-1");
     assert_eq!(host.settle(SETTLE).await, ["box gone session-1"]);
     assert_eq!(host.log(), Vec::<String>::new());
+    assert!(!host.vmm.staging.join("session-1").exists());
 
     host.turn("turn-2", "session-1", "two", vec![first]);
     assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
@@ -2190,7 +2205,9 @@ fn stuck_archive(name: &str) -> PathBuf {
         .status()
         .expect("mkfifo");
     assert!(made.success(), "mkfifo {}", archive.display());
-    archive
+    let held = session.with_file_name("restore.fifo");
+    std::fs::hard_link(&archive, &held).expect("a second name for the fifo outlives the box disk");
+    held
 }
 
 fn release(archive: &Path) {
@@ -2220,6 +2237,7 @@ async fn a_stuck_reassembly_outlasts_the_boot_budget_then_fails_with_its_size() 
             && seen[0].contains("bytes in"),
         "{seen:?}"
     );
+    assert!(!host.vmm.staging.join("session-1").exists());
 }
 
 #[tokio::test]
@@ -2234,5 +2252,28 @@ async fn a_restore_that_outlasts_the_dispatch_credential_fails_dispatch_credenti
             && seen[1].starts_with(&format!("failed {}", TurnFailureReason::DispatchCredentialExpired))
             && seen[1].contains("while its snapshot was restored"),
         "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_box_disk_that_cannot_be_deleted_stops_the_box_runner_with_disk_not_freed() {
+    let host = host("disk-not-freed", 1, Harness::Echo, Boot::Works);
+    std::fs::write(
+        host.vmm.staging.join("session-1"),
+        b"a file where the disk directory goes",
+    )
+    .expect("a file");
+
+    host.teardown("session-1");
+
+    let stopped = tokio::time::timeout(SETTLE, host.runner)
+        .await
+        .expect("the box runner stops")
+        .expect("the box runner ends without a panic");
+    assert!(
+        stopped
+            .as_ref()
+            .is_err_and(|error| error.starts_with("DiskNotFreed: the box of session session-1 ended, then removing")),
+        "{stopped:?}"
     );
 }
