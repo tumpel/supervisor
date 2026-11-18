@@ -392,9 +392,7 @@ impl Vmm for MemoryVmm {
     }
 
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
-        if !claimed.is_empty() {
-            note(&self.log, format!("keep boxes {claimed:?} and stop the rest"));
-        }
+        note(&self.log, format!("keep boxes {claimed:?} and stop the rest"));
         Ok(())
     }
 
@@ -1448,6 +1446,22 @@ async fn a_supervisor_started_after_a_crash_keeps_every_box_and_fails_only_the_c
         ["resume session-2", "pause session-2"],
         "the kept box takes the next turn without a boot"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_host_with_no_record_of_boxes_starts_without_the_systemd_user_manager_and_the_next_start_sweeps() {
+    let first = host("start-without-record", 1, Harness::SlowClone, Boot::Works);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(
+        first.log(),
+        Vec::<String>::new(),
+        "a host with nothing on record lists no box scopes"
+    );
+    let standing = first.standing();
+    assert_eq!(standing.boxes.len(), 0);
+    let next = first.after_crash(standing);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(next.log(), ["keep boxes [] and stop the rest"]);
 }
 
 #[tokio::test(start_paused = true)]
