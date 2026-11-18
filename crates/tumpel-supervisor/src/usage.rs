@@ -1,5 +1,5 @@
 use std::num::{NonZeroU32, NonZeroU64};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -83,6 +83,20 @@ fn written_mib(sessions: &Path, drives: &[String]) -> Result<u64> {
         }
     }
     Ok(blocks * 512 / (1024 * 1024))
+}
+
+pub fn prepare_data_dir(data_dir: &Path) -> Result<Disk> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(data_dir)
+        .with_context(|| {
+            format!(
+                "creating the data directory {} failed; set dataDir in runtime.json to a directory this user can write",
+                data_dir.display()
+            )
+        })?;
+    disk(data_dir, &[])
 }
 
 pub fn disk(data_dir: &Path, drives: &[String]) -> Result<Disk> {
@@ -183,7 +197,27 @@ pub fn sample(boxes_warm: u32, data_dir: &Path, held: &HeldDisk) -> Result<HostS
 mod tests {
     use std::path::Path;
 
-    use super::{cpu_times, resident_kib, stats, written_mib, Disk};
+    use super::{cpu_times, disk, prepare_data_dir, resident_kib, stats, written_mib, Disk};
+
+    #[test]
+    fn a_freshly_enrolled_host_without_a_data_directory_creates_it_and_reads_its_disk() {
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/usage-tests/fresh/tumpel-supervisor");
+        if let Some(parent) = data.parent().filter(|parent| parent.exists()) {
+            std::fs::remove_dir_all(parent).expect("clearing the last run");
+        }
+        assert!(
+            disk(&data, &[]).is_err(),
+            "a host that never booted a box has no data directory yet"
+        );
+        let prepared = prepare_data_dir(&data).expect("the supervisor creates its data directory at start");
+        assert!(prepared.total_mib > 0);
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&data).expect("the directory").permissions())
+                & 0o777,
+            0o700
+        );
+        assert!(disk(&data, &[]).is_ok(), "the heartbeat reads its disk");
+    }
 
     #[test]
     fn written_disk_counts_only_the_drives_of_boxes_the_pool_holds() {

@@ -339,6 +339,7 @@ fn start_boxes(
         .map(|handed| usage::resident_mib(handed.machine.process_id))
         .sum::<anyhow::Result<u64>>()
         .map_err(unreadable)?;
+    usage::prepare_data_dir(Path::new(&*runtime.data_dir)).map_err(unreadable)?;
     let (total_mib, available_mib) = usage::memory_total_and_available_mib().map_err(unreadable)?;
     let pool = TapPool::new(
         memory_budget_mib(total_mib, available_mib, handed_resident_mib),
