@@ -569,6 +569,7 @@ struct Host {
     vmm: MemoryVmm,
     capacity: u32,
     settings: Settings,
+    sessions: tokio::sync::watch::Receiver<Vec<EntityId>>,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -760,6 +761,7 @@ fn start_host(
     );
     let received = control_plane(store.clone(), lifecycle.answers(), Arc::clone(&log), from_lifecycle);
     lifecycle.start(taken).expect("the lifecycle starts");
+    let sessions = lifecycle.sessions();
     let (commands, from_host) = unbounded_channel();
     tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
     Host {
@@ -773,6 +775,7 @@ fn start_host(
         vmm,
         capacity,
         settings,
+        sessions,
     }
 }
 
@@ -1545,6 +1548,16 @@ async fn a_warm_box_handed_over_takes_the_next_turn_without_a_boot() {
             "pause session-1"
         ]
     );
+}
+
+#[tokio::test]
+async fn a_handed_box_is_held_before_the_new_supervisor_takes_any_command() {
+    let mut old = host("handover-held", 1, Harness::Echo, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    assert_eq!(*old.sessions.borrow(), [EntityId::try_from("session-1").expect("id")]);
+    let new = old.hand_over().await;
+    assert_eq!(*new.sessions.borrow(), [EntityId::try_from("session-1").expect("id")]);
 }
 
 #[tokio::test]

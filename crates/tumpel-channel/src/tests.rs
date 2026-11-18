@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use serde_json::{json, Value};
 use tumpel_api::types::{
-    ChannelControlMessage, ChannelHostMessage, ChannelProtocol, ChannelSnapshotDone, ChannelSnapshotDoneType,
+    ChannelControlMessage, ChannelHostMessage, ChannelProtocol, ChannelSnapshotDone, ChannelSnapshotDoneType, EntityId,
     HostUsage, SupervisorChannelState,
 };
 
@@ -355,4 +355,27 @@ fn a_frame_and_message_with_fields_this_supervisor_does_not_know_are_read_for_th
     };
     assert_eq!(request.snapshot_id.as_str(), "snap-1");
     assert_eq!(channel.state().received.0, 1);
+}
+
+#[test]
+fn a_heartbeat_names_every_held_session_and_an_empty_list_when_none() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    wire.sent();
+    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
+    let held = vec![EntityId::try_from("session-1").expect("id")];
+    channel.heartbeat(sent_at, usage(), held, &mut wire).expect("heartbeat");
+    channel
+        .heartbeat(sent_at, usage(), Vec::new(), &mut wire)
+        .expect("heartbeat");
+    let usage = json!({"boxesWarm": 1, "loadAverage": 0.5, "memoryAvailableMib": 4096});
+    assert_eq!(
+        wire.sent(),
+        [
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": ["session-1"]}),
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": []}),
+        ]
+    );
 }
