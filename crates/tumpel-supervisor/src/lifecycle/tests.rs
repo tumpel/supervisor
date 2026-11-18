@@ -14,7 +14,7 @@ use tumpel_api::types::{
     ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType,
     ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId,
     GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox,
-    SupervisorHandoverMachine, TurnFailureReason,
+    SupervisorHandoverBoxState, SupervisorHandoverMachine, TurnFailureReason,
 };
 
 use super::{
@@ -22,7 +22,7 @@ use super::{
     TeardownOrder, Vmm,
 };
 use crate::boot::BootOrder;
-use crate::exchange::{Answer, Answers};
+use crate::exchange::{Answer, Answers, Cancels};
 use crate::images::ImageOrder;
 use crate::pool::{Tap, TapPool};
 use crate::snapshot::{Born, Entry, Found, Kind, Scan, Upper};
@@ -92,6 +92,12 @@ fn message(value: serde_json::Value) -> GuestMessage {
 
 impl MemoryGuest {
     fn send_now(&mut self, input: &GuestInput) {
+        if let (GuestInput::TurnCancel(cancel), Harness::StallsAfterFirstLine) = (input, self.harness) {
+            self.pending.push_back(message(json!({
+                "type": "TurnEnd", "turnId": *cancel.turn_id, "reason": "Cancelled", "lastLineSeq": self.lines,
+                "detail": "the host cancelled the turn", "credentialFile": "refreshed"
+            })));
+        }
         let GuestInput::TurnStart(start) = input else {
             return;
         };
@@ -542,7 +548,13 @@ fn describe(message: ChannelHostMessage) -> Option<String> {
         ChannelHostMessage::TurnRepositoryCloneFailed(failed) => {
             format!("clone failed {}: {}", failed.cause, failed.detail)
         }
-        ChannelHostMessage::TurnFailed(failed) => format!("failed {}: {}", failed.reason, failed.detail),
+        ChannelHostMessage::TurnFailed(failed) => match failed.credential_file {
+            Some(file) => format!(
+                "failed {}: {} with credential file {}",
+                failed.reason, failed.detail, *file
+            ),
+            None => format!("failed {}: {}", failed.reason, failed.detail),
+        },
         ChannelHostMessage::SnapshotDone(_) => "snapshot done".to_string(),
         ChannelHostMessage::SnapshotFailed(failed) => {
             format!("snapshot failed {}: {}", failed.reason, failed.detail)
@@ -560,6 +572,7 @@ fn describe(message: ChannelHostMessage) -> Option<String> {
 
 struct Host {
     commands: UnboundedSender<Input>,
+    cancels: Cancels,
     received: UnboundedReceiver<ChannelHostMessage>,
     store: MemoryStore,
     log: Log,
@@ -763,9 +776,11 @@ fn start_host(
     lifecycle.start(taken).expect("the lifecycle starts");
     let sessions = lifecycle.sessions();
     let (commands, from_host) = unbounded_channel();
+    let cancels = lifecycle.cancels();
     tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
     Host {
         commands,
+        cancels,
         received,
         store,
         log,
@@ -990,6 +1005,10 @@ impl Host {
         let mut turn = self.box_turn(turn_id, session_id, prompt, Vec::new(), 300);
         turn.box_id = box_id.try_into().expect("box id");
         self.send(Command::Turn(Box::new(turn)));
+    }
+
+    fn cancel(&self, turn_id: &str) {
+        self.cancels.cancel(turn_id.try_into().expect("turn id"));
     }
 
     fn discard(&self, session_id: &str) {
@@ -1803,6 +1822,71 @@ async fn a_teardown_after_the_snapshot_stops_a_clean_box_inside_the_warm_window_
             "pause session-1"
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_turn_ends_in_the_guest_with_its_credential_file_and_the_plain_stop_frees_the_box() {
+    let mut host = host("cancel-turn", 1, Harness::StallsAfterFirstLine, Boot::Works);
+    host.turn("turn-1", "session-1", "one\ntwo", Vec::new());
+    assert_eq!(host.settle_until("line 1 one").await, ["claim turn-1", "line 1 one"]);
+    host.cancel("turn-1");
+    let failed = format!(
+        "failed {}: the host cancelled the turn The box's console printed nothing during the turn. with credential file refreshed",
+        TurnFailureReason::Cancelled
+    );
+    assert_eq!(host.settle_until(&failed).await, [failed]);
+    host.snapshot("session-1");
+    host.teardown("session-1");
+    assert_eq!(
+        host.settle_until("box gone session-1").await,
+        ["snapshot done", "box gone session-1"]
+    );
+    assert_eq!(
+        host.log(),
+        [
+            "boot session-1 on tumpel0",
+            "reconnect session-1",
+            "pause session-1",
+            "stop session-1"
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_an_older_guest_never_answers_ends_the_turn_by_closing_the_guest_connection() {
+    let mut host = host("cancel-old-guest", 1, Harness::Silent, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    assert_eq!(host.settle_until("claim turn-1").await, ["claim turn-1"]);
+    host.cancel("turn-1");
+    let failed = format!(
+        "failed {}: the guest did not end cancelled turn turn-1 within 10 s, so the host closed its connection, which stops the harness. The box's console printed nothing during the turn.",
+        TurnFailureReason::Cancelled
+    );
+    assert_eq!(host.settle_until(&failed).await, [failed]);
+    assert_eq!(
+        host.log(),
+        ["boot session-1 on tumpel0", "reconnect session-1", "pause session-1"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_that_crosses_a_handover_reaches_the_guest_through_the_successor() {
+    let mut old = host("cancel-handover", 1, Harness::StallsAfterFirstLine, Boot::Works);
+    old.turn("turn-1", "session-1", "one\ntwo", Vec::new());
+    assert_eq!(old.settle_until("line 1 one").await, ["claim turn-1", "line 1 one"]);
+    let handover = old.ask_handover();
+    old.cancel("turn-1");
+    let handover = handover.await.expect("the boxes are handed over");
+    let SupervisorHandoverBoxState::Turn(turn) = &handover.boxes[0].state else {
+        panic!("the running turn is handed over");
+    };
+    assert_eq!(turn.cancelled, Some(true));
+    let mut new = old.successor(&handover);
+    let failed = format!(
+        "failed {}: the host cancelled the turn The box's console printed nothing during the turn. with credential file refreshed",
+        TurnFailureReason::Cancelled
+    );
+    assert_eq!(new.settle_until(&failed).await, [failed]);
 }
 
 #[tokio::test]

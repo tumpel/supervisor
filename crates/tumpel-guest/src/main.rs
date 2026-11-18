@@ -139,7 +139,7 @@ fn connection(mut stream: File, guest: &Mutex<GuestState>) -> Result<(), String>
                     };
                     setup::run(&start, &config, &confinement, &mut stream, &mut decoder)?;
                 }
-                GuestInput::ClaudeSetupCode(_) => {}
+                GuestInput::ClaudeSetupCode(_) | GuestInput::TurnCancel(_) => {}
             }
         }
         let read = stream

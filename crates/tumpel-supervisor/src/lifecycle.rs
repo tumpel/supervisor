@@ -23,17 +23,17 @@ use tumpel_api::types::{
     ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLine,
     ChannelTurnLineType, ChannelTurnRepositoryCloneFailed, ChannelTurnRepositoryCloneFailedType,
     ChannelTurnRepositoryReady, ChannelTurnRepositoryReadyType, DisplayName, EmailAddress, EntityId, GuestHello,
-    GuestInput, GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnStart, GuestTurnStartPrebuildCommitSha,
-    GuestTurnStartType, ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl, Sequence, Sha256Digest,
-    SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState, SupervisorHandoverCommand,
-    SupervisorHandoverDiscard, SupervisorHandoverDiscardKind, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
-    SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, SupervisorHandoverTurn,
-    SupervisorHandoverTurnError, SupervisorHandoverTurnKind, SupervisorHandoverWarm, SupervisorHandoverWarmKind,
-    TurnFailureReason,
+    GuestInput, GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnStart,
+    GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl,
+    Sequence, Sha256Digest, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
+    SupervisorHandoverCommand, SupervisorHandoverDiscard, SupervisorHandoverDiscardKind, SupervisorHandoverMachine,
+    SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown,
+    SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
+    SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
 };
 
 use crate::boot::{self, Boot, BootOrder, Caches, Hold, Holds};
-use crate::exchange::{part_number, Answer, Answers, Ask, Key, Waiting, DIGESTS_PER_PART};
+use crate::exchange::{part_number, Answer, Answers, Ask, Cancels, Key, Waiting, DIGESTS_PER_PART};
 use crate::harness_result::{error_result, exit_result, turn_end};
 use crate::images;
 use crate::layers::LayerCache;
@@ -52,6 +52,7 @@ pub use setup::{SetupCommand, SetupInput, SetupOrder};
 
 const TRANSFERS: usize = 16;
 const HANDOVER_CLAIM_ALLOWANCE: Duration = Duration::from_secs(60);
+const CANCEL_END: Duration = Duration::from_secs(10);
 const RESTORE_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
 const RESTORE_ENTRIES_PER_SECOND: u64 = 2_000;
 const OVERLAY_BYTES_PER_INODE: u64 = 16 * 1024;
@@ -311,6 +312,7 @@ fn standing_state(turn_id: Option<EntityId>) -> SupervisorHandoverBoxState {
             repository_ready: false,
             seen_line: false,
             error: None,
+            cancelled: None,
             turn_id,
         }),
         None => SupervisorHandoverBoxState::Warm(SupervisorHandoverWarm {
@@ -625,6 +627,21 @@ fn console_during_turn(tail: &str) -> String {
     }
 }
 
+async fn cancel<M: Machine>(live: &mut LiveBox<M>, turn_id: &EntityId, state: &mut Follow) -> Result<(), Failure> {
+    state.end = state.end.min(Instant::now() + CANCEL_END);
+    state.first_line = state.first_line.min(state.end);
+    let cancel = GuestInput::TurnCancel(GuestTurnCancel {
+        turn_id: turn_id.clone(),
+        type_: GuestTurnCancelType::TurnCancel,
+    });
+    live.guest.send(&cancel).await.map_err(|error| {
+        Failure::turn(
+            TurnFailureReason::Cancelled,
+            format!("handing the cancel of turn {} to the guest failed: {error}.", **turn_id),
+        )
+    })
+}
+
 async fn stop_box<M: Machine>(standing: &Standing, live: LiveBox<M>) -> (Tap, String) {
     let tail = live.machine.console_tail();
     let LiveBox { machine, tap, .. } = live;
@@ -696,6 +713,7 @@ struct Runner<V: Vmm, S: Store> {
     holds: Holds,
     parking: watch::Receiver<bool>,
     standing: Standing,
+    cancels: Cancels,
 }
 
 impl<V: Vmm, S: Store> Clone for Runner<V, S> {
@@ -711,6 +729,7 @@ impl<V: Vmm, S: Store> Clone for Runner<V, S> {
             holds: self.holds.clone(),
             parking: self.parking.clone(),
             standing: self.standing.clone(),
+            cancels: self.cancels.clone(),
         }
     }
 }
@@ -1321,6 +1340,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 )
             }
         };
+        self.cancels.forget(turn_id);
         live.dirty = true;
         let result = result.map_err(|failure| match failure.report {
             Report::Turn(_) => Failure {
@@ -1422,6 +1442,17 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         Failure::turn(TurnFailureReason::NoFirstOutput, detail)
     }
 
+    fn timed_out(&self, turn_id: &EntityId) -> Failure {
+        Failure::turn(
+            TurnFailureReason::TurnTimedOut,
+            format!(
+                "turn {} ran past its {} s budget (budgets.turnSeconds in runtime.json).",
+                **turn_id,
+                self.settings.budgets.turn.as_secs()
+            ),
+        )
+    }
+
     async fn follow(
         &self,
         live: &mut LiveBox<V::Machine>,
@@ -1433,26 +1464,37 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let protocol = live.image.harness().protocol;
         let (mut cloning, mut first_output) = phases;
         let mut parking = self.parking.clone();
+        let mut cancelling = false;
         loop {
             let waiting_for_first = !state.seen_line && state.first_line < state.end;
             let deadline = if waiting_for_first { state.first_line } else { state.end };
             let received = tokio::select! {
                 biased;
+                () = self.cancels.cancelled(turn_id), if !cancelling => None,
                 Ok(_) = parking.wait_for(|parking| *parking) => return Followed::Parked(state.park()),
-                received = timeout_at(deadline, live.guest.receive()) => received,
+                received = timeout_at(deadline, live.guest.receive()) => Some(received),
+            };
+            let Some(received) = received else {
+                cancelling = true;
+                if let Err(failure) = cancel(live, turn_id, &mut state).await {
+                    return Followed::Ended(Err(failure));
+                }
+                continue;
             };
             let Ok(received) = received else {
-                return Followed::Ended(Err(if waiting_for_first {
-                    self.no_first_output(turn_id, clone, state.repository_ready)
-                } else {
+                return Followed::Ended(Err(if cancelling {
                     Failure::turn(
-                        TurnFailureReason::TurnTimedOut,
+                        TurnFailureReason::Cancelled,
                         format!(
-                            "turn {} ran past its {} s budget (budgets.turnSeconds in runtime.json).",
+                            "the guest did not end cancelled turn {} within {} s, so the host closed its connection, which stops the harness.",
                             **turn_id,
-                            self.settings.budgets.turn.as_secs()
+                            CANCEL_END.as_secs()
                         ),
                     )
+                } else if waiting_for_first {
+                    self.no_first_output(turn_id, clone, state.repository_ready)
+                } else {
+                    self.timed_out(turn_id)
                 }));
             };
             match received {
@@ -1843,6 +1885,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     path: standing,
                     boxes: Arc::default(),
                 },
+                cancels: Cancels::default(),
             },
             pool,
             slots: HashMap::new(),
@@ -1883,6 +1926,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     #[must_use]
     pub fn answers(&self) -> Answers {
         self.runner.answers.clone()
+    }
+
+    #[must_use]
+    pub fn cancels(&self) -> Cancels {
+        self.runner.cancels.clone()
     }
 
     fn publish(&self) {
@@ -2140,6 +2188,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                         .left
                         .error
                         .map(|(reason, detail)| SupervisorHandoverTurnError { detail, reason }),
+                    cancelled: self.runner.cancels.contains(&parked.turn_id).then_some(true),
                     turn_id: parked.turn_id,
                 }),
                 None => SupervisorHandoverBoxState::Warm(SupervisorHandoverWarm {
@@ -2337,6 +2386,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 });
             }
             (SupervisorHandoverBoxState::Turn(turn), Taken::Handed) => {
+                if turn.cancelled == Some(true) {
+                    self.runner.cancels.cancel(turn.turn_id.clone());
+                }
                 slot.parked = Some(Box::new(Parked {
                     turn_id: turn.turn_id,
                     left: Left {

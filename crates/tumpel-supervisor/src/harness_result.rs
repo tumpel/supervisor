@@ -10,6 +10,7 @@ pub fn turn_end(
 ) -> Result<Sequence, (TurnFailureReason, String)> {
     match (end.reason, error) {
         (GuestTurnEndReason::HarnessOutOfMemory, _) => Err((TurnFailureReason::HarnessOutOfMemory, end.detail)),
+        (GuestTurnEndReason::Cancelled, _) => Err((TurnFailureReason::Cancelled, end.detail)),
         (GuestTurnEndReason::Completed, Some(failure)) => Err(failure),
         (GuestTurnEndReason::HarnessExited, Some((reason, detail))) => Err((
             reason,

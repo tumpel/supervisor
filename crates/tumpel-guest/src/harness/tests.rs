@@ -8,7 +8,7 @@ use tumpel_api::types::GuestHarnessProtocol;
 
 use super::{
     answers_no_prompt, ends_turn, environment, home_path, launch, priced_by_anthropic, reuses, skips, turn_arguments,
-    turn_environment, without_list_price, HangUp, Output,
+    turn_environment, without_list_price, HostWatch, Output,
 };
 
 fn start(model: &str, variables: &Value, files: &Value) -> GuestTurnStart {
@@ -333,7 +333,8 @@ fn a_host_that_hangs_up_mid_turn_wakes_that_turn() {
     use std::time::Duration;
     let (host, peer) = std::os::unix::net::UnixStream::pair().expect("a host connection");
     let (sender, output) = std::sync::mpsc::channel();
-    let _watching = HangUp::watch(host.as_fd(), sender, 7).expect("the host connection is watched");
+    let _watching = HostWatch::watch(host.as_fd(), sender, 7, "turn-1".try_into().expect("turn id"))
+        .expect("the host connection is watched");
     assert!(
         output.recv_timeout(Duration::from_millis(300)).is_err(),
         "a connected host wakes nothing"
@@ -341,6 +342,89 @@ fn a_host_that_hangs_up_mid_turn_wakes_that_turn() {
     drop(peer);
     assert!(matches!(
         output.recv_timeout(Duration::from_secs(2)),
-        Ok(Output::HostGone(7))
+        Ok(Output::HostGone(7, _))
     ));
+}
+
+fn cancel_frame(turn_id: &str) -> Vec<u8> {
+    tumpel_guest::encode(&json!({ "type": "TurnCancel", "turnId": turn_id })).expect("a cancel frame")
+}
+
+#[test]
+fn a_cancel_of_the_running_turn_wakes_that_turn_and_a_cancel_of_another_does_not() {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    use std::time::Duration;
+    let (host, mut peer) = std::os::unix::net::UnixStream::pair().expect("a host connection");
+    let (sender, output) = std::sync::mpsc::channel();
+    let _watching = HostWatch::watch(host.as_fd(), sender, 7, "turn-1".try_into().expect("turn id"))
+        .expect("the host connection is watched");
+    peer.write_all(&cancel_frame("turn-0"))
+        .expect("the stale cancel is sent");
+    assert!(
+        output.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a cancel of another turn wakes nothing"
+    );
+    peer.write_all(&cancel_frame("turn-1")).expect("the cancel is sent");
+    assert!(matches!(
+        output.recv_timeout(Duration::from_secs(2)),
+        Ok(Output::Cancelled(7))
+    ));
+}
+
+#[test]
+fn a_cancel_kills_a_persistent_harness_and_every_process_it_started() {
+    use std::io::Write;
+    use std::time::Duration;
+    let config: GuestHarness = serde_json::from_value(json!({
+        "harness": "Shell", "harnessVersion": "1", "protocol": "ShellLines",
+        "command": ["sh"], "workingDirectory": "/", "cloneSeconds": 120,
+        "environment": { "PATH": "/usr/bin:/bin", "HOME": "/tmp", "LANG": "C.UTF-8" },
+        "fixedVariables": [],
+    }))
+    .expect("the test config matches GuestHarness");
+    let memory = crate::memory::Memory {
+        confinement: crate::memory::Confinement::Score {
+            score: c"/proc/self/oom_score_adj".to_owned(),
+        },
+        kernel: crate::memory::KernelLog::open(Path::new("/dev/null")).expect("a kernel log"),
+        box_mib: 1024,
+    };
+    let state = super::GuestState::new(config, memory).expect("a guest state");
+    let turn = start("m", &json!([]), &json!([]));
+    let mut harness = state
+        .start_process(std::process::Command::new("sh"), Vec::new(), false, &turn)
+        .expect("the harness starts");
+    harness
+        .stdin
+        .write_all(b"sleep 300 & echo $!\n")
+        .and_then(|()| harness.stdin.flush())
+        .expect("the harness reads its prompt");
+    let Ok(Output::Line(tool)) = harness.output.recv_timeout(Duration::from_secs(5)) else {
+        panic!("the harness names the process it started");
+    };
+    let tool: libc::pid_t = tool.parse().expect("a pid");
+    assert!(
+        std::fs::metadata(format!("/proc/{tool}")).is_ok(),
+        "the tool runs before the cancel"
+    );
+
+    harness.kill_group().expect("the cancel kills the harness");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let running = |pid: libc::pid_t| {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| !stat.contains(") Z "))
+    };
+    while running(tool) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tool {tool} outlived the cancel"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = harness.child.try_wait().expect("the harness is reaped");
+    assert_eq!(
+        status.and_then(|status| std::os::unix::process::ExitStatusExt::signal(&status)),
+        Some(libc::SIGKILL)
+    );
 }
