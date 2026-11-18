@@ -1284,7 +1284,10 @@ async fn a_box_on_another_host_downloads_the_chunks_its_cache_lacks() {
         .expect("the box disk directory")
         .map(|entry| entry.expect("an entry").file_name())
         .collect();
-    assert!(left.is_empty(), "the restore archive and its chunks outlived the boot: {left:?}");
+    assert!(
+        left.is_empty(),
+        "the restore archive and its chunks outlived the boot: {left:?}"
+    );
 }
 
 #[tokio::test]
@@ -2199,7 +2202,9 @@ fn stuck_archive(name: &str) -> PathBuf {
         .status()
         .expect("mkfifo");
     assert!(made.success(), "mkfifo {}", archive.display());
-    archive
+    let held = session.with_file_name("restore.fifo");
+    std::fs::hard_link(&archive, &held).expect("a second name for the fifo outlives the box disk");
+    held
 }
 
 fn release(archive: &Path) {
@@ -2229,6 +2234,7 @@ async fn a_stuck_reassembly_outlasts_the_boot_budget_then_fails_with_its_size() 
             && seen[0].contains("bytes in"),
         "{seen:?}"
     );
+    assert!(!host.vmm.staging.join("session-1").exists());
 }
 
 #[tokio::test]
