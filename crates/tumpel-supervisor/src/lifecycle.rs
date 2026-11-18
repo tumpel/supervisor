@@ -2210,6 +2210,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     /// # Errors
     /// Fails when the record of running boxes cannot be written or a box this supervisor did not take over cannot be stopped.
     pub fn start(&mut self, taken: Option<(SupervisorHandover, Taken)>) -> Result<(), String> {
+        let recorded = taken.is_some();
         let mut standing = BTreeMap::new();
         if let Some((handover, taken)) = taken {
             let elapsed = (now() - handover.handed_at).to_std().unwrap_or(Duration::ZERO);
@@ -2222,6 +2223,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let claimed: Vec<u8> = standing.keys().filter_map(|index| u8::try_from(*index).ok()).collect();
         self.runner.standing.write(|boxes| *boxes = standing)?;
         self.publish();
+        if !recorded {
+            return Ok(());
+        }
         self.runner.vmm.end_unclaimed(&claimed)
     }
 
