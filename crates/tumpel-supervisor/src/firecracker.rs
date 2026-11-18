@@ -987,17 +987,13 @@ impl Machine for FirecrackerBox {
         self.session.join(OVERLAY_DRIVE)
     }
 
-    async fn stop(mut self) {
+    async fn stop(mut self) -> Result<(), String> {
         if let Some(process) = self.process.take() {
             process.kill().await;
         }
-        let cleared = fd_store::forget_box(self.index).and_then(|()| remove_dir(&self.dir));
-        if let Err(error) = cleared {
-            eprintln!(
-                "tumpel-supervisor: DiskNotFreed: tearing down box {}: {error}; the next supervisor start deletes it",
-                self.index
-            );
-        }
+        fd_store::forget_box(self.index)
+            .and_then(|()| remove_dir(&self.dir))
+            .map_err(|error| format!("BoxNotCleared: tearing down box {}: {error}", self.index))
     }
 
     fn console_tail(&self) -> String {

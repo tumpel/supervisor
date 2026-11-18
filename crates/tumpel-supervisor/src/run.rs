@@ -370,7 +370,11 @@ fn start_boxes(
     let (to_lifecycle, from_boxes) = unbounded_channel();
     let idle = IdleGate::new(lifecycle.boxes(), lifecycle.busy());
     let (to_setups, from_setups) = unbounded_channel();
-    tokio::spawn(lifecycle.run(from_boxes, from_setups));
+    tokio::spawn(async move {
+        if let Err(error) = lifecycle.run(from_boxes, from_setups).await {
+            eprintln!("tumpel-supervisor: the box runner stopped: {error}");
+        }
+    });
     tokio::spawn(boxes(
         Path::new(&*runtime.data_dir).join(crate::persona_files::DIR),
         answers,

@@ -69,6 +69,13 @@ enum Ended {
     Failed(Stop),
 }
 
+fn then(detail: String, stopped: Result<(), String>) -> String {
+    match stopped {
+        Ok(()) => detail,
+        Err(error) => format!("{detail}; then {error}"),
+    }
+}
+
 fn failed_in_guest(reason: GuestClaudeSetupFailureReason, detail: String) -> Ended {
     let reason = match reason {
         GuestClaudeSetupFailureReason::UrlNotPrinted => ClaudeSetupFailureReason::SetupUrlMissing,
@@ -81,23 +88,29 @@ fn failed_in_guest(reason: GuestClaudeSetupFailureReason, detail: String) -> End
 }
 
 impl<V: Vmm, S: Store> Runner<V, S> {
-    pub(super) async fn claude_setup(&self, tap: Tap, order: SetupOrder, inputs: UnboundedReceiver<SetupInput>) -> Tap {
+    pub(super) async fn claude_setup(
+        &self,
+        tap: Tap,
+        order: SetupOrder,
+        inputs: UnboundedReceiver<SetupInput>,
+    ) -> (Tap, Result<(), String>) {
         let id = order.claude_setup_id.clone();
-        let failure = match self.boot_setup(&tap, &order).await {
+        let (failure, stopped) = match self.boot_setup(&tap, &order).await {
             Ok((machine, guest, hold)) => {
                 let (machine, ended) = self.follow_setup(machine, guest, &order, inputs).await;
                 let tail = machine.console_tail();
-                machine.stop().await;
+                let stopped = machine.stop().await;
                 drop(hold);
-                match ended {
+                let failure = match ended {
                     Ended::Stored | Ended::Discarded => None,
                     Ended::Failed(failed) => Some(Stop {
                         detail: format!("{} Console: {tail}", failed.detail),
                         ..failed
                     }),
-                }
+                };
+                (failure, stopped)
             }
-            Err(failed) => Some(failed),
+            Err(failed) => (Some(failed), Ok(())),
         };
         if let Some(failed) = failure {
             emit(
@@ -111,7 +124,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 },
             );
         }
-        tap
+        (tap, stopped)
     }
 
     async fn boot_setup(
@@ -146,8 +159,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             ),
         };
         let tail = machine.console_tail();
-        machine.stop().await;
-        Err(missing(format!("{failed}. Console: {tail}")))
+        let stopped = machine.stop().await;
+        Err(missing(then(format!("{failed}. Console: {tail}"), stopped)))
     }
 
     async fn hand_setup(
@@ -159,10 +172,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let token_credential: Result<GuestClaudeSetupStartTokenCredential, _> =
             order.token_credential.to_string().try_into();
         let Ok(token_credential) = token_credential else {
-            machine.stop().await;
+            let stopped = machine.stop().await;
             return Err(stop(
                 ClaudeSetupFailureReason::SetupUrlMissing,
-                format!("the offer of Claude setup {} carried a token credential the guest protocol refuses; update the supervisor and the control plane together", *order.claude_setup_id),
+                then(format!("the offer of Claude setup {} carried a token credential the guest protocol refuses; update the supervisor and the control plane together", *order.claude_setup_id), stopped),
             ));
         };
         let start = GuestInput::ClaudeSetupStart(GuestClaudeSetupStart {
@@ -174,12 +187,15 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         });
         if let Err(error) = guest.send(&start).await {
             let tail = machine.console_tail();
-            machine.stop().await;
+            let stopped = machine.stop().await;
             return Err(stop(
                 ClaudeSetupFailureReason::SetupUrlMissing,
-                format!(
-                    "handing Claude setup {} to the guest failed: {error}. Console: {tail}",
-                    *order.claude_setup_id
+                then(
+                    format!(
+                        "handing Claude setup {} to the guest failed: {error}. Console: {tail}",
+                        *order.claude_setup_id
+                    ),
+                    stopped,
                 ),
             ));
         }

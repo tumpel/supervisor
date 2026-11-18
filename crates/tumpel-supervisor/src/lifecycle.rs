@@ -133,7 +133,7 @@ pub trait Machine: Send + 'static {
     fn pause(&mut self) -> impl Future<Output = Result<(), String>> + Send;
     fn resume(&mut self) -> impl Future<Output = Result<(), String>> + Send;
     fn drive(&self) -> PathBuf;
-    fn stop(self) -> impl Future<Output = ()> + Send;
+    fn stop(self) -> impl Future<Output = Result<(), String>> + Send;
     fn console_tail(&self) -> String;
     fn clear_console(&mut self);
     fn hand_over(self, guest: Self::Guest) -> Result<SupervisorHandoverMachine, String>;
@@ -387,7 +387,7 @@ impl Standing {
 enum Outcome<M: Machine> {
     Kept(LiveBox<M>),
     Parked(LiveBox<M>, Box<Parked>),
-    Gone(Tap),
+    Gone(Tap, Result<(), String>),
 }
 
 struct Follow {
@@ -478,6 +478,7 @@ enum Event<M: Machine> {
     },
     SetupFinished {
         claude_setup_id: String,
+        stopped: Result<(), String>,
         tap: Tap,
     },
     HandoverExpired,
@@ -656,10 +657,10 @@ async fn cancel<M: Machine>(live: &mut LiveBox<M>, turn_id: &EntityId, state: &m
     })
 }
 
-async fn stop_box<M: Machine>(standing: &Standing, live: LiveBox<M>) -> (Tap, String) {
+async fn stop_box<M: Machine>(standing: &Standing, live: LiveBox<M>) -> (Tap, String, Result<(), String>) {
     let tail = live.machine.console_tail();
     let LiveBox { machine, tap, .. } = live;
-    machine.stop().await;
+    let stopped = machine.stop().await;
     let index = i32::from(tap.index());
     if let Err(error) = standing.write(|boxes| {
         boxes.remove(&index);
@@ -668,7 +669,7 @@ async fn stop_box<M: Machine>(standing: &Standing, live: LiveBox<M>) -> (Tap, St
             "tumpel-supervisor: forgetting stopped box {index} in the record of running boxes failed: {error}; the next start finds it gone"
         );
     }
-    (tap, tail)
+    (tap, tail, stopped)
 }
 
 struct Asking {
@@ -843,20 +844,20 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 ),
             },
         };
-        let (tap, tail) = stop_box(&self.standing, live).await;
+        let (tap, tail, stopped) = stop_box(&self.standing, live).await;
         turn_failed(
             &self.out,
             &turn.turn_id,
             TurnFailureReason::BoxBootFailed,
             format!("{failed}. Console: {tail}"),
         );
-        Outcome::Gone(tap)
+        Outcome::Gone(tap, stopped)
     }
 
     async fn cold_turn(&self, tap: Tap, turn: &BoxTurn) -> Outcome<V::Machine> {
         let claiming = self.claim(turn);
         let Some(files) = self.files(turn).await else {
-            return Outcome::Gone(tap);
+            return Outcome::Gone(tap, Ok(()));
         };
         let restoring = (!turn.snapshots.is_empty())
             .then(|| expired(&turn.credential, "before its snapshot was restored"))
@@ -868,13 +869,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 TurnFailureReason::DispatchCredentialExpired,
                 detail,
             );
-            return Outcome::Gone(tap);
+            return Outcome::Gone(tap, Ok(()));
         }
         let restored = match timeout_at(instant_at(turn.credential.expires_at), self.restore(turn, &tap)).await {
             Ok(Ok(restored)) => restored,
             Ok(Err(detail)) => {
                 turn_failed(&self.out, &turn.turn_id, TurnFailureReason::SnapshotUnreadable, detail);
-                return Outcome::Gone(tap);
+                return Outcome::Gone(tap, Ok(()));
             }
             Err(_) => {
                 turn_failed(
@@ -883,7 +884,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     TurnFailureReason::DispatchCredentialExpired,
                     credential_expired(&turn.credential, "while its snapshot was restored"),
                 );
-                return Outcome::Gone(tap);
+                return Outcome::Gone(tap, Ok(()));
             }
         };
         let (image, hold) = match self.image(turn).await {
@@ -894,7 +895,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     _ => refusal.detail,
                 };
                 turn_failed(&self.out, &turn.turn_id, refusal.reason, detail);
-                return Outcome::Gone(tap);
+                return Outcome::Gone(tap, Ok(()));
             }
         };
         let mut machine = match self.vmm.machine(&turn.session_id, &tap) {
@@ -906,7 +907,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     TurnFailureReason::BoxBootFailed,
                     format!("preparing box {}: {error}", *turn.box_id),
                 );
-                return Outcome::Gone(tap);
+                return Outcome::Gone(tap, Ok(()));
             }
         };
         let (restore, base, archived) = restored.map_or((None, Base::default(), 0), |(path, base, archived)| {
@@ -934,14 +935,14 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             ),
         };
         let tail = machine.console_tail();
-        machine.stop().await;
+        let stopped = machine.stop().await;
         turn_failed(
             &self.out,
             &turn.turn_id,
             TurnFailureReason::BoxBootFailed,
             format!("{failed}. Console: {tail}"),
         );
-        Outcome::Gone(tap)
+        Outcome::Gone(tap, stopped)
     }
 
     async fn first_turn(
@@ -954,7 +955,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let Err(error) = self.standing.put(&live, Some(&turn.turn_id)) else {
             return self.run_turn(live, turn, files, claiming).await;
         };
-        let (tap, tail) = stop_box(&self.standing, live).await;
+        let (tap, tail, stopped) = stop_box(&self.standing, live).await;
         turn_failed(
             &self.out,
             &turn.turn_id,
@@ -964,7 +965,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 *turn.box_id
             ),
         );
-        Outcome::Gone(tap)
+        Outcome::Gone(tap, stopped)
     }
 
     fn send(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Option<Instant>) -> Asking {
@@ -1414,11 +1415,11 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             ),
         };
         let session = live.session_id.to_string();
-        let (tap, tail) = stop_box(&self.standing, live).await;
+        let (tap, tail, stopped) = stop_box(&self.standing, live).await;
         eprintln!(
             "tumpel-supervisor: the box of session {session} did not take a new guest connection and was stopped: {failed}. Console: {tail}"
         );
-        Outcome::Gone(tap)
+        Outcome::Gone(tap, stopped)
     }
 
     async fn pause(&self, mut live: LiveBox<V::Machine>) -> Outcome<V::Machine> {
@@ -1433,11 +1434,11 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 self.settings.budgets.boot.as_secs()
             ),
         };
-        let (tap, tail) = stop_box(&self.standing, live).await;
+        let (tap, tail, stopped) = stop_box(&self.standing, live).await;
         eprintln!(
             "tumpel-supervisor: a box could not be paused after its turn and was stopped: {failed}. Console: {tail}"
         );
-        Outcome::Gone(tap)
+        Outcome::Gone(tap, stopped)
     }
 
     fn no_first_output(&self, turn_id: &EntityId, clone: Duration, repository_ready: bool) -> Failure {
@@ -1973,22 +1974,28 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.disk_held.send_replace(self.held_disk());
     }
 
-    pub async fn run(mut self, mut inputs: UnboundedReceiver<Input>, mut setups: UnboundedReceiver<SetupCommand>) {
+    /// # Errors
+    /// Fails when a box ends and its files cannot be deleted.
+    pub async fn run(
+        mut self,
+        mut inputs: UnboundedReceiver<Input>,
+        mut setups: UnboundedReceiver<SetupCommand>,
+    ) -> Result<(), String> {
         let Some(mut finished) = self.finished.take() else {
-            return;
+            return Ok(());
         };
         loop {
             tokio::select! {
                 input = inputs.recv() => match input {
-                    Some(Input::Command(command)) => self.command(command).await,
+                    Some(Input::Command(command)) => self.command(command).await?,
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
                     Some(Input::Abandon(reply)) => self.abandon(reply).await,
                     None => break,
                 },
                 Some(setup) = setups.recv() => self.setup_command(setup).await,
-                Some(event) = finished.recv() => self.event(event).await,
+                Some(event) = finished.recv() => self.event(event).await?,
             }
-            self.settle_handover();
+            self.settle_handover()?;
             self.publish();
         }
         for inputs in self.setups.values() {
@@ -1998,16 +2005,23 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             let Some(event) = finished.recv().await else {
                 break;
             };
-            if let Event::SetupFinished { claude_setup_id, tap } = event {
+            if let Event::SetupFinished {
+                claude_setup_id,
+                tap,
+                stopped,
+            } = event
+            {
                 self.setups.remove(&claude_setup_id);
                 self.pool.release(tap);
-                self.free_disk(&claude_setup_id);
+                stopped?;
+                self.free_disk(&claude_setup_id)?;
             }
         }
         let sessions: Vec<String> = self.slots.keys().cloned().collect();
         for session in sessions {
-            self.teardown(&session).await;
+            self.teardown(&session).await?;
         }
+        Ok(())
     }
 
     fn box_count(&self) -> u32 {
@@ -2071,16 +2085,16 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.handing = Some((reply, timer.abort_handle()));
     }
 
-    fn settle_handover(&mut self) {
+    fn settle_handover(&mut self) -> Result<(), String> {
         if self.handing.is_none() || !self.setups.is_empty() || self.slots.values().any(|slot| slot.busy) {
-            return;
+            return Ok(());
         }
-        self.finish_handover();
+        self.finish_handover()
     }
 
-    async fn handover_expired(&mut self) {
+    async fn handover_expired(&mut self) -> Result<(), String> {
         if self.handing.is_none() {
-            return;
+            return Ok(());
         }
         let limit = self.handover_limit().as_secs();
         eprintln!(
@@ -2091,6 +2105,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             task.abort();
             let _ = task.await;
             self.setups.remove(&claude_setup_id);
+            self.free_disk(&claude_setup_id)?;
         }
         let busy: Vec<String> = self
             .slots
@@ -2107,7 +2122,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             if let Some(slot) = self.slots.get_mut(&session) {
                 slot.busy = false;
             }
-            self.free_disk(&session);
             match running {
                 Running::Turn(turn_id) => turn_failed(
                     &self.runner.out,
@@ -2132,8 +2146,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     },
                 ),
             }
+            self.free_disk(&session)?;
         }
-        self.finish_handover();
+        self.finish_handover()
     }
 
     async fn abandon(&mut self, reply: oneshot::Sender<()>) {
@@ -2190,10 +2205,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    fn finish_handover(&mut self) {
+    fn finish_handover(&mut self) -> Result<(), String> {
         let Some((reply, timer)) = self.handing.take() else {
-            return;
+            return Ok(());
         };
+        let mut freed = Ok(());
         timer.abort();
         let mut boxes = Vec::new();
         let sessions: Vec<String> = self.slots.keys().cloned().collect();
@@ -2271,7 +2287,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                         );
                     }
                     self.pool.release(tap);
-                    self.free_disk(&session);
+                    freed = freed.and(self.free_disk(&session));
                 }
             }
         }
@@ -2279,6 +2295,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             boxes,
             handed_at: now(),
         });
+        freed
     }
 
     fn resume(&mut self, session: String) {
@@ -2439,24 +2456,27 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         Some(record)
     }
 
-    async fn command(&mut self, command: Command) {
+    async fn command(&mut self, command: Command) -> Result<(), String> {
         if let (Some(why), Command::Turn(turn)) = (self.refusal(), &command) {
             self.refuse_turn(&turn.turn_id, why);
-            return;
+            return Ok(());
         }
         let session = command.session();
         let slot = self.slots.entry(session.clone()).or_default();
         if slot.busy || slot.parked.is_some() {
             slot.queue.push_back(command);
-            return;
+            return Ok(());
         }
-        self.dispatch(session, command).await;
+        self.dispatch(session, command).await
     }
 
-    async fn dispatch(&mut self, session: String, command: Command) {
+    async fn dispatch(&mut self, session: String, command: Command) -> Result<(), String> {
         match command {
             Command::Turn(turn) => self.start_turn(session, *turn).await,
-            Command::Snapshot(order) => self.start_snapshot(session, order),
+            Command::Snapshot(order) => {
+                self.start_snapshot(session, order);
+                Ok(())
+            }
             Command::Teardown(order) => self.start_teardown(session, order).await,
             Command::Discard(order) => self.start_discard(session, order).await,
         }
@@ -2526,9 +2546,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let events = self.events.clone();
         let named = id.clone();
         let task = tokio::spawn(async move {
-            let tap = runner.claude_setup(tap, order, received).await;
+            let (tap, stopped) = runner.claude_setup(tap, order, received).await;
             let _ = events.send(Event::SetupFinished {
                 claude_setup_id: named,
+                stopped,
                 tap,
             });
         });
@@ -2557,18 +2578,34 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.slots.entry(session).or_default().task = Some((running, handle));
     }
 
-    async fn start_turn(&mut self, session: String, turn: BoxTurn) {
+    async fn end_other_box(&mut self, session: &str, turn: &BoxTurn, root: &tracing::Span) -> Result<(), String> {
+        if self.live_box(session).is_none_or(|live| live.box_id == turn.box_id) {
+            return Ok(());
+        }
+        let Err(error) = self.teardown(session).await else {
+            return Ok(());
+        };
+        root.in_scope(|| {
+            turn_failed(
+                &self.runner.out,
+                &turn.turn_id,
+                TurnFailureReason::BoxBootFailed,
+                format!("stopping the earlier box of session {session} failed: {error}"),
+            );
+        });
+        Err(error)
+    }
+
+    async fn start_turn(&mut self, session: String, turn: BoxTurn) -> Result<(), String> {
         let (harness, harness_version) = turn.image.harness();
         let root = telemetry::turn(&turn.turn_id, &turn.session_id, harness, harness_version, &turn.model);
         let out = &self.runner.out;
         if let Some(detail) = expired(&turn.credential, "before the turn reached a box") {
             root.in_scope(|| turn_failed(out, &turn.turn_id, TurnFailureReason::DispatchCredentialExpired, detail));
             self.prune(&session);
-            return;
+            return Ok(());
         }
-        if self.live_box(&session).is_some_and(|live| live.box_id != turn.box_id) {
-            self.teardown(&session).await;
-        }
+        self.end_other_box(&session, &turn, &root).await?;
         let warm = self.slots.get_mut(&session).and_then(|slot| {
             let live = slot.live.take()?;
             slot.disarm();
@@ -2585,7 +2622,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 running,
                 async move { runner.warm_turn(live, &turn).await }.instrument(root),
             );
-            return;
+            return Ok(());
         }
         let memory_mib = match positive_mib(turn.box_memory_mib) {
             Ok(memory_mib) => memory_mib,
@@ -2603,7 +2640,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     );
                 });
                 self.prune(&session);
-                return;
+                return Ok(());
             }
         };
         let disk_mib = match positive_mib(turn.box_disk_mib) {
@@ -2622,7 +2659,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     );
                 });
                 self.prune(&session);
-                return;
+                return Ok(());
             }
         };
         let tap = match self.claim(memory_mib, disk_mib).await {
@@ -2637,7 +2674,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     );
                 });
                 self.prune(&session);
-                return;
+                return Ok(());
             }
         };
         self.slots.entry(session.clone()).or_default().busy = true;
@@ -2648,6 +2685,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             running,
             async move { runner.cold_turn(tap, &turn).await }.instrument(root),
         );
+        Ok(())
     }
 
     fn start_snapshot(&mut self, session: String, order: SnapshotOrder) {
@@ -2696,28 +2734,29 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
     }
 
-    async fn start_discard(&mut self, session: String, order: TeardownOrder) {
+    async fn start_discard(&mut self, session: String, order: TeardownOrder) -> Result<(), String> {
         match self.live_box(&session) {
-            Some(live) if live.box_id == order.box_id => self.teardown(&session).await,
+            Some(live) if live.box_id == order.box_id => self.teardown(&session).await?,
             Some(_) => {}
-            None => self.free_disk(&session),
+            None => self.free_disk(&session)?,
         }
         self.prune(&session);
         self.box_gone(order);
+        Ok(())
     }
 
-    async fn start_teardown(&mut self, session: String, order: TeardownOrder) {
+    async fn start_teardown(&mut self, session: String, order: TeardownOrder) -> Result<(), String> {
         let Some(dirty) = self
             .live_box(&session)
             .filter(|live| live.box_id == order.box_id)
             .map(|live| live.dirty)
         else {
             if self.live_box(&session).is_none() {
-                self.free_disk(&session);
+                self.free_disk(&session)?;
             }
             self.prune(&session);
             self.box_gone(order);
-            return;
+            return Ok(());
         };
         if dirty {
             emit(
@@ -2734,11 +2773,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     type_: ChannelBoxTeardownFailedType::BoxTeardownFailed,
                 },
             );
-            return;
+            return Ok(());
         }
-        self.teardown(&session).await;
+        self.teardown(&session).await?;
         self.prune(&session);
         self.box_gone(order);
+        Ok(())
     }
 
     async fn claim(&mut self, memory_mib: Option<NonZeroU32>, disk_mib: Option<NonZeroU32>) -> Result<Tap, String> {
@@ -2765,7 +2805,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             let Some((_, _, victim)) = victims.next() else {
                 break;
             };
-            self.teardown(&victim).await;
+            self.teardown(&victim).await?;
         }
         self.pool
             .claim(size, self.available_memory_mib()?, self.disk()?)
@@ -2823,31 +2863,28 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
     }
 
-    fn free_disk(&self, session: &str) {
-        let freed = self
-            .runner
+    fn free_disk(&self, session: &str) -> Result<(), String> {
+        self.runner
             .vmm
             .staging(&held_session(session))
-            .and_then(|dir| remove_dir(&dir));
-        if let Err(error) = freed {
-            eprintln!(
-                "tumpel-supervisor: DiskNotFreed: the box of session {session} ended, then {error}; the next supervisor start deletes it"
-            );
-        }
+            .and_then(|dir| remove_dir(&dir))
+            .map_err(|error| format!("DiskNotFreed: the box of session {session} ended, then {error}"))
     }
 
-    async fn teardown(&mut self, session: &str) {
+    async fn teardown(&mut self, session: &str) -> Result<(), String> {
         let Some(slot) = self.slots.get_mut(session) else {
-            return;
+            return Ok(());
         };
         slot.disarm();
         let Some(live) = slot.live.take() else {
-            return;
+            return Ok(());
         };
-        let (tap, _) = stop_box(&self.runner.standing, live).await;
+        let (tap, _, stopped) = stop_box(&self.runner.standing, live).await;
         self.pool.release(tap);
-        self.free_disk(session);
+        stopped?;
+        self.free_disk(session)?;
         self.prune(session);
+        Ok(())
     }
 
     fn prune(&mut self, session: &str) {
@@ -2860,21 +2897,26 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    async fn event(&mut self, event: Event<V::Machine>) {
+    async fn event(&mut self, event: Event<V::Machine>) -> Result<(), String> {
         match event {
             Event::Finished { session, work, outcome } => self.finished(session, work, outcome).await,
             Event::Expired { session, generation } => self.expired(&session, generation).await,
-            Event::SetupFinished { claude_setup_id, tap } => {
+            Event::SetupFinished {
+                claude_setup_id,
+                tap,
+                stopped,
+            } => {
                 self.setups.remove(&claude_setup_id);
                 self.setup_tasks.remove(&claude_setup_id);
                 self.pool.release(tap);
-                self.free_disk(&claude_setup_id);
+                stopped?;
+                self.free_disk(&claude_setup_id)
             }
             Event::HandoverExpired => self.handover_expired().await,
         }
     }
 
-    async fn finished(&mut self, session: String, work: Work, outcome: Outcome<V::Machine>) {
+    async fn finished(&mut self, session: String, work: Work, outcome: Outcome<V::Machine>) -> Result<(), String> {
         let slot = self.slots.entry(session.clone()).or_default();
         slot.busy = false;
         slot.task = None;
@@ -2885,7 +2927,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             Outcome::Parked(live, parked) => {
                 slot.live = Some(live);
                 slot.parked = Some(parked);
-                return;
+                return Ok(());
             }
             Outcome::Kept(live) => {
                 match work {
@@ -2894,43 +2936,44 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 }
                 slot.live = Some(live);
             }
-            Outcome::Gone(tap) => {
+            Outcome::Gone(tap, stopped) => {
                 slot.disarm();
-                freed = Some(tap);
+                freed = Some((tap, stopped));
             }
         }
-        if let Some(tap) = freed {
+        if let Some((tap, stopped)) = freed {
             self.pool.release(tap);
-            self.free_disk(&session);
+            stopped?;
+            self.free_disk(&session)?;
         }
         if arm {
             self.arm(&session);
         }
         if tear_down {
-            self.teardown(&session).await;
+            self.teardown(&session).await?;
         }
         let next = self.slots.get_mut(&session).and_then(|slot| slot.queue.pop_front());
         if let Some(command) = next {
-            self.dispatch(session, command).await;
-            return;
+            return self.dispatch(session, command).await;
         }
         self.prune(&session);
+        Ok(())
     }
 
-    async fn expired(&mut self, session: &str, generation: u64) {
+    async fn expired(&mut self, session: &str, generation: u64) -> Result<(), String> {
         let Some(slot) = self.slots.get_mut(session) else {
-            return;
+            return Ok(());
         };
         if slot.generation != generation || slot.paused_at.is_none() {
-            return;
+            return Ok(());
         }
         slot.expiry = None;
         let clean = slot.live.as_ref().is_some_and(|live| !live.dirty);
         if slot.busy || !clean {
             slot.expired = true;
-            return;
+            return Ok(());
         }
-        self.teardown(session).await;
+        self.teardown(session).await
     }
 }
 

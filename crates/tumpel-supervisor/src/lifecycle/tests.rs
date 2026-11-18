@@ -288,9 +288,10 @@ impl Machine for MemoryMachine {
         self.drive.clone()
     }
 
-    async fn stop(self) {
+    fn stop(self) -> impl Future<Output = Result<(), String>> + Send {
         self.drives.lock().expect("drives").remove(&self.drive);
         note(&self.log, format!("stop {}", self.session));
+        std::future::ready(Ok(()))
     }
 
     fn console_tail(&self) -> String {
@@ -607,6 +608,7 @@ struct Host {
     settings: Settings,
     sessions: tokio::sync::watch::Receiver<Vec<EntityId>>,
     disk_held: tokio::sync::watch::Receiver<HeldDisk>,
+    runner: tokio::task::JoinHandle<Result<(), String>>,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -804,7 +806,7 @@ fn start_host(
     let disk_held = lifecycle.disk_held();
     let (commands, from_host) = unbounded_channel();
     let cancels = lifecycle.cancels();
-    tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
+    let runner = tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
     Host {
         commands,
         cancels,
@@ -819,6 +821,7 @@ fn start_host(
         settings,
         sessions,
         disk_held,
+        runner,
     }
 }
 
@@ -2249,5 +2252,28 @@ async fn a_restore_that_outlasts_the_dispatch_credential_fails_dispatch_credenti
             && seen[1].starts_with(&format!("failed {}", TurnFailureReason::DispatchCredentialExpired))
             && seen[1].contains("while its snapshot was restored"),
         "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_box_disk_that_cannot_be_deleted_stops_the_box_runner_with_disk_not_freed() {
+    let host = host("disk-not-freed", 1, Harness::Echo, Boot::Works);
+    std::fs::write(
+        host.vmm.staging.join("session-1"),
+        b"a file where the disk directory goes",
+    )
+    .expect("a file");
+
+    host.teardown("session-1");
+
+    let stopped = tokio::time::timeout(SETTLE, host.runner)
+        .await
+        .expect("the box runner stops")
+        .expect("the box runner ends without a panic");
+    assert!(
+        stopped
+            .as_ref()
+            .is_err_and(|error| error.starts_with("DiskNotFreed: the box of session session-1 ended, then removing")),
+        "{stopped:?}"
     );
 }
