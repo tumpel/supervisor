@@ -161,6 +161,18 @@ async fn refresh_unit(layout: &Layout) -> Result<(), Failure> {
     }
 }
 
+/// # Errors
+/// Fails when rewriting the unit, reloading systemd or reaching the systemd user manager fails.
+pub async fn take_over_unit(layout: &Layout) -> Result<(), Failure> {
+    refresh_unit(layout).await?;
+    fd_store::reach_user_manager().map_err(|error| {
+        fail(
+            SupervisorFailure::UpdateNotOnline,
+            format!("{error}; the next start puts the previous binary back"),
+        )
+    })
+}
+
 enum Ended {
     Revoked(String),
     Refused(String),
@@ -675,6 +687,9 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         Startup::Trial(pending) => Some(pending),
     };
     let on_trial = trial.is_some();
+    if handed {
+        take_over_unit(&started.layout).await?;
+    }
     let taken = taken(&started.layout, &out, handed, received)?;
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::path::Path;
 
 use sd_notify::NotifyState;
 use tumpel_api::types::SupervisorHandover;
@@ -17,6 +18,14 @@ fn systemd() -> Result<(), String> {
         return Ok(());
     }
     Err("NOTIFY_SOCKET is unset, so systemd cannot hold the box's descriptors across a restart; run the supervisor from its systemd user unit".to_string())
+}
+
+pub fn reach_user_manager() -> Result<(), String> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
+        "XDG_RUNTIME_DIR is unset, so this supervisor cannot reach the systemd user manager that holds the boxes' descriptors; run the supervisor from its systemd user unit".to_string()
+    })?;
+    std::env::set_var("NOTIFY_SOCKET", Path::new(&runtime).join("systemd").join("notify"));
+    Ok(())
 }
 
 fn remove(name: &str) -> Result<(), String> {

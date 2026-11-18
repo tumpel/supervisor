@@ -363,6 +363,29 @@ fn in_scope(pid: libc::pid_t, scope: &str) -> bool {
         .is_ok_and(|cgroups| cgroups.lines().any(|line| line.ends_with(&format!("/{scope}"))))
 }
 
+fn move_into_scope(pid: libc::pid_t, scope: &str) -> Result<(), String> {
+    let moved = std::process::Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "--unit", scope, "--"])
+        .args([
+            "/bin/sh",
+            "-c",
+            r#"echo "$1" > "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/cgroup.procs""#,
+            "sh",
+        ])
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("starting systemd-run to move Firecracker process {pid} into {scope}: {error}"))?;
+    if moved.status.success() && in_scope(pid, scope) {
+        return Ok(());
+    }
+    Err(format!(
+        "moving Firecracker process {pid} into {scope} failed with {}: {}; run the supervisor from its systemd user unit",
+        moved.status,
+        String::from_utf8_lossy(&moved.stderr).trim()
+    ))
+}
+
 fn alive(pid: libc::pid_t, scope: &str) -> Result<Owner, String> {
     let mut status = 0;
     let waited = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
@@ -476,10 +499,17 @@ impl Firecracker {
             ));
         }
         let pid = handed_pid(handed).ok_or_else(|| format!("process id {} is out of range", handed.process_id))?;
-        let owner = alive(pid, &scope_of(tap.index()))?;
+        let scope = scope_of(tap.index());
+        let owner = alive(pid, &scope)?;
         let guest = adopt(taken.guest.take(), "the guest connection", true)?;
         let stdout = adopt(taken.stdout.take(), "the box's standard output", false)?;
         let stderr = adopt(taken.stderr.take(), "the box's standard error", false)?;
+        if !in_scope(pid, &scope) {
+            move_into_scope(pid, &scope)?;
+            fd_store::keep(tap.index(), fd_store::GUEST, guest.as_fd())?;
+            fd_store::keep(tap.index(), fd_store::STDOUT, stdout.as_fd())?;
+            fd_store::keep(tap.index(), fd_store::STDERR, stderr.as_fd())?;
+        }
         let stream = std::os::unix::net::UnixStream::from(guest);
         stream
             .set_nonblocking(true)

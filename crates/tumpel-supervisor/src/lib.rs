@@ -33,8 +33,8 @@ pub use lifecycle::{
     BoxTurn, Budgets, Command, Guest, IdleGate, Input, Lifecycle, Machine, Settings, SnapshotOrder, Taken, Vmm,
 };
 pub use pool::{PoolExhausted, Tap, TapPool};
-pub use run::{run, Failure, Stopped};
+pub use run::{run, take_over_unit, Failure, Stopped};
 pub use snapshot::{Entry, Ext4Upper, Kind, Manifest, Scan, Upper};
 pub use store::{HttpStore, Store, UploadError};
 pub use telemetry::{install as install_telemetry, Telemetry};
-pub use update::on_trial;
+pub use update::{on_trial, Layout};
