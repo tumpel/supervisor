@@ -1,8 +1,7 @@
 use serde_json::json;
 
 use super::{
-    host_network, link_index, migrate_runtime, tap_index, tap_pool_size, tap_unit_text, HostNetwork, FILTER_TEXT,
-    NETWORK_MANAGER_TEXT,
+    host_network, link_index, migrate_runtime, tap_index, tap_unit_text, HostNetwork, FILTER_TEXT, NETWORK_MANAGER_TEXT,
 };
 
 #[test]
@@ -90,15 +89,6 @@ fn the_tap_unit_makes_each_device_once_for_the_supervisor_user_with_its_gateway(
     );
     assert!(!unit.contains("tumpel2"));
     assert!(unit.ends_with("[Install]\nWantedBy=multi-user.target\n"));
-}
-
-#[test]
-fn the_tap_unit_makes_64_devices_whatever_the_box_limit_so_raising_it_needs_no_root() {
-    let unit = tap_unit_text(tap_pool_size(8), "builder");
-    assert_eq!(unit, tap_unit_text(tap_pool_size(1), "builder"));
-    assert!(unit.contains("ExecStart=ip link set dev tumpel63 up\n"));
-    assert!(!unit.contains("tumpel64"));
-    assert!(tap_unit_text(tap_pool_size(100), "builder").contains("ExecStart=ip link set dev tumpel99 up\n"));
 }
 
 #[test]
