@@ -23,6 +23,15 @@ const cargoVersion = (cargo) =>
 const tumpelApiPin = (cargo) =>
   cargo.match(/^tumpel-api = "=([^"]+)"$/m)?.[1] ?? die('Cargo.toml pins no tumpel-api = "=X.Y.Z"');
 
+const schemasPin = (packageJson) =>
+  JSON.parse(packageJson).dependencies?.["@tumpel/schemas"]?.match(/tumpel-schemas-(\d+\.\d+\.\d+)\.tgz$/)?.[1] ??
+  die("package.json pins no @tumpel/schemas release tarball");
+
+export const assertProtocolPinsAgree = (schemas, api) => {
+  if (schemas !== api)
+    die(`@tumpel/schemas is ${schemas} and tumpel-api is ${api}; pin both to the same protocol release`);
+};
+
 const SHIPS = [
   /^Cargo\.(toml|lock)$/,
   /^rust-toolchain\.toml$/,
@@ -132,8 +141,7 @@ const assets = async (version, out) => {
   if (cargoVersion(cargo) !== version) die(`Cargo.toml names ${cargoVersion(cargo)}, not ${version}; stamp it first`);
   const api = tumpelApiPin(cargo);
   const schemas = JSON.parse(readFileSync(join(ROOT, "node_modules/@tumpel/schemas/package.json"), "utf8")).version;
-  if (schemas !== api)
-    die(`@tumpel/schemas is ${schemas} and tumpel-api is ${api}; pin both to the same protocol release`);
+  assertProtocolPinsAgree(schemas, api);
   mkdirSync(out, { recursive: true });
   const release = join(ROOT, "target", TARGET, "release");
   const binaries = [
@@ -162,11 +170,18 @@ const assets = async (version, out) => {
   for (const asset of [...binaries, join(out, "release.json")]) console.log(`staged ${basename(asset)}`);
 };
 
+const pins = () =>
+  assertProtocolPinsAgree(
+    schemasPin(readFileSync(join(ROOT, "package.json"), "utf8")),
+    tumpelApiPin(readFileSync(CARGO, "utf8")),
+  );
+
 const cli = async ([command, ...args]) => {
   if (command === "plan" && args.length === 1 && ["stable", "dev"].includes(args[0])) {
     const { version, ref } = await plan(args[0]);
     return `version=${version}\nref=${ref}`;
   }
+  if (command === "pins" && args.length === 0) return pins();
   if (command === "stamp" && args.length === 1) return stamp(args[0]);
   if (command === "assets" && args.length === 2) return assets(args[0], args[1]);
   if (command === "unpublished" && args.length === 1)
@@ -174,7 +189,9 @@ const cli = async ([command, ...args]) => {
       args[0],
       Object.fromEntries(await Promise.all(CRATES.map(async (c) => [c, await registryIndex(c)]))),
     ).join(" ");
-  return die("usage: release.mjs plan <stable|dev> | stamp <X.Y.Z> | assets <X.Y.Z> <dir> | unpublished <X.Y.Z>");
+  return die(
+    "usage: release.mjs pins | plan <stable|dev> | stamp <X.Y.Z> | assets <X.Y.Z> <dir> | unpublished <X.Y.Z>",
+  );
 };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
