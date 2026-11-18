@@ -20,6 +20,7 @@ const HELPER: &str =
 const PRE_PUSH: &str = include_str!("repository/pre-push.sh");
 const ASKED: &str = "TUMPEL_CLONE_CREDENTIAL_LOG";
 const RECORDER: &str = "credential.helper=!f() { printf '%s\\n' \"$1\" >> \"$TUMPEL_CLONE_CREDENTIAL_LOG\"; }; f";
+const BLOB_FILTER: &str = "--filter=blob:none";
 const PREBUILT: &str = ".git/tumpel-prebuilt";
 const START_BUDGET: &str = "TUMPEL_PREBUILD_SECONDS";
 
@@ -260,7 +261,7 @@ fn clone(
     let mut command = Command::new("git");
     confinement.apply(&mut command);
     let child = command
-        .args(["-c", RECORDER, "clone", "--quiet", "--", repository])
+        .args(["-c", RECORDER, "clone", "--quiet", BLOB_FILTER, "--", repository])
         .arg(dir)
         .env_clear()
         .envs(environment.iter().map(|(name, value)| (name, value)))
