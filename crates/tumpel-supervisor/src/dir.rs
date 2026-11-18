@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use tumpel_api::types::{BoxMemoryLimit, SupervisorChannelState, SupervisorRuntime};
+use tumpel_api::types::{BoxDiskLimit, BoxMemoryLimit, SupervisorChannelState, SupervisorRuntime};
 use tumpel_channel::{ChannelError, Store};
 
 pub const CONFIG_FILE: &str = "supervisor.json";
@@ -44,7 +44,7 @@ pub fn default_runtime() -> Result<SupervisorRuntime> {
         "warmWindowSeconds": 900,
         "vcpuCount": 2,
         "memoryMib": BoxMemoryLimit::DEFAULT_MIB,
-        "overlayMib": 8192,
+        "overlayMib": BoxDiskLimit::DEFAULT_MIB,
         "layerCacheMib": 8192,
         "budgets": { "bootSeconds": 30, "firstLineSeconds": 120, "turnSeconds": 3600, "snapshotSeconds": 60 },
         "heartbeatIntervalSeconds": 10,

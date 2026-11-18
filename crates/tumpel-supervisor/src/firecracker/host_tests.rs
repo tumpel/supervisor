@@ -7,7 +7,7 @@ use tumpel_api::types::SupervisorHandoverMachine;
 
 use super::{Firecracker, Process};
 use crate::lifecycle::Vmm;
-use crate::pool::TapPool;
+use crate::pool::{Size, TapPool};
 use crate::update::Layout;
 use crate::{fd_store, run};
 
@@ -106,9 +106,11 @@ async fn exec_handed_supervisor() {
         images: data.clone(),
         data: data.clone(),
         vcpus: 1,
-        overlay_bytes: 0,
     };
-    let mib = NonZeroU32::new(512).expect("512");
+    let mib = Size {
+        memory_mib: NonZeroU32::new(512).expect("512"),
+        disk_mib: NonZeroU32::new(64).expect("64"),
+    };
     let mut pool = TapPool::new(1024, 4096, mib);
     let old_tap = pool.claim_device(63, mib).expect("tap 63");
     let old_session = "restart-test-old".try_into().expect("session id");
