@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
-use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::path::Path;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixDatagram;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use sd_notify::NotifyState;
+use sendfd::SendWithFd;
 use tumpel_api::types::SupervisorHandover;
 
 pub const GUEST: &str = "guest";
@@ -13,41 +15,62 @@ fn name(tap: u8, role: &str) -> String {
     format!("box{tap}-{role}")
 }
 
-fn systemd() -> Result<(), String> {
-    if std::env::var_os("NOTIFY_SOCKET").is_some() {
-        return Ok(());
-    }
-    Err("NOTIFY_SOCKET is unset, so systemd cannot hold the box's descriptors across a restart; run the supervisor from its systemd user unit".to_string())
+static NOTIFY_SOCKET: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn notify_socket() -> MutexGuard<'static, Option<PathBuf>> {
+    NOTIFY_SOCKET.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// # Errors
-/// Fails when `XDG_RUNTIME_DIR` is unset.
+/// Fails when the supervisor took a handover by exec and `XDG_RUNTIME_DIR` is unset.
 ///
 /// # Safety
-/// Call it before any other thread starts: it sets `NOTIFY_SOCKET` in the environment.
-pub unsafe fn reach_user_manager() -> Result<(), String> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
-        "XDG_RUNTIME_DIR is unset, so this supervisor cannot reach the systemd user manager that holds the boxes' descriptors; run the supervisor from its systemd user unit".to_string()
-    })?;
-    std::env::set_var("NOTIFY_SOCKET", Path::new(&runtime).join("systemd").join("notify"));
+/// Call it before any other thread starts: it removes `NOTIFY_SOCKET` from the environment.
+pub unsafe fn take_notify_socket(handed: bool) -> Result<(), String> {
+    let socket = if handed {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
+            "XDG_RUNTIME_DIR is unset, so this supervisor cannot reach the systemd user manager that holds the boxes' descriptors; run the supervisor from its systemd user unit".to_string()
+        })?;
+        Some(Path::new(&runtime).join("systemd").join("notify"))
+    } else {
+        std::env::var_os("NOTIFY_SOCKET").map(PathBuf::from)
+    };
+    std::env::remove_var("NOTIFY_SOCKET");
+    *notify_socket() = socket;
     Ok(())
 }
 
+fn notify(action: &str, message: &str, fds: &[RawFd]) -> Result<(), String> {
+    let socket = notify_socket().clone().ok_or_else(|| {
+        "NOTIFY_SOCKET is unset, so systemd cannot hold the box's descriptors across a restart; run the supervisor from its systemd user unit".to_string()
+    })?;
+    let datagram = UnixDatagram::unbound().map_err(|error| format!("{action}: opening a socket failed: {error}"))?;
+    datagram
+        .connect(&socket)
+        .and_then(|()| datagram.send_with_fd(message.as_bytes(), fds))
+        .map(drop)
+        .map_err(|error| format!("{action} at {} failed: {error}", socket.display()))
+}
+
 fn remove(name: &str) -> Result<(), String> {
-    sd_notify::notify(&[NotifyState::FdStoreRemove, NotifyState::FdName(name)])
-        .map_err(|error| format!("asking systemd to drop {name}: {error}"))
+    notify(
+        &format!("asking systemd to drop {name}"),
+        &format!("FDSTOREREMOVE=1\nFDNAME={name}\n"),
+        &[],
+    )
 }
 
 pub fn keep(tap: u8, role: &str, fd: BorrowedFd<'_>) -> Result<(), String> {
-    systemd()?;
     let name = name(tap, role);
     remove(&name)?;
-    sd_notify::notify_with_fds(&[NotifyState::FdStore, NotifyState::FdName(&name)], &[fd])
-        .map_err(|error| format!("handing {name} to systemd: {error}"))
+    notify(
+        &format!("handing {name} to systemd"),
+        &format!("FDSTORE=1\nFDNAME={name}\n"),
+        &[fd.as_raw_fd()],
+    )
 }
 
 pub fn forget(tap: u8, role: &str) -> Result<(), String> {
-    systemd()?;
     remove(&name(tap, role))
 }
 
