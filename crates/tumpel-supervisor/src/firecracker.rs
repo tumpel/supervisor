@@ -363,6 +363,30 @@ fn in_scope(pid: libc::pid_t, scope: &str) -> bool {
         .is_ok_and(|cgroups| cgroups.lines().any(|line| line.ends_with(&format!("/{scope}"))))
 }
 
+fn move_into_scope(pid: libc::pid_t, scope: &str) -> Result<(), String> {
+    let moved = std::process::Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "--unit", scope, "--"])
+        .args([
+            "/bin/sh",
+            "-c",
+            r#"echo "$1" > "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/cgroup.procs""#,
+            "sh",
+        ])
+        .arg(pid.to_string())
+        .env_remove("NOTIFY_SOCKET")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("starting systemd-run to move Firecracker process {pid} into {scope}: {error}"))?;
+    if moved.status.success() && in_scope(pid, scope) {
+        return Ok(());
+    }
+    Err(format!(
+        "moving Firecracker process {pid} into {scope} failed with {}: {}; run the supervisor from its systemd user unit",
+        moved.status,
+        String::from_utf8_lossy(&moved.stderr).trim()
+    ))
+}
+
 fn alive(pid: libc::pid_t, scope: &str) -> Result<Owner, String> {
     let mut status = 0;
     let waited = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
@@ -534,7 +558,9 @@ impl Vmm for Firecracker {
         handed: &SupervisorHandoverMachine,
     ) -> Result<(FirecrackerBox, VsockGuest), String> {
         let mut taken = Taken::from(handed);
-        let attached = self.attach_box(session_id, tap, handed, &mut taken);
+        let attached = self
+            .attach_box(session_id, tap, handed, &mut taken)
+            .and_then(|(machine, guest)| machine.home(&guest).map(|()| (machine, guest)));
         if attached.is_err() {
             if let Some(pid) = handed_pid(handed) {
                 end_child(pid);
@@ -629,6 +655,27 @@ pub struct FirecrackerBox {
 }
 
 impl FirecrackerBox {
+    fn home(&self, guest: &VsockGuest) -> Result<(), String> {
+        let pid = self
+            .process
+            .as_ref()
+            .and_then(Process::id)
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+            .ok_or_else(|| "the box has no running Firecracker process".to_string())?;
+        let scope = scope_of(self.index);
+        if in_scope(pid, &scope) {
+            return Ok(());
+        }
+        move_into_scope(pid, &scope)?;
+        fd_store::keep(self.index, fd_store::GUEST, guest.stream.as_fd())?;
+        for (role, fd) in [(fd_store::STDOUT, &self.stdout), (fd_store::STDERR, &self.stderr)] {
+            if let Some(fd) = fd {
+                fd_store::keep(self.index, role, fd.as_fd())?;
+            }
+        }
+        Ok(())
+    }
+
     fn console_bytes(&self) -> Vec<u8> {
         self.console
             .lock()
@@ -663,6 +710,7 @@ impl FirecrackerBox {
         let mut child = Command::new("systemd-run")
             .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
             .arg(scope_of(self.index))
+            .env_remove("NOTIFY_SOCKET")
             .arg("--")
             .arg(&self.binary)
             .arg("--api-sock")
@@ -964,3 +1012,6 @@ impl Machine for FirecrackerBox {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "host-tests"))]
+mod host_tests;
