@@ -52,6 +52,10 @@ pub fn memory_bytes() -> Result<NonZeroU64> {
         .ok_or_else(|| anyhow!("{MEMINFO} reports no memory"))
 }
 
+pub fn memory_available_mib() -> Result<u64> {
+    Ok(meminfo_kib(&read_meminfo()?, "MemAvailable")? / 1024)
+}
+
 pub fn memory_total_and_available_mib() -> Result<(u64, u64)> {
     let meminfo = read_meminfo()?;
     Ok((

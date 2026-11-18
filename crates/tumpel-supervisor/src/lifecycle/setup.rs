@@ -141,7 +141,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             },
             Ok(Err(error)) => format!("booting setup box {} failed: {error}", *order.box_id),
             Err(_) => format!(
-                "setup box {} did not say GuestHello within {seconds} s of booting; raise budgets.bootSeconds in runtime.json",
+                "setup box {} did not say GuestHello within {seconds} s of booting; start the Claude setup again",
                 *order.box_id
             ),
         };
