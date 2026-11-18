@@ -1,14 +1,18 @@
 use chrono::{DateTime, FixedOffset, TimeDelta, Utc};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::net::IpAddr;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tumpel_api::types::{ChannelDispatchConnector, ConnectorAccessToken, Problem, ProblemCode};
 
 pub const PORT: u16 = 47160;
 const UPSTREAM_BUDGET: Duration = Duration::from_secs(10);
 const TOKEN_BUDGET: Duration = Duration::from_secs(15);
+const DRAIN_BUDGET: Duration = Duration::from_secs(5);
+const POISONED: &str = "the connector forwarder state was poisoned by a panic";
 const EARLY_SECONDS: i64 = 30;
 const HEAD_LIMIT: usize = 64 * 1024;
 const BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -53,10 +57,67 @@ struct Route {
     token: Option<Token>,
 }
 
-type Turn = Arc<Mutex<Option<HashMap<String, Route>>>>;
+struct Live {
+    generation: u64,
+    routes: HashMap<String, Route>,
+    ended: watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct State {
+    generation: u64,
+    live: Option<Live>,
+    active: usize,
+}
+
+#[derive(Default)]
+struct Shared {
+    state: Mutex<State>,
+    drained: Condvar,
+}
+
+type Turn = Arc<Shared>;
 
 pub fn route(connector_id: &str) -> String {
     format!("http://127.0.0.1:{PORT}{PREFIX}{connector_id}")
+}
+
+fn loopback(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn private(host: &str) -> bool {
+    match host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
+        Ok(IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+        Err(_) => host == "localhost" || host.ends_with(".localhost"),
+    }
+}
+
+fn destination(raw: &str, what: &str, connector_id: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(raw)
+        .map_err(|error| format!("connector {connector_id}: the {what} {raw} is not a URL: {error}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("connector {connector_id}: the {what} {raw} names no host"))?;
+    let test_loopback = cfg!(test) && loopback(host);
+    match url.scheme() {
+        "https" if !private(host) || test_loopback => Ok(raw.to_string()),
+        "http" if test_loopback => Ok(raw.to_string()),
+        _ => Err(format!(
+            "connector {connector_id}: the {what} {raw} is not a public HTTPS address, so the turn's credential would leave over the box network in the clear or to a private host"
+        )),
+    }
 }
 
 #[derive(Clone)]
@@ -89,7 +150,7 @@ impl Forwarder {
             .build()
             .map_err(|error| format!("building the connector forwarder client: {error}"))?;
         let forwarder = Self {
-            turn: Arc::new(Mutex::new(None)),
+            turn: Arc::new(Shared::default()),
         };
         let turn = Arc::clone(&forwarder.turn);
         std::thread::spawn(move || {
@@ -112,33 +173,71 @@ impl Forwarder {
     }
 
     pub fn begin(&self, connectors: &[ChannelDispatchConnector]) -> Result<(), String> {
-        let routes = connectors
-            .iter()
-            .map(|connector| {
-                (
-                    connector.connector_id.to_string(),
-                    Route {
-                        url: connector.url.clone(),
-                        token_url: connector.token_url.clone(),
-                        credential: connector.token_credential.to_string(),
-                        token: None,
-                    },
-                )
-            })
-            .collect();
-        *self
-            .turn
-            .lock()
-            .map_err(|_| "the connector forwarder state was poisoned")? = Some(routes);
+        let mut routes = HashMap::new();
+        for connector in connectors {
+            let id = connector.connector_id.to_string();
+            let route = Route {
+                url: destination(&connector.url, "connector URL", &id)?,
+                token_url: destination(&connector.token_url, "token URL", &id)?,
+                credential: connector.token_credential.to_string(),
+                token: None,
+            };
+            routes.insert(id, route);
+        }
+        let mut state = self.turn.state.lock().map_err(|_| POISONED)?;
+        if state.live.is_some() {
+            return Err("the connector forwarder began a turn while another one still runs".to_string());
+        }
+        state.generation += 1;
+        state.live = Some(Live {
+            generation: state.generation,
+            routes,
+            ended: watch::channel(false).0,
+        });
         Ok(())
     }
 
     pub fn end(&self) -> Result<(), String> {
-        *self
+        let mut state = self.turn.state.lock().map_err(|_| POISONED)?;
+        if let Some(live) = state.live.take() {
+            live.ended.send_replace(true);
+        }
+        let (state, waited) = self
             .turn
-            .lock()
-            .map_err(|_| "the connector forwarder state was poisoned")? = None;
+            .drained
+            .wait_timeout_while(state, DRAIN_BUDGET, |state| state.active > 0)
+            .map_err(|_| POISONED)?;
+        if waited.timed_out() {
+            return Err(format!(
+                "{} connector calls of the ended turn did not stop within {} s",
+                state.active,
+                DRAIN_BUDGET.as_secs()
+            ));
+        }
         Ok(())
+    }
+}
+
+struct Admission {
+    turn: Turn,
+    generation: u64,
+    ended: watch::Receiver<bool>,
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.turn.state.lock() {
+            state.active -= 1;
+        }
+        self.turn.drained.notify_all();
+    }
+}
+
+async fn turn_ended(mut ended: watch::Receiver<bool>) {
+    while !*ended.borrow_and_update() {
+        if ended.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -373,42 +472,70 @@ async fn fetch_token(
     Ok(token)
 }
 
-async fn token(turn: &Turn, client: &reqwest::Client, connector_id: &str) -> Result<(String, String), Refusal> {
-    let poisoned = || {
+fn poisoned() -> Refusal {
+    refusal(
+        500,
+        ProblemCode::ConnectorRefreshFailed,
+        "Connector forwarder failed",
+        POISONED.to_string(),
+        "Start a new turn.",
+    )
+}
+
+struct Admitted {
+    admission: Admission,
+    url: String,
+    token_url: String,
+    credential: String,
+    token: Option<String>,
+}
+
+fn admit(turn: &Turn, connector_id: &str) -> Result<Admitted, Refusal> {
+    let mut state = turn.state.lock().map_err(|_| poisoned())?;
+    let live = state.live.as_ref().ok_or_else(|| not_running(connector_id))?;
+    let route = live.routes.get(connector_id).ok_or_else(|| {
         refusal(
-            500,
-            ProblemCode::ConnectorRefreshFailed,
-            "Connector forwarder failed",
-            "the forwarder state was poisoned by a panic".to_string(),
-            "Start a new turn.",
+            404,
+            ProblemCode::NotFound,
+            "Connector not in this session",
+            format!("connector {connector_id} is not one of this session's connectors"),
+            "Use a connector the session's persona lists.",
         )
+    })?;
+    let admitted = Admitted {
+        admission: Admission {
+            turn: Arc::clone(turn),
+            generation: live.generation,
+            ended: live.ended.subscribe(),
+        },
+        url: route.url.clone(),
+        token_url: route.token_url.clone(),
+        credential: route.credential.clone(),
+        token: route
+            .token
+            .as_ref()
+            .filter(|token| fresh(token, Utc::now()))
+            .map(|token| token.value.clone()),
     };
-    let (url, token_url, credential) = {
-        let turn = turn.lock().map_err(|_| poisoned())?;
-        let routes = turn.as_ref().ok_or_else(|| not_running(connector_id))?;
-        let route = routes.get(connector_id).ok_or_else(|| {
-            refusal(
-                404,
-                ProblemCode::NotFound,
-                "Connector not in this session",
-                format!("connector {connector_id} is not one of this session's connectors"),
-                "Use a connector the session's persona lists.",
-            )
-        })?;
-        if let Some(token) = route.token.as_ref().filter(|token| fresh(token, Utc::now())) {
-            return Ok((route.url.clone(), token.value.clone()));
-        }
-        (route.url.clone(), route.token_url.clone(), route.credential.clone())
-    };
-    let fetched = fetch_token(client, connector_id, &token_url, &credential).await?;
+    state.active += 1;
+    Ok(admitted)
+}
+
+async fn token(admitted: &Admitted, client: &reqwest::Client, connector_id: &str) -> Result<String, Refusal> {
+    if let Some(token) = &admitted.token {
+        return Ok(token.clone());
+    }
+    let fetched = fetch_token(client, connector_id, &admitted.token_url, &admitted.credential).await?;
     let value = fetched.value.clone();
-    let mut turn = turn.lock().map_err(|_| poisoned())?;
-    let route = turn
+    let mut state = admitted.admission.turn.state.lock().map_err(|_| poisoned())?;
+    let route = state
+        .live
         .as_mut()
-        .and_then(|routes| routes.get_mut(connector_id))
+        .filter(|live| live.generation == admitted.admission.generation)
+        .and_then(|live| live.routes.get_mut(connector_id))
         .ok_or_else(|| not_running(connector_id))?;
     route.token = Some(fetched);
-    Ok((url, value))
+    Ok(value)
 }
 
 async fn write_refusal(stream: &mut TcpStream, refusal: &Refusal) -> std::io::Result<()> {
@@ -446,8 +573,54 @@ async fn forward(
     budget: Duration,
 ) -> Result<(), Failure> {
     let (head, body) = read_request(stream, port).await?;
+    let admitted = admit(turn, &head.connector_id)?;
+    let ended = admitted.admission.ended.clone();
+    tokio::select! {
+        biased;
+        () = turn_ended(ended) => Ok(()),
+        proxied = proxy(stream, &admitted, client, port, budget, head, body) => proxied,
+    }
+}
+
+fn upstream_failure(status: reqwest::StatusCode, id: &str, url: &str) -> Refusal {
+    let detail = format!("connector {id} at {url} answered {status}");
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => refusal(
+            502,
+            ProblemCode::ConnectorAuthRefused,
+            "Connector refused the credential",
+            detail,
+            "An Owner reconnects the connector; the turn goes on.",
+        ),
+        status if status.is_server_error() => refusal(
+            status.as_u16(),
+            ProblemCode::ConnectorUnreachable,
+            "Connector failed",
+            detail,
+            "Try the tool call again later; the turn goes on.",
+        ),
+        status => refusal(
+            status.as_u16(),
+            ProblemCode::InvalidRequest,
+            "Connector refused the request",
+            detail,
+            "Change the tool call; the turn goes on.",
+        ),
+    }
+}
+
+async fn proxy(
+    stream: &mut TcpStream,
+    admitted: &Admitted,
+    client: &reqwest::Client,
+    port: u16,
+    budget: Duration,
+    head: Head,
+    body: Vec<u8>,
+) -> Result<(), Failure> {
     let id = head.connector_id.as_str();
-    let (url, access_token) = token(turn, client, id).await?;
+    let url = admitted.url.as_str();
+    let access_token = token(admitted, client, id).await?;
     let unreachable = |detail: String| {
         refusal(
             502,
@@ -457,7 +630,7 @@ async fn forward(
             "Try the tool call again later; the turn goes on.",
         )
     };
-    let mut request = client.request(head.method, &url).bearer_auth(&access_token).body(body);
+    let mut request = client.request(head.method, url).bearer_auth(&access_token).body(body);
     for (name, value) in head.headers {
         request = request.header(name, value);
     }
@@ -467,15 +640,25 @@ async fn forward(
         Ok(Ok(response)) => response,
     };
     let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(refusal(
-            502,
-            ProblemCode::ConnectorAuthRefused,
-            "Connector refused the credential",
-            format!("connector {id} at {url} answered {status}"),
-            "An Owner reconnects the connector; the turn goes on.",
-        )
+    if status.is_redirection() {
+        let location = response.headers().get(reqwest::header::LOCATION);
+        if location.is_some_and(|location| location.as_bytes() == url.as_bytes()) {
+            let head = format!(
+                "HTTP/1.1 {} {}\r\nlocation: http://127.0.0.1:{port}{PREFIX}{id}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("")
+            );
+            stream.write_all(head.as_bytes()).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+        return Err(unreachable(format!(
+            "answered {status} with a redirect to another address, which the forwarder never follows"
+        ))
         .into());
+    }
+    if !status.is_success() {
+        return Err(upstream_failure(status, id, url).into());
     }
     let mut head = format!(
         "HTTP/1.1 {} {}\r\n",
@@ -484,13 +667,7 @@ async fn forward(
     )
     .into_bytes();
     for (name, value) in response.headers() {
-        if !forwarded(name.as_str(), &DROPPED_RESPONSE) {
-            continue;
-        }
-        if name == reqwest::header::LOCATION {
-            if value.as_bytes() == url.as_bytes() {
-                head.extend_from_slice(format!("location: http://127.0.0.1:{port}{PREFIX}{id}\r\n").as_bytes());
-            }
+        if !forwarded(name.as_str(), &DROPPED_RESPONSE) || name == reqwest::header::LOCATION {
             continue;
         }
         head.extend_from_slice(name.as_str().as_bytes());

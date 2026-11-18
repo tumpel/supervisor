@@ -8,11 +8,13 @@ use tumpel_api::types::{ChannelDispatchConnector, GuestHarnessProtocol};
 use crate::forwarder;
 
 const CACHES: &str = "/run/tumpel/connectors/caches";
-const OAUTH_CACHES: [&str; 3] = [
+const OAUTH_FILES: [&str; 4] = [
     ".claude/.credentials.json",
+    ".claude/mcp-needs-auth-cache.json",
     ".codex/.credentials.json",
     ".local/share/opencode/mcp-auth.json",
 ];
+const OAUTH_DIRECTORIES: [&str; 1] = [".codex/secrets"];
 pub const OPENCODE_CONFIG: &str = "OPENCODE_CONFIG_CONTENT";
 
 fn servers(connectors: &[ChannelDispatchConnector]) -> Vec<(String, String)> {
@@ -104,24 +106,76 @@ fn bind(source: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn mask_oauth_caches(home: &Path) -> Result<(), String> {
+fn masked(path: &str) -> bool {
+    OAUTH_FILES.contains(&path)
+        || OAUTH_DIRECTORIES
+            .iter()
+            .any(|directory| Path::new(path).starts_with(directory))
+}
+
+pub fn mask_oauth_caches(home: &Path, credential_file: Option<&str>) -> Result<(), String> {
+    if let Some(path) = credential_file.filter(|path| masked(path)) {
+        return Err(format!(
+            "the turn's credential file {path} is a native MCP OAuth store the box keeps empty while connectors run; store that credential under another path"
+        ));
+    }
     std::fs::create_dir_all(CACHES).map_err(|error| format!("creating {CACHES}: {error}"))?;
-    for relative in OAUTH_CACHES {
+    for relative in OAUTH_FILES {
         let target = home.join(relative);
         let source = Path::new(CACHES).join(relative.replace('/', "_"));
         let parent = target
             .parent()
             .ok_or_else(|| format!("{} has no parent", target.display()))?;
         std::fs::create_dir_all(parent).map_err(|error| format!("creating {}: {error}", parent.display()))?;
-        match std::fs::copy(&target, &source) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::write(&source, b"{}").map_err(|error| format!("creating {}: {error}", source.display()))?;
-                std::fs::write(&target, b"{}").map_err(|error| format!("creating {}: {error}", target.display()))?;
-            }
-            Err(error) => return Err(format!("copying {} to {}: {error}", target.display(), source.display())),
+        std::fs::write(&source, b"{}").map_err(|error| format!("creating {}: {error}", source.display()))?;
+        if !target.exists() {
+            std::fs::write(&target, b"{}").map_err(|error| format!("creating {}: {error}", target.display()))?;
         }
         bind(&source, &target)?;
+    }
+    for relative in OAUTH_DIRECTORIES {
+        let target = home.join(relative);
+        let source = Path::new(CACHES).join(relative.replace('/', "_"));
+        for directory in [&source, &target] {
+            std::fs::create_dir_all(directory).map_err(|error| format!("creating {}: {error}", directory.display()))?;
+        }
+        bind(&source, &target)?;
+    }
+    Ok(())
+}
+
+fn harness_configs(protocol: GuestHarnessProtocol) -> &'static [&'static str] {
+    match protocol {
+        GuestHarnessProtocol::ClaudeStreamJson => &[".claude.json"],
+        GuestHarnessProtocol::CodexExecJson => &[".codex/config.toml"],
+        GuestHarnessProtocol::PromptOnStdin => &[".config/opencode/opencode.json", ".config/opencode/opencode.jsonc"],
+        GuestHarnessProtocol::PiRpc | GuestHarnessProtocol::ShellLines => &[],
+    }
+}
+
+pub fn refuse_reserved(
+    protocol: GuestHarnessProtocol,
+    home: &Path,
+    connectors: &[ChannelDispatchConnector],
+) -> Result<(), String> {
+    let keys = ids(connectors);
+    for relative in harness_configs(protocol) {
+        let path = home.join(relative);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "reading {} to check its MCP server names: {error}",
+                    path.display()
+                ))
+            }
+        };
+        if let Some(key) = keys.iter().find(|key| text.contains(key.as_str())) {
+            return Err(format!(
+                "{relative} in the persona already names {key}, the name this session's connector takes; rename that MCP server in the persona"
+            ));
+        }
     }
     Ok(())
 }

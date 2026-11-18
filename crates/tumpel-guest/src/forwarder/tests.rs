@@ -7,7 +7,7 @@ use chrono::{TimeDelta, Utc};
 use serde_json::json;
 use tumpel_api::types::ChannelDispatchConnector;
 
-use super::{fresh, Forwarder, Token};
+use super::{destination, fresh, Forwarder, Token};
 
 const CONNECTOR: &str = "01HZY8Q6V0M1C2D3E4F5G6H7J8";
 
@@ -248,4 +248,109 @@ fn a_harness_that_hangs_up_mid_stream_closes_the_upstream_stream() {
         ),
         "{kind:?}"
     );
+}
+
+#[test]
+fn only_a_public_https_destination_takes_a_credential() {
+    assert!(destination("https://mcp.example.com/mcp", "connector URL", "A1").is_ok());
+    for refused in [
+        "http://mcp.example.com/mcp",
+        "https://10.1.2.3/mcp",
+        "https://169.254.169.254/token",
+        "https://[fd00::1]/mcp",
+        "ftp://mcp.example.com/mcp",
+    ] {
+        let error = destination(refused, "connector URL", "A1").expect_err(refused);
+        assert!(error.contains("public HTTPS"), "{error}");
+    }
+}
+
+#[test]
+fn an_upstream_error_or_foreign_redirect_reaches_the_harness_only_as_a_problem() {
+    let (port, _) = upstream(vec![
+        ("/token", token_answer("access-1")),
+        (
+            "/mcp",
+            "HTTP/1.1 500 Internal Server Error\r\nconnection: close\r\nx-provider-trace: abc\r\ncontent-type: text/html\r\ncontent-length: 23\r\n\r\n<pre>stack trace</pre>\n".to_string(),
+        ),
+    ]);
+    let (forwarder, forwarder_port) = Forwarder::listen(0, Duration::from_secs(10)).expect("the forwarder starts");
+    forwarder.begin(&[connector(port)]).expect("the turn begins");
+    let failed = call(forwarder_port, "");
+    assert!(failed.starts_with("HTTP/1.1 500"), "{failed}");
+    assert!(failed.contains("ConnectorUnreachable"), "{failed}");
+    assert!(
+        !failed.contains("stack trace") && !failed.contains("x-provider-trace"),
+        "{failed}"
+    );
+    forwarder.end().expect("the turn ends");
+
+    let (port, _) = upstream(vec![
+        ("/token", token_answer("access-1")),
+        (
+            "/mcp",
+            "HTTP/1.1 307 Temporary Redirect\r\nconnection: close\r\nlocation: https://elsewhere.example.com/mcp\r\ncontent-length: 0\r\n\r\n".to_string(),
+        ),
+    ]);
+    forwarder.begin(&[connector(port)]).expect("the next turn begins");
+    let redirected = call(forwarder_port, "");
+    assert!(redirected.starts_with("HTTP/1.1 502"), "{redirected}");
+    assert!(!redirected.contains("elsewhere.example.com"), "{redirected}");
+}
+
+#[test]
+fn a_turn_end_cancels_its_calls_and_a_late_token_never_reaches_the_next_turn() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("the fake upstream binds");
+    let port = listener.local_addr().expect("the fake upstream has an address").port();
+    let (fetched, first_fetch) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        let mut slow = listener
+            .incoming()
+            .next()
+            .expect("turn A's fetch")
+            .expect("it connects");
+        read_request(&mut slow);
+        fetched.send(()).expect("the first fetch is reported");
+        let mut fast = listener
+            .incoming()
+            .next()
+            .expect("turn B's fetch")
+            .expect("it connects");
+        read_request(&mut fast);
+        fast.write_all(token_answer("access-B").as_bytes())
+            .expect("turn B's token answers");
+        let mut call = listener.incoming().next().expect("turn B's call").expect("it connects");
+        recorded.lock().expect("the record lock").push(read_request(&mut call));
+        call.write_all(
+            b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
+        )
+        .expect("turn B's call answers");
+        released.recv().expect("the test releases turn A's fetch");
+        if let Err(error) = slow.write_all(token_answer("access-A").as_bytes()) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+                "{error}"
+            );
+        }
+    });
+    let (forwarder, forwarder_port) = Forwarder::listen(0, Duration::from_secs(10)).expect("the forwarder starts");
+    forwarder.begin(&[connector(port)]).expect("turn A begins");
+    let turn_a = std::thread::spawn(move || call(forwarder_port, ""));
+    first_fetch
+        .recv_timeout(Duration::from_secs(5))
+        .expect("turn A fetches a token");
+    forwarder.end().expect("turn A ends at once, its call cancelled");
+    assert!(!turn_a.join().expect("turn A's caller").starts_with("HTTP/1.1 200"));
+    forwarder.begin(&[connector(port)]).expect("turn B begins");
+    let turn_b = call(forwarder_port, "");
+    release.send(()).expect("turn A's fetch is released");
+    assert!(turn_b.starts_with("HTTP/1.1 200"), "{turn_b}");
+    let seen = seen.lock().expect("the record lock");
+    assert!(seen[0].contains("authorization: Bearer access-B"), "{seen:?}");
 }

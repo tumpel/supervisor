@@ -737,6 +737,7 @@ impl GuestState {
 
     fn spawn(&self, start: &GuestTurnStart) -> Result<Harness, String> {
         let written = write_files(&self.home, &start.files, &read_written()?)?;
+        connectors::refuse_reserved(self.config.protocol, &self.home, &start.credential.connectors)?;
         std::fs::create_dir_all(STATE_DIR).map_err(|error| format!("creating {STATE_DIR}: {error}"))?;
         std::fs::write(
             WRITTEN_FILE,
@@ -846,8 +847,10 @@ impl GuestState {
     pub fn run(&mut self, start: &GuestTurnStart, host: &mut (impl Write + AsFd)) -> Result<(), String> {
         self.last_line_seq = start.last_line_seq.0;
         let first = self.last_line_seq;
-        self.forwarder.begin(&start.credential.connectors)?;
-        let ending = self.turn(start, host);
+        let ending = match self.forwarder.begin(&start.credential.connectors) {
+            Ok(()) => self.turn(start, host),
+            Err(error) => Ok(ended(GuestTurnEndReason::HarnessStartFailed, error)),
+        };
         self.forwarder.end()?;
         let credential_file = self.take_credential()?;
         let ending = match ending {
@@ -943,7 +946,8 @@ impl GuestState {
         write_constraints(self.memory.box_mib, start.turn_seconds)?;
         self.write_credential(start)?;
         if !self.caches_masked && !start.credential.connectors.is_empty() {
-            connectors::mask_oauth_caches(&self.home)?;
+            let credential_file = start.credential.credential_file.as_ref().map(|file| file.path.as_str());
+            connectors::mask_oauth_caches(&self.home, credential_file)?;
             self.caches_masked = true;
         }
         self.harness_for(start)
