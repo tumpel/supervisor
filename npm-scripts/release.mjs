@@ -27,6 +27,7 @@ const SHIPS = [
   /^Cargo\.(toml|lock)$/,
   /^rust-toolchain\.toml$/,
   /^npm-scripts\/guest-drive\.mjs$/,
+  /^package\.json$/,
   /^crates\/[^/]+\/(Cargo\.toml|build\.rs|release_version\.rs|src\/.+)$/,
 ];
 
@@ -55,14 +56,16 @@ export const nextVersion = (latest, commits) => {
   return `${major}.${minor}.${patch + 1}`;
 };
 
-export const devVersion = (latest, sinceLatest, pushed) => {
+export const devVersion = (latest, sinceLatest, sinceNearest) => {
   const next = nextVersion(latest, sinceLatest);
-  if (!next || !pushed.some(({ files }) => files.some(ships))) return "";
+  if (!next || !sinceNearest.some(({ files }) => files.some(ships))) return "";
   return `${next}-main.${sinceLatest.length}`;
 };
 
-export const promotion = (tags) => {
-  const latest = semver(latestTag(tags));
+export const promotion = (tags, latestReleased) => {
+  const tag = latestTag(tags);
+  if (!latestReleased) return { version: tag.slice(1), ref: tag };
+  const latest = semver(tag);
   const dev = tags
     .map((tag) => tag.match(DEV))
     .filter((match) => match && order(parts(match[1]), latest) > 0)
@@ -82,18 +85,26 @@ const commitsIn = (range) =>
       return { message: message.trim(), files: files.split("\n").filter(Boolean) };
     });
 
-const plan = (build, before) => {
+const published = async (tag) => {
+  const response = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/releases/tags/${tag}`, {
+    headers: { authorization: `Bearer ${process.env.GH_TOKEN}` },
+  });
+  if (response.status === 404) return false;
+  if (!response.ok) die(`GitHub answered ${response.status} for the release ${tag}`);
+  return true;
+};
+
+const plan = async (build) => {
   const tags = git("tag", "--list", "v*").split("\n").filter(Boolean);
-  if (build === "stable") return promotion(tags);
   const latest = latestTag(tags);
-  const version = devVersion(latest, commitsIn(`${latest}..HEAD`), commitsIn(`${before}..HEAD`));
+  if (build === "stable") return promotion(tags, await published(latest));
+  const nearest = git("describe", "--tags", "--abbrev=0", "--match", "v*").trim();
+  const version = devVersion(latest, commitsIn(`${latest}..HEAD`), commitsIn(`${nearest}..HEAD`));
   return { version, ref: version && git("rev-parse", "HEAD").trim() };
 };
 
 export const unpublished = (version, indexes) =>
-  CRATES.filter(
-    (crate) => !(indexes[crate] ?? "").split("\n").some((line) => line && JSON.parse(line).vers === version),
-  );
+  CRATES.filter((crate) => !indexes[crate].split("\n").some((line) => line && JSON.parse(line).vers === version));
 
 const registryIndex = async (crate) => {
   const response = await fetch(`https://index.crates.io/${crate.slice(0, 2)}/${crate.slice(2, 4)}/${crate}`);
@@ -152,8 +163,8 @@ const assets = async (version, out) => {
 };
 
 const cli = async ([command, ...args]) => {
-  if (command === "plan" && (args[0] === "stable" ? args.length === 1 : args[0] === "dev" && args.length === 2)) {
-    const { version, ref } = plan(args[0], args[1]);
+  if (command === "plan" && args.length === 1 && ["stable", "dev"].includes(args[0])) {
+    const { version, ref } = await plan(args[0]);
     return `version=${version}\nref=${ref}`;
   }
   if (command === "stamp" && args.length === 1) return stamp(args[0]);
@@ -163,9 +174,7 @@ const cli = async ([command, ...args]) => {
       args[0],
       Object.fromEntries(await Promise.all(CRATES.map(async (c) => [c, await registryIndex(c)]))),
     ).join(" ");
-  return die(
-    "usage: release.mjs plan stable | plan dev <before> | stamp <X.Y.Z> | assets <X.Y.Z> <dir> | unpublished <X.Y.Z>",
-  );
+  return die("usage: release.mjs plan <stable|dev> | stamp <X.Y.Z> | assets <X.Y.Z> <dir> | unpublished <X.Y.Z>");
 };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

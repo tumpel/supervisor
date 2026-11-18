@@ -9,11 +9,11 @@ test("crate sources, manifests and what builds the binary ship; docs, tests and 
   assert.equal(ships("crates/tumpel-channel/Cargo.toml"), true);
   assert.equal(ships("Cargo.lock"), true);
   assert.equal(ships("npm-scripts/guest-drive.mjs"), true);
+  assert.equal(ships("package.json"), true);
   assert.equal(ships("crates/tumpel-supervisor/tests/lifecycle.rs"), false);
   assert.equal(ships("README.md"), false);
   assert.equal(ships(".github/workflows/release.yml"), false);
   assert.equal(ships("npm-scripts/release.mjs"), false);
-  assert.equal(ships("package.json"), false);
 });
 
 test("commits that change nothing shipped cut no release, whatever their type", () => {
@@ -54,7 +54,7 @@ test("the latest stable release is the highest vX.Y.Z tag, never a dev build", (
   assert.throws(() => latestTag(["vnext"]), /no vX.Y.Z tag/);
 });
 
-test("a push that changes shipped files builds a dev version of the next stable release", () => {
+test("shipped changes since the newest reachable tag build a dev version of the next stable release", () => {
   const fix = { message: "fix(pool): adopt a box", files: ["crates/tumpel-supervisor/src/pool.rs"] };
   const docs = { message: "docs: explain pools", files: ["README.md"] };
   const feat = { message: "feat(turn): end a turn", files: ["crates/tumpel-guest/src/turn.rs"] };
@@ -62,7 +62,13 @@ test("a push that changes shipped files builds a dev version of the next stable 
   assert.equal(devVersion("v0.1.18", [feat, docs, fix], [feat]), "0.2.0-main.3");
 });
 
-test("a push that changes no shipped file builds nothing, even after shipped changes", () => {
+test("a docs push still builds the shipped change before it that has no dev build yet", () => {
+  const fix = { message: "fix(pool): adopt a box", files: ["crates/tumpel-supervisor/src/pool.rs"] };
+  const docs = { message: "docs: explain pools", files: ["README.md"] };
+  assert.equal(devVersion("v0.1.18", [docs, fix], [docs, fix]), "0.1.19-main.2");
+});
+
+test("no shipped change since the newest reachable tag builds nothing", () => {
   const fix = { message: "fix(pool): adopt a box", files: ["crates/tumpel-supervisor/src/pool.rs"] };
   const docs = { message: "docs: explain pools", files: ["README.md"] };
   assert.equal(devVersion("v0.1.18", [docs, fix], [docs]), "");
@@ -70,19 +76,30 @@ test("a push that changes no shipped file builds nothing, even after shipped cha
 });
 
 test("the newest dev build after the latest stable release is promoted to its stable version", () => {
-  assert.deepEqual(promotion(["v0.1.18", "v0.1.19-main.2", "v0.1.19-main.10", "v0.1.19-main.9"]), {
+  assert.deepEqual(promotion(["v0.1.18", "v0.1.19-main.2", "v0.1.19-main.10", "v0.1.19-main.9"], true), {
     version: "0.1.19",
     ref: "v0.1.19-main.10",
   });
-  assert.deepEqual(promotion(["v0.1.18", "v0.1.19-main.2", "v0.2.0-main.5"]), {
+  assert.deepEqual(promotion(["v0.1.18", "v0.1.19-main.2", "v0.2.0-main.5"], true), {
     version: "0.2.0",
     ref: "v0.2.0-main.5",
   });
 });
 
+test("a stable tag without a published release is finished before any newer dev build is promoted", () => {
+  assert.deepEqual(promotion(["v0.1.21", "v0.1.22-main.5", "v0.1.22-main.8"], true), {
+    version: "0.1.22",
+    ref: "v0.1.22-main.8",
+  });
+  assert.deepEqual(promotion(["v0.1.21", "v0.1.22-main.5", "v0.1.22", "v0.1.23-main.8"], false), {
+    version: "0.1.22",
+    ref: "v0.1.22",
+  });
+});
+
 test("nothing is promoted once the newest dev build has its stable release", () => {
-  assert.deepEqual(promotion(["v0.1.18", "v0.1.19-main.4", "v0.1.19"]), { version: "", ref: "" });
-  assert.deepEqual(promotion(["v0.1.18", "v0.1.18-main.3"]), { version: "", ref: "" });
+  assert.deepEqual(promotion(["v0.1.18", "v0.1.19-main.4", "v0.1.19"], true), { version: "", ref: "" });
+  assert.deepEqual(promotion(["v0.1.18", "v0.1.18-main.3"], true), { version: "", ref: "" });
 });
 
 test("crates already on crates.io at the version are skipped, in publish order", () => {

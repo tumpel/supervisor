@@ -34,12 +34,11 @@ jobs:
           node-version: 24
 
       - id: plan
-        name: Plan a dev build of this push, or the daily promotion of the newest dev build to stable
+        name: Plan a dev build of main, or the daily stable release of the newest dev build
         env:
           BUILD: ${{ github.event_name == 'schedule' && 'stable' || 'dev' }}
-          BEFORE: ${{ github.event.before }}
-        run: |
-          node npm-scripts/release.mjs plan "$BUILD" ${BEFORE:+"$BEFORE"} | tee -a "$GITHUB_OUTPUT"
+          GH_TOKEN: ${{ github.token }}
+        run: node npm-scripts/release.mjs plan "$BUILD" | tee -a "$GITHUB_OUTPUT"
 
   release:
     needs: plan
@@ -54,6 +53,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.plan.outputs.ref }}
+
+      - name: Take the release script from the workflow's commit
+        run: |
+          git fetch -q --depth 1 origin "$GITHUB_SHA"
+          git checkout FETCH_HEAD -- npm-scripts/release.mjs
 
       - uses: actions/setup-node@v7
         with:
@@ -72,23 +76,27 @@ jobs:
 
       - name: Build the static guest, the guest drive and the supervisor
         env:
-          TUMPEL_RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          TUMPEL_RELEASE_VERSION: ${{ env.VERSION }}
           TUMPEL_TARGET: ${{ env.TARGET }}
         run: npm run supervisor:build
 
       - name: Stage the binaries, their sha256, release.json and the crate's guest drive
         run: node npm-scripts/release.mjs assets "$VERSION" .tmp/release
 
+      - name: Package the crates
+        run: cargo publish --dry-run --allow-dirty -p tumpel-channel -p tumpel-guest -p tumpel-supervisor
+
+      - if: env.STABLE == 'true'
+        name: Tag the stable release before anything is published
+        run: |
+          git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null && exit 0
+          git tag "$TAG" HEAD
+          git push origin "refs/tags/$TAG"
+
       - id: crates
         if: env.STABLE == 'true'
         name: List the crates crates.io lacks at this version
         run: echo "unpublished=$(node npm-scripts/release.mjs unpublished "$VERSION")" >> "$GITHUB_OUTPUT"
-
-      - if: steps.crates.outputs.unpublished != ''
-        name: Package the crates before anything is published
-        env:
-          CRATES: ${{ steps.crates.outputs.unpublished }}
-        run: cargo publish --dry-run --allow-dirty $(printf -- '-p %s ' $CRATES)
 
       - if: steps.crates.outputs.unpublished != ''
         name: Publish the crates crates.io lacks
@@ -97,14 +105,18 @@ jobs:
           CRATES: ${{ steps.crates.outputs.unpublished }}
         run: cargo publish --allow-dirty $(printf -- '-p %s ' $CRATES)
 
-      - name: Tag the commit and publish the GitHub release with the binaries
+      - name: Publish the GitHub release with the binaries
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$STABLE" = true ]; then kind=(--latest); else kind=(--prerelease --latest=false); fi
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" .tmp/release/* --clobber
-            gh release edit "$TAG" --draft=false "${kind[@]}"
+          if [ "$STABLE" = true ]; then
+            create=(--verify-tag) kind=(--latest)
           else
-            gh release create "$TAG" .tmp/release/* --target "$(git rev-parse HEAD)" --title "$TAG" --generate-notes "${kind[@]}"
+            create=(--target "$(git rev-parse HEAD)") kind=(--prerelease --latest=false)
           fi
+          draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          case "$draft" in
+            none) gh release create "$TAG" .tmp/release/* --title "$TAG" --generate-notes "${create[@]}" "${kind[@]}" ;;
+            true) gh release upload "$TAG" .tmp/release/* --clobber && gh release edit "$TAG" --draft=false "${kind[@]}" ;;
+            *) echo "release: $TAG is already published; its binaries stay as they are" >&2; exit 1 ;;
+          esac
