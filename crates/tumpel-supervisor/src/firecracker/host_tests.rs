@@ -96,7 +96,7 @@ async fn exec_handed_supervisor() {
         stdout_fd: stdout.into_raw_fd(),
         vsock: data.join("box63").join("v.sock").display().to_string(),
     };
-    unsafe { fd_store::reach_user_manager() }.expect("the user manager's notify socket");
+    unsafe { fd_store::take_notify_socket(true) }.expect("the user manager's notify socket");
     let layout = Layout::new(data.join("tumpel-supervisor"), data.clone(), unit_path());
     if let Err(failure) = run::refresh_unit(&layout, "the restart test fails").await {
         panic!("{}: {}", failure.kind, failure.detail);

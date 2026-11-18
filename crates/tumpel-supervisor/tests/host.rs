@@ -7,8 +7,8 @@ use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tumpel_api::types::{ChannelHostMessage, GuestImageManifest, Sequence, SupervisorRuntime};
 use tumpel_supervisor::{
-    restored_descriptors, BootOrder, BoxTurn, Budgets, Command, Ext4Upper, Firecracker, HttpStore, ImageOrder, Input,
-    Lifecycle, Settings, Taken, TapPool, Upper,
+    restored_descriptors, take_notify_socket, BootOrder, BoxTurn, Budgets, Command, Ext4Upper, Firecracker, HttpStore,
+    ImageOrder, Input, Lifecycle, Settings, Taken, TapPool, Upper,
 };
 
 #[cfg(test)]
@@ -103,6 +103,7 @@ async fn a_shell_box_runs_a_turn_pauses_resumes_warm_and_its_drive_reads_back() 
     std::fs::create_dir_all(&data).expect("the data directory");
     let _systemd = std::os::unix::net::UnixDatagram::bind(data.join("notify.sock")).expect("a stand-in for systemd");
     std::env::set_var("NOTIFY_SOCKET", data.join("notify.sock"));
+    unsafe { take_notify_socket(false) }.expect("the stand-in notify socket");
     let runtime: SupervisorRuntime = serde_json::from_value(json!({
         "firecrackerPath": std::env::var("TUMPEL_FIRECRACKER").map_or_else(|_| home().join(".local/bin/firecracker"), PathBuf::from),
         "imageCacheDir": manifest_path.parent().expect("cache dir"),
@@ -257,6 +258,7 @@ fn crash_paths() -> (PathBuf, PathBuf) {
 #[tokio::test]
 #[ignore = "the crashing supervisor of the crash host test; that test starts it and kills it mid-turn"]
 async fn crashing_supervisor() {
+    unsafe { take_notify_socket(false) }.expect("the stand-in notify socket");
     let (data, manifest_path) = crash_paths();
     let image: GuestImageManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("manifest"))
         .expect("a GuestImageManifest");
@@ -325,6 +327,7 @@ async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_i
     );
 
     std::env::set_var("NOTIFY_SOCKET", data.join("notify.sock"));
+    unsafe { take_notify_socket(false) }.expect("the stand-in notify socket");
     let mut descriptors = stored(&systemd);
     let record = restored_descriptors(record, &mut descriptors);
     let (runtime, settings) = crash_runtime(&data, &manifest_path);
