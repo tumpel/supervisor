@@ -1,9 +1,11 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use tumpel_api::types::RepositoryCloneFailureCause;
 
 use super::{git_environment, CloneFailure, GH_WRAPPER};
@@ -510,19 +512,97 @@ fn the_pre_push_hook_refuses_the_default_branch_and_force_pushes_and_lets_a_new_
     );
 }
 
+fn serving_with_token(project_root: &Path, token: &str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a local port is bound");
+    let port = listener.local_addr().expect("the port is known").port();
+    let project_root = project_root.to_path_buf();
+    let authorization = format!("Basic {}", STANDARD.encode(format!("x-access-token:{token}")));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut reader = BufReader::new(stream.try_clone().expect("the stream is cloned"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("the request line is read");
+            let mut headers = Vec::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 0) && line != "\r\n" {
+                if let Some((name, value)) = line.trim_end().split_once(": ") {
+                    headers.push((name.to_ascii_lowercase(), value.to_string()));
+                }
+                line.clear();
+            }
+            let header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(found, _)| found == name)
+                    .map_or(String::new(), |(_, value)| value.clone())
+            };
+            if header("authorization") != authorization {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"acme\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            let mut body = vec![0; header("content-length").parse().unwrap_or(0)];
+            reader.read_exact(&mut body).expect("the request body is read");
+            let mut parts = request.split_whitespace();
+            let method = parts.next().expect("the request has a method");
+            let target = parts.next().expect("the request has a target");
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let mut backend = Command::new("git")
+                .arg("http-backend")
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_HTTP_EXPORT_ALL", "1")
+                .env("GIT_PROJECT_ROOT", &project_root)
+                .env("REQUEST_METHOD", method)
+                .env("PATH_INFO", path)
+                .env("QUERY_STRING", query)
+                .env("CONTENT_TYPE", header("content-type"))
+                .env("HTTP_CONTENT_ENCODING", header("content-encoding"))
+                .env("GIT_PROTOCOL", header("git-protocol"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("git http-backend runs");
+            backend
+                .stdin
+                .take()
+                .expect("git http-backend reads standard input")
+                .write_all(&body)
+                .expect("the request body is passed on");
+            let output = backend.wait_with_output().expect("git http-backend ends");
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n");
+            let _ = stream.write_all(&output.stdout);
+        }
+    });
+    port
+}
+
 #[test]
 fn a_prebuild_pins_its_commit_and_the_first_turn_restored_from_it_pulls_the_branch_and_starts_once() {
     let root = scratch("prebuild");
-    let environment = box_environment(&root, None);
+    let port = serving_with_token(&root, "ghp-prebuild");
+    let mut environment = box_environment(&root, Some("ghp-prebuild"));
+    environment.retain(|(name, _)| name != "GIT_CONFIG_COUNT");
+    environment.extend([
+        ("GIT_CONFIG_COUNT".to_string(), "2".to_string()),
+        (
+            "GIT_CONFIG_KEY_1".to_string(),
+            format!("credential.http://127.0.0.1:{port}.helper"),
+        ),
+        ("GIT_CONFIG_VALUE_1".to_string(), super::HELPER.to_string()),
+    ]);
     let source = public_repository(&root, &environment);
     git(&source, &environment, &["switch", "--quiet", "trunk"]);
     let recorded = text(&git(&source, &environment, &["rev-parse", "HEAD"]));
-    std::fs::write(source.join("LATER.md"), "later\n").expect("a file is written");
-    git(&source, &environment, &["add", "LATER.md"]);
+    std::fs::write(source.join("README.md"), "later\n").expect("a file is written");
+    git(&source, &environment, &["add", "README.md"]);
     git(&source, &environment, &["commit", "--quiet", "-m", "feat: later"]);
     let work = root.join("workspace");
     git(&source, &environment, &["config", "uploadpack.allowFilter", "true"]);
-    let url = format!("file://{}", source.display());
+    let url = format!("http://127.0.0.1:{port}/source");
     let start = root.join("prebuild.mjs");
     std::fs::write(&start, "#!/bin/sh\ntest -f NEWEST.md && echo \"$1\" >> ../started\n")
         .expect("the start script is written");
@@ -538,6 +618,10 @@ fn a_prebuild_pins_its_commit_and_the_first_turn_restored_from_it_pulls_the_bran
             &["config", "remote.origin.partialclonefilter"]
         )),
         "blob:none"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.join("README.md")).expect("the pinned file is checked out"),
+        "hello\n"
     );
     assert_eq!(text(&git(&work, &environment, &["branch", "--show-current"])), "trunk");
     std::fs::write(source.join("NEWEST.md"), "newest\n").expect("a file is written");
