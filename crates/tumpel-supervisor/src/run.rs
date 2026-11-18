@@ -342,7 +342,6 @@ fn start_boxes(
     let pool = TapPool::new(memory_budget_mib(total_mib), box_size);
     let settings = Settings {
         budgets: Budgets::from(&runtime.budgets),
-        warm_window: Duration::from_secs(u64::from(runtime.warm_window_seconds.get())),
         layer_cache_mib: runtime.layer_cache_mib,
     };
     let box_capacity = pool.capacity();
