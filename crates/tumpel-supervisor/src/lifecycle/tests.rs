@@ -65,6 +65,9 @@ impl Upper for Tree {
 
     fn open(&self, path: &[u8]) -> Result<Box<dyn Read + '_>, String> {
         let (_, text) = self.0.get(path).ok_or("no such file")?;
+        if path.starts_with(b"root/slow") {
+            std::thread::sleep(SLOW_CUT);
+        }
         Ok(Box::new(Cursor::new(text.clone())))
     }
 }
@@ -534,6 +537,7 @@ const BOX: Size = Size {
 const SETTLE: Duration = Duration::from_millis(60);
 const SLOW_CLONE: Duration = Duration::from_millis(300);
 const SLOW_BOOT: Duration = Duration::from_millis(50);
+const SLOW_CUT: Duration = Duration::from_millis(300);
 const LATE_CLAIM: Duration = Duration::from_millis(150);
 const STALLED_CLAIM: Duration = Duration::from_secs(600);
 
@@ -1193,6 +1197,17 @@ async fn a_paused_box_outlives_any_delay() {
         host.log(),
         ["resume session-1", "reconnect session-1", "pause session-1"]
     );
+}
+
+#[tokio::test]
+async fn a_snapshot_whose_drive_reads_past_the_snapshot_budget_is_stored_before_its_upload_deadline() {
+    let mut fast = settings();
+    fast.budgets.snapshot = Duration::from_millis(50);
+    let mut host = host_with("slow-cut", 1, Harness::Echo, Boot::Works, fast, 120);
+    host.turn("slow-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.snapshot("session-1");
+    assert_eq!(host.settle(SLOW_CUT * 2).await, ["snapshot done"]);
 }
 
 fn pack_uploads(uploads: &[String]) -> usize {

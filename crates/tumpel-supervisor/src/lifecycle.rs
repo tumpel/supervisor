@@ -1599,8 +1599,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             .join(format!("snapshot-{:08}", order.snapshot_seq.0));
         std::fs::create_dir_all(&dir).map_err(|error| unreadable(format!("creating {}: {error}", dir.display())))?;
         let stored = self.stage_snapshot(drive, base, order, &dir).await;
-        remove_dir(&dir).map_err(unreadable)?;
-        stored
+        let removed = remove_dir(&dir).map_err(unreadable);
+        let stored = stored?;
+        removed?;
+        Ok(stored)
     }
 
     async fn cut_files(
@@ -1608,6 +1610,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         drive: PathBuf,
         base: Arc<Base>,
         cache: Arc<ChunkCache>,
+        order: &SnapshotOrder,
     ) -> Result<Cut, (ChannelSnapshotFailureReason, String)> {
         let vmm = Arc::clone(&self.vmm);
         let shown = drive.display().to_string();
@@ -1616,8 +1619,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             cache.create()?;
             cut(&upper, &base, &cache)
         });
-        let seconds = self.settings.budgets.snapshot.as_secs();
-        match timeout(self.settings.budgets.snapshot, cutting).await {
+        match timeout_at(instant_at(order.upload_expires_at), cutting).await {
             Ok(Ok(Ok(cut))) => Ok(cut),
             Ok(Ok(Err(error))) => Err((
                 ChannelSnapshotFailureReason::UpperDirectoryUnreadable,
@@ -1629,7 +1631,11 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             )),
             Err(_) => Err((
                 ChannelSnapshotFailureReason::SnapshotTimedOut,
-                format!("reading the box's drive did not finish within {seconds} s; raise budgets.snapshotSeconds in runtime.json"),
+                format!(
+                    "reading the box's drive did not finish before the upload URLs of snapshot {} expired at {}; raise snapshotDeadlineSeconds on the control plane or check the host's disk",
+                    *order.snapshot_id,
+                    order.upload_expires_at.to_rfc3339()
+                ),
             )),
         }
     }
@@ -1667,7 +1673,9 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
         let known = base.places();
         let cache = Arc::new(ChunkCache::new(dir.join(CHUNKS)));
-        let cut = self.cut_files(drive, Arc::clone(base), Arc::clone(&cache)).await?;
+        let cut = self
+            .cut_files(drive, Arc::clone(base), Arc::clone(&cache), order)
+            .await?;
         let new = fresh(draft_digests(&cut.draft), &known);
         let held = self.held(&order.snapshot_id, &new, deadline).await.map_err(expired)?;
         let staging = dir.to_path_buf();
