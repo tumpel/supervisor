@@ -817,9 +817,7 @@ impl Machine for FirecrackerBox {
         create_private_file(&overlay)
             .and_then(|file| file.set_len(self.overlay_bytes))
             .map_err(|error| format!("creating the overlay drive {}: {error}", overlay.display()))?;
-        if let Ok(mut tail) = self.console.lock() {
-            tail.clear();
-        }
+        self.clear_console();
         self.spawn().await?;
         let ready = UnixListener::bind(self.ready_socket())
             .map_err(|error| format!("listening on {}: {error}", self.ready_socket().display()))?;
@@ -910,6 +908,12 @@ impl Machine for FirecrackerBox {
 
     fn console_tail(&self) -> String {
         console_text(&self.console_bytes())
+    }
+
+    fn clear_console(&mut self) {
+        if let Ok(mut tail) = self.console.lock() {
+            tail.clear();
+        }
     }
 
     fn record(&self) -> Result<SupervisorHandoverMachine, String> {

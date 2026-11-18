@@ -130,6 +130,7 @@ pub trait Machine: Send + 'static {
     fn drive(&self) -> PathBuf;
     fn stop(self) -> impl Future<Output = ()> + Send;
     fn console_tail(&self) -> String;
+    fn clear_console(&mut self);
     fn hand_over(self, guest: Self::Guest) -> Result<SupervisorHandoverMachine, String>;
     fn record(&self) -> Result<SupervisorHandoverMachine, String>;
     fn reconnect(&mut self, guest: &mut Self::Guest) -> impl Future<Output = Result<(), String>> + Send;
@@ -613,6 +614,14 @@ fn remove_file(path: &Path) -> Result<(), String> {
             Err(format!("removing {}: {error}", path.display()))
         }
         _ => Ok(()),
+    }
+}
+
+fn console_during_turn(tail: &str) -> String {
+    if tail.is_empty() {
+        "The box's console printed nothing during the turn.".to_string()
+    } else {
+        format!("The box's console during the turn: {tail}")
     }
 }
 
@@ -1205,6 +1214,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 format!("handing turn {} to the guest failed: {error}", *turn.turn_id),
             )));
         }
+        live.machine.clear_console();
         let clone = Duration::from_secs(u64::from(live.image.harness().clone_seconds.get()));
         let state = Follow {
             end: started + self.settings.budgets.turn,
@@ -1348,7 +1358,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     &self.out,
                     turn_id,
                     failure.report,
-                    format!("{} Console: {tail}", failure.detail),
+                    format!("{} {}", failure.detail, console_during_turn(&tail)),
                 );
                 Outcome::Gone(tap)
             }
