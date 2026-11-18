@@ -61,7 +61,7 @@ fn turn(image: &GuestImageManifest, turn_id: &str, prompt: &str, last_line_seq: 
             .expect("repository"),
         git_author_name: "Tumpel Agent".try_into().expect("author name"),
         git_author_email: "agent@tumpel.invalid".try_into().expect("author email"),
-        files_cache: home().join(".cache/tumpel-host-test/persona-files"),
+        files_dir: home().join(".cache/tumpel-host-test/persona-files"),
         prebuild_commit_sha: None,
         box_memory_mib: None,
         box_disk_mib: None,
