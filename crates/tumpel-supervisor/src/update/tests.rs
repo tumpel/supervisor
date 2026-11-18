@@ -360,10 +360,11 @@ async fn the_start_after_a_swap_puts_the_new_binary_on_trial_before_it_runs() {
 }
 
 #[tokio::test]
-async fn a_new_binary_that_reaches_welcome_ends_its_trial_and_the_next_start_keeps_it() {
+async fn a_new_binary_that_reaches_welcome_ends_its_trial_deletes_the_binary_it_replaced_and_the_next_start_keeps_it() {
     let layout = layout("confirmed");
     let (_, new) = swapped(&layout).await;
     exec_start_pre(&layout);
+    assert!(layout.previous.exists());
     let (out, mut events) = unbounded_channel();
     let Startup::Trial(trial) = startup(&layout, &new, &out).expect("startup reads the state") else {
         panic!("the new binary starts its trial");
@@ -371,6 +372,7 @@ async fn a_new_binary_that_reaches_welcome_ends_its_trial_and_the_next_start_kee
     confirm(&layout, &trial, &out).expect("the trial ends");
     assert_eq!(seen(&mut events), vec![Seen::Step(SupervisorUpdatePhase::Online)]);
     assert!(!layout.state.join(TRIAL_FILE).exists());
+    assert!(!layout.previous.exists());
     exec_start_pre(&layout);
     assert_eq!(*super::binary_sha256(&layout.binary).expect("the binary hashes"), *new);
     assert_eq!(startup(&layout, &new, &out), Ok(Startup::Steady));

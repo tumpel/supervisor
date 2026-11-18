@@ -8,7 +8,8 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout_at, Instant};
 use tumpel_api::types::{HarnessLayerManifest, ReleaseHarnessLayer, TurnFailureReason};
 
-use crate::images::{is_digest, remove, verify, Refusal};
+use crate::boot::Holds;
+use crate::images::{is_digest, remove, supersede, verify, Refusal};
 use crate::store::Store;
 
 #[derive(Clone, Debug)]
@@ -55,6 +56,7 @@ impl LayerOrder {
 
 #[derive(Clone, Debug)]
 pub struct LayerCache {
+    pub images: PathBuf,
     pub dir: PathBuf,
     pub limit_mib: NonZeroU32,
 }
@@ -63,6 +65,7 @@ impl LayerCache {
     #[must_use]
     pub fn new(image_cache: &Path, limit_mib: NonZeroU32) -> Self {
         Self {
+            images: image_cache.to_path_buf(),
             dir: image_cache.join("layers"),
             limit_mib,
         }
@@ -238,7 +241,8 @@ fn evict(cache: &LayerCache, landed: &str, held: &BTreeSet<String>) -> Result<()
     Ok(())
 }
 
-fn place(cache: &LayerCache, order: &LayerOrder, staged: &Staged, held: &BTreeSet<String>) -> Result<Layer, String> {
+fn place(cache: &LayerCache, order: &LayerOrder, staged: &Staged, holds: &Holds) -> Result<Layer, String> {
+    let held = holds.held();
     let digest = order.digest();
     verify(&staged.layer, "harness layer", digest)?;
     verify(&staged.manifest, "harness layer manifest", &order.layer.manifest_digest)?;
@@ -248,12 +252,13 @@ fn place(cache: &LayerCache, order: &LayerOrder, staged: &Staged, held: &BTreeSe
         .map_err(|error| format!("moving {} into place: {error}", staged.layer.display()))?;
     std::fs::rename(&staged.manifest, cache.manifest(digest))
         .map_err(|error| format!("moving {} into place: {error}", staged.manifest.display()))?;
-    evict(cache, digest, held)?;
+    evict(cache, digest, &held)?;
+    supersede(&cache.images, &manifest.harness.harness, &held)?;
     Ok(Layer { path, manifest })
 }
 
-fn adopt(cache: &LayerCache, order: &LayerOrder, staged: &Staged, held: &BTreeSet<String>) -> Result<Layer, Refusal> {
-    place(cache, order, staged, held).map_err(|detail| {
+fn adopt(cache: &LayerCache, order: &LayerOrder, staged: &Staged, holds: &Holds) -> Result<Layer, Refusal> {
+    place(cache, order, staged, holds).map_err(|detail| {
         staged.remove();
         order.failed(detail)
     })
@@ -263,7 +268,7 @@ async fn fetch(
     store: &impl Store,
     cache: &LayerCache,
     order: &LayerOrder,
-    held: BTreeSet<String>,
+    holds: &Holds,
     deadline: Instant,
 ) -> Result<Layer, Refusal> {
     std::fs::create_dir_all(&cache.dir)
@@ -288,12 +293,12 @@ async fn fetch(
             return Err(order.timed_out());
         }
     }
-    let adopting = (cache.clone(), order.clone(), held);
+    let adopting = (cache.clone(), order.clone(), holds.clone());
     match timeout_at(
         deadline,
         tokio::task::spawn_blocking(move || {
-            let (cache, order, held) = adopting;
-            adopt(&cache, &order, &staged, &held)
+            let (cache, order, holds) = adopting;
+            adopt(&cache, &order, &staged, &holds)
         }),
     )
     .await
@@ -308,7 +313,7 @@ pub async fn resolve(
     store: &impl Store,
     cache: &LayerCache,
     order: &LayerOrder,
-    held: BTreeSet<String>,
+    holds: &Holds,
     lock: &Mutex<()>,
     deadline: Instant,
 ) -> Result<Layer, Refusal> {
@@ -321,7 +326,7 @@ pub async fn resolve(
     if let Some(layer) = cached(cache, order)? {
         return Ok(layer);
     }
-    fetch(store, cache, order, held, deadline).await
+    fetch(store, cache, order, holds, deadline).await
 }
 
 #[cfg(test)]

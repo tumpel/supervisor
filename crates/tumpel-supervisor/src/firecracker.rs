@@ -21,7 +21,7 @@ use tumpel_guest::{encode, Decoder, GUEST_CID, GUEST_PORT, READY_PORT};
 use crate::boot::Boot;
 use crate::fd_store;
 use crate::guest_drive;
-use crate::lifecycle::{Guest, Machine, Vmm};
+use crate::lifecycle::{remove_dir, Guest, Machine, Vmm};
 use crate::pool::{Disk, Tap};
 use crate::snapshot::Ext4Upper;
 
@@ -112,6 +112,35 @@ fn remove(path: &Path) -> Result<(), String> {
         }
         _ => Ok(()),
     }
+}
+
+fn entries(dir: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|error| format!("listing {}: {error}", dir.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("listing {}: {error}", dir.display())),
+    }
+}
+
+pub fn remove_leftovers(data: &Path, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String> {
+    let kept_boxes: Vec<String> = boxes.iter().map(|index| format!("box{index}")).collect();
+    for entry in entries(data)? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_box = name
+            .strip_prefix("box")
+            .is_some_and(|index| index.parse::<u8>().is_ok());
+        if is_box && !kept_boxes.contains(&name) {
+            remove_dir(&entry.path())?;
+        }
+    }
+    for entry in entries(&data.join("sessions"))? {
+        if !sessions.iter().any(|session| entry.file_name() == session.as_str()) {
+            remove_dir(&entry.path())?;
+        }
+    }
+    remove_dir(&data.join(crate::persona_files::DIR))
 }
 
 fn console_text(tail: &[u8]) -> String {
@@ -641,16 +670,16 @@ impl Vmm for Firecracker {
         stop_scopes(&unclaimed)
     }
 
+    fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String> {
+        remove_leftovers(&self.data, boxes, sessions)
+    }
+
     fn open_upper(&self, drive: &Path) -> Result<Ext4Upper, String> {
         Ext4Upper::load(drive)
     }
 
     fn staging(&self, session_id: &EntityId) -> Result<PathBuf, String> {
         session_dir(&self.data, session_id)
-    }
-
-    fn chunk_cache(&self) -> PathBuf {
-        self.images.join("chunks")
     }
 
     fn image_cache(&self) -> PathBuf {
@@ -958,23 +987,13 @@ impl Machine for FirecrackerBox {
         self.session.join(OVERLAY_DRIVE)
     }
 
-    async fn stop(mut self) {
+    async fn stop(mut self) -> Result<(), String> {
         if let Some(process) = self.process.take() {
             process.kill().await;
         }
-        let cleared = fd_store::forget_box(self.index)
-            .and_then(|()| self.clear_sockets())
-            .and_then(|()| match std::fs::remove_dir_all(&self.session) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    Err(format!("deleting {}: {error}", self.session.display()))
-                }
-                _ => Ok(()),
-            });
-        if let Err(error) = cleared {
-            eprintln!(
-                "tumpel-supervisor: tearing down a box: {error}; its files stay on the host's disk, shrinking the disk budget, until a box of the same session boots here again"
-            );
-        }
+        fd_store::forget_box(self.index)
+            .and_then(|()| remove_dir(&self.dir))
+            .map_err(|error| format!("BoxNotCleared: tearing down box {}: {error}", self.index))
     }
 
     fn console_tail(&self) -> String {

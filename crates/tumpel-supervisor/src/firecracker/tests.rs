@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde_json::json;
-use tumpel_api::types::{GuestMessage, SupervisorHandoverMachine};
+use tumpel_api::types::{EntityId, GuestMessage, SupervisorHandoverMachine};
 use tumpel_guest::encode;
 
 use super::{adopt, alive, booted_memory, take, Firecracker, Owner, Taken};
@@ -199,7 +199,7 @@ async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_bin
     };
     assert_eq!(line.text, "one");
     assert!(machine.console_tail().contains("booted"));
-    machine.stop().await;
+    let _ = machine.stop().await;
     assert!(reaped(pid), "stopping an adopted box kills and reaps its process");
 }
 
@@ -256,4 +256,23 @@ fn booted_memory_reads_mem_size_mib_from_the_firecracker_api_of_a_running_box() 
         .join()
         .expect("the server")
         .starts_with("GET /machine-config HTTP/1.1\r\n"));
+}
+
+#[test]
+fn a_start_deletes_the_disk_of_a_box_it_did_not_take_over_and_keeps_the_one_it_did() {
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/firecracker-tests/leftovers");
+    if data.exists() {
+        std::fs::remove_dir_all(&data).expect("clearing the last run");
+    }
+    for session in ["kept", "lost"] {
+        let dir = data.join("sessions").join(session);
+        std::fs::create_dir_all(&dir).expect("a box disk directory");
+        std::fs::write(dir.join("overlay.ext4"), b"disk").expect("a box disk");
+    }
+    let kept = EntityId::try_from("kept").expect("an id");
+
+    super::remove_leftovers(&data, &[], &[kept]).expect("the leftovers are deleted");
+
+    assert!(data.join("sessions/kept/overlay.ext4").exists());
+    assert!(!data.join("sessions/lost").exists());
 }

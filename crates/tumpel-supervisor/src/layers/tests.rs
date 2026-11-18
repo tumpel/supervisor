@@ -11,6 +11,7 @@ use tokio::time::Instant;
 use tumpel_api::types::TurnFailureReason;
 
 use super::{resolve, LayerCache, LayerOrder};
+use crate::boot::Holds;
 use crate::snapshot::hex;
 use crate::store::{Store, UploadError};
 
@@ -136,7 +137,7 @@ async fn a_layer_whose_bytes_miss_the_release_digest_is_never_placed() {
         &bucket,
         &cache,
         &published.order,
-        BTreeSet::new(),
+        &Holds::default(),
         &Mutex::new(()),
         deadline(),
     )
@@ -166,7 +167,7 @@ async fn a_landed_layer_evicts_the_least_recently_attached_layers_no_box_holds_u
     let bucket = bucket.with(&idle).with(&held).with(&reattached).with(&newest);
     let lock = Mutex::new(());
     for published in [&idle, &held, &reattached] {
-        resolve(&bucket, &cache, &published.order, BTreeSet::new(), &lock, deadline())
+        resolve(&bucket, &cache, &published.order, &Holds::default(), &lock, deadline())
             .await
             .expect("a layer under the limit is placed");
     }
@@ -177,7 +178,7 @@ async fn a_landed_layer_evicts_the_least_recently_attached_layers_no_box_holds_u
         &Bucket::default(),
         &cache,
         &reattached.order,
-        BTreeSet::new(),
+        &Holds::default(),
         &lock,
         deadline(),
     )
@@ -185,17 +186,12 @@ async fn a_landed_layer_evicts_the_least_recently_attached_layers_no_box_holds_u
     .expect("a cached layer is attached without a download");
     assert_eq!(attached.path, cache.layer(reattached.order.digest()));
     attached_at(&cache, &idle, 50);
+    let holds = Holds::default();
+    let _held = holds.hold(vec![held.order.digest().to_string()]);
 
-    let landed = resolve(
-        &bucket,
-        &cache,
-        &newest.order,
-        BTreeSet::from([held.order.digest().to_string()]),
-        &lock,
-        deadline(),
-    )
-    .await
-    .expect("the new layer is placed");
+    let landed = resolve(&bucket, &cache, &newest.order, &holds, &lock, deadline())
+        .await
+        .expect("the new layer is placed");
 
     assert_eq!(*landed.manifest.layer_digest, newest.order.digest());
     assert_eq!(std::fs::read(&landed.path).expect("the layer reads"), newest.layer);
@@ -215,7 +211,7 @@ async fn waiting_on_another_fetch_counts_against_the_layer_budget() {
         &Bucket::default().with(&published),
         &cache,
         &published.order,
-        BTreeSet::new(),
+        &Holds::default(),
         &lock,
         started + Duration::from_secs(30),
     )
