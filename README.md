@@ -1,3 +1,5 @@
+<p align="center"><img src="doc/assets/mascot.svg" alt="The tumpel salamander" width="160"></p>
+
 # tumpel supervisor
 
 The tumpel host supervisor. It enrols a Linux machine with KVM as a tumpel host, boots Firecracker boxes and runs coding agent turns for the control plane.
