@@ -421,9 +421,7 @@ impl Vmm for MemoryVmm {
         Ok(())
     }
 
-    fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String> {
-        let sessions: Vec<&str> = sessions.iter().map(|session| session.as_str()).collect();
-        note(&self.log, format!("remove leftovers but boxes {boxes:?} and sessions {sessions:?}"));
+    fn remove_leftovers(&self, _: &[u8], _: &[EntityId]) -> Result<(), String> {
         Ok(())
     }
 
@@ -1282,6 +1280,11 @@ async fn a_box_on_another_host_downloads_the_chunks_its_cache_lacks() {
         ["claim turn-2", "line 1 two", "complete 1"]
     );
     assert_eq!(second.log()[0], "restore session-1 root/turn-1");
+    let left: Vec<_> = std::fs::read_dir(second.vmm.staging.join("session-1"))
+        .expect("the box disk directory")
+        .map(|entry| entry.expect("an entry").file_name())
+        .collect();
+    assert!(left.is_empty(), "the restore archive and its chunks outlived the boot: {left:?}");
 }
 
 #[tokio::test]
@@ -1345,6 +1348,7 @@ async fn a_restore_missing_a_chunk_fails_the_turn_snapshot_unreadable() {
             && seen[1].contains("snapshot-1 (seq 1) of session session-1"),
         "{seen:?}"
     );
+    assert!(!second.vmm.staging.join("session-1").exists());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1864,10 +1868,13 @@ async fn a_teardown_after_the_snapshot_stops_a_clean_box_inside_the_warm_window_
             "stop session-1"
         ]
     );
+    assert!(!host.vmm.staging.join("session-1").exists());
+    std::fs::create_dir_all(host.vmm.staging.join("session-1")).expect("a disk a lost box left");
 
     host.teardown("session-1");
     assert_eq!(host.settle(SETTLE).await, ["box gone session-1"]);
     assert_eq!(host.log(), Vec::<String>::new());
+    assert!(!host.vmm.staging.join("session-1").exists());
 
     host.turn("turn-2", "session-1", "two", vec![first]);
     assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
