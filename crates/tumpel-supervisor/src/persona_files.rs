@@ -7,6 +7,7 @@ use tokio::time::timeout_at;
 use tumpel_api::types::{ChannelPersonaFileDownload, GuestPersonaFile};
 
 use crate::lifecycle::remove_dir;
+use crate::lifecycle::setup::then;
 use crate::store::Store;
 
 pub const DIR: &str = "persona-files";
@@ -62,12 +63,7 @@ pub async fn fetch(
     for file in files {
         let bytes = match blob(store, dir, file).await {
             Ok(bytes) => bytes,
-            Err(error) => {
-                return Err(match remove_dir(dir) {
-                    Ok(()) => error,
-                    Err(removed) => format!("{error}; then {removed}"),
-                })
-            }
+            Err(error) => return Err(then(error, remove_dir(dir))),
         };
         fetched.push(GuestPersonaFile {
             content: STANDARD.encode(bytes),

@@ -46,7 +46,7 @@ use crate::store::{Store, UploadError};
 use crate::telemetry::{self, Phase};
 use crate::update::Idle;
 
-mod setup;
+pub(crate) mod setup;
 
 pub use setup::{SetupCommand, SetupInput, SetupOrder};
 
@@ -2472,7 +2472,17 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
 
     async fn dispatch(&mut self, session: String, command: Command) -> Result<(), String> {
         match command {
-            Command::Turn(turn) => self.start_turn(session, *turn).await,
+            Command::Turn(turn) => {
+                let turn_id = turn.turn_id.clone();
+                self.start_turn(session, *turn).await.inspect_err(|error| {
+                    turn_failed(
+                        &self.runner.out,
+                        &turn_id,
+                        TurnFailureReason::BoxBootFailed,
+                        format!("stopping the earlier box of its session failed: {error}"),
+                    );
+                })
+            }
             Command::Snapshot(order) => {
                 self.start_snapshot(session, order);
                 Ok(())
@@ -2578,24 +2588,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.slots.entry(session).or_default().task = Some((running, handle));
     }
 
-    async fn end_other_box(&mut self, session: &str, turn: &BoxTurn, root: &tracing::Span) -> Result<(), String> {
-        if self.live_box(session).is_none_or(|live| live.box_id == turn.box_id) {
-            return Ok(());
-        }
-        let Err(error) = self.teardown(session).await else {
-            return Ok(());
-        };
-        root.in_scope(|| {
-            turn_failed(
-                &self.runner.out,
-                &turn.turn_id,
-                TurnFailureReason::BoxBootFailed,
-                format!("stopping the earlier box of session {session} failed: {error}"),
-            );
-        });
-        Err(error)
-    }
-
     async fn start_turn(&mut self, session: String, turn: BoxTurn) -> Result<(), String> {
         let (harness, harness_version) = turn.image.harness();
         let root = telemetry::turn(&turn.turn_id, &turn.session_id, harness, harness_version, &turn.model);
@@ -2605,7 +2597,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             self.prune(&session);
             return Ok(());
         }
-        self.end_other_box(&session, &turn, &root).await?;
+        if self.live_box(&session).is_some_and(|live| live.box_id != turn.box_id) {
+            self.teardown(&session).await?;
+        }
         let warm = self.slots.get_mut(&session).and_then(|slot| {
             let live = slot.live.take()?;
             slot.disarm();

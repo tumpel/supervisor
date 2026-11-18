@@ -69,7 +69,7 @@ enum Ended {
     Failed(Stop),
 }
 
-fn then(detail: String, stopped: Result<(), String>) -> String {
+pub(crate) fn then(detail: String, stopped: Result<(), String>) -> String {
     match stopped {
         Ok(()) => detail,
         Err(error) => format!("{detail}; then {error}"),
