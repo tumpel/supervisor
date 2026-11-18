@@ -116,7 +116,6 @@ async fn a_shell_box_runs_a_turn_pauses_resumes_warm_and_its_drive_reads_back() 
         "imageCacheDir": manifest_path.parent().expect("cache dir"),
         "dataDir": data,
         "boxCapacity": 1,
-        "warmWindowSeconds": 900,
         "vcpuCount": 1,
         "memoryMib": 512,
         "overlayMib": 1024,
@@ -128,7 +127,6 @@ async fn a_shell_box_runs_a_turn_pauses_resumes_warm_and_its_drive_reads_back() 
     .expect("runtime");
     let settings = Settings {
         budgets: Budgets::from(&runtime.budgets),
-        warm_window: Duration::from_mins(15),
         layer_cache_mib: runtime.layer_cache_mib,
     };
     let (out, mut received) = unbounded_channel();
@@ -231,7 +229,6 @@ fn crash_runtime(data: &std::path::Path, manifest_path: &std::path::Path) -> (Su
         "imageCacheDir": manifest_path.parent().expect("cache dir"),
         "dataDir": data,
         "boxCapacity": 1,
-        "warmWindowSeconds": 900,
         "vcpuCount": 1,
         "memoryMib": 512,
         "overlayMib": 1024,
@@ -243,7 +240,6 @@ fn crash_runtime(data: &std::path::Path, manifest_path: &std::path::Path) -> (Su
     .expect("runtime");
     let settings = Settings {
         budgets: Budgets::from(&runtime.budgets),
-        warm_window: Duration::from_mins(15),
         layer_cache_mib: runtime.layer_cache_mib,
     };
     (runtime, settings)

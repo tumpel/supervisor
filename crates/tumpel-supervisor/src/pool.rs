@@ -24,7 +24,7 @@ pub fn mib(value: i64) -> Option<NonZeroU32> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Held {
     pub drives: Vec<String>,
-    pub unevictable_disk_mib: u64,
+    pub disk_held_mib: u64,
     pub memory_budget_mib: u64,
     pub memory_held_mib: u64,
 }
@@ -128,7 +128,7 @@ impl fmt::Display for PoolExhausted {
         match self {
             Self::Devices => write!(
                 formatter,
-                "all {TAP_POOL} TAP devices of this host are held by boxes that run a turn or wait for a snapshot of their last turn"
+                "all {TAP_POOL} TAP devices of this host are held by boxes"
             ),
             Self::Memory {
                 boxes,
@@ -137,7 +137,7 @@ impl fmt::Display for PoolExhausted {
                 requested_mib,
             } => write!(
                 formatter,
-                "this host's {boxes} boxes hold {held_mib} MiB of the {budget_mib} MiB it gives boxes, so a box of {requested_mib} MiB does not fit; they run a turn or wait for a snapshot of their last turn"
+                "this host's {boxes} boxes hold {held_mib} MiB of the {budget_mib} MiB it gives boxes, so a box of {requested_mib} MiB does not fit"
             ),
             Self::Disk {
                 boxes,
@@ -199,18 +199,12 @@ impl TapPool {
         self.held_mib
     }
 
-    pub fn admits(&self, size: Size, freeing: &[Size], disk: Disk) -> Result<(), PoolExhausted> {
-        if self.held.range(..TAP_POOL).count() == usize::from(TAP_POOL) && freeing.is_empty() {
+    fn admits(&self, size: Size, disk: Disk) -> Result<(), PoolExhausted> {
+        if self.held.range(..TAP_POOL).count() == usize::from(TAP_POOL) {
             return Err(PoolExhausted::Devices);
         }
         let memory_mib = size.memory_mib;
-        let freed_mib = freeing
-            .iter()
-            .map(|freed| u64::from(freed.memory_mib.get()))
-            .sum::<u64>();
-        let freed_disk_mib = freeing.iter().map(|freed| u64::from(freed.disk_mib.get())).sum::<u64>();
-        let held_mib = self.held_mib - freed_mib;
-        if held_mib + u64::from(memory_mib.get()) > self.budget_mib {
+        if self.held_mib + u64::from(memory_mib.get()) > self.budget_mib {
             return Err(PoolExhausted::Memory {
                 boxes: self.held.len(),
                 held_mib: self.held_mib,
@@ -218,10 +212,10 @@ impl TapPool {
                 requested_mib: memory_mib,
             });
         }
-        if held_mib == 0 {
+        if self.held_mib == 0 {
             return Ok(());
         }
-        if self.held_disk_mib - freed_disk_mib + u64::from(size.disk_mib.get()) > disk.budget_mib() {
+        if self.held_disk_mib + u64::from(size.disk_mib.get()) > disk.budget_mib() {
             return Err(PoolExhausted::Disk {
                 boxes: self.held.len(),
                 held_mib: self.held_disk_mib,
@@ -233,7 +227,7 @@ impl TapPool {
     }
 
     pub fn claim(&mut self, size: Size, disk: Disk) -> Result<Tap, PoolExhausted> {
-        self.admits(size, &[], disk)?;
+        self.admits(size, disk)?;
         let index = (0..TAP_POOL)
             .find(|index| !self.held.contains(index))
             .ok_or(PoolExhausted::Devices)?;
@@ -307,7 +301,7 @@ mod tests {
             .collect();
         assert_eq!(
             pool.claim(memory(2048), ROOMY).map_err(|refused| refused.to_string()),
-            Err("this host's 16 boxes hold 32768 MiB of the 33792 MiB it gives boxes, so a box of 2048 MiB does not fit; they run a turn or wait for a snapshot of their last turn".to_string())
+            Err("this host's 16 boxes hold 32768 MiB of the 33792 MiB it gives boxes, so a box of 2048 MiB does not fit".to_string())
         );
         assert!(pool.claim(memory(1024), ROOMY).is_ok());
         assert_eq!(taps.len(), 16);
@@ -364,22 +358,17 @@ mod tests {
                 requested_mib: NonZeroU32::new(128).expect("128")
             })
         );
-        assert_eq!(
-            pool.admits(memory(8192), &[BOX], ROOMY),
-            Err(PoolExhausted::Memory {
-                boxes: 2,
-                held_mib: 12_288,
-                budget_mib: 12_288,
-                requested_mib: NonZeroU32::new(8192).expect("8192")
-            })
-        );
-        assert_eq!(pool.admits(memory(8192), &[memory(8192)], ROOMY), Ok(()));
         pool.release(second);
         pool.release(first);
         let mut small = TapPool::new(memory_budget_mib(8192), BOX);
         assert_eq!(
-            small.claim(memory(65_536), ROOMY).map_err(|refused| refused.to_string()),
-            Err("this host's 0 boxes hold 0 MiB of the 4096 MiB it gives boxes, so a box of 65536 MiB does not fit; they run a turn or wait for a snapshot of their last turn".to_string())
+            small
+                .claim(memory(65_536), ROOMY)
+                .map_err(|refused| refused.to_string()),
+            Err(
+                "this host's 0 boxes hold 0 MiB of the 4096 MiB it gives boxes, so a box of 65536 MiB does not fit"
+                    .to_string()
+            )
         );
         assert!(small.claim(BOX, ROOMY).is_ok());
     }
@@ -391,9 +380,8 @@ mod tests {
         assert_eq!(pool.claim(BOX, ROOMY), Err(PoolExhausted::Devices));
         assert_eq!(
             PoolExhausted::Devices.to_string(),
-            "all 64 TAP devices of this host are held by boxes that run a turn or wait for a snapshot of their last turn"
+            "all 64 TAP devices of this host are held by boxes"
         );
-        assert_eq!(pool.admits(BOX, &[BOX], ROOMY), Ok(()));
         assert_eq!(pool.capacity().get(), 64);
         let mut taps = taps.into_iter();
         pool.release(taps.next().expect("the first device"));
@@ -436,10 +424,9 @@ mod tests {
             })
         );
         assert_eq!(
-            pool.admits(BOX, &[], written).map_err(|refused| refused.to_string()),
+            pool.claim(BOX, written).map_err(|refused| refused.to_string()),
             Err("this host gives box disks 148800 MiB, its 150000 MiB of free disk and the 50000 MiB its boxes wrote less the 51200 MiB it keeps free; its 4 boxes hold 131072 MiB of it, so a box disk of 32768 MiB does not fit; free disk on the host, or lower the persona's boxDiskMib".to_string())
         );
-        assert_eq!(pool.admits(BOX, &[BOX], written), Ok(()));
         assert_eq!(pool.held_disk_mib(), 131_072);
         let mut taps = taps.into_iter();
         pool.release(taps.next().expect("the first box"));
