@@ -139,7 +139,7 @@ struct Launch {
     model: String,
     variables: u64,
     files: u64,
-    connectors: Vec<String>,
+    connectors: Vec<(String, String)>,
 }
 
 fn launch(keys: &RandomState, start: &GuestTurnStart) -> Launch {
@@ -155,7 +155,7 @@ fn launch(keys: &RandomState, start: &GuestTurnStart) -> Launch {
         model: start.model.to_string(),
         variables: keys.hash_one(&variables),
         files: keys.hash_one(&files),
-        connectors: connectors::ids(&start.credential.connectors),
+        connectors: connectors::servers(&start.credential.connectors),
     }
 }
 
