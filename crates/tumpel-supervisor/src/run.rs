@@ -241,7 +241,7 @@ fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> SetupCommand {
     }))
 }
 
-fn command(files_cache: &Path, offer: ChannelTurnOffer) -> Command {
+fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Command {
     Command::Turn(Box::new(BoxTurn {
         turn_id: offer.turn_id,
         session_id: offer.session_id,
@@ -260,7 +260,7 @@ fn command(files_cache: &Path, offer: ChannelTurnOffer) -> Command {
         repository: offer.repository,
         git_author_name: offer.git_author_name,
         git_author_email: offer.git_author_email,
-        files_cache: files_cache.to_path_buf(),
+        files_dir: files_dir.to_path_buf(),
         prebuild_commit_sha: offer.prebuild_commit_sha.map(String::from),
         box_memory_mib: offer.box_memory_mib,
         box_disk_mib: offer.box_disk_mib,
@@ -268,7 +268,7 @@ fn command(files_cache: &Path, offer: ChannelTurnOffer) -> Command {
 }
 
 async fn boxes(
-    files_cache: PathBuf,
+    files_dir: PathBuf,
     answers: Answers,
     cancels: Cancels,
     mut commands: UnboundedReceiver<BoxCommand>,
@@ -277,7 +277,7 @@ async fn boxes(
 ) {
     while let Some(command) = commands.recv().await {
         let next = match command {
-            BoxCommand::Turn(offer) => self::command(&files_cache, *offer),
+            BoxCommand::Turn(offer) => self::command(&files_dir, *offer),
             BoxCommand::Snapshot(request) => Command::Snapshot(request.into()),
             BoxCommand::Teardown(teardown) => Command::Teardown(TeardownOrder {
                 session_id: teardown.session_id,
@@ -372,7 +372,7 @@ fn start_boxes(
     let (to_setups, from_setups) = unbounded_channel();
     tokio::spawn(lifecycle.run(from_boxes, from_setups));
     tokio::spawn(boxes(
-        Path::new(&*runtime.data_dir).join("persona-files"),
+        Path::new(&*runtime.data_dir).join(crate::persona_files::DIR),
         answers,
         cancels,
         received,

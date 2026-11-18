@@ -726,6 +726,14 @@ pub enum Startup {
     Trial(SupervisorUpdatePending),
 }
 
+fn steady(layout: &Layout) -> Result<Startup, String> {
+    if !layout.pending().exists() {
+        remove(&layout.previous)?;
+    }
+    remove(&layout.candidate)?;
+    Ok(Startup::Steady)
+}
+
 pub fn startup(
     layout: &Layout,
     running: &Sha256Digest,
@@ -762,12 +770,12 @@ pub fn startup(
     let Some(trial) = read::<SupervisorUpdatePending>(&layout.trial(), "SupervisorUpdatePending")? else {
         return match read::<SupervisorUpdatePending>(&layout.pending(), "SupervisorUpdatePending")? {
             Some(pending) if pending.to_sha256 == *running => Ok(Startup::Trial(pending)),
-            _ => Ok(Startup::Steady),
+            _ => steady(layout),
         };
     };
     if trial.to_sha256 != *running {
         remove(&layout.trial())?;
-        return Ok(Startup::Steady);
+        return steady(layout);
     }
     Ok(Startup::Trial(trial))
 }
@@ -782,6 +790,7 @@ pub fn confirm(
         .map_err(|error| format!("the supervisor version is empty: {error}"))?;
     remove(&layout.trial())?;
     remove(&layout.pending())?;
+    remove(&layout.previous)?;
     let _ = out.send(ChannelHostMessage::SupervisorUpdateStep(ChannelSupervisorUpdateStep {
         type_: ChannelSupervisorUpdateStepType::SupervisorUpdateStep,
         from_sha256: trial.from_sha256.clone(),

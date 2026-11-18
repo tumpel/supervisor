@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout_at, Instant};
 use tumpel_api::types::{HarnessLayerManifest, ReleaseHarnessLayer, TurnFailureReason};
 
-use crate::images::{is_digest, remove, verify, Refusal};
+use crate::images::{is_digest, remove, supersede, verify, Refusal};
 use crate::store::Store;
 
 #[derive(Clone, Debug)]
@@ -55,6 +55,7 @@ impl LayerOrder {
 
 #[derive(Clone, Debug)]
 pub struct LayerCache {
+    pub images: PathBuf,
     pub dir: PathBuf,
     pub limit_mib: NonZeroU32,
 }
@@ -63,6 +64,7 @@ impl LayerCache {
     #[must_use]
     pub fn new(image_cache: &Path, limit_mib: NonZeroU32) -> Self {
         Self {
+            images: image_cache.to_path_buf(),
             dir: image_cache.join("layers"),
             limit_mib,
         }
@@ -249,6 +251,7 @@ fn place(cache: &LayerCache, order: &LayerOrder, staged: &Staged, held: &BTreeSe
     std::fs::rename(&staged.manifest, cache.manifest(digest))
         .map_err(|error| format!("moving {} into place: {error}", staged.manifest.display()))?;
     evict(cache, digest, held)?;
+    supersede(&cache.images, &manifest.harness.harness, held)?;
     Ok(Layer { path, manifest })
 }
 

@@ -273,18 +273,17 @@ fn drop_image(cache: &Path, image_digest: &str) -> Result<(), String> {
     remove(&cache.join(format!("{image_digest}.json")))
 }
 
-fn prune(cache: &Path, manifest: &GuestImageManifest, others: Manifests) -> Result<(), String> {
-    let (replaced, kept): (Vec<_>, Vec<_>) = others.images.into_iter().partition(|other| {
-        other.image_digest != manifest.image_digest
-            && other.harness.harness == manifest.harness.harness
-            && other.harness.harness_version == manifest.harness.harness_version
-    });
+pub(crate) fn supersede(cache: &Path, harness: &str, held: &BTreeSet<String>) -> Result<(), String> {
+    let others = manifests(cache)?;
+    let (replaced, kept): (Vec<_>, Vec<_>) = others
+        .images
+        .into_iter()
+        .partition(|other| other.harness.harness.as_str() == harness && !held.contains(other.image_digest.as_str()));
     for other in &replaced {
         drop_image(cache, &other.image_digest)?;
     }
     let digests = kept
         .iter()
-        .chain(std::iter::once(manifest))
         .map(|kept| (kept.image_digest.as_str(), kept.kernel_digest.as_str()))
         .chain(
             others
@@ -337,7 +336,12 @@ fn sweep<'a>(cache: &Path, digests: impl Iterator<Item = (&'a str, &'a str)>) ->
     Ok(())
 }
 
-fn place(cache: &Path, order: &ImageOrder, staged: &Staged) -> Result<GuestImageManifest, String> {
+fn place(
+    cache: &Path,
+    order: &ImageOrder,
+    staged: &Staged,
+    held: &BTreeSet<String>,
+) -> Result<GuestImageManifest, String> {
     let download = &order.download;
     verify(&staged.image, "image", &download.image_digest)?;
     if let Some(kernel) = &staged.kernel {
@@ -345,19 +349,25 @@ fn place(cache: &Path, order: &ImageOrder, staged: &Staged) -> Result<GuestImage
     }
     verify(&staged.manifest, "manifest", &download.manifest_digest)?;
     let manifest = read_manifest(order, staged)?;
-    let others = manifests(cache)?;
     let digest = order.digest();
     rename(&staged.image, &cache.join(format!("{digest}.ext4")))?;
     if let Some(kernel) = &staged.kernel {
         rename(kernel, &cache.join(format!("{}.vmlinux", *download.kernel_digest)))?;
     }
     rename(&staged.manifest, &cache.join(format!("{digest}.json")))?;
-    prune(cache, &manifest, others)?;
+    let mut kept = held.clone();
+    kept.insert(digest.to_string());
+    supersede(cache, &manifest.harness.harness, &kept)?;
     Ok(manifest)
 }
 
-pub fn adopt(cache: &Path, order: &ImageOrder, staged: &Staged) -> Result<GuestImageManifest, Refusal> {
-    place(cache, order, staged).map_err(|detail| {
+pub fn adopt(
+    cache: &Path,
+    order: &ImageOrder,
+    staged: &Staged,
+    held: &BTreeSet<String>,
+) -> Result<GuestImageManifest, Refusal> {
+    place(cache, order, staged, held).map_err(|detail| {
         staged.remove();
         order.failed(detail)
     })
@@ -400,6 +410,7 @@ async fn fetch(
     store: &impl Store,
     cache: &Path,
     order: &ImageOrder,
+    held: BTreeSet<String>,
     deadline: Instant,
 ) -> Result<GuestImageManifest, Refusal> {
     let staged = stage(cache, order)?;
@@ -423,7 +434,7 @@ async fn fetch(
     let adopting = order.clone();
     match timeout_at(
         deadline,
-        tokio::task::spawn_blocking(move || adopt(&cache, &adopting, &staged)),
+        tokio::task::spawn_blocking(move || adopt(&cache, &adopting, &staged, &held)),
     )
     .await
     {
@@ -440,6 +451,7 @@ pub async fn resolve(
     store: &impl Store,
     cache: &Path,
     order: &ImageOrder,
+    held: BTreeSet<String>,
     lock: &Mutex<()>,
     fetching: impl FnOnce(),
 ) -> Result<GuestImageManifest, Refusal> {
@@ -454,7 +466,7 @@ pub async fn resolve(
     if let Some(manifest) = cached(cache, order.digest())? {
         return Ok(manifest);
     }
-    fetch(store, cache, order, deadline).await
+    fetch(store, cache, order, held, deadline).await
 }
 
 pub fn cached_base(cache: &Path, image_digest: &str) -> Result<Option<BaseImageManifest>, Refusal> {

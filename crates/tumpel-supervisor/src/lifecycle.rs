@@ -51,6 +51,7 @@ mod setup;
 pub use setup::{SetupCommand, SetupInput, SetupOrder};
 
 const TRANSFERS: usize = 16;
+const CHUNKS: &str = "chunks";
 const HANDOVER_CLAIM_ALLOWANCE: Duration = Duration::from_secs(60);
 const CANCEL_END: Duration = Duration::from_secs(10);
 const RESTORE_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
@@ -156,9 +157,9 @@ pub trait Vmm: Send + Sync + 'static {
     fn disk(&self, drives: &[String]) -> Result<Disk, String>;
     fn discard(&self, handed: &SupervisorHandoverMachine);
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String>;
+    fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
     fn staging(&self, session_id: &EntityId) -> Result<PathBuf, String>;
-    fn chunk_cache(&self) -> PathBuf;
     fn image_cache(&self) -> PathBuf;
 }
 
@@ -176,7 +177,7 @@ pub struct BoxTurn {
     pub repository: RepositoryUrl,
     pub git_author_name: DisplayName,
     pub git_author_email: EmailAddress,
-    pub files_cache: PathBuf,
+    pub files_dir: PathBuf,
     pub prebuild_commit_sha: Option<String>,
     pub box_memory_mib: Option<i32>,
     pub box_disk_mib: Option<i32>,
@@ -785,7 +786,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     async fn files(&self, turn: &BoxTurn) -> Option<Vec<GuestPersonaFile>> {
-        match crate::persona_files::fetch(&*self.store, &turn.files_cache, &turn.persona_files).await {
+        match crate::persona_files::fetch(&*self.store, &turn.files_dir.join(&*turn.turn_id), &turn.persona_files).await
+        {
             Ok(files) => Some(files),
             Err(detail) => {
                 turn_failed(
@@ -963,10 +965,6 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             ),
         );
         Outcome::Gone(tap)
-    }
-
-    fn cache(&self) -> Arc<ChunkCache> {
-        Arc::new(ChunkCache::new(self.vmm.chunk_cache()))
     }
 
     fn send(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Option<Instant>) -> Asking {
@@ -1182,7 +1180,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let damaged = |error: String| {
             format!("{named} is unreadable: {error}; the stored snapshot is damaged, so start a new session")
         };
-        let cache = self.cache();
+        let cache = Arc::new(ChunkCache::new(dir.join(CHUNKS)));
         let reading = Arc::clone(&cache);
         let root_file = file.clone();
         let read = tokio::task::spawn_blocking(move || -> Result<(Vec<Place>, Vec<Place>), String> {
@@ -1213,10 +1211,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         self.fetch_within(turn, wanted, &cache, &dir, &named, expires).await?;
         let target = dir.join("restore.tar");
         let output = target.clone();
+        let chunks = dir.join(CHUNKS);
         let rebuild = tokio::task::spawn_blocking(move || -> Result<(Manifest, u64), String> {
             let out =
                 std::fs::File::create(&output).map_err(|error| format!("creating {}: {error}", output.display()))?;
             write_restore(&manifest, &cache, BufWriter::new(out))?;
+            remove_dir(&chunks)?;
             let archived = std::fs::metadata(&output)
                 .map_err(|error| format!("reading the size of {}: {error}", output.display()))?
                 .len();
@@ -1622,9 +1622,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         stored
     }
 
-    async fn cut_files(&self, drive: PathBuf, base: Arc<Base>) -> Result<Cut, (ChannelSnapshotFailureReason, String)> {
+    async fn cut_files(
+        &self,
+        drive: PathBuf,
+        base: Arc<Base>,
+        cache: Arc<ChunkCache>,
+    ) -> Result<Cut, (ChannelSnapshotFailureReason, String)> {
         let vmm = Arc::clone(&self.vmm);
-        let cache = self.cache();
         let shown = drive.display().to_string();
         let cutting = tokio::task::spawn_blocking(move || -> Result<Cut, String> {
             let upper = vmm.open_upper(&drive)?;
@@ -1681,10 +1685,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             return Err(expired("the request reached the box too late".to_string()));
         }
         let known = base.places();
-        let cut = self.cut_files(drive, Arc::clone(base)).await?;
+        let cache = Arc::new(ChunkCache::new(dir.join(CHUNKS)));
+        let cut = self.cut_files(drive, Arc::clone(base), Arc::clone(&cache)).await?;
         let new = fresh(draft_digests(&cut.draft), &known);
         let held = self.held(&order.snapshot_id, &new, deadline).await.map_err(expired)?;
-        let cache = self.cache();
         let staging = dir.to_path_buf();
         let packing = tokio::task::spawn_blocking(move || stage(cut, known, held, &new, &cache, &staging));
         let staged = match timeout_at(deadline, packing).await {
@@ -1997,6 +2001,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             if let Event::SetupFinished { claude_setup_id, tap } = event {
                 self.setups.remove(&claude_setup_id);
                 self.pool.release(tap);
+                self.free_disk(&claude_setup_id);
             }
         }
         let sessions: Vec<String> = self.slots.keys().cloned().collect();
@@ -2102,6 +2107,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             if let Some(slot) = self.slots.get_mut(&session) {
                 slot.busy = false;
             }
+            self.free_disk(&session);
             match running {
                 Running::Turn(turn_id) => turn_failed(
                     &self.runner.out,
@@ -2265,6 +2271,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                         );
                     }
                     self.pool.release(tap);
+                    self.free_disk(&session);
                 }
             }
         }
@@ -2293,7 +2300,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     /// # Errors
-    /// Fails when the record of running boxes cannot be written or a box this supervisor did not take over cannot be stopped.
+    /// Fails when the record of running boxes cannot be written, a leftover file of an ended box cannot be deleted or a box this supervisor did not take over cannot be stopped.
     pub fn start(&mut self, taken: Option<(SupervisorHandover, Taken)>) -> Result<(), String> {
         let recorded = taken.is_some();
         let mut standing = BTreeMap::new();
@@ -2306,6 +2313,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             }
         }
         let claimed: Vec<u8> = standing.keys().filter_map(|index| u8::try_from(*index).ok()).collect();
+        let sessions: Vec<EntityId> = standing.values().map(|record| record.session_id.clone()).collect();
+        self.runner.vmm.remove_leftovers(&claimed, &sessions)?;
         self.runner.standing.write(|boxes| *boxes = standing)?;
         self.publish();
         if !recorded {
@@ -2688,8 +2697,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     async fn start_discard(&mut self, session: String, order: TeardownOrder) {
-        if self.live_box(&session).is_some_and(|live| live.box_id == order.box_id) {
-            self.teardown(&session).await;
+        match self.live_box(&session) {
+            Some(live) if live.box_id == order.box_id => self.teardown(&session).await,
+            Some(_) => {}
+            None => self.free_disk(&session),
         }
         self.prune(&session);
         self.box_gone(order);
@@ -2701,6 +2712,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .filter(|live| live.box_id == order.box_id)
             .map(|live| live.dirty)
         else {
+            if self.live_box(&session).is_none() {
+                self.free_disk(&session);
+            }
             self.prune(&session);
             self.box_gone(order);
             return;
@@ -2809,6 +2823,19 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
     }
 
+    fn free_disk(&self, session: &str) {
+        let freed = self
+            .runner
+            .vmm
+            .staging(&held_session(session))
+            .and_then(|dir| remove_dir(&dir));
+        if let Err(error) = freed {
+            eprintln!(
+                "tumpel-supervisor: DiskNotFreed: the box of session {session} ended, then {error}; the next supervisor start deletes it"
+            );
+        }
+    }
+
     async fn teardown(&mut self, session: &str) {
         let Some(slot) = self.slots.get_mut(session) else {
             return;
@@ -2819,6 +2846,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         };
         let (tap, _) = stop_box(&self.runner.standing, live).await;
         self.pool.release(tap);
+        self.free_disk(session);
         self.prune(session);
     }
 
@@ -2840,6 +2868,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 self.setups.remove(&claude_setup_id);
                 self.setup_tasks.remove(&claude_setup_id);
                 self.pool.release(tap);
+                self.free_disk(&claude_setup_id);
             }
             Event::HandoverExpired => self.handover_expired().await,
         }
@@ -2872,6 +2901,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         if let Some(tap) = freed {
             self.pool.release(tap);
+            self.free_disk(&session);
         }
         if arm {
             self.arm(&session);

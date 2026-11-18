@@ -421,6 +421,12 @@ impl Vmm for MemoryVmm {
         Ok(())
     }
 
+    fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String> {
+        let sessions: Vec<&str> = sessions.iter().map(|session| session.as_str()).collect();
+        note(&self.log, format!("remove leftovers but boxes {boxes:?} and sessions {sessions:?}"));
+        Ok(())
+    }
+
     fn open_upper(&self, drive: &Path) -> Result<Tree, String> {
         self.drives
             .lock()
@@ -433,10 +439,6 @@ impl Vmm for MemoryVmm {
 
     fn staging(&self, session_id: &EntityId) -> Result<PathBuf, String> {
         Ok(self.staging.join(&**session_id))
-    }
-
-    fn chunk_cache(&self) -> PathBuf {
-        self.staging.join("chunks")
     }
 
     fn image_cache(&self) -> PathBuf {
@@ -1027,7 +1029,7 @@ impl Host {
             repository: "https://github.com/acme/app.git".try_into().expect("repository"),
             git_author_name: "Tumpel Agent".try_into().expect("author name"),
             git_author_email: "agent@tumpel.invalid".try_into().expect("author email"),
-            files_cache: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/lifecycle-tests/persona-files"),
+            files_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/lifecycle-tests/persona-files"),
             prebuild_commit_sha: None,
             box_memory_mib: None,
             box_disk_mib: None,

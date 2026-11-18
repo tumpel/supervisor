@@ -114,6 +114,63 @@ fn remove(path: &Path) -> Result<(), String> {
     }
 }
 
+fn remove_dir(path: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("deleting {}: {error}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn entries(dir: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|error| format!("listing {}: {error}", dir.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("listing {}: {error}", dir.display())),
+    }
+}
+
+fn remove_entry(entry: &std::fs::DirEntry) -> Result<(), String> {
+    let path = entry.path();
+    let is_dir = entry
+        .file_type()
+        .map_err(|error| format!("reading the type of {}: {error}", path.display()))?
+        .is_dir();
+    if is_dir {
+        return remove_dir(&path);
+    }
+    remove(&path)
+}
+
+pub fn remove_leftovers(data: &Path, images: &Path, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String> {
+    let kept_boxes: Vec<String> = boxes.iter().map(|index| format!("box{index}")).collect();
+    for entry in entries(data)? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_box = name
+            .strip_prefix("box")
+            .is_some_and(|index| index.parse::<u8>().is_ok());
+        if is_box && !kept_boxes.contains(&name) {
+            remove_entry(&entry)?;
+        }
+    }
+    for entry in entries(&data.join("sessions"))? {
+        if !sessions.iter().any(|session| entry.file_name() == session.as_str()) {
+            remove_entry(&entry)?;
+            continue;
+        }
+        for file in entries(&entry.path())? {
+            if file.file_name() != OVERLAY_DRIVE {
+                remove_entry(&file)?;
+            }
+        }
+    }
+    remove_dir(&data.join(crate::persona_files::DIR))?;
+    remove_dir(&images.join("chunks"))
+}
+
 fn console_text(tail: &[u8]) -> String {
     let text = strip_ansi(&String::from_utf8_lossy(tail));
     let lines: Vec<&str> = text
@@ -641,16 +698,16 @@ impl Vmm for Firecracker {
         stop_scopes(&unclaimed)
     }
 
+    fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String> {
+        remove_leftovers(&self.data, &self.images, boxes, sessions)
+    }
+
     fn open_upper(&self, drive: &Path) -> Result<Ext4Upper, String> {
         Ext4Upper::load(drive)
     }
 
     fn staging(&self, session_id: &EntityId) -> Result<PathBuf, String> {
         session_dir(&self.data, session_id)
-    }
-
-    fn chunk_cache(&self) -> PathBuf {
-        self.images.join("chunks")
     }
 
     fn image_cache(&self) -> PathBuf {
@@ -962,17 +1019,11 @@ impl Machine for FirecrackerBox {
         if let Some(process) = self.process.take() {
             process.kill().await;
         }
-        let cleared = fd_store::forget_box(self.index)
-            .and_then(|()| self.clear_sockets())
-            .and_then(|()| match std::fs::remove_dir_all(&self.session) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    Err(format!("deleting {}: {error}", self.session.display()))
-                }
-                _ => Ok(()),
-            });
+        let cleared = fd_store::forget_box(self.index).and_then(|()| remove_dir(&self.dir));
         if let Err(error) = cleared {
             eprintln!(
-                "tumpel-supervisor: tearing down a box: {error}; its files stay on the host's disk, shrinking the disk budget, until a box of the same session boots here again"
+                "tumpel-supervisor: DiskNotFreed: tearing down box {}: {error}; the next supervisor start deletes it",
+                self.index
             );
         }
     }

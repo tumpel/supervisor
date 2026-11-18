@@ -150,7 +150,7 @@ impl Holds {
     #[must_use]
     pub fn hold_boot(&self, boot: &Boot) -> Hold {
         match boot {
-            Boot::Full(_) => self.hold(Vec::new()),
+            Boot::Full(image) => self.hold(vec![image.image_digest.to_string()]),
             Boot::Layered(layered) => self.hold(vec![
                 layered.base.image_digest.to_string(),
                 layered.layer.manifest.layer_digest.to_string(),
@@ -213,9 +213,17 @@ pub async fn resolve<S: Store>(
     match order {
         BootOrder::Full(image) => {
             let digest = image.download.image_digest.clone();
-            let manifest =
-                images::resolve(caches.store, caches.images, image, caches.lock, || fetching(digest)).await?;
-            Ok((Boot::Full(manifest), caches.holds.hold(Vec::new())))
+            let hold = caches.holds.hold(vec![digest.to_string()]);
+            let manifest = images::resolve(
+                caches.store,
+                caches.images,
+                image,
+                caches.holds.held(),
+                caches.lock,
+                || fetching(digest),
+            )
+            .await?;
+            Ok((Boot::Full(manifest), hold))
         }
         BootOrder::Layered(layered) => {
             let hold = caches.holds.hold(vec![

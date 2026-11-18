@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
@@ -111,7 +111,7 @@ fn a_fetched_image_whose_bytes_miss_the_digest_leaves_the_cache_untouched() {
     }
     std::fs::write(&staged.manifest, &new.manifest).expect("manifest");
 
-    let refusal = adopt(&cache, &order, &staged).expect_err("a wrong digest is refused");
+    let refusal = adopt(&cache, &order, &staged, &BTreeSet::new()).expect_err("a wrong digest is refused");
 
     assert_eq!(refusal.reason, TurnFailureReason::ImageFetchFailed);
     assert!(
@@ -126,12 +126,14 @@ fn a_fetched_image_whose_bytes_miss_the_digest_leaves_the_cache_untouched() {
 }
 
 #[test]
-fn a_verified_image_replaces_the_cached_image_of_its_harness_version_and_whatever_no_valid_manifest_names() {
+fn a_verified_image_replaces_every_unheld_image_of_its_harness_and_whatever_no_valid_manifest_names() {
     let cache = cache("replace");
     let old = image("old rootfs", "1");
     let other_version = image("other version rootfs", "2");
+    let running = image("running rootfs", "3");
     put(&cache, &old);
     put(&cache, &other_version);
+    put(&cache, &running);
     let base = sha256(b"base rootfs");
     let base_kernel = sha256(b"base kernel");
     std::fs::write(cache.join(format!("{base}.ext4")), b"base rootfs").expect("base image");
@@ -169,15 +171,16 @@ fn a_verified_image_replaces_the_cached_image_of_its_harness_version_and_whateve
     std::fs::write(kernel, KERNEL).expect("kernel");
     std::fs::write(&staged.manifest, &new.manifest).expect("manifest");
 
-    let manifest = adopt(&cache, &order, &staged).expect("a verified image is adopted");
+    let held = BTreeSet::from([running.digest.clone()]);
+    let manifest = adopt(&cache, &order, &staged, &held).expect("a verified image is adopted");
 
     assert_eq!(*manifest.image_digest, new.digest);
     let names: Vec<String> = listing(&cache).into_keys().collect();
     let mut expected = vec![
         format!("{}.ext4", new.digest),
         format!("{}.json", new.digest),
-        format!("{}.ext4", other_version.digest),
-        format!("{}.json", other_version.digest),
+        format!("{}.ext4", running.digest),
+        format!("{}.json", running.digest),
         format!("{}.vmlinux", sha256(KERNEL)),
         format!("{base}.ext4"),
         format!("{base}.json"),
@@ -223,7 +226,7 @@ async fn the_fetch_budget_counts_the_wait_for_another_image_from_turn_image_fetc
     let started = tokio::time::Instant::now();
     let mut sent = None;
 
-    let refusal = resolve(&Unreachable, &cache, &order, &lock, || {
+    let refusal = resolve(&Unreachable, &cache, &order, BTreeSet::new(), &lock, || {
         sent = Some(tokio::time::Instant::now());
     })
     .await
