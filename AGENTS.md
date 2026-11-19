@@ -12,7 +12,7 @@ Always follow `rules/errors.md` and `rules/coding-standards.md`.
 
 ## Commands
 
-- `npm install` installs dependencies and enables the pre-commit hook.
+- `npm install` installs dependencies.
 - `npm run check` runs every check. `npm run fix` formats.
 - `npm test` runs the Rust and release script tests. The `host-tests` feature needs KVM and runs by hand.
 - `npm run supervisor:build` builds the static guest, packs the guest drive and builds the release supervisor.

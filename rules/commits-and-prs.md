@@ -2,7 +2,7 @@
 
 1. Start from the latest `origin/main` on a new branch.
 2. A pull request does one thing.
-3. `npm run check` passes before every commit. `npm install` enables the pre-commit hook that runs it. Never bypass the hook.
+3. CI runs `npm run check` and `npm test` on every pull request.
 4. A commit subject and a PR title are conventional commits: `type(scope): summary`, imperative, lower case, 72 characters or fewer, no full stop. The type is feat, fix, chore, docs, refactor, perf, test, build, ci, style or revert.
 5. A commit body gives the reason for the change. Skip it when the diff is obvious.
 6. Open the PR as a draft. The body is exactly this, one or two sentences a section:
