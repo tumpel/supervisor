@@ -1,0 +1,5 @@
+treatMajorZeroAsStable: true
+types:
+  - { type: feat, increment: Minor, section: Features, hidden: false }
+  - { type: fix, increment: Patch, section: Fixes, hidden: false }
+  - { type: perf, increment: Patch, section: Performance, hidden: false }

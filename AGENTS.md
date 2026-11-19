@@ -15,4 +15,4 @@ Always follow `rules/errors.md` and `rules/coding-standards.md`.
 - `npm run check` runs every check. `npm run fix` formats.
 - `npm test` runs the Rust and release script tests. The `host-tests` feature needs KVM and runs by hand.
 - `npm run supervisor:build` builds the static guest, packs the guest drive and builds the release supervisor.
-- A push to `main` that changes a shipped file publishes a GitHub pre-release `vX.Y.Z-main.N`; a daily run promotes the newest one to the stable `vX.Y.Z` on crates.io and GitHub. A rerun releases the same version.
+- Releases are mechanical; never bump a version, tag or publish by hand. A merge to `main` that changes a shipped file publishes a GitHub pre-release `vX.Y.Z-rc.N`, versioned from the conventional commit types (breaking major, `feat` minor, `fix` and `perf` patch). Only the manual `promote` workflow ships a release candidate to crates.io as `vX.Y.Z`. A rerun releases the same version.

@@ -1,0 +1,96 @@
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: The release candidate tag to ship, such as v0.3.0-rc.12
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  TARGET: x86_64-unknown-linux-gnu
+  CANDIDATE: ${{ inputs.candidate }}
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Name the stable version of the release candidate
+        run: |
+          [[ "$CANDIDATE" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-rc\.[0-9]+$ ]] || { echo "promote: $CANDIDATE is no release candidate tag; pass vX.Y.Z-rc.N" >&2; exit 1; }
+          echo "VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+          echo "TAG=v${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.candidate }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Install mksquashfs for the guest drive
+        run: sudo apt-get update -q && sudo apt-get install -y -q squashfs-tools
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Stamp the version into the workspace
+        run: node npm-scripts/release.mjs stamp "$VERSION"
+
+      - name: Build the static guest, the guest drive and the supervisor
+        env:
+          TUMPEL_RELEASE_VERSION: ${{ env.VERSION }}
+          TUMPEL_TARGET: ${{ env.TARGET }}
+        run: npm run supervisor:build
+
+      - name: Stage the binaries, their sha256, release.json and the crate's guest drive
+        run: node npm-scripts/release.mjs assets "$VERSION" .tmp/release
+
+      - name: Package the crates
+        run: cargo publish --dry-run --allow-dirty -p tumpel-channel -p tumpel-guest -p tumpel-supervisor
+
+      - name: Tag the release candidate's commit with the stable version before anything is published
+        run: |
+          tagged=$(git ls-remote --tags origin "refs/tags/$TAG" | cut -f1)
+          if [ -z "$tagged" ]; then
+            git tag "$TAG" HEAD
+            git push origin "refs/tags/$TAG"
+          elif [ "$tagged" != "$(git rev-parse HEAD)" ]; then
+            echo "promote: $TAG already tags $tagged, not the commit of $CANDIDATE; promote a release candidate of that commit" >&2
+            exit 1
+          fi
+
+      - id: crates
+        name: List the crates crates.io lacks at this version
+        run: echo "unpublished=$(node npm-scripts/release.mjs unpublished "$VERSION")" >> "$GITHUB_OUTPUT"
+
+      - if: steps.crates.outputs.unpublished != ''
+        name: Publish the crates crates.io lacks
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CRATES: ${{ steps.crates.outputs.unpublished }}
+        run: cargo publish --allow-dirty $(printf -- '-p %s ' $CRATES)
+
+      - name: Publish the stable GitHub release with the binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          case "$draft" in
+            none) gh release create "$TAG" .tmp/release/* --title "$TAG" --generate-notes --verify-tag --latest ;;
+            true) gh release upload "$TAG" .tmp/release/* --clobber && gh release edit "$TAG" --draft=false --latest ;;
+            *) echo "promote: $TAG is already published; its binaries stay as they are" >&2; exit 1 ;;
+          esac

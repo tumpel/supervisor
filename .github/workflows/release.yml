@@ -3,8 +3,6 @@ name: release
 on:
   push:
     branches: [main]
-  schedule:
-    - cron: "0 4 * * *"
 
 concurrency:
   group: release
@@ -16,6 +14,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: never
   TARGET: x86_64-unknown-linux-gnu
+  SHIPPED: >-
+    Cargo.toml Cargo.lock rust-toolchain.toml package.json npm-scripts/guest-drive.mjs
+    crates/tumpel-channel/Cargo.toml crates/tumpel-channel/src
+    crates/tumpel-guest/Cargo.toml crates/tumpel-guest/src
+    crates/tumpel-supervisor/Cargo.toml crates/tumpel-supervisor/build.rs
+    crates/tumpel-supervisor/release_version.rs crates/tumpel-supervisor/src
 
 jobs:
   plan:
@@ -23,41 +27,39 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.plan.outputs.version }}
-      ref: ${{ steps.plan.outputs.ref }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v7
+      - uses: taiki-e/install-action@v2
         with:
-          node-version: 24
+          tool: convco@0.7.2
 
       - id: plan
-        name: Plan a dev build of main, or the daily stable release of the newest dev build
-        env:
-          BUILD: ${{ github.event_name == 'schedule' && 'stable' || 'dev' }}
-          GH_TOKEN: ${{ github.token }}
-        run: node npm-scripts/release.mjs plan "$BUILD" | tee -a "$GITHUB_OUTPUT"
+        name: Name the release candidate when a shipped file changed since the newest tag
+        run: |
+          set -f
+          stable=$(convco version --ignore-prereleases)
+          next=$(convco version --bump --ignore-prereleases $(printf -- '-P %s ' $SHIPPED))
+          nearest=$(git describe --tags --abbrev=0 --match 'v[0-9]*')
+          if [ "$next" = "$stable" ] || git diff --quiet "$nearest" HEAD -- $SHIPPED; then
+            echo "release: nothing shipped needs a new version since $nearest" >&2
+            echo "version=" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$next-rc.$(git rev-list --count "v$stable..HEAD")" | tee -a "$GITHUB_OUTPUT"
+          fi
 
-  release:
+  candidate:
     needs: plan
     if: needs.plan.outputs.version != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      STABLE: ${{ github.event_name == 'schedule' }}
       VERSION: ${{ needs.plan.outputs.version }}
       TAG: v${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.plan.outputs.ref }}
-
-      - name: Take the release script from the workflow's commit
-        run: |
-          git fetch -q --depth 1 origin "$GITHUB_SHA"
-          git checkout FETCH_HEAD -- npm-scripts/release.mjs
 
       - uses: actions/setup-node@v7
         with:
@@ -86,37 +88,13 @@ jobs:
       - name: Package the crates
         run: cargo publish --dry-run --allow-dirty -p tumpel-channel -p tumpel-guest -p tumpel-supervisor
 
-      - if: env.STABLE == 'true'
-        name: Tag the stable release before anything is published
-        run: |
-          git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null && exit 0
-          git tag "$TAG" HEAD
-          git push origin "refs/tags/$TAG"
-
-      - id: crates
-        if: env.STABLE == 'true'
-        name: List the crates crates.io lacks at this version
-        run: echo "unpublished=$(node npm-scripts/release.mjs unpublished "$VERSION")" >> "$GITHUB_OUTPUT"
-
-      - if: steps.crates.outputs.unpublished != ''
-        name: Publish the crates crates.io lacks
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          CRATES: ${{ steps.crates.outputs.unpublished }}
-        run: cargo publish --allow-dirty $(printf -- '-p %s ' $CRATES)
-
-      - name: Publish the GitHub release with the binaries
+      - name: Publish the GitHub pre-release with the binaries
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$STABLE" = true ]; then
-            create=(--verify-tag) kind=(--latest)
-          else
-            create=(--target "$(git rev-parse HEAD)") kind=(--prerelease --latest=false)
-          fi
           draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo none)
           case "$draft" in
-            none) gh release create "$TAG" .tmp/release/* --title "$TAG" --generate-notes "${create[@]}" "${kind[@]}" ;;
-            true) gh release upload "$TAG" .tmp/release/* --clobber && gh release edit "$TAG" --draft=false "${kind[@]}" ;;
+            none) gh release create "$TAG" .tmp/release/* --title "$TAG" --generate-notes --target "$GITHUB_SHA" --prerelease --latest=false ;;
+            true) gh release upload "$TAG" .tmp/release/* --clobber && gh release edit "$TAG" --draft=false --prerelease --latest=false ;;
             *) echo "release: $TAG is already published; its binaries stay as they are" >&2; exit 1 ;;
           esac
