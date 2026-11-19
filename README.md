@@ -14,12 +14,17 @@ The API types come from `tumpel-api`, generated in [tumpel/protocol](https://git
 
 ## Install and enrol
 
-Download `tumpel-supervisor-x86_64-linux` and its `.sha256` from the [latest release](https://github.com/tumpel/supervisor/releases/latest), then check and install it:
+A host installs either a stable release or a release candidate. Stable releases are on crates.io and GitHub; release candidates are on GitHub only. Set `version` to a stable release such as `0.3.0` or a release candidate such as `0.3.0-rc.12`, then download that release's binary and check it:
 
 ```sh
+version=0.3.0
+base=https://github.com/tumpel/supervisor/releases/download/v$version
+curl -fL -O "$base/tumpel-supervisor-x86_64-linux" -O "$base/tumpel-supervisor-x86_64-linux.sha256"
 sha256sum -c tumpel-supervisor-x86_64-linux.sha256
 install -m 0755 tumpel-supervisor-x86_64-linux ./tumpel-supervisor
 ```
+
+`cargo install tumpel-supervisor --version <version>` builds a stable release from crates.io, with the guest drive that ships inside the crate. The [releases page](https://github.com/tumpel/supervisor/releases) lists every version; the release candidates are its pre-releases.
 
 Mint an enrolment token on your own machine and pipe it to the installer on the host. Run the installer as the user that will own the boxes, never as root:
 
@@ -27,7 +32,7 @@ Mint an enrolment token on your own machine and pipe it to the installer on the 
 tumpel host mint-token --expires-in 600 | ssh <host> ./tumpel-supervisor install --endpoint <control plane url> --token-file -
 ```
 
-`cargo install tumpel-supervisor` builds the same binary, with the guest drive that ships inside the crate.
+An enrolled host updates itself to the supervisor its control plane stage pins, stable or release candidate, so a development host follows the release candidate its stage pins.
 
 ## Restart and stop
 
@@ -35,16 +40,14 @@ Each box runs in its own systemd user scope, `tumpel-box<k>.scope`, outside the 
 
 ## Releases
 
-The supervisor ships two builds, and neither needs a person to cut it.
+Only a change to a shipped file makes a new version: a crate source, a Cargo manifest, `package.json`, the toolchain or the guest drive build. Docs, tests and CI never do. The conventional commits that changed shipped files since the latest stable tag pick the next version: a breaking change bumps major, `feat` bumps minor, and `fix` or `perf` bumps patch. Other types ride along with the next release.
 
-- Dev build: a push to `main` publishes a GitHub pre-release `vX.Y.Z-main.N` when a commit since the newest release tag changed a shipped file, so a skipped or failed run is built by the next push. A shipped file is a crate source, a Cargo manifest, `package.json`, the toolchain or the guest drive build. `X.Y.Z` is the next stable version and `N` counts the commits since the latest stable release, so semver orders every dev build after the latest stable release and before the next one. A dev build never touches crates.io.
-- Stable build: once a day at 04:00 UTC, the newest dev build without a stable release is promoted. The run tags that dev build's commit `vX.Y.Z`, publishes the crates to crates.io, and publishes the GitHub release as Latest. A day with no new dev build releases nothing.
+- Release candidate: a push to `main` with such a change publishes the GitHub pre-release `vX.Y.Z-rc.N`, where `N` counts the commits since the latest stable tag. A release candidate never touches crates.io.
+- Stable release: a person runs the `promote` workflow and names one release candidate. It tags that commit `vX.Y.Z`, publishes the crates to crates.io and publishes the GitHub release as Latest. To ship several changes together, merge them and promote the last release candidate.
 
-The conventional commit types since the latest stable release pick `X.Y.Z`: a breaking change bumps major, or minor while the version is 0.x, a `feat` bumps minor, and any other type bumps patch. Docs, tests and CI changes never build.
+Every release attaches `tumpel-supervisor-x86_64-linux`, `tumpel-guest-x86_64-linux`, their `.sha256` files and `release.json`, which names the version, the protocol windows and the sha256 of the supervisor.
 
-Every release, dev or stable, attaches the same assets under the same names: `tumpel-supervisor-x86_64-linux`, `tumpel-guest-x86_64-linux`, their `.sha256` files and `release.json`. Fetch one by tag from `https://github.com/tumpel/supervisor/releases/download/v<version>/<asset>`. `release.json` names the version, the protocol windows and the sha256 of the supervisor.
-
-Every build packages all three crates before it publishes anything. A stable tag is pushed before the crates publish, and the next daily run finishes a stable tag that has no published release before it promotes anything newer, so one version always comes from one commit. That run skips crates already on crates.io. A dev tag appears only when its GitHub release publishes. A published release is never overwritten: a rerun of a published version fails and names it.
+A failed run is rerun as it is and releases the same version. The stable tag is pushed before the crates publish, a rerun skips crates already on crates.io and finishes a draft release, and a published release is never overwritten.
 
 ## Development
 
