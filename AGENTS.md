@@ -8,6 +8,7 @@ Always follow `rules/errors.md` and `rules/coding-standards.md`.
 - When writing text a user reads, docs, an issue or a PR body, follow `rules/writing.md`.
 - No comments in code.
 - The API types come from `tumpel-api`, pinned exactly. Change them in tumpel/protocol, release it, then bump the pin.
+- Consume a tumpel/protocol release candidate as a Cargo git dependency on `https://github.com/tumpel/protocol`, pinned to its exact `vX.Y.Z-rc.N` tag. The `promote` workflow switches it to the exact crates.io `X.Y.Z` version before `cargo publish`.
 
 ## Commands
 
