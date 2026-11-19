@@ -17,8 +17,8 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, EntityId, HostUsage,
-    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
+    HostUsage, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
 };
 use tumpel_channel::{ChannelError, Event, HostChannel, Phase, Port, Signer, HEARTBEAT_DEADLINE};
@@ -238,7 +238,11 @@ fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> SetupCommand {
         claude_setup_id: offer.claude_setup_id,
         tenant_id: offer.tenant_id,
         box_id: offer.box_id,
-        image: BootOrder::from_offer(offer.image, "ClaudeCode".to_string(), offer.harness_version.to_string()),
+        image: BootOrder::from_offer(
+            offer.image,
+            offer.harness.unwrap_or(ClaudeSetupHarness::ClaudeCode).to_string(),
+            offer.harness_version.to_string(),
+        ),
         token_url: offer.token_url,
         token_credential: offer.token_credential,
         expires_at: offer.expires_at,
@@ -983,5 +987,46 @@ async fn session(
                 return Ok(dropped(welcomed, format!("sending failed: {error}")));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_setup_box_boots_the_harness_its_offer_names_and_claude_code_without_one() {
+        let mut frame = serde_json::json!({
+            "type": "ClaudeSetupBoxOffer",
+            "claudeSetupId": "setup-1",
+            "tenantId": "tenant-1",
+            "boxId": "box-1",
+            "harnessVersion": "0.169.0",
+            "image": {
+                "kind": "Full",
+                "imageDigest": "a".repeat(64),
+                "kernelDigest": "b".repeat(64),
+                "manifestDigest": "c".repeat(64),
+                "imageUrl": "https://r2.example.test/image",
+                "kernelUrl": "https://r2.example.test/kernel",
+                "manifestUrl": "https://r2.example.test/manifest",
+                "downloadExpiresAt": "2026-11-19T00:00:00Z",
+                "fetchSeconds": 300
+            },
+            "tokenUrl": "https://api.example.test/v1/claude-setups/setup-1/token",
+            "tokenCredential": "t".repeat(43),
+            "expiresAt": "2026-11-19T00:15:00Z"
+        });
+        let booted = |frame: &serde_json::Value| {
+            let offer: ChannelClaudeSetupBoxOffer = serde_json::from_value(frame.clone()).expect("the offer parses");
+            let SetupCommand::Start(order) = setup_order(offer) else {
+                panic!("a setup offer starts a setup box");
+            };
+            let (harness, version) = order.image.harness();
+            format!("{harness} {version}")
+        };
+        assert_eq!(booted(&frame), "ClaudeCode 0.169.0");
+        frame["harness"] = serde_json::json!("Codex");
+        assert_eq!(booted(&frame), "Codex 0.169.0");
     }
 }
