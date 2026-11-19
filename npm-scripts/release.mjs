@@ -17,12 +17,15 @@ const die = (message) => {
 const cargoVersion = (cargo) =>
   cargo.match(/^version = "([^"]+)"$/m)?.[1] ?? die("Cargo.toml names no workspace version");
 
-const tumpelApiPin = (cargo) =>
-  cargo.match(/^tumpel-api = "=([^"]+)"$/m)?.[1] ?? die('Cargo.toml pins no tumpel-api = "=X.Y.Z"');
+export const tumpelApiPin = (cargo) =>
+  cargo.match(
+    /^tumpel-api = (?:"=|\{ git = "https:\/\/github\.com\/tumpel\/protocol", tag = "v)([^"]+)"(?: \})?$/m,
+  )?.[1] ?? die('Cargo.toml pins no tumpel-api = "=X.Y.Z" or protocol tag "vX.Y.Z-rc.N"');
 
-const schemasPin = (packageJson) =>
-  JSON.parse(packageJson).dependencies?.["@tumpel/schemas"]?.match(/tumpel-schemas-(\d+\.\d+\.\d+)\.tgz$/)?.[1] ??
-  die("package.json pins no @tumpel/schemas release tarball");
+export const schemasPin = (packageJson) =>
+  JSON.parse(packageJson).dependencies?.["@tumpel/schemas"]?.match(
+    /tumpel-schemas-(\d+\.\d+\.\d+(?:-rc\.\d+)?)\.tgz$/,
+  )?.[1] ?? die("package.json pins no @tumpel/schemas release tarball");
 
 export const assertProtocolPinsAgree = (schemas, api) => {
   if (schemas !== api)

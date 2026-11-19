@@ -204,6 +204,8 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         }
         let hello = ChannelHello {
             box_capacity,
+            channel_protocol_oldest: None,
+            guest_protocol: None,
             host_id: self.host_id.clone(),
             protocol_version: NonZeroU32::new(u32::from(ChannelProtocol::VERSION))
                 .ok_or_else(|| protocol("protocol version 0"))?,

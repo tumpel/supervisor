@@ -17,8 +17,8 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, EntityId, Harness, HostUsage,
-    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
+    HostUsage, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
 };
 use tumpel_channel::{ChannelError, Event, HostChannel, Phase, Port, Signer, HEARTBEAT_DEADLINE};
@@ -240,7 +240,7 @@ fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> SetupCommand {
         box_id: offer.box_id,
         image: BootOrder::from_offer(
             offer.image,
-            offer.harness.unwrap_or(Harness::ClaudeCode).to_string(),
+            offer.harness.unwrap_or(ClaudeSetupHarness::ClaudeCode).to_string(),
             offer.harness_version.to_string(),
         ),
         token_url: offer.token_url,
