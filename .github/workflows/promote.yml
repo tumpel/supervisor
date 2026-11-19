@@ -92,5 +92,5 @@ jobs:
           case "$draft" in
             none) gh release create "$TAG" .tmp/release/* --title "$TAG" --generate-notes --verify-tag --latest ;;
             true) gh release upload "$TAG" .tmp/release/* --clobber && gh release edit "$TAG" --draft=false --latest ;;
-            *) echo "promote: $TAG is already published; its binaries stay as they are" >&2; exit 1 ;;
+            *) echo "promote: $TAG is already published; its binaries stay as they are" ;;
           esac

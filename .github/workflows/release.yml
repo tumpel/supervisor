@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: never
@@ -42,7 +42,7 @@ jobs:
           set -f
           stable=$(convco version --ignore-prereleases)
           next=$(convco version --bump --ignore-prereleases $(printf -- '-P %s ' $SHIPPED))
-          nearest=$(git describe --tags --abbrev=0 --match 'v[0-9]*')
+          nearest=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude 'v*-main.*')
           if [ "$next" = "$stable" ] || git diff --quiet "$nearest" HEAD -- $SHIPPED; then
             echo "release: nothing shipped needs a new version since $nearest" >&2
             echo "version=" >> "$GITHUB_OUTPUT"
@@ -53,6 +53,8 @@ jobs:
   candidate:
     needs: plan
     if: needs.plan.outputs.version != ''
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
