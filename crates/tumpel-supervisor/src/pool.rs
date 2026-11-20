@@ -4,8 +4,6 @@ use std::num::NonZeroU32;
 
 pub const TAP_POOL: u8 = 64;
 
-const CAPACITY_BOX_MIB: u64 = 2048;
-
 #[must_use]
 pub fn headroom_mib(total_mib: u64) -> u64 {
     (total_mib / 4).max(4096)
@@ -259,7 +257,8 @@ impl TapPool {
 
     #[must_use]
     pub fn capacity(&self) -> NonZeroU32 {
-        let boxes = u8::try_from(self.budget_mib / CAPACITY_BOX_MIB).map_or(TAP_POOL, |boxes| boxes.min(TAP_POOL));
+        let boxes = u8::try_from(self.budget_mib / u64::from(self.box_size.memory_mib.get()))
+            .map_or(TAP_POOL, |boxes| boxes.min(TAP_POOL));
         NonZeroU32::MIN.saturating_add(u32::from(boxes.saturating_sub(1)))
     }
 }
@@ -291,20 +290,27 @@ mod tests {
     };
 
     #[test]
-    fn a_44_gib_host_admits_boxes_until_their_reserved_memory_fills_its_budget() {
+    fn a_44_gib_host_refuses_the_box_that_would_pass_its_budget_at_configured_size() {
         let budget = memory_budget_mib(45_056);
         assert_eq!(budget, 33_792);
         let mut pool = TapPool::new(budget, BOX);
-        assert_eq!(pool.capacity().get(), 16);
-        let taps: Vec<_> = (0..16)
-            .map(|_| pool.claim(memory(2048), ROOMY).expect("a 2 GiB box"))
+        assert_eq!(pool.capacity().get(), 8);
+        let taps: Vec<_> = (0..8)
+            .map(|_| {
+                pool.claim(pool.size(None, None), ROOMY)
+                    .expect("a box at the configured 4 GiB")
+            })
             .collect();
         assert_eq!(
-            pool.claim(memory(2048), ROOMY).map_err(|refused| refused.to_string()),
-            Err("this host's 16 boxes hold 32768 MiB of the 33792 MiB it gives boxes, so a box of 2048 MiB does not fit".to_string())
+            pool.claim(pool.size(None, None), ROOMY)
+                .map_err(|refused| refused.to_string()),
+            Err(
+                "this host's 8 boxes hold 32768 MiB of the 33792 MiB it gives boxes, so a box of 4096 MiB does not fit"
+                    .to_string()
+            )
         );
         assert!(pool.claim(memory(1024), ROOMY).is_ok());
-        assert_eq!(taps.len(), 16);
+        assert_eq!(taps.len(), 8);
     }
 
     #[test]
