@@ -15,7 +15,8 @@ use tumpel_api::types::{
     ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType,
     ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId,
     GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox,
-    SupervisorHandoverBoxState, SupervisorHandoverMachine, TurnFailureReason,
+    SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverTeardown,
+    SupervisorHandoverTeardownKind, TurnFailureReason,
 };
 
 use super::{
@@ -1581,6 +1582,38 @@ async fn a_warm_box_handed_over_takes_the_next_turn_without_a_boot() {
             "pause session-1"
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_warm_box_handed_over_with_a_queued_teardown_is_stopped_and_answers_box_gone() {
+    let mut old = host("handover-queued-teardown", 1, Harness::Echo, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    old.snapshot("session-1");
+    old.settle_until("snapshot done").await;
+    assert!(
+        !old.standing().boxes[0].dirty,
+        "a snapshot that holds the turn records the box clean"
+    );
+    old.log();
+    let mut handover = old.ask_handover().await.expect("the boxes are handed over");
+    handover.boxes[0]
+        .queued
+        .push(SupervisorHandoverCommand::Teardown(SupervisorHandoverTeardown {
+            kind: SupervisorHandoverTeardownKind::Teardown,
+        }));
+    let mut new = old.successor(&handover);
+    assert_eq!(new.settle_until("box gone session-1").await, ["box gone session-1"]);
+    assert_eq!(
+        new.log(),
+        [
+            "hand over session-1",
+            "reattach session-1 on tumpel0",
+            "keep boxes [0] and stop the rest",
+            "stop session-1"
+        ]
+    );
+    assert_eq!(new.standing().boxes.len(), 0);
 }
 
 #[tokio::test]
