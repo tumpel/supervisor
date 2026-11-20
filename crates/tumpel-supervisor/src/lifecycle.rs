@@ -217,15 +217,15 @@ impl From<ChannelSnapshotRequest> for SnapshotOrder {
 }
 
 impl Command {
-    fn record(self) -> Option<SupervisorHandoverCommand> {
+    fn record(&self) -> Option<SupervisorHandoverCommand> {
         match self {
             Self::Turn(_) => None,
             Self::Snapshot(order) => Some(SupervisorHandoverCommand::Snapshot(SupervisorHandoverSnapshot {
                 kind: SupervisorHandoverSnapshotKind::Snapshot,
-                snapshot_id: order.snapshot_id,
-                snapshot_seq: order.snapshot_seq,
+                snapshot_id: order.snapshot_id.clone(),
+                snapshot_seq: order.snapshot_seq.clone(),
                 upload_expires_at: order.upload_expires_at,
-                upload_url: order.upload_url,
+                upload_url: order.upload_url.clone(),
             })),
             Self::Teardown(_) => Some(SupervisorHandoverCommand::Teardown(SupervisorHandoverTeardown {
                 kind: SupervisorHandoverTeardownKind::Teardown,
@@ -345,7 +345,6 @@ fn standing_record(handed: &SupervisorHandoverBox) -> SupervisorHandoverBox {
             stdout_fd: -1,
             ..handed.machine.clone()
         },
-        queued: Vec::new(),
         state: standing_state(turn_id),
         ..handed.clone()
     }
@@ -376,9 +375,26 @@ impl Standing {
     }
 
     fn put<M: Machine>(&self, live: &LiveBox<M>, turn_id: Option<&EntityId>) -> Result<(), String> {
-        let record = live.record(turn_id)?;
+        let mut record = live.record(turn_id)?;
         self.write(|boxes| {
+            if let Some(kept) = boxes
+                .remove(&record.tap_index)
+                .filter(|kept| kept.session_id == record.session_id)
+            {
+                record.queued = kept.queued;
+            }
             boxes.insert(record.tap_index, record);
+        })
+    }
+
+    fn queue(&self, session: &str, queued: &[SupervisorHandoverCommand]) -> Result<(), String> {
+        self.write(|boxes| {
+            for record in boxes
+                .values_mut()
+                .filter(|record| record.session_id.as_str() == session)
+            {
+                record.queued = queued.to_vec();
+            }
         })
     }
 }
@@ -1561,28 +1577,40 @@ impl<V: Vmm, S: Store> Runner<V, S> {
 
     async fn snapshot(&self, mut live: LiveBox<V::Machine>, order: &SnapshotOrder) -> Outcome<V::Machine> {
         let drive = live.machine.drive();
-        let message: ChannelHostMessage = match self.store_snapshot(drive, &live.base, order).await {
+        let (message, stored): (ChannelHostMessage, bool) = match self.store_snapshot(drive, &live.base, order).await {
             Ok((uploaded_bytes, base)) => {
                 live.base = Arc::new(base);
                 live.dirty = false;
-                ChannelSnapshotDone {
+                let done = ChannelSnapshotDone {
                     snapshot_id: order.snapshot_id.clone(),
                     type_: ChannelSnapshotDoneType::SnapshotDone,
                     uploaded_bytes,
-                }
-                .into()
+                };
+                (done.into(), true)
             }
-            Err((reason, detail)) => ChannelSnapshotFailed {
-                detail,
-                failed_at: now(),
-                reason,
-                snapshot_id: order.snapshot_id.clone(),
-                type_: ChannelSnapshotFailedType::SnapshotFailed,
+            Err((reason, detail)) => {
+                let failed = ChannelSnapshotFailed {
+                    detail,
+                    failed_at: now(),
+                    reason,
+                    snapshot_id: order.snapshot_id.clone(),
+                    type_: ChannelSnapshotFailedType::SnapshotFailed,
+                };
+                (failed.into(), false)
             }
-            .into(),
         };
         emit(&self.out, message);
-        Outcome::Kept(live)
+        if !stored {
+            return Outcome::Kept(live);
+        }
+        let Err(error) = self.standing.put(&live, None) else {
+            return Outcome::Kept(live);
+        };
+        let (tap, tail, stopped) = stop_box(&self.standing, live).await;
+        eprintln!(
+            "tumpel-supervisor: recording a snapshotted box as clean for a supervisor restart failed and the box was stopped: {error}. Console: {tail}"
+        );
+        Outcome::Gone(tap, stopped)
     }
 
     async fn store_snapshot(
@@ -1976,6 +2004,16 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let Some(mut finished) = self.finished.take() else {
             return Ok(());
         };
+        let adopted: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|(_, slot)| !slot.queue.is_empty())
+            .map(|(session, _)| session.clone())
+            .collect();
+        for session in adopted {
+            self.drain(session).await?;
+        }
+        self.publish();
         loop {
             tokio::select! {
                 input = inputs.recv() => match input {
@@ -2235,7 +2273,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     warm_milliseconds: 0,
                 }),
             };
-            let queued = queue.into_iter().filter_map(Command::record).collect();
+            let queued = queue.iter().filter_map(Command::record).collect();
             let LiveBox {
                 session_id,
                 box_id,
@@ -2441,7 +2479,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let slot = self.slots.entry(session.clone()).or_default();
         if slot.busy || slot.parked.is_some() {
             slot.queue.push_back(command);
-            return Ok(());
+            return self.record_queue(&session);
         }
         self.dispatch(session, command).await
     }
@@ -2853,12 +2891,32 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             stopped?;
             self.free_disk(&session)?;
         }
-        let next = self.slots.get_mut(&session).and_then(|slot| slot.queue.pop_front());
-        if let Some(command) = next {
-            return self.dispatch(session, command).await;
+        self.drain(session).await
+    }
+
+    async fn drain(&mut self, session: String) -> Result<(), String> {
+        loop {
+            let next = self
+                .slots
+                .get_mut(&session)
+                .filter(|slot| !slot.busy && slot.parked.is_none())
+                .and_then(|slot| slot.queue.pop_front());
+            let Some(command) = next else {
+                break;
+            };
+            self.record_queue(&session)?;
+            self.dispatch(session.clone(), command).await?;
         }
         self.prune(&session);
         Ok(())
+    }
+
+    fn record_queue(&self, session: &str) -> Result<(), String> {
+        let queued: Vec<SupervisorHandoverCommand> = self
+            .slots
+            .get(session)
+            .map_or_else(Vec::new, |slot| slot.queue.iter().filter_map(Command::record).collect());
+        self.runner.standing.queue(session, &queued)
     }
 }
 
