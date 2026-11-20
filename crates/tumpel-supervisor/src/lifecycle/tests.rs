@@ -48,6 +48,7 @@ enum Boot {
     Hangs,
     OldImage,
     NewImage,
+    RefusesHandover,
 }
 
 type Files = BTreeMap<Vec<u8>, (Found, Vec<u8>)>;
@@ -307,6 +308,9 @@ impl Machine for MemoryMachine {
     }
 
     fn hand_over(self, guest: MemoryGuest) -> Result<SupervisorHandoverMachine, String> {
+        if self.boot == Boot::RefusesHandover {
+            return Err("its Firecracker process refused the handover".to_string());
+        }
         let mut hands = self.hands.lock().expect("hands");
         let guest_fd = i32::try_from(hands.len()).expect("a descriptor") + 3;
         hands.insert(guest_fd, (guest, self.memory_mib));
@@ -1532,6 +1536,25 @@ async fn a_box_on_record_that_cannot_be_reattached_after_a_crash_is_stopped_with
             "keep boxes [0] and stop the rest"
         ],
         "the box of session-2 on tumpel1 is not kept, so its scope is stopped"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_box_that_cannot_be_handed_over_answers_its_queued_teardown_with_box_gone() {
+    let mut old = host("handover-refused", 1, Harness::SlowClone, Boot::RefusesHandover);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("claim turn-1").await;
+    tokio::time::sleep(SLOW_CLONE / 2).await;
+    old.teardown("session-1");
+    let handover = old.ask_handover().await.expect("the handover answers");
+    assert_eq!(handover.boxes.len(), 0);
+    let failed = format!(
+        "failed {}: box box-session-1 of session session-1 could not be handed to the new supervisor binary and was stopped: its Firecracker process refused the handover; send the turn again",
+        TurnFailureReason::HarnessExited
+    );
+    assert_eq!(
+        old.settle_until("box gone session-1").await,
+        [failed.as_str(), "box gone session-1"]
     );
 }
 

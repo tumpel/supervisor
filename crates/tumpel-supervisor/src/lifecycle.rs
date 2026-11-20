@@ -388,6 +388,16 @@ impl Standing {
     }
 
     fn queue(&self, session: &str, queued: &[SupervisorHandoverCommand]) -> Result<(), String> {
+        let unchanged = self
+            .boxes
+            .lock()
+            .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?
+            .values()
+            .filter(|record| record.session_id.as_str() == session)
+            .all(|record| record.queued == queued);
+        if unchanged {
+            return Ok(());
+        }
         self.write(|boxes| {
             for record in boxes
                 .values_mut()
@@ -2316,6 +2326,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     }
                     self.pool.release(tap);
                     freed = freed.and(self.free_disk(&session));
+                    self.answer_lost(&session, queue);
                 }
             }
         }
