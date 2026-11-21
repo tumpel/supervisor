@@ -121,7 +121,7 @@ async fn a_shell_box_runs_a_turn_pauses_resumes_warm_and_its_drive_reads_back() 
         "memoryMib": 512,
         "overlayMib": 1024,
         "layerCacheMib": 1024,
-        "budgets": { "bootSeconds": 30, "firstLineSeconds": 10, "turnSeconds": 30, "snapshotSeconds": 30 },
+        "budgets": { "bootSeconds": 30, "firstLineSeconds": 10, "snapshotSeconds": 30 },
         "heartbeatIntervalSeconds": 10,
         "updateGraceSeconds": 600
     }))
@@ -234,7 +234,7 @@ fn crash_runtime(data: &std::path::Path, manifest_path: &std::path::Path) -> (Su
         "memoryMib": 512,
         "overlayMib": 1024,
         "layerCacheMib": 1024,
-        "budgets": { "bootSeconds": 30, "firstLineSeconds": 90, "turnSeconds": 120, "snapshotSeconds": 30 },
+        "budgets": { "bootSeconds": 30, "firstLineSeconds": 90, "snapshotSeconds": 30 },
         "heartbeatIntervalSeconds": 10,
         "updateGraceSeconds": 600
     }))
