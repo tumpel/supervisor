@@ -3,6 +3,7 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use ring::signature::Ed25519KeyPair;
 use std::collections::BTreeMap;
+use std::hash::{BuildHasher, RandomState};
 use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use tumpel_api::types::{
     HostUsage, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
 };
-use tumpel_channel::{ChannelError, Event, HostChannel, Phase, Port, Signer, HEARTBEAT_DEADLINE};
+use tumpel_channel::{Backoff, ChannelError, Event, HostChannel, Phase, Port, Signer, HEARTBEAT_DEADLINE, MAX_REPLAYS};
 
 use crate::boot::BootOrder;
 use crate::dir::{self, ChannelFile, CHANNEL_FILE, CONFIG_FILE, KEY_FILE, RUNTIME_FILE};
@@ -39,8 +40,6 @@ use crate::telemetry::{Telemetry, BATCH_POINTS};
 use crate::update::{self, HttpSource, Layout, Limits, Outcome, Startup, Updater};
 use crate::usage;
 
-const FIRST_BACKOFF: Duration = Duration::from_secs(1);
-const LAST_BACKOFF: Duration = Duration::from_secs(30);
 const TICK: Duration = Duration::from_millis(500);
 const UNIT_RELOAD: Duration = Duration::from_secs(30);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
@@ -815,7 +814,7 @@ async fn serve(
     dir: &Path,
     updates: &mut Updates,
 ) -> Result<Served, Failure> {
-    let mut backoff = FIRST_BACKOFF;
+    let mut backoff = Backoff::default();
     loop {
         match session(channel, url, heartbeat, usage, commands, from_box, updates).await? {
             Ended::Revoked(reason) => {
@@ -844,24 +843,26 @@ async fn serve(
                 return Err(fail(SupervisorFailure::ProtocolError, reason));
             }
             Ended::Dropped { welcomed, reason } => {
-                if welcomed {
-                    backoff = FIRST_BACKOFF;
-                }
+                let wait = backoff.next(welcomed && channel.delivered(), jitter());
                 eprintln!(
-                    "channel to {url} dropped: {reason}; reconnecting in {}s",
-                    backoff.as_secs()
+                    "channel to {url} dropped: {reason}; reconnecting in {:.1}s",
+                    wait.as_secs_f64()
                 );
-                let wake = tokio::time::Instant::now() + backoff;
+                let wake = tokio::time::Instant::now() + wait;
                 loop {
                     tokio::select! {
                         () = tokio::time::sleep_until(wake) => break,
                         Some(message) = from_box.recv() => channel.send(message, &mut Outbox::default()).map_err(|error| store_lost(&error))?,
                     }
                 }
-                backoff = (backoff * 2).min(LAST_BACKOFF);
             }
         }
     }
+}
+
+fn jitter() -> u16 {
+    let [low, high, ..] = RandomState::new().hash_one(()).to_le_bytes();
+    u16::from_le_bytes([low, high])
 }
 
 fn dropped(welcomed: bool, reason: impl Into<String>) -> Ended {
@@ -920,7 +921,10 @@ async fn session(
                     last_received = Instant::now();
                     match channel.receive(text.as_str(), &mut outbox) {
                         Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, &mut outbox).err().map(Err),
-                        Ok(Event::Welcomed) => {
+                        Ok(Event::Welcomed { abandoned }) => {
+                            for frame in abandoned {
+                                eprintln!("tumpel-supervisor: FrameAbandoned: the control plane did not acknowledge {frame} across {MAX_REPLAYS} reconnects; dropped it from channel.json");
+                            }
                             welcomed = true;
                             eprintln!("connected to {url}");
                             last_beat = Instant::now();

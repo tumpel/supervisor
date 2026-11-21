@@ -1,16 +1,22 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, Utc};
+use serde_json::Value;
 use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRefused, ChannelHello,
     ChannelHelloType, ChannelHostEnvelope, ChannelHostFrame, ChannelHostFrameType, ChannelHostHeartbeat,
-    ChannelHostHeartbeatType, ChannelHostMessage, ChannelProtocol, ChannelStoredHostFrame, ChannelStoredHostFrameType,
+    ChannelHostHeartbeatType, ChannelHostMessage, ChannelProtocol, ChannelSnapshotDone, ChannelSnapshotFailed,
+    ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelStoredHostFrame, ChannelStoredHostFrameType,
     EntityId, HostUsage, Sequence, SupervisorChannelState,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
+pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
+pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
+pub const MAX_REPLAYS: u32 = 10;
 
 const HELLO_CONTEXT: &[u8] = b"tumpel-channel-hello-v1";
 
@@ -78,11 +84,31 @@ pub enum Phase {
     Closed,
 }
 
+pub struct Backoff(Duration);
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self(FIRST_BACKOFF)
+    }
+}
+
+impl Backoff {
+    pub fn next(&mut self, delivered: bool, jitter: u16) -> Duration {
+        if delivered {
+            self.0 = FIRST_BACKOFF;
+        }
+        let half = self.0 / 2;
+        let wait = half + half.mul_f64(f64::from(jitter) / f64::from(u16::MAX));
+        self.0 = (self.0 * 2).min(LAST_BACKOFF);
+        wait
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
     None,
     Challenged(String),
-    Welcomed,
+    Welcomed { abandoned: Vec<String> },
     Heartbeat,
     ReleasePublished,
     FrameRefused { seq: i64, reason: String },
@@ -96,6 +122,8 @@ pub struct HostChannel<S: Store, K: Signer> {
     host_id: EntityId,
     supervisor_version: String,
     phase: Phase,
+    replays: BTreeMap<i64, u32>,
+    replayed_through: Option<i64>,
 }
 
 fn encode(envelope: &ChannelHostEnvelope) -> Result<String, ChannelError> {
@@ -104,6 +132,31 @@ fn encode(envelope: &ChannelHostEnvelope) -> Result<String, ChannelError> {
 
 fn protocol(reason: impl Into<String>) -> ChannelError {
     ChannelError::Protocol(reason.into())
+}
+
+fn message_type(frame: &ChannelStoredHostFrame) -> &str {
+    frame.message.get("type").and_then(Value::as_str).unwrap_or("unknown")
+}
+
+fn snapshot_failed(frame: &ChannelStoredHostFrame) -> Result<Option<ChannelHostMessage>, ChannelError> {
+    if message_type(frame) != "SnapshotDone" {
+        return Ok(None);
+    }
+    let done: ChannelSnapshotDone = serde_json::from_value(frame.message.clone())
+        .map_err(|error| protocol(format!("reading saved SnapshotDone frame {}: {error}", frame.seq.0)))?;
+    Ok(Some(
+        ChannelSnapshotFailed {
+            detail: format!(
+                "the control plane did not acknowledge SnapshotDone for snapshot {} across {MAX_REPLAYS} reconnects, so the host stopped resending it; check the control plane logs for this snapshot",
+                *done.snapshot_id
+            ),
+            failed_at: Utc::now().fixed_offset(),
+            reason: ChannelSnapshotFailureReason::NotAnswered,
+            snapshot_id: done.snapshot_id,
+            type_: ChannelSnapshotFailedType::SnapshotFailed,
+        }
+        .into(),
+    ))
 }
 
 impl<S: Store, K: Signer> HostChannel<S, K> {
@@ -121,6 +174,8 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             host_id,
             supervisor_version,
             phase: Phase::Closed,
+            replays: BTreeMap::new(),
+            replayed_through: None,
         }
     }
 
@@ -134,8 +189,15 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         &self.state
     }
 
+    #[must_use]
+    pub fn delivered(&self) -> bool {
+        self.replayed_through
+            .is_some_and(|through| self.state.unacked.iter().all(|frame| frame.seq.0 > through))
+    }
+
     pub fn connect(&mut self) {
         self.phase = Phase::AwaitingChallenge;
+        self.replayed_through = None;
     }
 
     pub fn disconnect(&mut self) {
@@ -253,6 +315,23 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                 Err(protocol(format!("expected Challenge first, got {}", kind(&other))))
             }
             (Phase::AwaitingWelcome, ChannelControlEnvelope::Welcome(_)) => {
+                let (abandoned, kept): (Vec<_>, Vec<_>) =
+                    std::mem::take(&mut self.state.unacked).into_iter().partition(|frame| {
+                        self.replays
+                            .get(&frame.seq.0)
+                            .is_some_and(|count| *count >= MAX_REPLAYS)
+                    });
+                self.state.unacked = kept;
+                for frame in &abandoned {
+                    self.replays.remove(&frame.seq.0);
+                }
+                for frame in &self.state.unacked {
+                    *self.replays.entry(frame.seq.0).or_default() += 1;
+                }
+                self.replayed_through = Some(self.state.unacked.iter().map(|frame| frame.seq.0).max().unwrap_or(0));
+                if !abandoned.is_empty() {
+                    self.store.save(&self.state)?;
+                }
                 for frame in &self.state.unacked {
                     let resent = ChannelStoredHostFrame {
                         ack: Sequence(self.state.received.0),
@@ -264,7 +343,17 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                     )?;
                 }
                 self.phase = Phase::Open;
-                Ok(Event::Welcomed)
+                for frame in &abandoned {
+                    if let Some(failed) = snapshot_failed(frame)? {
+                        self.send(failed, port)?;
+                    }
+                }
+                Ok(Event::Welcomed {
+                    abandoned: abandoned
+                        .iter()
+                        .map(|frame| format!("frame {} ({})", frame.seq.0, message_type(frame)))
+                        .collect(),
+                })
             }
             (Phase::Open, ChannelControlEnvelope::ControlFrame(frame)) => self.accept(frame),
             (Phase::AwaitingWelcome | Phase::Open, ChannelControlEnvelope::Heartbeat(_)) => Ok(Event::Heartbeat),
@@ -276,6 +365,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     fn refused(&mut self, refused: ChannelFrameRefused) -> Result<Event, ChannelError> {
         self.state.unacked.retain(|own| own.seq.0 != refused.seq.0);
+        self.replays.remove(&refused.seq.0);
         self.store.save(&self.state)?;
         Ok(Event::FrameRefused {
             seq: refused.seq.0,
@@ -297,6 +387,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         }
         self.state.received = Sequence(frame.seq.0);
         self.state.unacked.retain(|own| own.seq.0 > frame.ack.0);
+        self.replays.retain(|seq, _| *seq > frame.ack.0);
         self.store.save(&self.state)?;
         Ok(Event::Message(Box::new(frame.message)))
     }
