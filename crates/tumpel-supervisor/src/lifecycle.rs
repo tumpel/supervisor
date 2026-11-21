@@ -53,7 +53,7 @@ pub use setup::{SetupCommand, SetupInput, SetupOrder};
 
 const TRANSFERS: usize = 16;
 const CHUNKS: &str = "chunks";
-const HANDOVER_CLAIM_ALLOWANCE: Duration = Duration::from_secs(60);
+const HANDOVER_REPORT_ALLOWANCE: Duration = Duration::from_secs(60);
 const CANCEL_END: Duration = Duration::from_secs(10);
 const RESTORE_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
 const RESTORE_ENTRIES_PER_SECOND: u64 = 2_000;
@@ -471,7 +471,7 @@ struct Parked {
 
 enum Running {
     Turn(EntityId),
-    Snapshot(EntityId),
+    Snapshot,
 }
 
 fn milliseconds(duration: Duration) -> i64 {
@@ -1318,7 +1318,25 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     ),
                 )
             });
-        let followed = match claiming.answer().await {
+        let mut parking = self.parking.clone();
+        let answered = tokio::select! {
+            biased;
+            answer = claiming.answer() => Some(answer),
+            Ok(_) = parking.wait_for(|parking| *parking) => None,
+        };
+        let Some(answer) = answered else {
+            turn_failed(
+                &self.out,
+                &turn.turn_id,
+                TurnFailureReason::HostUpdating,
+                format!(
+                    "this host started handing its boxes to a new supervisor binary before the control plane answered the claim of turn {}, so its harness never started and its box stays warm; the control plane offers the turn again",
+                    *turn.turn_id
+                ),
+            );
+            return self.pause(live).await;
+        };
+        let followed = match answer {
             Some(Answer::Claimed(_)) => match start {
                 Ok(start) => self.start(&mut live, turn, start).await,
                 Err(failure) => Followed::Ended(Err(failure)),
@@ -2068,9 +2086,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         u32::try_from(self.slots.len() + self.setups.len()).unwrap_or(u32::MAX)
     }
 
-    fn handover_limit(&self) -> Duration {
+    fn handover_report_interval(&self) -> Duration {
         let budgets = self.runner.settings.budgets;
-        HANDOVER_CLAIM_ALLOWANCE + budgets.boot + budgets.snapshot
+        HANDOVER_REPORT_ALLOWANCE + budgets.boot + budgets.snapshot
     }
 
     fn refusal(&self) -> Option<&'static str> {
@@ -2095,11 +2113,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     fn start_handover(&mut self, reply: oneshot::Sender<SupervisorHandover>) {
         self.mode = Mode::HandingOver;
         self.parking.send_replace(true);
-        let limit = self.handover_limit();
         eprintln!(
-            "tumpel-supervisor: handing {} boxes to the new supervisor binary: this host claims no new turn, parks each running turn at its next guest message and waits up to {} s for the boots and snapshots in flight",
+            "tumpel-supervisor: handing {} boxes to the new supervisor binary: this host claims no new turn, parks each running turn at its next guest message, gives back each turn still waiting for its claim and waits for the boots and snapshots in flight, logging every {} s while any runs",
             self.box_count(),
-            limit.as_secs()
+            self.handover_report_interval().as_secs()
         );
         let mut queued = Vec::new();
         for slot in self.slots.values_mut() {
@@ -2117,12 +2134,17 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         for inputs in self.setups.values() {
             let _ = inputs.send(SetupInput::Discard);
         }
+        self.handing = Some((reply, self.handover_timer()));
+    }
+
+    fn handover_timer(&self) -> AbortHandle {
         let events = self.events.clone();
-        let timer = tokio::spawn(async move {
+        let limit = self.handover_report_interval();
+        tokio::spawn(async move {
             tokio::time::sleep(limit).await;
             let _ = events.send(Event::HandoverExpired);
-        });
-        self.handing = Some((reply, timer.abort_handle()));
+        })
+        .abort_handle()
     }
 
     fn settle_handover(&mut self) -> Result<(), String> {
@@ -2136,10 +2158,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         if self.handing.is_none() {
             return Ok(());
         }
-        let limit = self.handover_limit().as_secs();
-        eprintln!(
-            "tumpel-supervisor: HandoverTimedOut: boxes still booting or snapshotting {limit} s into the handover are stopped, and the rest are handed over"
-        );
         let setups: Vec<(String, JoinHandle<()>)> = self.setup_tasks.drain().collect();
         for (claude_setup_id, task) in setups {
             task.abort();
@@ -2147,48 +2165,19 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             self.setups.remove(&claude_setup_id);
             self.free_disk(&claude_setup_id)?;
         }
-        let busy: Vec<String> = self
-            .slots
-            .iter()
-            .filter(|(_, slot)| slot.busy)
-            .map(|(session, _)| session.clone())
-            .collect();
-        for session in busy {
-            let Some((running, task)) = self.slots.get_mut(&session).and_then(|slot| slot.task.take()) else {
-                continue;
-            };
-            task.abort();
-            let _ = task.await;
-            if let Some(slot) = self.slots.get_mut(&session) {
-                slot.busy = false;
-            }
-            match running {
-                Running::Turn(turn_id) => turn_failed(
-                    &self.runner.out,
-                    &turn_id,
-                    TurnFailureReason::HostUpdating,
-                    format!(
-                        "HandoverTimedOut: the box of turn {} did not reach a point it could be handed to the new supervisor binary within {limit} s, so it was stopped; the control plane offers the turn to another host",
-                        *turn_id
-                    ),
-                ),
-                Running::Snapshot(snapshot_id) => emit(
-                    &self.runner.out,
-                    ChannelSnapshotFailed {
-                        detail: format!(
-                            "HandoverTimedOut: snapshot {} of session {session} did not finish within {limit} s of the supervisor update, so its box was stopped; the session's next turn restores from its last snapshot",
-                            *snapshot_id
-                        ),
-                        failed_at: now(),
-                        reason: ChannelSnapshotFailureReason::SnapshotTimedOut,
-                        snapshot_id,
-                        type_: ChannelSnapshotFailedType::SnapshotFailed,
-                    },
-                ),
-            }
-            self.free_disk(&session)?;
+        let busy = self.slots.values().filter(|slot| slot.busy).count();
+        if busy == 0 {
+            return self.finish_handover();
         }
-        self.finish_handover()
+        eprintln!(
+            "tumpel-supervisor: HandoverTimedOut: {busy} boxes are still booting or snapshotting {} s into the handover; this supervisor keeps them running and hands every box over once each reaches a point it can be handed over",
+            self.handover_report_interval().as_secs()
+        );
+        let timer = self.handover_timer();
+        if let Some((_, waiting)) = self.handing.as_mut() {
+            *waiting = timer;
+        }
+        Ok(())
     }
 
     async fn abandon(&mut self, reply: oneshot::Sender<()>) {
@@ -2203,7 +2192,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     let _ = task.await;
                     match running {
                         Running::Turn(turn_id) => Some(turn_id),
-                        Running::Snapshot(_) => None,
+                        Running::Snapshot => None,
                     }
                 }
                 (None, Some(parked)) => Some(parked.turn_id),
@@ -2732,7 +2721,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             return;
         };
         let runner = self.runner.clone();
-        let running = Running::Snapshot(order.snapshot_id.clone());
+        let running = Running::Snapshot;
         self.spawn(session, Work::Snapshot, running, async move {
             runner.snapshot(live, &order).await
         });
