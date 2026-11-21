@@ -44,6 +44,12 @@ fn the_upper_reads_a_journal_transaction_that_wraps_past_the_end_of_the_log() {
         .output()
         .expect("mkfs.ext4 runs");
     assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+    let mounted = Command::new(sbin("debugfs"))
+        .args(["-w", "-R", "feature needs_recovery"])
+        .arg(&drive)
+        .output()
+        .expect("debugfs runs");
+    assert!(mounted.status.success(), "{}", String::from_utf8_lossy(&mounted.stderr));
     let mapped = Command::new(sbin("debugfs"))
         .args(["-R", "bmap /upper/f 0"])
         .arg(&drive)
@@ -66,6 +72,8 @@ fn the_upper_reads_a_journal_transaction_that_wraps_past_the_end_of_the_log() {
     let mut superblock = opened.raw_block(journal[&0]).expect("journal superblock");
     let max_len = u64::from(super::be32(&superblock, 0x10));
     let first = u64::from(super::be32(&superblock, 0x14));
+    superblock[0x28..0x2C].copy_from_slice(&0x13u32.to_be_bytes());
+    superblock[0x50] = 4;
     superblock[0x18..0x1C].copy_from_slice(&7u32.to_be_bytes());
     superblock[0x1C..0x20].copy_from_slice(&u32::try_from(max_len - 1).expect("log").to_be_bytes());
     superblock[0xFC..0x100].fill(0);
