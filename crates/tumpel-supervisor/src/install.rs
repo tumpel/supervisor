@@ -588,7 +588,7 @@ ExecStart={binary} run
 ExecStopPost=/bin/sh -c 'if [ \"$$EXIT_CODE\" = exited ] && [ \"$$EXIT_STATUS\" = 6 ]; then sleep 60; fi'
 Restart=on-failure
 RestartSec=5
-RestartPreventExitStatus=3 5
+RestartPreventExitStatus=3 5 11 12
 NotifyAccess=main
 FileDescriptorStoreMax={descriptors}
 FileDescriptorStorePreserve=yes
