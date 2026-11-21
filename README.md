@@ -14,7 +14,7 @@ The API types come from `tumpel-api`, generated in [tumpel/protocol](https://git
 
 ## Install and enrol
 
-A host installs either a stable release or a release candidate. Stable releases are on crates.io and GitHub; release candidates are on GitHub only. Set `version` to a stable release such as `0.3.0` or a release candidate such as `0.3.0-rc.12`, then download that release's binary and check it:
+A host installs either a stable release or a release candidate. Both are GitHub releases. Set `version` to a stable release such as `0.3.0` or a release candidate such as `0.3.0-rc.12`, then download that release's binary and check it:
 
 ```sh
 version=0.3.0
@@ -24,7 +24,7 @@ sha256sum -c tumpel-supervisor-x86_64-linux.sha256
 install -m 0755 tumpel-supervisor-x86_64-linux ./tumpel-supervisor
 ```
 
-`cargo install tumpel-supervisor --version <version>` builds a stable release from crates.io, with the guest drive that ships inside the crate. The [releases page](https://github.com/tumpel/supervisor/releases) lists every version; the release candidates are its pre-releases.
+The [releases page](https://github.com/tumpel/supervisor/releases) lists every version; the release candidates are its pre-releases.
 
 Mint an enrolment token on your own machine and pipe it to the installer on the host. Run the installer as the user that will own the boxes, never as root:
 
@@ -42,12 +42,12 @@ Each box runs in its own systemd user scope, `tumpel-box<k>.scope`, outside the 
 
 Only a change to a shipped file makes a new version: a crate source, a Cargo manifest, `package.json`, the toolchain or the guest drive build. Docs, tests and CI never do. The conventional commits that changed shipped files since the latest stable tag pick the next version: a breaking change bumps major, `feat` bumps minor, and `fix` or `perf` bumps patch. Other types ride along with the next release.
 
-- Release candidate: a push to `main` with such a change publishes the GitHub pre-release `vX.Y.Z-rc.N`, where `N` counts the commits since the latest stable tag. A release candidate never touches crates.io.
-- Stable release: a person runs the `promote` workflow and names one release candidate. It tags that commit `vX.Y.Z`, publishes the crates to crates.io and publishes the GitHub release as Latest. To ship several changes together, merge them and promote the last release candidate.
+- Release candidate: a push to `main` with such a change publishes the GitHub pre-release `vX.Y.Z-rc.N`, where `N` counts the commits since the latest stable tag.
+- Stable release: a person runs the `promote` workflow and names one release candidate. It tags that commit `vX.Y.Z` and publishes the GitHub release as Latest. To ship several changes together, merge them and promote the last release candidate.
 
 Every release attaches `tumpel-supervisor-x86_64-linux`, `tumpel-guest-x86_64-linux`, their `.sha256` files and `release.json`, which names the version, the protocol windows and the sha256 of the supervisor.
 
-A failed run is rerun as it is and releases the same version. The stable tag is pushed before the crates publish, a rerun skips crates already on crates.io and finishes a draft release, and a published release is never overwritten.
+A failed run is rerun as it is and releases the same version. A rerun reuses the stable tag and finishes a draft release, and a published release is never overwritten.
 
 ## Development
 

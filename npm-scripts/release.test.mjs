@@ -1,23 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { schemasPin, tumpelApiPin, unpublished } from "./release.mjs";
+import { schemasPin, tumpelApiPin } from "./release.mjs";
 
-test("crates already on crates.io at the version are skipped, in publish order", () => {
-  const indexes = {
-    "tumpel-channel": '{"name":"tumpel-channel","vers":"0.1.18"}\n{"name":"tumpel-channel","vers":"0.1.19"}\n',
-    "tumpel-guest": '{"name":"tumpel-guest","vers":"0.1.19"}\n',
-    "tumpel-supervisor": '{"name":"tumpel-supervisor","vers":"0.1.18"}\n',
-  };
-  assert.deepEqual(unpublished("0.1.19", indexes), ["tumpel-supervisor"]);
-  assert.deepEqual(unpublished("0.1.20", indexes), ["tumpel-channel", "tumpel-guest", "tumpel-supervisor"]);
-  assert.deepEqual(unpublished("0.1.18", { ...indexes, "tumpel-guest": "" }), ["tumpel-guest"]);
-});
-
-test("the protocol pins read a crates.io release and a release candidate tag", () => {
+test("the protocol pins read an exact crates.io pin and refuse a git dependency", () => {
   assert.equal(tumpelApiPin('sendfd = "0.4.5"\ntumpel-api = "=0.8.5"\n'), "0.8.5");
-  assert.equal(
-    tumpelApiPin('tumpel-api = { git = "https://github.com/tumpel/protocol", tag = "v0.21.0-rc.14" }\n'),
-    "0.21.0-rc.14",
+  assert.equal(tumpelApiPin('tumpel-api = "=0.21.0-rc.14"\n'), "0.21.0-rc.14");
+  assert.throws(
+    () => tumpelApiPin('tumpel-api = { git = "https://github.com/tumpel/protocol", tag = "v0.21.0-rc.14" }\n'),
+    /a git dependency is refused/,
   );
   const schemas = (url) => schemasPin(JSON.stringify({ dependencies: { "@tumpel/schemas": url } }));
   assert.equal(

@@ -70,6 +70,10 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+
       - name: Install mksquashfs for the guest drive
         run: sudo apt-get update -q && sudo apt-get install -y -q squashfs-tools
 
@@ -84,11 +88,8 @@ jobs:
           TUMPEL_TARGET: ${{ env.TARGET }}
         run: npm run supervisor:build
 
-      - name: Stage the binaries, their sha256, release.json and the crate's guest drive
+      - name: Stage the binaries, their sha256 and release.json
         run: node npm-scripts/release.mjs assets "$VERSION" .tmp/release
-
-      - name: Package the crates
-        run: cargo publish --dry-run --allow-dirty -p tumpel-channel -p tumpel-guest -p tumpel-supervisor
 
       - name: Publish the GitHub pre-release with the binaries
         env:

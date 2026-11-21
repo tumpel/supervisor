@@ -8,7 +8,6 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CARGO = join(ROOT, "Cargo.toml");
 const TARGET = "x86_64-unknown-linux-gnu";
 const VERSION = /^\d+\.\d+\.\d+(-rc\.\d+)?$/;
-const CRATES = ["tumpel-channel", "tumpel-guest", "tumpel-supervisor"];
 
 const die = (message) => {
   throw new Error(`release: ${message}`);
@@ -18,9 +17,8 @@ const cargoVersion = (cargo) =>
   cargo.match(/^version = "([^"]+)"$/m)?.[1] ?? die("Cargo.toml names no workspace version");
 
 export const tumpelApiPin = (cargo) =>
-  cargo.match(
-    /^tumpel-api = (?:"=|\{ git = "https:\/\/github\.com\/tumpel\/protocol", tag = "v)([^"]+)"(?: \})?$/m,
-  )?.[1] ?? die('Cargo.toml pins no tumpel-api = "=X.Y.Z" or protocol tag "vX.Y.Z-rc.N"');
+  cargo.match(/^tumpel-api = "=(\d+\.\d+\.\d+(?:-rc\.\d+)?)"$/m)?.[1] ??
+  die('Cargo.toml pins no tumpel-api = "=X.Y.Z[-rc.N]" from crates.io; a git dependency is refused');
 
 export const schemasPin = (packageJson) =>
   JSON.parse(packageJson).dependencies?.["@tumpel/schemas"]?.match(
@@ -30,16 +28,6 @@ export const schemasPin = (packageJson) =>
 export const assertProtocolPinsAgree = (schemas, api) => {
   if (schemas !== api)
     die(`@tumpel/schemas is ${schemas} and tumpel-api is ${api}; pin both to the same protocol release`);
-};
-
-export const unpublished = (version, indexes) =>
-  CRATES.filter((crate) => !indexes[crate].split("\n").some((line) => line && JSON.parse(line).vers === version));
-
-const registryIndex = async (crate) => {
-  const response = await fetch(`https://index.crates.io/${crate.slice(0, 2)}/${crate.slice(2, 4)}/${crate}`);
-  if (response.status === 404) return "";
-  if (!response.ok) die(`the crates.io index answered ${response.status} for ${crate}`);
-  return response.text();
 };
 
 const stamp = (version) => {
@@ -84,9 +72,6 @@ const assets = async (version, out) => {
     binaries: [{ architecture: "Amd64", sha256: sha256(supervisor), sizeBytes: readFileSync(supervisor).byteLength }],
   };
   writeFileSync(join(out, "release.json"), `${JSON.stringify(manifest, null, 2)}\n`);
-  const drives = join(ROOT, "crates/tumpel-supervisor/guest-drive");
-  mkdirSync(drives, { recursive: true });
-  copyFileSync(join(ROOT, ".tmp/guest-drive", `${TARGET}.squashfs`), join(drives, `${TARGET}.squashfs`));
   for (const asset of [...binaries, join(out, "release.json")]) console.log(`staged ${basename(asset)}`);
 };
 
@@ -100,12 +85,7 @@ const cli = async ([command, ...args]) => {
   if (command === "pins" && args.length === 0) return pins();
   if (command === "stamp" && args.length === 1) return stamp(args[0]);
   if (command === "assets" && args.length === 2) return assets(args[0], args[1]);
-  if (command === "unpublished" && args.length === 1)
-    return unpublished(
-      args[0],
-      Object.fromEntries(await Promise.all(CRATES.map(async (c) => [c, await registryIndex(c)]))),
-    ).join(" ");
-  return die("usage: release.mjs pins | stamp <X.Y.Z[-rc.N]> | assets <X.Y.Z[-rc.N]> <dir> | unpublished <X.Y.Z>");
+  return die("usage: release.mjs pins | stamp <X.Y.Z[-rc.N]> | assets <X.Y.Z[-rc.N]> <dir>");
 };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
