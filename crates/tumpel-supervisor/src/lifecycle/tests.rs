@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io::{Cursor, Read};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -611,6 +611,7 @@ struct Host {
     sessions: tokio::sync::watch::Receiver<Vec<EntityId>>,
     holdings: tokio::sync::watch::Receiver<Held>,
     runner: tokio::task::JoinHandle<Result<(), String>>,
+    answering: Arc<AtomicBool>,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -660,6 +661,7 @@ fn control_plane(
     store: MemoryStore,
     answers: Answers,
     log: Log,
+    answering: Arc<AtomicBool>,
     mut from_lifecycle: UnboundedReceiver<ChannelHostMessage>,
 ) -> UnboundedReceiver<ChannelHostMessage> {
     let (forward, received) = unbounded_channel();
@@ -744,8 +746,12 @@ fn control_plane(
                     note(&log, format!("claim {}", *turn_id));
                     let answers = answers.clone();
                     let log = Arc::clone(&log);
+                    let answering = Arc::clone(&answering);
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
+                        if !answering.load(Ordering::SeqCst) {
+                            return;
+                        }
                         note(&log, format!("claimed {}", *turn_id));
                         answers.deliver(claim_answer(turn_id));
                     });
@@ -801,7 +807,14 @@ fn start_host(
         out,
         vmm.staging.join("boxes.json"),
     );
-    let received = control_plane(store.clone(), lifecycle.answers(), Arc::clone(&log), from_lifecycle);
+    let answering = Arc::new(AtomicBool::new(true));
+    let received = control_plane(
+        store.clone(),
+        lifecycle.answers(),
+        Arc::clone(&log),
+        Arc::clone(&answering),
+        from_lifecycle,
+    );
     lifecycle.start(taken).expect("the lifecycle starts");
     let sessions = lifecycle.sessions();
     let holdings = lifecycle.holdings();
@@ -823,6 +836,7 @@ fn start_host(
         sessions,
         holdings,
         runner,
+        answering,
     }
 }
 
@@ -849,6 +863,7 @@ fn in_seconds(seconds: i64) -> chrono::DateTime<chrono::FixedOffset> {
 impl Host {
     fn ask_handover(&self) -> tokio::sync::oneshot::Receiver<SupervisorHandover> {
         let (reply, answer) = tokio::sync::oneshot::channel();
+        self.answering.store(false, Ordering::SeqCst);
         self.commands.send(Input::HandOver(reply)).expect("send");
         answer
     }
@@ -1460,15 +1475,33 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_box_still_busy_past_the_handover_limit_is_kept_and_handed_over_once_it_parks() {
-    let mut old = host("handover-past-limit", 1, Harness::Echo, Boot::Works);
-    old.turn("stalled-1", "session-1", "one", Vec::new());
-    assert_eq!(old.settle_until("claim stalled-1").await, ["claim stalled-1"]);
+async fn a_turn_waiting_for_its_claim_at_a_handover_is_given_back_and_its_warm_box_finishes_it_on_the_new_supervisor() {
+    let mut old = host("handover-unclaimed", 1, Harness::Echo, Boot::Works);
+    old.turn("late-1", "session-1", "one", Vec::new());
+    assert_eq!(old.settle_until("claim late-1").await, ["claim late-1"]);
     let handover = old.ask_handover().await.expect("the boxes are handed over");
-    assert_eq!(old.settle(SETTLE).await, Vec::<String>::new(), "nothing failed");
+    let given_back = format!(
+        "failed {}: this host started handing its boxes to a new supervisor binary before the control plane answered the claim of turn late-1, so its harness never started and its box stays warm; the control plane offers the turn again",
+        TurnFailureReason::HostUpdating
+    );
+    assert_eq!(old.settle(LATE_CLAIM + SETTLE).await, [given_back]);
     assert_eq!(handover.boxes.len(), 1);
+    let old_log = old.log();
+    assert!(
+        old_log.contains(&"hand over session-1".to_string()) && !old_log.contains(&"claimed late-1".to_string()),
+        "{old_log:?}"
+    );
     let mut new = old.successor(&handover);
-    assert_eq!(new.settle_until("complete 1").await, ["line 1 one", "complete 1"]);
+    new.turn("late-1", "session-1", "one", Vec::new());
+    assert_eq!(
+        new.settle_until("complete 1").await,
+        ["claim late-1", "line 1 one", "complete 1"]
+    );
+    let new_log = new.log();
+    assert!(
+        new_log.contains(&"resume session-1".to_string()) && !new_log.iter().any(|event| event.starts_with("boot")),
+        "the handed warm box takes the turn without a boot: {new_log:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
