@@ -497,6 +497,11 @@ fn a_snapshot_done_the_control_plane_never_takes_is_resent_ten_times_with_growin
     assert_eq!(saved.unacked[0].message["type"], "SnapshotFailed");
 
     control.taking = true;
+    assert!(matches!(
+        control.reconnect(&mut channel, &mut wire),
+        Ok(Event::Welcomed)
+    ));
+    control.read(&mut wire);
     channel.send(done("snap-2"), &mut wire).expect("send");
     control.read(&mut wire);
     assert_eq!(
