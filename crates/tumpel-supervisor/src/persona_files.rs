@@ -6,6 +6,7 @@ use ring::digest::{digest, SHA256};
 use tokio::time::timeout_at;
 use tumpel_api::types::{ChannelPersonaFileDownload, GuestPersonaFile};
 
+use crate::bounded::bounded;
 use crate::lifecycle::remove_dir;
 use crate::lifecycle::setup::then;
 use crate::store::Store;
@@ -61,12 +62,15 @@ pub async fn fetch(
     std::fs::create_dir_all(dir).map_err(|error| format!("creating {}: {error}", dir.display()))?;
     let mut fetched = Vec::with_capacity(files.len());
     for file in files {
-        let bytes = match blob(store, dir, file).await {
-            Ok(bytes) => bytes,
+        let content = match blob(store, dir, file)
+            .await
+            .and_then(|bytes| bounded(&format!("persona file {}", file.path), STANDARD.encode(bytes)))
+        {
+            Ok(content) => content,
             Err(error) => return Err(then(error, remove_dir(dir))),
         };
         fetched.push(GuestPersonaFile {
-            content: STANDARD.encode(bytes),
+            content,
             digest: file.digest.clone(),
             path: file.path.clone(),
         });

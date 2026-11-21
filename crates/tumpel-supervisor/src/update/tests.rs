@@ -160,7 +160,10 @@ fn seen(events: &mut UnboundedReceiver<ChannelHostMessage>) -> Vec<Seen> {
 fn failure(events: &mut UnboundedReceiver<ChannelHostMessage>) -> (String, Vec<String>) {
     std::iter::from_fn(|| events.try_recv().ok())
         .find_map(|event| match event {
-            ChannelHostMessage::SupervisorUpdateFailed(failed) => Some((failed.detail, failed.output_tail)),
+            ChannelHostMessage::SupervisorUpdateFailed(failed) => Some((
+                failed.detail.into(),
+                failed.output_tail.into_iter().map(String::from).collect(),
+            )),
             _ => None,
         })
         .expect("a SupervisorUpdateFailed was sent")

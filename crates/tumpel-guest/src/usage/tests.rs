@@ -97,7 +97,7 @@ fn summary(usage: Usage, priced: bool) -> Vec<(String, Option<String>, f64)> {
         .map(|metric| {
             (
                 metric.metric.to_string(),
-                metric.dimensions.get("tokenKind").cloned(),
+                metric.dimensions.get("tokenKind").map(ToString::to_string),
                 metric.value,
             )
         })

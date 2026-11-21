@@ -11,6 +11,7 @@ use tumpel_api::types::{
     SupervisorHandoverLayeredImageKind, TurnFailureReason,
 };
 
+use crate::bounded::bounded;
 use crate::images::{self, BaseOrder, ImageOrder, Refusal};
 use crate::layers::{self, Layer, LayerCache, LayerOrder};
 use crate::store::Store;
@@ -53,8 +54,8 @@ impl BootOrder {
                 },
                 layer: LayerOrder {
                     layer: download.layer.layer,
-                    layer_url: download.layer.layer_url,
-                    manifest_url: download.layer.manifest_url,
+                    layer_url: download.layer.layer_url.into(),
+                    manifest_url: download.layer.manifest_url.into(),
                     fetch_seconds: download.fetch_seconds,
                 },
                 harness,
@@ -85,9 +86,8 @@ impl Boot {
         }
     }
 
-    #[must_use]
-    pub fn record(&self) -> SupervisorHandoverImage {
-        match self {
+    pub fn record(&self) -> Result<SupervisorHandoverImage, String> {
+        Ok(match self {
             Self::Full(manifest) => SupervisorHandoverImage::FullImage(SupervisorHandoverFullImage {
                 kind: SupervisorHandoverFullImageKind::Full,
                 manifest: manifest.clone(),
@@ -96,9 +96,9 @@ impl Boot {
                 base: layered.base.clone(),
                 kind: SupervisorHandoverLayeredImageKind::Layered,
                 layer: layered.layer.manifest.clone(),
-                layer_path: layered.layer.path.display().to_string(),
+                layer_path: bounded("the layer path", layered.layer.path.display().to_string())?,
             }),
-        }
+        })
     }
 
     #[must_use]
@@ -108,7 +108,7 @@ impl Boot {
             SupervisorHandoverImage::LayeredImage(layered) => Self::Layered(Layered {
                 base: layered.base,
                 layer: Layer {
-                    path: layered.layer_path.into(),
+                    path: String::from(layered.layer_path).into(),
                     manifest: layered.layer,
                 },
             }),

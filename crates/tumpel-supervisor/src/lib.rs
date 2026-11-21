@@ -1,4 +1,5 @@
 mod boot;
+mod bounded;
 mod check;
 mod dir;
 mod enrol;

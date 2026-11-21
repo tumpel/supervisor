@@ -485,7 +485,7 @@ fn turn_arguments(
                 return Err("the turn's credential names no Codex model provider; grant the persona's secret set a credential the Codex catalog entry lists".to_string());
             }
             let mut arguments = vec!["--model".to_string(), model];
-            arguments.extend(start.credential.arguments.iter().cloned());
+            arguments.extend(start.credential.arguments.iter().map(ToString::to_string));
             arguments.extend(connectors);
             if let Some(thread) = thread {
                 arguments.extend(["resume".to_string(), thread.to_string()]);
@@ -899,7 +899,9 @@ impl GuestState {
                     .map(TryInto::try_into)
                     .transpose()
                     .map_err(|error| format!("the credential file the harness left: {error}"))?,
-                detail,
+                detail: detail
+                    .try_into()
+                    .map_err(|error| format!("the turn end detail: {error}"))?,
                 last_line_seq: Sequence(self.last_line_seq),
                 metrics,
                 reason,
@@ -913,7 +915,10 @@ impl GuestState {
             .into(),
             Ending::Clone(failure) => GuestTurnRepositoryCloneFailed {
                 cause: failure.cause,
-                detail: failure.detail,
+                detail: failure
+                    .detail
+                    .try_into()
+                    .map_err(|error| format!("the repository clone failure detail: {error}"))?,
                 turn_id: start.turn_id.clone(),
                 type_: GuestTurnRepositoryCloneFailedType::TurnRepositoryCloneFailed,
             }
@@ -1044,14 +1049,7 @@ impl GuestState {
             }
             let finished = ends_turn(protocol, &text);
             let text = if priced { text } else { without_list_price(text) };
-            let line: GuestMessage = GuestTurnLine {
-                line_seq: Sequence(last_line_seq),
-                text,
-                turn_id: start.turn_id.clone(),
-                type_: GuestTurnLineType::TurnLine,
-            }
-            .into();
-            if let Err(error) = send(host, &line) {
+            if let Err(error) = send_line(host, &start.turn_id, last_line_seq, text) {
                 self.last_line_seq = last_line_seq;
                 return Err(error);
             }
@@ -1090,6 +1088,18 @@ fn prompt_input(protocol: GuestHarnessProtocol, setup: bool, prompt: &str, marke
         GuestHarnessProtocol::ShellLines => format!("{prompt}\nprintf '%s\\n' '{marker}'\n"),
         GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::CodexExecJson => prompt.to_string(),
     }
+}
+
+fn send_line(host: &mut impl Write, turn_id: &EntityId, line_seq: i64, text: String) -> Result<(), String> {
+    let line = GuestTurnLine {
+        line_seq: Sequence(line_seq),
+        text: text
+            .try_into()
+            .map_err(|error| format!("harness line {line_seq}: {error}"))?,
+        turn_id: turn_id.clone(),
+        type_: GuestTurnLineType::TurnLine,
+    };
+    send(host, &line.into())
 }
 
 fn send(host: &mut impl Write, message: &GuestMessage) -> Result<(), String> {

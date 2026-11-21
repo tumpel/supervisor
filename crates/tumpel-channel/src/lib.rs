@@ -161,7 +161,9 @@ fn snapshot_failed(frame: &ChannelStoredHostFrame) -> Result<Option<Value>, Chan
         detail: format!(
             "the control plane did not ack SnapshotDone for snapshot {} after the host resent it after {MAX_REPLAYS} Welcomes, so the host reports the snapshot failed in its place; check the control plane logs for this snapshot",
             *done.snapshot_id
-        ),
+        )
+        .try_into()
+        .map_err(|error| protocol(format!("the SnapshotFailed detail for snapshot {}: {error}", *done.snapshot_id)))?,
         failed_at: Utc::now().fixed_offset(),
         reason: ChannelSnapshotFailureReason::NotAnswered,
         snapshot_id: done.snapshot_id,

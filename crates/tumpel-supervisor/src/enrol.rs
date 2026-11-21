@@ -7,6 +7,7 @@ use std::path::Path;
 use tumpel_api::types::{Host, HostEnrol, SupervisorConfig, SupervisorHostKey};
 use tumpel_api::{Client, Error};
 
+use crate::bounded::bounded;
 use crate::dir::{self, CHANNEL_FILE, CONFIG_FILE, KEY_FILE, RUNTIME_FILE};
 use crate::usage;
 
@@ -104,7 +105,7 @@ pub async fn enrol_with_token(endpoint: &str, token: String, name: Option<String
     dir::write_json(
         &dir.join(CONFIG_FILE),
         &SupervisorConfig {
-            endpoint: endpoint.to_string(),
+            endpoint: bounded("the control plane endpoint", endpoint).map_err(anyhow::Error::msg)?,
             host_id: host.host_id.clone(),
             tenant_id: host.tenant_id.clone(),
         },

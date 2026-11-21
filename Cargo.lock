@@ -1821,9 +1821,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tumpel-api"
-version = "0.21.0-rc.30"
+version = "0.21.0-rc.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa03be0f9f254971c6026817130070b785cd94ab7086d06bdd725d7946f99055"
+checksum = "33a5dd87a2a3ef175ab40c8c53ebc0c3ca4fdcd10c04e9b9ab3e84b424d10855"
 dependencies = [
  "chrono",
  "progenitor-client",
