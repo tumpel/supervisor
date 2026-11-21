@@ -25,7 +25,6 @@ fn an_old_budgets_object_gets_the_missing_field_and_keeps_its_values() {
         serde_json::from_str(&std::fs::read_to_string(&path).expect("runtime.json is written"))
             .expect("runtime.json is JSON");
     assert_eq!(runtime.budgets.boot_seconds.get(), 45);
-    assert_eq!(runtime.budgets.turn_seconds.get(), 900);
     assert_eq!(runtime.budgets.snapshot_seconds.get(), 90);
     assert_eq!(runtime.budgets.first_line_seconds.get(), 120);
     assert_eq!(runtime.box_capacity.get(), 4);

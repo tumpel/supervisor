@@ -251,6 +251,7 @@ fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> SetupCommand {
 
 fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Command {
     Command::Turn(Box::new(BoxTurn {
+        turn_seconds: offer.turn_total_budget_seconds.into(),
         turn_id: offer.turn_id,
         session_id: offer.session_id,
         box_id: offer.box_id,
