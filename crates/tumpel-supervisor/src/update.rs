@@ -122,7 +122,7 @@ pub trait Idle: Send + Sync {
 pub struct Release {
     pub version: ChannelSupervisorUpdateStepReleaseVersion,
     pub sha256: Sha256Digest,
-    pub supervisor_version: Option<ReleaseSupervisorSupervisorVersion>,
+    pub supervisor_version: ReleaseSupervisorSupervisorVersion,
     pub channel_protocol_version: u32,
 }
 
@@ -211,7 +211,7 @@ struct AnnouncedSupervisor {
     architecture: HostArchitecture,
     sha256: Sha256Digest,
     #[serde(rename = "supervisorVersion")]
-    supervisor_version: Option<ReleaseSupervisorSupervisorVersion>,
+    supervisor_version: ReleaseSupervisorSupervisorVersion,
 }
 
 fn announced_release(body: &[u8], url: &str, architecture: HostArchitecture) -> Result<Release, String> {
@@ -241,13 +241,8 @@ fn announced_release(body: &[u8], url: &str, architecture: HostArchitecture) -> 
 
 fn version_refusal(running: &str, announced: &str) -> Option<String> {
     let parse = |version: &str| semver::Version::parse(version.trim_start_matches('v'));
-    let running_version = match parse(running) {
-        Ok(version) => version,
-        Err(error) => {
-            return Some(format!(
-                "the running supervisor version {running} is no semver version ({error}), so it cannot tell whether {announced} is newer; install a released supervisor"
-            ))
-        }
+    let Ok(running_version) = parse(running) else {
+        return None;
     };
     let announced_version = match parse(announced) {
         Ok(version) => version,
@@ -293,10 +288,7 @@ fn short(sha256: &Sha256Digest) -> &str {
 }
 
 fn named(release: &Release) -> String {
-    match &release.supervisor_version {
-        Some(version) => format!("{} ({})", **version, short(&release.sha256)),
-        None => short(&release.sha256).to_string(),
-    }
+    format!("{} ({})", *release.supervisor_version, short(&release.sha256))
 }
 
 fn read<T: DeserializeOwned>(path: &Path, schema: &str) -> Result<Option<T>, String> {
@@ -375,6 +367,7 @@ pub struct Updater<S: Source, I: Idle> {
     layout: Layout,
     limits: Limits,
     running: Sha256Digest,
+    version: &'static str,
     idle: I,
     out: UnboundedSender<ChannelHostMessage>,
     running_update: Mutex<()>,
@@ -386,6 +379,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         layout: Layout,
         limits: Limits,
         running: Sha256Digest,
+        version: &'static str,
         idle: I,
         out: UnboundedSender<ChannelHostMessage>,
     ) -> Self {
@@ -394,6 +388,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
             layout,
             limits,
             running,
+            version,
             idle,
             out,
             running_update: Mutex::new(()),
@@ -416,6 +411,15 @@ impl<S: Source, I: Idle> Updater<S, I> {
             Ok(release) => release,
             Err(outcome) => return outcome,
         };
+        if let Some(refusal) = version_refusal(self.version, &release.supervisor_version) {
+            eprintln!(
+                "tumpel-supervisor: refusing supervisor update to {}: {refusal}; supervisor {} ({}) keeps running",
+                named(&release),
+                self.version,
+                short(&self.running)
+            );
+            return Outcome::Refused;
+        }
         if self.idle.busy() > 0 {
             eprintln!(
                 "tumpel-supervisor: supervisor {} is out and {} boxes run a turn; updating once they finish or in {} s, whichever comes first",
@@ -451,17 +455,6 @@ impl<S: Source, I: Idle> Updater<S, I> {
         if release.sha256 == self.running {
             return Err(Outcome::Current);
         }
-        if let Some(announced) = &release.supervisor_version {
-            if let Some(refusal) = version_refusal(env!("TUMPEL_RELEASE_VERSION"), announced) {
-                eprintln!(
-                    "tumpel-supervisor: refusing supervisor update to {}: {refusal}; supervisor {} ({}) keeps running",
-                    named(&release),
-                    env!("TUMPEL_RELEASE_VERSION"),
-                    short(&self.running)
-                );
-                return Err(Outcome::Refused);
-            }
-        }
         match read::<SupervisorUpdateRefusal>(&self.layout.refusal(), "SupervisorUpdateRefusal") {
             Ok(Some(refusal)) if refusal.to_sha256 == release.sha256 => Err(Outcome::Refused),
             Ok(_) => Ok(release),
@@ -480,7 +473,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         }
         eprintln!(
             "tumpel-supervisor: swapping supervisor {} ({}) for {} and handing its boxes over",
-            env!("TUMPEL_RELEASE_VERSION"),
+            self.version,
             short(&self.running),
             named(release)
         );

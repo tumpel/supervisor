@@ -750,16 +750,16 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     );
     let (restart, mut restarted) = unbounded_channel();
     let (confirmed, online) = watch::channel(false);
-    let self_updater = Arc::new(Updater::new(
-        started.source,
-        started.layout.clone(),
-        Limits::HOST,
-        started.running,
-        idle.clone(),
-        out.clone(),
-    ));
     let mut updates = Updates {
-        updater: self_updater,
+        updater: Arc::new(Updater::new(
+            started.source,
+            started.layout.clone(),
+            Limits::HOST,
+            started.running,
+            env!("TUMPEL_RELEASE_VERSION"),
+            idle.clone(),
+            out.clone(),
+        )),
         layout: started.layout,
         out,
         restart,
