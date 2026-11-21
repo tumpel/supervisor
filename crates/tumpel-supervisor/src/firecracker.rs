@@ -19,6 +19,7 @@ use tumpel_guest::setup_output::{redacted, strip_ansi};
 use tumpel_guest::{encode, Decoder, GUEST_CID, GUEST_PORT, READY_PORT};
 
 use crate::boot::Boot;
+use crate::bounded::bounded;
 use crate::fd_store;
 use crate::guest_drive;
 use crate::lifecycle::{remove_dir, Guest, Machine, Vmm};
@@ -539,13 +540,13 @@ impl Firecracker {
         let mut decoder = Decoder::default();
         decoder.push(
             &STANDARD
-                .decode(&handed.guest_buffer)
+                .decode(handed.guest_buffer.as_bytes())
                 .map_err(|error| format!("guestBuffer is not base64: {error}"))?,
         );
         tail_of(&stdout, &machine.console, "the box's standard output")?;
         tail_of(&stderr, &machine.console, "the box's standard error")?;
         if let Ok(mut tail) = machine.console.lock() {
-            tail.extend(STANDARD.decode(&handed.console_tail).unwrap_or_default());
+            tail.extend(STANDARD.decode(handed.console_tail.as_bytes()).unwrap_or_default());
         }
         machine.stdout = Some(stdout);
         machine.stderr = Some(stderr);
@@ -1010,14 +1011,17 @@ impl Machine for FirecrackerBox {
             .and_then(std::num::NonZeroU32::new)
             .ok_or_else(|| "the box has no running Firecracker process".to_string())?;
         Ok(SupervisorHandoverMachine {
-            api_socket: self.api_socket().display().to_string(),
-            console_tail: String::new(),
-            guest_buffer: String::new(),
+            api_socket: bounded(
+                "the Firecracker API socket path",
+                self.api_socket().display().to_string(),
+            )?,
+            console_tail: bounded("the empty console tail", String::new())?,
+            guest_buffer: bounded("the empty guest buffer", String::new())?,
             guest_fd: -1,
             process_id,
             stderr_fd: -1,
             stdout_fd: -1,
-            vsock: self.vsock().display().to_string(),
+            vsock: bounded("the vsock path", self.vsock().display().to_string())?,
         })
     }
 
@@ -1037,8 +1041,11 @@ impl Machine for FirecrackerBox {
 
     fn hand_over(mut self, guest: VsockGuest) -> Result<SupervisorHandoverMachine, String> {
         let machine = SupervisorHandoverMachine {
-            console_tail: STANDARD.encode(self.console_bytes()),
-            guest_buffer: STANDARD.encode(guest.decoder.buffered()),
+            console_tail: bounded("the console tail", STANDARD.encode(self.console_bytes()))?,
+            guest_buffer: bounded(
+                "the guest bytes buffered past the last frame",
+                STANDARD.encode(guest.decoder.buffered()),
+            )?,
             ..self.record()?
         };
         if let Some(process) = self.process.take() {

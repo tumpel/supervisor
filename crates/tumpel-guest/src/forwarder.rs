@@ -243,7 +243,10 @@ async fn turn_ended(mut ended: watch::Receiver<bool>) {
 
 struct Refusal {
     status: u16,
-    problem: Problem,
+    code: ProblemCode,
+    title: String,
+    detail: String,
+    fix: String,
 }
 
 enum Failure {
@@ -266,12 +269,10 @@ impl From<std::io::Error> for Failure {
 fn refusal(status: u16, code: ProblemCode, title: &str, detail: String, fix: &str) -> Refusal {
     Refusal {
         status,
-        problem: Problem {
-            code,
-            title: title.to_string(),
-            detail,
-            fix: fix.to_string(),
-        },
+        code,
+        title: title.to_string(),
+        detail,
+        fix: fix.to_string(),
     }
 }
 
@@ -451,7 +452,10 @@ async fn fetch_token(
         return Err(match serde_json::from_slice::<Problem>(&body) {
             Ok(problem) => Refusal {
                 status: status.as_u16(),
-                problem,
+                code: problem.code,
+                title: problem.title.into(),
+                detail: problem.detail.into(),
+                fix: problem.fix.into(),
             },
             Err(_) => failed(format!("the control plane answered {status}")),
         });
@@ -538,7 +542,34 @@ async fn token(admitted: &Admitted, client: &reqwest::Client, connector_id: &str
 }
 
 async fn write_refusal(stream: &mut TcpStream, refusal: &Refusal) -> std::io::Result<()> {
-    let body = serde_json::to_vec(&refusal.problem)?;
+    let over_bound = |field: &str, error: tumpel_api::types::error::ConversionError| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "the {} refusal {field} does not fit the Problem schema ({error}), so the harness gets no problem body; shorten the {field} this refusal builds",
+                refusal.status
+            ),
+        )
+    };
+    let problem = Problem {
+        code: refusal.code.clone(),
+        title: refusal
+            .title
+            .clone()
+            .try_into()
+            .map_err(|error| over_bound("title", error))?,
+        detail: refusal
+            .detail
+            .clone()
+            .try_into()
+            .map_err(|error| over_bound("detail", error))?,
+        fix: refusal
+            .fix
+            .clone()
+            .try_into()
+            .map_err(|error| over_bound("fix", error))?,
+    };
+    let body = serde_json::to_vec(&problem)?;
     let head = format!(
         "HTTP/1.1 {} {}\r\ncontent-type: application/problem+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         refusal.status,

@@ -23,17 +23,19 @@ use tumpel_api::types::{
     ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete, ChannelTurnCompleteType,
     ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnImageFetching,
     ChannelTurnImageFetchingType, ChannelTurnLine, ChannelTurnLineType, ChannelTurnRepositoryCloneFailed,
-    ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady, ChannelTurnRepositoryReadyType, DisplayName,
-    EmailAddress, EntityId, GuestHello, GuestInput, GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel,
-    GuestTurnCancelType, GuestTurnStart, GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName, Prompt,
-    RepositoryCloneFailureCause, RepositoryUrl, Sequence, Sha256Digest, SupervisorHandover, SupervisorHandoverBox,
-    SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverDiscard, SupervisorHandoverDiscardKind,
-    SupervisorHandoverMachine, SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown,
-    SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
-    SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
+    ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady, ChannelTurnRepositoryReadyType, CredentialText,
+    DisplayName, EmailAddress, EntityId, GuestHello, GuestInput, GuestMessage, GuestPersonaFile, GuestProtocol,
+    GuestTurnCancel, GuestTurnCancelType, GuestTurnStart, GuestTurnStartPrebuildCommitSha, GuestTurnStartType,
+    ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl, Sequence, Sha256Digest, SupervisorHandover,
+    SupervisorHandoverBox, SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverDiscard,
+    SupervisorHandoverDiscardKind, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
+    SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, SupervisorHandoverTurn,
+    SupervisorHandoverTurnError, SupervisorHandoverTurnKind, SupervisorHandoverWarm, SupervisorHandoverWarmKind,
+    TurnFailureReason,
 };
 
 use crate::boot::{self, Boot, BootOrder, Caches, Hold, Holds};
+use crate::bounded::{bounded, reported};
 use crate::exchange::{part_number, Answer, Answers, Ask, Cancels, Key, Waiting, DIGESTS_PER_PART};
 use crate::harness_result::{error_result, exit_result, turn_end};
 use crate::images;
@@ -211,22 +213,22 @@ impl From<ChannelSnapshotRequest> for SnapshotOrder {
             session_id: request.session_id,
             box_id: request.box_id,
             snapshot_seq: request.snapshot_seq,
-            upload_url: request.upload_url,
+            upload_url: request.upload_url.into(),
             upload_expires_at: request.upload_expires_at,
         }
     }
 }
 
 impl Command {
-    fn record(&self) -> Option<SupervisorHandoverCommand> {
-        match self {
+    fn record(&self) -> Result<Option<SupervisorHandoverCommand>, String> {
+        Ok(match self {
             Self::Turn(_) => None,
             Self::Snapshot(order) => Some(SupervisorHandoverCommand::Snapshot(SupervisorHandoverSnapshot {
                 kind: SupervisorHandoverSnapshotKind::Snapshot,
                 snapshot_id: order.snapshot_id.clone(),
                 snapshot_seq: order.snapshot_seq.clone(),
                 upload_expires_at: order.upload_expires_at,
-                upload_url: order.upload_url.clone(),
+                upload_url: bounded("the snapshot upload URL", order.upload_url.clone())?,
             })),
             Self::Teardown(_) => Some(SupervisorHandoverCommand::Teardown(SupervisorHandoverTeardown {
                 kind: SupervisorHandoverTeardownKind::Teardown,
@@ -234,7 +236,15 @@ impl Command {
             Self::Discard(_) => Some(SupervisorHandoverCommand::Discard(SupervisorHandoverDiscard {
                 kind: SupervisorHandoverDiscardKind::Discard,
             })),
-        }
+        })
+    }
+
+    fn records<'a>(queue: impl IntoIterator<Item = &'a Self>) -> Result<Vec<SupervisorHandoverCommand>, String> {
+        queue
+            .into_iter()
+            .map(Self::record)
+            .filter_map(Result::transpose)
+            .collect()
     }
 
     fn from_record(record: SupervisorHandoverCommand, session_id: &EntityId, box_id: &EntityId) -> Self {
@@ -248,7 +258,7 @@ impl Command {
                 session_id: session_id.clone(),
                 box_id: box_id.clone(),
                 snapshot_seq: snapshot.snapshot_seq,
-                upload_url: snapshot.upload_url,
+                upload_url: snapshot.upload_url.into(),
                 upload_expires_at: snapshot.upload_expires_at,
             }),
             SupervisorHandoverCommand::Teardown(_) => Self::Teardown(order()),
@@ -299,9 +309,9 @@ impl<M: Machine> LiveBox<M> {
     fn record(&self, turn_id: Option<&EntityId>) -> Result<SupervisorHandoverBox, String> {
         Ok(SupervisorHandoverBox {
             box_id: self.box_id.clone(),
-            credential_file: self.credential_file.clone(),
+            credential_file: credential_record(self.credential_file.clone())?,
             dirty: self.dirty || turn_id.is_some(),
-            image: self.image.record(),
+            image: self.image.record()?,
             machine: self.machine.record()?,
             queued: Vec::new(),
             session_id: self.session_id.clone(),
@@ -331,16 +341,20 @@ fn standing_state(turn_id: Option<EntityId>) -> SupervisorHandoverBoxState {
     }
 }
 
-fn standing_record(handed: &SupervisorHandoverBox) -> SupervisorHandoverBox {
+fn credential_record(file: Option<String>) -> Result<Option<CredentialText>, String> {
+    file.map(|file| bounded("the turn's credential file", file)).transpose()
+}
+
+fn standing_record(handed: &SupervisorHandoverBox) -> Result<SupervisorHandoverBox, String> {
     let turn_id = match &handed.state {
         SupervisorHandoverBoxState::Turn(turn) => Some(turn.turn_id.clone()),
         SupervisorHandoverBoxState::Warm(_) => None,
     };
-    SupervisorHandoverBox {
+    Ok(SupervisorHandoverBox {
         dirty: handed.dirty || turn_id.is_some(),
         machine: SupervisorHandoverMachine {
-            console_tail: String::new(),
-            guest_buffer: String::new(),
+            console_tail: bounded("the empty console tail", String::new())?,
+            guest_buffer: bounded("the empty guest buffer", String::new())?,
             guest_fd: -1,
             stderr_fd: -1,
             stdout_fd: -1,
@@ -348,7 +362,7 @@ fn standing_record(handed: &SupervisorHandoverBox) -> SupervisorHandoverBox {
         },
         state: standing_state(turn_id),
         ..handed.clone()
-    }
+    })
 }
 
 #[derive(Clone)]
@@ -570,13 +584,13 @@ pub(crate) fn turn_failed(
     out: &UnboundedSender<ChannelHostMessage>,
     turn_id: &EntityId,
     reason: TurnFailureReason,
-    detail: String,
+    detail: impl AsRef<str>,
 ) {
     emit(
         out,
         ChannelTurnFailed {
             credential_file: None,
-            detail,
+            detail: reported("the turn failure detail", detail.as_ref()),
             failed_at: now(),
             reason,
             turn_id: turn_id.clone(),
@@ -592,7 +606,7 @@ fn report_failure(out: &UnboundedSender<ChannelHostMessage>, turn_id: &EntityId,
             out,
             ChannelTurnRepositoryCloneFailed {
                 cause,
-                detail,
+                detail: reported("the repository clone failure detail", &detail),
                 failed_at: now(),
                 turn_id: turn_id.clone(),
                 type_: ChannelTurnRepositoryCloneFailedType::TurnRepositoryCloneFailed,
@@ -1101,7 +1115,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 answer
                     .uploads
                     .into_iter()
-                    .map(|upload| (upload.pack_digest.as_str().to_string(), upload.url)),
+                    .map(|upload| (upload.pack_digest.as_str().to_string(), upload.url.into())),
             );
         }
         Ok(urls)
@@ -1138,7 +1152,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 for pack in answer.packs {
                     let digest = pack.pack_digest.as_str().to_string();
                     sizes.insert(digest.clone(), pack.size_bytes.get());
-                    urls.insert(digest, pack.url);
+                    urls.insert(digest, String::from(pack.url));
                 }
                 for fetch in fetches(&part, &sizes)? {
                     let url = urls
@@ -1508,7 +1522,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 &self.out,
                 ChannelTurnFailed {
                     credential_file: file.try_into().ok(),
-                    detail,
+                    detail: reported("the turn failure detail", &detail),
                     failed_at: now(),
                     reason,
                     turn_id: turn_id.clone(),
@@ -1677,7 +1691,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 Ok(GuestMessage::TurnRepositoryCloneFailed(failed)) if failed.turn_id == *turn_id => {
                     return Followed::Ended(Err(Failure {
                         report: Report::Clone(failed.cause),
-                        detail: failed.detail,
+                        detail: failed.detail.into(),
                     }));
                 }
                 Ok(other) => {
@@ -1705,7 +1719,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             }
             Err((reason, detail)) => {
                 let failed = ChannelSnapshotFailed {
-                    detail,
+                    detail: reported("the snapshot failure detail", &detail),
                     failed_at: now(),
                     reason,
                     snapshot_id: order.snapshot_id.clone(),
@@ -2315,8 +2329,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 Command::Snapshot(order) => emit(
                     &self.runner.out,
                     ChannelSnapshotFailed {
-                        detail: format!(
-                            "this host runs no box of session {session}; it was stopped while the host handed its boxes to a new supervisor binary, so the session's last turn is not on this host"
+                        detail: reported(
+                            "the snapshot failure detail",
+                            &format!(
+                                "this host runs no box of session {session}; it was stopped while the host handed its boxes to a new supervisor binary, so the session's last turn is not on this host"
+                            ),
                         ),
                         failed_at: now(),
                         reason: ChannelSnapshotFailureReason::BoxNotFound,
@@ -2354,10 +2371,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     kind: SupervisorHandoverTurnKind::Turn,
                     repository_ready: parked.left.repository_ready,
                     seen_line: parked.left.seen_line,
-                    error: parked
-                        .left
-                        .error
-                        .map(|(reason, detail)| SupervisorHandoverTurnError { detail, reason }),
+                    error: parked.left.error.map(|(reason, detail)| SupervisorHandoverTurnError {
+                        detail: reported("the parked turn's failure detail", &detail),
+                        reason,
+                    }),
                     cancelled: self.runner.cancels.contains(&parked.turn_id).then_some(true),
                     turn_id: parked.turn_id,
                 }),
@@ -2367,7 +2384,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     warm_milliseconds: 0,
                 }),
             };
-            let queued = queue.iter().filter_map(Command::record).collect();
+            let queued = Command::records(&queue);
             let LiveBox {
                 session_id,
                 box_id,
@@ -2380,13 +2397,20 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 ..
             } = live;
             let tap_index = i32::from(tap.index());
-            match machine.hand_over(guest) {
-                Ok(machine) => {
+            let handed = queued.and_then(|queued| {
+                let credential_file = credential_record(credential_file)?;
+                let image = image.record()?;
+                machine
+                    .hand_over(guest)
+                    .map(|machine| (machine, queued, credential_file, image))
+            });
+            match handed {
+                Ok((machine, queued, credential_file, image)) => {
                     boxes.push(SupervisorHandoverBox {
                         box_id,
                         credential_file,
                         dirty,
-                        image: image.record(),
+                        image,
                         machine,
                         queued,
                         session_id,
@@ -2485,7 +2509,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
 
     fn adopt(&mut self, handed: SupervisorHandoverBox, taken: Taken) -> Option<SupervisorHandoverBox> {
         let session = handed.session_id.to_string();
-        let (machine, guest, tap) = match self.attach(&handed) {
+        let attached = self
+            .attach(&handed)
+            .and_then(|attached| standing_record(&handed).map(|record| (attached, record)));
+        let ((machine, guest, tap), record) = match attached {
             Ok(attached) => attached,
             Err(error) => {
                 let detail = format!(
@@ -2504,7 +2531,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 return None;
             }
         };
-        let record = standing_record(&handed);
         let image = Boot::from_record(handed.image);
         let hold = self.runner.holds.hold_boot(&image);
         let queue = handed
@@ -2524,7 +2550,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             image: Box::new(image),
             _hold: hold,
             dirty: handed.dirty,
-            credential_file: handed.credential_file,
+            credential_file: handed.credential_file.map(String::from),
         });
         match (handed.state, taken) {
             (SupervisorHandoverBoxState::Warm(_), _) => slot.paused = true,
@@ -2556,7 +2582,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                         first_line: duration(turn.first_line_milliseconds),
                         repository_ready: turn.repository_ready,
                         seen_line: turn.seen_line,
-                        error: turn.error.map(|error| (error.reason, error.detail)),
+                        error: turn.error.map(|error| (error.reason, error.detail.into())),
                     },
                 }));
                 self.resume(session);
@@ -2632,7 +2658,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         let refused = |detail: String| tumpel_api::types::ChannelClaudeSetupBoxFailed {
             claude_setup_id: order.claude_setup_id.clone(),
-            detail,
+            detail: reported("the Claude setup failure detail", &detail),
             failed_at: now(),
             reason: tumpel_api::types::ClaudeSetupFailureReason::NoHostOnline,
             type_: tumpel_api::types::ChannelClaudeSetupBoxFailedType::ClaudeSetupBoxFailed,
@@ -2805,7 +2831,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             emit(
                 &self.runner.out,
                 ChannelSnapshotFailed {
-                    detail,
+                    detail: reported("the snapshot failure detail", &detail),
                     failed_at: now(),
                     reason: ChannelSnapshotFailureReason::BoxNotFound,
                     snapshot_id: order.snapshot_id,
@@ -2865,9 +2891,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             emit(
                 &self.runner.out,
                 ChannelBoxTeardownFailed {
-                    detail: format!(
-                        "box {} of session {} holds a turn that no snapshot holds yet, so the host keeps it; stop the session again to snapshot it first",
-                        *order.box_id, *order.session_id
+                    detail: reported(
+                        "the teardown failure detail",
+                        &format!(
+                            "box {} of session {} holds a turn that no snapshot holds yet, so the host keeps it; stop the session again to snapshot it first",
+                            *order.box_id, *order.session_id
+                        ),
                     ),
                     failed_at: now(),
                     reason: ChannelBoxTeardownFailureReason::BoxDirty,
@@ -3014,7 +3043,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let queued: Vec<SupervisorHandoverCommand> = self
             .slots
             .get(session)
-            .map_or_else(Vec::new, |slot| slot.queue.iter().filter_map(Command::record).collect());
+            .map_or_else(|| Ok(Vec::new()), |slot| Command::records(&slot.queue))?;
         self.runner.standing.queue(session, &queued)
     }
 }

@@ -7,11 +7,12 @@ use tumpel_api::types::{
     ChannelClaudeSetupBoxFailed, ChannelClaudeSetupBoxFailedType, ChannelClaudeSetupBoxOfferTokenCredential,
     ChannelClaudeSetupBoxUrl, ChannelClaudeSetupBoxUrlType, ClaudeSetupCodeText, ClaudeSetupFailureReason, EntityId,
     GuestClaudeSetupCode, GuestClaudeSetupCodeType, GuestClaudeSetupFailureReason, GuestClaudeSetupStart,
-    GuestClaudeSetupStartTokenCredential, GuestClaudeSetupStartType, GuestInput, GuestMessage,
+    GuestClaudeSetupStartTokenCredential, GuestClaudeSetupStartType, GuestInput, GuestMessage, HttpUrl,
 };
 
 use super::{emit, instant_at, mismatch, now, Guest, Machine, Runner, Vmm};
 use crate::boot::{BootOrder, Hold};
+use crate::bounded::reported;
 use crate::pool::Tap;
 use crate::store::Store;
 
@@ -20,7 +21,7 @@ pub struct SetupOrder {
     pub tenant_id: EntityId,
     pub box_id: EntityId,
     pub image: BootOrder,
-    pub token_url: String,
+    pub token_url: HttpUrl,
     pub token_credential: ChannelClaudeSetupBoxOfferTokenCredential,
     pub expires_at: DateTime<FixedOffset>,
 }
@@ -117,7 +118,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 &self.out,
                 ChannelClaudeSetupBoxFailed {
                     claude_setup_id: id,
-                    detail: failed.detail,
+                    detail: reported("the Claude setup failure detail", &failed.detail),
                     failed_at: now(),
                     reason: failed.reason,
                     type_: ChannelClaudeSetupBoxFailedType::ClaudeSetupBoxFailed,
@@ -263,7 +264,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     Some(Ended::Stored)
                 }
                 Next::Received(Ok(GuestMessage::ClaudeSetupFailed(failed))) if failed.claude_setup_id == *id => {
-                    Some(failed_in_guest(failed.reason, failed.detail))
+                    Some(failed_in_guest(failed.reason, failed.detail.into()))
                 }
                 Next::Received(Ok(_)) => None,
                 Next::Received(Err(error)) => Some(Ended::Failed(stop(

@@ -11,9 +11,9 @@ pub fn turn_end(
     error: Option<(TurnFailureReason, String)>,
 ) -> Result<(Sequence, Option<ChannelTurnCompleteWarning>), (TurnFailureReason, String)> {
     match (end.reason, error) {
-        (GuestTurnEndReason::HarnessOutOfMemory, _) => Err((TurnFailureReason::HarnessOutOfMemory, end.detail)),
-        (GuestTurnEndReason::BoxDiskFull, _) => Err((TurnFailureReason::BoxDiskFull, end.detail)),
-        (GuestTurnEndReason::Cancelled, _) => Err((TurnFailureReason::Cancelled, end.detail)),
+        (GuestTurnEndReason::HarnessOutOfMemory, _) => Err((TurnFailureReason::HarnessOutOfMemory, end.detail.into())),
+        (GuestTurnEndReason::BoxDiskFull, _) => Err((TurnFailureReason::BoxDiskFull, end.detail.into())),
+        (GuestTurnEndReason::Cancelled, _) => Err((TurnFailureReason::Cancelled, end.detail.into())),
         (GuestTurnEndReason::Completed, Some((reason, detail))) => Err((
             reason,
             end.warning

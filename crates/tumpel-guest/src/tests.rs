@@ -27,7 +27,7 @@ fn frames_split_at_any_byte_decode_in_order() {
             let GuestMessage::TurnLine(line) = message else {
                 panic!("expected a TurnLine, got {message:?}");
             };
-            texts.push((line.line_seq.0, line.text));
+            texts.push((line.line_seq.0, line.text.to_string()));
         }
     }
     assert_eq!(texts, vec![(1, "one".to_string()), (2, "two".to_string())]);

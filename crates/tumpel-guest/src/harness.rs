@@ -20,7 +20,7 @@ use tumpel_api::types::{
     EntityId, GuestHarness, GuestHarnessProtocol, GuestInput, GuestMessage, GuestMetric, GuestPersonaFile,
     GuestTurnEnd, GuestTurnEndReason, GuestTurnEndType, GuestTurnLine, GuestTurnLineType,
     GuestTurnRepositoryCloneFailed, GuestTurnRepositoryCloneFailedType, GuestTurnRepositoryReady,
-    GuestTurnRepositoryReadyType, GuestTurnStart, Sequence,
+    GuestTurnRepositoryReadyType, GuestTurnStart, LongText, Sequence,
 };
 use tumpel_guest::disk::{self, Space};
 use tumpel_guest::{credential_file, encode, Decoder};
@@ -485,7 +485,7 @@ fn turn_arguments(
                 return Err("the turn's credential names no Codex model provider; grant the persona's secret set a credential the Codex catalog entry lists".to_string());
             }
             let mut arguments = vec!["--model".to_string(), model];
-            arguments.extend(start.credential.arguments.iter().cloned());
+            arguments.extend(start.credential.arguments.iter().map(ToString::to_string));
             arguments.extend(connectors);
             if let Some(thread) = thread {
                 arguments.extend(["resume".to_string(), thread.to_string()]);
@@ -899,7 +899,9 @@ impl GuestState {
                     .map(TryInto::try_into)
                     .transpose()
                     .map_err(|error| format!("the credential file the harness left: {error}"))?,
-                detail,
+                detail: detail
+                    .try_into()
+                    .map_err(|error| format!("the turn end detail: {error}"))?,
                 last_line_seq: Sequence(self.last_line_seq),
                 metrics,
                 reason,
@@ -913,7 +915,10 @@ impl GuestState {
             .into(),
             Ending::Clone(failure) => GuestTurnRepositoryCloneFailed {
                 cause: failure.cause,
-                detail: failure.detail,
+                detail: failure
+                    .detail
+                    .try_into()
+                    .map_err(|error| format!("the repository clone failure detail: {error}"))?,
                 turn_id: start.turn_id.clone(),
                 type_: GuestTurnRepositoryCloneFailedType::TurnRepositoryCloneFailed,
             }
@@ -1044,14 +1049,7 @@ impl GuestState {
             }
             let finished = ends_turn(protocol, &text);
             let text = if priced { text } else { without_list_price(text) };
-            let line: GuestMessage = GuestTurnLine {
-                line_seq: Sequence(last_line_seq),
-                text,
-                turn_id: start.turn_id.clone(),
-                type_: GuestTurnLineType::TurnLine,
-            }
-            .into();
-            if let Err(error) = send(host, &line) {
+            if let Err(error) = send_line(host, &start.turn_id, last_line_seq, text) {
                 self.last_line_seq = last_line_seq;
                 return Err(error);
             }
@@ -1091,6 +1089,40 @@ fn prompt_input(protocol: GuestHarnessProtocol, setup: bool, prompt: &str, marke
         GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::CodexExecJson => prompt.to_string(),
     }
 }
+
+fn send_line(host: &mut impl Write, turn_id: &EntityId, line_seq: i64, text: String) -> Result<(), String> {
+    let line = |text: LongText| -> GuestMessage {
+        GuestTurnLine {
+            line_seq: Sequence(line_seq),
+            text,
+            turn_id: turn_id.clone(),
+            type_: GuestTurnLineType::TurnLine,
+        }
+        .into()
+    };
+    let too_long = match LongText::try_from(text) {
+        Err(error) => error.to_string(),
+        Ok(text) => match encode(&line(text)) {
+            Ok(frame) if frame.len() <= LINE_FRAME_BYTES => {
+                return host
+                    .write_all(&frame)
+                    .map_err(|error| format!("sending to the host: {error}"));
+            }
+            Ok(frame) => format!(
+                "its frame of {} bytes leaves no room for its envelope under the control plane's {CONTROL_PLANE_FRAME_BYTES}-byte frame cap",
+                frame.len()
+            ),
+            Err(error) => error.to_string(),
+        },
+    };
+    let notice = LongText::try_from(format!("tumpel: harness line {line_seq} was left out: {too_long}"))
+        .map_err(|error| format!("harness line {line_seq}: {error}"))?;
+    send(host, &line(notice))
+}
+
+const CONTROL_PLANE_FRAME_BYTES: usize = 4_000_000;
+const HOST_ENVELOPE_BYTES: usize = 4096;
+const LINE_FRAME_BYTES: usize = CONTROL_PLANE_FRAME_BYTES - HOST_ENVELOPE_BYTES;
 
 fn send(host: &mut impl Write, message: &GuestMessage) -> Result<(), String> {
     let frame = encode(message).map_err(|error| error.to_string())?;

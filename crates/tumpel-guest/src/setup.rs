@@ -174,7 +174,9 @@ fn fail(
         stream,
         GuestClaudeSetupFailed {
             claude_setup_id: start.claude_setup_id.clone(),
-            detail,
+            detail: detail
+                .try_into()
+                .map_err(|error| format!("the Claude setup failure detail: {error}"))?,
             reason,
             type_: GuestClaudeSetupFailedType::ClaudeSetupFailed,
         },
@@ -251,7 +253,7 @@ fn store(start: &GuestClaudeSetupStart, token: &str, expires_at: Option<&str>) -
         .build()
         .map_err(|error| format!("building the HTTP client: {error}"))?;
     let answer = client
-        .post(&start.token_url)
+        .post(start.token_url.as_str())
         .bearer_auth(&*start.token_credential)
         .json(&match expires_at {
             Some(expires_at) => json!({ "tenantId": *start.tenant_id, "value": token, "expiresAt": expires_at }),
@@ -334,7 +336,10 @@ fn codex(
         stream,
         GuestClaudeSetupUrl {
             claude_setup_id: start.claude_setup_id.clone(),
-            sign_in_url: prompt.url,
+            sign_in_url: prompt
+                .url
+                .try_into()
+                .map_err(|error| format!("the sign-in URL Codex printed: {error}"))?,
             type_: GuestClaudeSetupUrlType::ClaudeSetupUrl,
             user_code: Some(user_code),
         },
@@ -385,7 +390,9 @@ pub fn run(
         stream,
         GuestClaudeSetupUrl {
             claude_setup_id: start.claude_setup_id.clone(),
-            sign_in_url: url,
+            sign_in_url: url
+                .try_into()
+                .map_err(|error| format!("the sign-in URL Claude Code printed: {error}"))?,
             type_: GuestClaudeSetupUrlType::ClaudeSetupUrl,
             user_code: None,
         },

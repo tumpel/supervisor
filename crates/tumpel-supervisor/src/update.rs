@@ -24,6 +24,7 @@ use tumpel_api::types::{
 };
 use tumpel_guest::setup_output::{redacted, strip_ansi};
 
+use crate::bounded::reported;
 use crate::dir;
 use crate::install::supervisor_unit_text;
 use crate::snapshot::hex;
@@ -516,8 +517,12 @@ impl<S: Source, I: Idle> Updater<S, I> {
                 from_sha256: self.running.clone(),
                 to_sha256: to.clone(),
                 reason: stopped.reason,
-                detail,
-                output_tail: stopped.tail,
+                detail: reported("the update failure detail", &detail),
+                output_tail: stopped
+                    .tail
+                    .into_iter()
+                    .map(|line| reported("an update output line", &line))
+                    .collect(),
                 failed_at: Utc::now().fixed_offset(),
             },
         ));
@@ -798,7 +803,7 @@ pub fn startup(
                 from_sha256: record.from_sha256,
                 to_sha256: record.to_sha256,
                 reason: SupervisorUpdateFailureReason::SupervisorUpdateRolledBack,
-                detail,
+                detail: reported("the update failure detail", &detail),
                 output_tail: Vec::new(),
                 failed_at: now,
             },

@@ -283,8 +283,14 @@ fn metric(
             .map_err(|error| format!("{name} description: {error}"))?,
         dimensions: dimensions
             .iter()
-            .map(|(key, value)| ((*key).to_string(), value.clone()))
-            .collect(),
+            .map(|(key, value)| {
+                value
+                    .clone()
+                    .try_into()
+                    .map(|value| ((*key).to_string(), value))
+                    .map_err(|error| format!("{name} dimension {key}: {error}"))
+            })
+            .collect::<Result<_, String>>()?,
         kind: MetricKind::Turn,
         metric: name.try_into().map_err(|error| format!("{name}: {error}"))?,
         unit: unit.try_into().map_err(|error| format!("{name} unit: {error}"))?,

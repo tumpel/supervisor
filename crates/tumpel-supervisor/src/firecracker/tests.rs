@@ -150,14 +150,24 @@ fn handed(vmm: &Firecracker, pid: libc::pid_t, guest_is_socket: bool) -> Handed 
     let dir = vmm.data.join("box0");
     Handed {
         machine: SupervisorHandoverMachine {
-            api_socket: dir.join("api.sock").display().to_string(),
-            console_tail: STANDARD.encode("booted\n"),
-            guest_buffer: STANDARD.encode(first),
+            api_socket: dir
+                .join("api.sock")
+                .display()
+                .to_string()
+                .try_into()
+                .expect("a socket path"),
+            console_tail: STANDARD.encode("booted\n").try_into().expect("a console tail"),
+            guest_buffer: STANDARD.encode(first).try_into().expect("a guest buffer"),
             guest_fd,
             process_id: NonZeroU32::new(u32::try_from(pid).expect("a pid")).expect("a pid"),
             stderr_fd: OwnedFd::from(err).into_raw_fd(),
             stdout_fd: OwnedFd::from(out).into_raw_fd(),
-            vsock: dir.join("v.sock").display().to_string(),
+            vsock: dir
+                .join("v.sock")
+                .display()
+                .to_string()
+                .try_into()
+                .expect("a vsock path"),
         },
         peer,
         stdout,
@@ -197,7 +207,7 @@ async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_bin
     let GuestMessage::TurnLine(line) = guest.receive().await.expect("a message") else {
         panic!("the guest sent its line");
     };
-    assert_eq!(line.text, "one");
+    assert_eq!(line.text.as_str(), "one");
     assert!(machine.console_tail().contains("booted"));
     let _ = machine.stop().await;
     assert!(reaped(pid), "stopping an adopted box kills and reaps its process");

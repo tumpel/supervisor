@@ -705,7 +705,7 @@ fn control_plane(
                             .map(|pack| ChannelPackUrl {
                                 pack_digest: pack.pack_digest.clone(),
                                 size_bytes: pack.size_bytes,
-                                url: pack_url(&pack.pack_digest),
+                                url: pack_url(&pack.pack_digest).parse().expect("a pack URL"),
                             })
                             .collect(),
                     }));
@@ -720,7 +720,7 @@ fn control_plane(
                             packs.push(ChannelPackUrl {
                                 pack_digest: chunk.pack_digest.clone(),
                                 size_bytes: size,
-                                url: pack_url(&chunk.pack_digest),
+                                url: pack_url(&chunk.pack_digest).parse().expect("a pack URL"),
                             });
                         }
                     }
@@ -1005,9 +1005,9 @@ impl Host {
             harness_version: "1".to_string(),
         };
         let mut store = self.store.0.lock().expect("store");
-        store.insert(order.download.image_url.clone(), rootfs);
-        store.insert(order.download.kernel_url.clone(), kernel);
-        store.insert(order.download.manifest_url.clone(), manifest);
+        store.insert(order.download.image_url.to_string(), rootfs);
+        store.insert(order.download.kernel_url.to_string(), kernel);
+        store.insert(order.download.manifest_url.to_string(), manifest);
         order
     }
 
@@ -1254,7 +1254,7 @@ async fn a_torn_down_box_restores_its_next_turn_from_the_latest_snapshot() {
     assert_eq!(host.log(), ["stop session-1"]);
     let uploads = host.store.uploads();
     assert_eq!(pack_uploads(&uploads), 2, "{uploads:?}");
-    assert_eq!(uploads.last(), Some(&second.download_url));
+    assert_eq!(uploads.last().map(String::as_str), Some(second.download_url.as_str()));
 
     host.turn("turn-3", "session-1", "three", vec![second]);
     assert_eq!(
@@ -1285,7 +1285,7 @@ async fn a_snapshot_uploads_no_chunk_the_store_holds_already() {
     let second = host.snapshot("session-2");
     assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
     let uploads = host.store.uploads();
-    assert_eq!(uploads.last(), Some(&second.download_url));
+    assert_eq!(uploads.last().map(String::as_str), Some(second.download_url.as_str()));
     let packs: Vec<Vec<u8>> = uploads
         .iter()
         .filter(|url| url.contains("/packs/"))
@@ -1354,7 +1354,7 @@ async fn a_snapshot_after_a_restore_on_another_host_uploads_no_chunk() {
     );
     let again = second.snapshot("session-1");
     assert_eq!(second.settle_until("snapshot done").await, ["snapshot done"]);
-    assert_eq!(second.store.uploads(), [again.download_url]);
+    assert_eq!(second.store.uploads(), [again.download_url.to_string()]);
 }
 
 #[tokio::test]

@@ -11,9 +11,10 @@ use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::{LookupSpan, Registry};
 use tumpel_api::types::{
     ChannelHostMessage, ChannelTelemetryBatch, ChannelTelemetryBatchType, EntityId, GuestMetric, MetricInstrument,
-    MetricKind, MetricName, SamplePoint, TurnPoint,
+    MetricKind, MetricName, SamplePoint, ShortText, TurnPoint,
 };
 
+use crate::bounded::bounded;
 use crate::usage::{CpuTimes, HostStats};
 
 pub const BUFFER_POINTS: usize = 5_000;
@@ -362,6 +363,12 @@ impl Opened {
     }
 
     fn point_with(&self, name: &str, value: f64, dimensions: HashMap<String, String>) -> Option<Point> {
+        let dimensions = dimensions
+            .into_iter()
+            .map(|(key, value)| bounded(&format!("the {name} dimension {key}"), value).map(|value| (key, value)))
+            .collect::<Result<HashMap<String, ShortText>, String>>()
+            .inspect_err(|error| eprintln!("tumpel-supervisor: dropping a {name} point: {error}"))
+            .ok()?;
         Some(Point::Turn(TurnPoint {
             at: now(),
             dimensions,
@@ -410,7 +417,12 @@ pub fn guest_metrics(metrics: &[GuestMetric]) {
                 continue;
             };
             let mut dimensions = opened.dimensions_of(&GUEST_DIMENSIONS);
-            dimensions.extend(metric.dimensions.clone());
+            dimensions.extend(
+                metric
+                    .dimensions
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.to_string())),
+            );
             let Some(point) = opened.point_with(metric.metric.as_str(), metric.value, dimensions) else {
                 continue;
             };
@@ -539,7 +551,7 @@ mod tests {
     use tracing::Instrument;
     use tracing_subscriber::layer::SubscriberExt;
     use tumpel_api::types::{
-        ChannelTurnComplete, ChannelTurnCompleteType, MetricKind, SamplePoint, Sequence, TurnPoint,
+        ChannelTurnComplete, ChannelTurnCompleteType, MetricKind, SamplePoint, Sequence, ShortText, TurnPoint,
     };
 
     use super::{instrument, metric, Phase, Point, Telemetry, TelemetryLayer, INSTRUMENTS};
@@ -565,8 +577,11 @@ mod tests {
             .find(|point| point.metric.as_str() == "turn.tokens")
             .expect("turn.tokens");
         assert_eq!(tokens.value, 12.0);
-        assert_eq!(tokens.dimensions.get("tokenKind").map(String::as_str), Some("Input"));
-        assert_eq!(tokens.dimensions.get("model").map(String::as_str), Some("claude-test"));
+        assert_eq!(tokens.dimensions.get("tokenKind").map(ShortText::as_str), Some("Input"));
+        assert_eq!(
+            tokens.dimensions.get("model").map(ShortText::as_str),
+            Some("claude-test")
+        );
         assert_eq!(tokens.dimensions.len(), 3, "{:?}", tokens.dimensions);
         assert_eq!(tokens.turn_id.as_str(), "turn-1");
         let batch = telemetry.drain(500).pop().expect("a batch");
@@ -690,7 +705,7 @@ mod tests {
             .map(|point| {
                 (
                     point.metric.to_string(),
-                    point.dimensions.get("phase").cloned(),
+                    point.dimensions.get("phase").map(ToString::to_string),
                     point.value.round(),
                 )
             })
@@ -705,9 +720,12 @@ mod tests {
             ]
         );
         let end = points.last().expect("turn.end");
-        assert_eq!(end.dimensions.get("outcome").map(String::as_str), Some("Completed"));
-        assert_eq!(end.dimensions.get("startKind").map(String::as_str), Some("Cold"));
-        assert_eq!(end.dimensions.get("harnessVersion").map(String::as_str), Some("1.0.0"));
+        assert_eq!(end.dimensions.get("outcome").map(ShortText::as_str), Some("Completed"));
+        assert_eq!(end.dimensions.get("startKind").map(ShortText::as_str), Some("Cold"));
+        assert_eq!(
+            end.dimensions.get("harnessVersion").map(ShortText::as_str),
+            Some("1.0.0")
+        );
         assert_eq!(end.turn_id.as_str(), "turn-1");
         assert_eq!(end.session_id.as_str(), "session-1");
     }
