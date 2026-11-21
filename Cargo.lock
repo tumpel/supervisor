@@ -1864,6 +1864,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "crc",
  "ext4-view",
  "fastcdc",
  "futures-util",

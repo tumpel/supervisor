@@ -13,7 +13,7 @@ use super::{
     Base, Born, ChunkCache, Entry, Ext4Upper, Found, Kind, Manifest, Places, Scan, Span, Staged, Stored, Upper,
 };
 
-fn sbin(tool: &str) -> PathBuf {
+pub(super) fn sbin(tool: &str) -> PathBuf {
     ["/usr/sbin", "/sbin"]
         .iter()
         .map(|dir| Path::new(dir).join(tool))
@@ -21,7 +21,7 @@ fn sbin(tool: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(tool))
 }
 
-fn scratch(name: &str) -> PathBuf {
+pub(super) fn scratch(name: &str) -> PathBuf {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/test-images")
         .join(name);

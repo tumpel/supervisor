@@ -1,7 +1,11 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::error::Error;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+
+use crc::{Crc, CRC_32_ISCSI};
+use ext4_view::Ext4Read;
 
 const EXT4_MAGIC: u16 = 0xEF53;
 const ROOT_INODE: u32 = 2;
@@ -19,11 +23,31 @@ const JOURNAL_MAGIC: u32 = 0xC03B_3998;
 const JOURNAL_DESCRIPTOR: u32 = 1;
 const JOURNAL_COMMIT: u32 = 2;
 const JOURNAL_REVOKE: u32 = 5;
+const JOURNAL_REVOCATIONS: u32 = 0x1;
 const JOURNAL_64BIT: u32 = 0x2;
 const JOURNAL_CSUM_V3: u32 = 0x10;
+const JOURNAL_REPLAYED: u32 = JOURNAL_REVOCATIONS | JOURNAL_64BIT | JOURNAL_CSUM_V3;
+const JOURNAL_CRC32C: u8 = 4;
+const JOURNAL_SUPERBLOCK_BYTES: usize = 1024;
+const JOURNAL_SUPERBLOCK_CHECKSUM: usize = 0xFC;
+const COMMIT_CHECKSUM: usize = 16;
 const TAG_ESCAPED: u32 = 0x1;
 const TAG_SAME_UUID: u32 = 0x2;
 const TAG_LAST: u32 = 0x8;
+const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+
+fn crc32c(seed: u32, parts: &[&[u8]]) -> u32 {
+    let mut digest = CRC32C.digest_with_initial(seed.reverse_bits());
+    for part in parts {
+        digest.update(part);
+    }
+    digest.finalize() ^ !0
+}
+
+fn sealed(seed: u32, bytes: &[u8], checksum_at: usize) -> bool {
+    let computed = crc32c(seed, &[&bytes[..checksum_at], &[0; 4], &bytes[checksum_at + 4..]]);
+    computed == be32(bytes, checksum_at)
+}
 
 fn le16(bytes: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([bytes[at], bytes[at + 1]])
@@ -48,6 +72,23 @@ fn slice(bytes: &[u8], at: usize, len: usize, what: &str) -> Result<Vec<u8>, Str
         .ok_or_else(|| format!("{what} runs past the end of its block"))
 }
 
+fn journal_seed(superblock: &[u8]) -> Result<u32, String> {
+    if superblock[0x50] != JOURNAL_CRC32C
+        || !sealed(!0, &superblock[..JOURNAL_SUPERBLOCK_BYTES], JOURNAL_SUPERBLOCK_CHECKSUM)
+    {
+        return Err("the journal superblock fails its crc32c checksum; the drive is damaged".to_string());
+    }
+    let features = be32(superblock, 0x28);
+    if features & !JOURNAL_REPLAYED != 0
+        || features & (JOURNAL_64BIT | JOURNAL_CSUM_V3) != JOURNAL_64BIT | JOURNAL_CSUM_V3
+    {
+        return Err(format!(
+            "the journal has features {features:#x}; the replay reads only revocations, 64bit and checksum v3 ({JOURNAL_REPLAYED:#x})"
+        ));
+    }
+    Ok(crc32c(!0, &[&superblock[0x30..0x40]]))
+}
+
 struct Drive {
     file: File,
     block_size: u64,
@@ -55,6 +96,7 @@ struct Drive {
     inodes_per_group: u64,
     inode_tables: Vec<u64>,
     journal: HashMap<u64, u64>,
+    log: HashSet<u64>,
 }
 
 impl Drive {
@@ -103,9 +145,12 @@ impl Drive {
             inodes_per_group,
             inode_tables,
             journal: HashMap::new(),
+            log: HashSet::new(),
         };
         if le32(&superblock, 0x5C) & COMPAT_HAS_JOURNAL != 0 {
-            drive.journal = drive.replay(le32(&superblock, 0xE0))?;
+            let journal_inode = le32(&superblock, 0xE0);
+            drive.journal = drive.replay(journal_inode)?;
+            drive.log = drive.log_blocks(journal_inode)?;
         }
         Ok(drive)
     }
@@ -177,6 +222,16 @@ impl Drive {
             .collect())
     }
 
+    fn log_blocks(&self, journal_inode: u32) -> Result<HashSet<u64>, String> {
+        let inode = self.inode(journal_inode)?;
+        Ok(self
+            .block_map(journal_inode, &inode)?
+            .into_iter()
+            .filter(|(logical, _)| *logical != 0)
+            .map(|(_, physical)| physical)
+            .collect())
+    }
+
     fn replay(&self, journal_inode: u32) -> Result<HashMap<u64, u64>, String> {
         let inode = self.inode(journal_inode)?;
         let map = self.block_map(journal_inode, &inode)?;
@@ -196,15 +251,10 @@ impl Drive {
         if position == 0 {
             return Ok(HashMap::new());
         }
-        let features = be32(&superblock, 0x28);
-        if features & JOURNAL_64BIT == 0 || features & JOURNAL_CSUM_V3 == 0 {
-            return Err(format!(
-                "the journal has features {features:#x}; only 64bit with checksum v3 is read"
-            ));
-        }
+        let seed = journal_seed(&superblock)?;
         let next = |position: u64| if position + 1 >= max_len { first } else { position + 1 };
         let tail = usize::try_from(self.block_size).map_err(|error| error.to_string())? - 4;
-        let mut pending = Vec::new();
+        let mut pending: Vec<(u64, u64, u32)> = Vec::new();
         let mut committed: Vec<(u32, u64, u64)> = Vec::new();
         let mut pending_revokes = Vec::new();
         let mut revoked: HashMap<u64, u32> = HashMap::new();
@@ -215,6 +265,9 @@ impl Drive {
             }
             match be32(&block, 4) {
                 JOURNAL_DESCRIPTOR => {
+                    if !sealed(seed, &block, tail) {
+                        break;
+                    }
                     let mut at = 12;
                     while at + 16 <= tail {
                         let flags = be32(&block, at + 4);
@@ -223,7 +276,7 @@ impl Drive {
                         }
                         let target = (u64::from(be32(&block, at + 8)) << 32) | u64::from(be32(&block, at));
                         position = next(position);
-                        pending.push((target, position));
+                        pending.push((target, position, be32(&block, at + 12)));
                         at += if flags & TAG_SAME_UUID == 0 { 32 } else { 16 };
                         if flags & TAG_LAST != 0 {
                             break;
@@ -231,15 +284,28 @@ impl Drive {
                     }
                 }
                 JOURNAL_REVOKE => {
+                    if !sealed(seed, &block, tail) {
+                        break;
+                    }
                     let used = usize::try_from(be32(&block, 12)).map_err(|error| error.to_string())?;
                     let mut at = 16;
-                    while at + 8 <= used.min(block.len()) {
+                    while at + 8 <= used.min(tail) {
                         pending_revokes.push(be64(&block, at));
                         at += 8;
                     }
                 }
                 JOURNAL_COMMIT => {
-                    committed.extend(pending.drain(..).map(|(target, at)| (sequence, target, at)));
+                    if !sealed(seed, &block, COMMIT_CHECKSUM) {
+                        break;
+                    }
+                    for (target, at, checksum) in &pending {
+                        if crc32c(seed, &[&sequence.to_be_bytes(), &read(*at)?]) != *checksum {
+                            return Err(format!(
+                                "the journal's copy of block {target} in committed transaction {sequence} fails its checksum; the drive is damaged"
+                            ));
+                        }
+                    }
+                    committed.extend(pending.drain(..).map(|(target, at, _)| (sequence, target, at)));
                     for target in pending_revokes.drain(..) {
                         revoked.insert(target, sequence);
                     }
@@ -361,23 +427,64 @@ fn opaque_in(bytes: &[u8], first: usize, values: usize, place: &str) -> Result<b
     }
 }
 
-pub fn opaque_dirs(drive: &Path, root: &[u8]) -> Result<BTreeSet<Vec<u8>>, String> {
-    let shown = drive.display();
-    let drive = Drive::open(drive)?;
-    let mut top = ROOT_INODE;
-    for name in root.split(|byte| *byte == b'/').filter(|name| !name.is_empty()) {
-        top = drive
-            .children(top)?
-            .into_iter()
-            .find(|(child, _)| child == name)
-            .map(|(_, inode)| inode)
-            .ok_or_else(|| format!("{shown} has no directory {}", String::from_utf8_lossy(root)))?;
+pub struct Replayed {
+    file: File,
+    block_size: u64,
+    journal: HashMap<u64, u64>,
+    log: HashSet<u64>,
+}
+
+pub fn open_drive(path: &Path, root: &[u8]) -> Result<(Replayed, BTreeSet<Vec<u8>>), String> {
+    let drive = Drive::open(path)?;
+    let opaque = drive.opaque_dirs(path, root)?;
+    let replayed = Replayed {
+        file: drive.file,
+        block_size: drive.block_size,
+        journal: drive.journal,
+        log: drive.log,
+    };
+    Ok((replayed, opaque))
+}
+
+impl Ext4Read for Replayed {
+    fn read(&mut self, start_byte: u64, dst: &mut [u8]) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        let mut at = start_byte;
+        let mut filled = 0;
+        while filled < dst.len() {
+            let block = at / self.block_size;
+            let offset = at % self.block_size;
+            let len = usize::try_from(self.block_size - offset)?.min(dst.len() - filled);
+            let part = &mut dst[filled..filled + len];
+            if self.log.contains(&block) {
+                part.fill(0);
+            } else {
+                let physical = self.journal.get(&block).copied().unwrap_or(block);
+                self.file.read_exact_at(part, physical * self.block_size + offset)?;
+            }
+            filled += len;
+            at += u64::try_from(len)?;
+        }
+        Ok(())
     }
-    let mut out = BTreeSet::new();
-    drive
-        .walk(top, b"", &mut out)
-        .map_err(|error| format!("reading the opaque directories of {shown}: {error}"))?;
-    Ok(out)
+}
+
+impl Drive {
+    fn opaque_dirs(&self, path: &Path, root: &[u8]) -> Result<BTreeSet<Vec<u8>>, String> {
+        let shown = path.display();
+        let mut top = ROOT_INODE;
+        for name in root.split(|byte| *byte == b'/').filter(|name| !name.is_empty()) {
+            top = self
+                .children(top)?
+                .into_iter()
+                .find(|(child, _)| child == name)
+                .map(|(_, inode)| inode)
+                .ok_or_else(|| format!("{shown} has no directory {}", String::from_utf8_lossy(root)))?;
+        }
+        let mut out = BTreeSet::new();
+        self.walk(top, b"", &mut out)
+            .map_err(|error| format!("reading the opaque directories of {shown}: {error}"))?;
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
