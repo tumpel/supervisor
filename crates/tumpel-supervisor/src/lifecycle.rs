@@ -1969,10 +1969,15 @@ pub enum Taken {
     Crashed,
 }
 
+pub struct Abandoned {
+    pub reason: TurnFailureReason,
+    pub cause: String,
+}
+
 pub enum Input {
     Command(Command),
     HandOver(oneshot::Sender<SupervisorHandover>),
-    Abandon(oneshot::Sender<()>),
+    Abandon(oneshot::Sender<()>, Abandoned),
 }
 
 #[derive(Clone)]
@@ -2156,7 +2161,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 input = inputs.recv() => match input {
                     Some(Input::Command(command)) => self.command(command).await?,
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
-                    Some(Input::Abandon(reply)) => self.abandon(reply).await,
+                    Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
                     None => break,
                 },
                 Some(setup) = setups.recv() => self.setup_command(setup),
@@ -2289,7 +2294,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         Ok(())
     }
 
-    async fn abandon(&mut self, reply: oneshot::Sender<()>) {
+    async fn abandon(&mut self, reply: oneshot::Sender<()>, abandoned: Abandoned) {
         let sessions: Vec<String> = self.slots.keys().cloned().collect();
         for session in sessions {
             let Some(slot) = self.slots.get_mut(&session) else {
@@ -2311,10 +2316,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 turn_failed(
                     &self.runner.out,
                     &turn_id,
-                    TurnFailureReason::HarnessExited,
+                    abandoned.reason,
                     format!(
-                        "this supervisor binary stopped before it reached the control plane, so the box of turn {} ended with it; send the turn again",
-                        *turn_id
+                        "{}, so the box of turn {} ended with it; send the turn again",
+                        abandoned.cause, *turn_id
                     ),
                 );
             }

@@ -6,11 +6,12 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tumpel_api::types::{
     ChannelControlMessage, ChannelHostMessage, ChannelProtocol, ChannelSnapshotDone, ChannelSnapshotDoneType, EntityId,
-    HostUsage, SupervisorChannelState,
+    HostReportedHealth, HostUsage, SupervisorChannelState,
 };
 
 use super::{
-    empty_state, hello_bytes, Backoff, ChannelError, Event, HostChannel, Phase, Port, Signer, Store, MAX_RECONNECTS,
+    empty_state, hello_bytes, Backoff, ChannelError, Event, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer,
+    Store, MAX_RATE_BACKOFFS, MAX_RECONNECTS,
 };
 
 #[derive(Default)]
@@ -167,6 +168,7 @@ fn open(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) {
     let Ok(Event::Welcomed) = welcome(channel, wire, &quiet) else {
         panic!("the welcome opens the channel");
     };
+    channel.release(usize::MAX, wire).expect("release");
 }
 
 struct ControlPlane {
@@ -211,6 +213,7 @@ impl ControlPlane {
     fn reconnect(&mut self, channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) -> Result<Event, ChannelError> {
         channel.disconnect();
         let event = welcome(channel, wire, &self.welcome())?;
+        channel.release(usize::MAX, wire)?;
         Ok(event)
     }
 }
@@ -429,16 +432,18 @@ fn a_heartbeat_names_every_held_session_and_an_empty_list_when_none() {
     wire.sent();
     let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
     let held = vec![EntityId::try_from("session-1").expect("id")];
-    channel.heartbeat(sent_at, usage(), held, &mut wire).expect("heartbeat");
     channel
-        .heartbeat(sent_at, usage(), Vec::new(), &mut wire)
+        .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, &mut wire)
+        .expect("heartbeat");
+    channel
+        .heartbeat(sent_at, usage(), Vec::new(), HostReportedHealth::RateLimited, &mut wire)
         .expect("heartbeat");
     let usage = json!({"boxesWarm": 1, "loadAverage": 0.5, "memoryAvailableMib": 4096});
     assert_eq!(
         wire.sent(),
         [
-            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": ["session-1"]}),
-            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": []}),
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": ["session-1"], "health": "Healthy"}),
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": [], "health": "RateLimited"}),
         ]
     );
 }
@@ -734,4 +739,134 @@ fn jitter_takes_up_to_half_off_each_reconnect_wait() {
     assert_eq!(backoff.next(false, 0), Some(Duration::from_millis(500)));
     assert_eq!(backoff.next(false, u16::MAX), Some(Duration::from_secs(2)));
     assert_eq!(backoff.next(false, 0), Some(Duration::from_secs(2)));
+}
+
+fn at(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_795_000_000 + seconds, 0).expect("time")
+}
+
+#[test]
+fn rate_limit_backoffs_start_at_the_retry_after_double_each_time_up_to_fifteen_minutes_and_give_up_after_ten() {
+    let mut limit = RateLimit::default();
+    let mut now = 0;
+    let mut waits = Vec::new();
+    for _ in 0..MAX_RATE_BACKOFFS {
+        let RateBackoff::Until(until) = limit.limited(at(now), at(now + 20), 600, 0) else {
+            panic!("a refusal after the pause ended backs off again");
+        };
+        waits.push((until - at(now)).num_seconds());
+        assert_eq!(limit.limited(at(now + 1), at(now + 20), 600, 0), RateBackoff::Paused);
+        now = (until - at(0)).num_seconds();
+    }
+    assert_eq!(waits, [20, 40, 80, 160, 320, 640, 900, 900, 900, 900]);
+    assert_eq!(limit.limited(at(now), at(now + 20), 600, 0), RateBackoff::Exhausted);
+}
+
+#[test]
+fn jitter_only_lengthens_a_rate_limit_backoff_by_up_to_half() {
+    let mut limit = RateLimit::default();
+    let RateBackoff::Until(until) = limit.limited(at(0), at(20), 600, u16::MAX) else {
+        panic!("the first refusal backs off");
+    };
+    assert_eq!((until - at(0)).num_seconds(), 30);
+}
+
+#[test]
+fn a_rate_limited_host_reports_rate_limited_until_a_full_minute_passes_with_no_refusal_then_healthy_with_its_backoffs_reset(
+) {
+    let mut limit = RateLimit::default();
+    assert_eq!(limit.health(at(0)), HostReportedHealth::Healthy);
+    assert_eq!(limit.limited(at(0), at(20), 600, 0), RateBackoff::Until(at(20)));
+    assert_eq!(limit.limited(at(30), at(60), 600, 0), RateBackoff::Until(at(90)));
+    assert_eq!(limit.health(at(80)), HostReportedHealth::RateLimited);
+    assert!(!limit.recovered(at(89)));
+    assert_eq!(limit.health(at(90)), HostReportedHealth::Healthy);
+    assert!(limit.recovered(at(90)));
+    assert!(!limit.recovered(at(91)), "it turns Healthy once");
+    assert_eq!(limit.backoffs(), 0);
+    assert_eq!(limit.limited(at(100), at(120), 600, 0), RateBackoff::Until(at(120)));
+}
+
+#[test]
+fn a_frame_refused_over_the_rate_is_dropped_and_frames_sent_while_withheld_go_out_paced_after_the_pause() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    channel.send(done("snap-1"), &mut wire).expect("send");
+    wire.sent();
+    let limited = json!({"type": "FrameRateLimited", "seq": 1, "reason": "host host-1 sent more than 600 frames a minute", "framesPerMinute": 600, "retryAfter": "2026-11-21T11:01:00Z"});
+    let Ok(Event::FrameRateLimited {
+        seq: 1,
+        frames_per_minute: 600,
+        ..
+    }) = channel.receive(&limited.to_string(), &mut wire)
+    else {
+        panic!("the refusal names the limit");
+    };
+    assert!(channel.state().unacked.is_empty(), "a refused frame is never resent");
+    channel.withhold();
+    for snapshot in ["snap-2", "snap-3", "snap-4"] {
+        channel.send(done(snapshot), &mut wire).expect("send");
+    }
+    assert!(
+        wire.sent().is_empty(),
+        "nothing goes out while the host holds its frames"
+    );
+    channel.release(2, &mut wire).expect("release");
+    let seqs = |wire: &mut Wire| {
+        wire.sent()
+            .iter()
+            .map(|frame| frame["seq"].as_i64().expect("seq"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(seqs(&mut wire), [2, 3]);
+    assert!(channel.withholding());
+    channel.release(2, &mut wire).expect("release");
+    assert_eq!(seqs(&mut wire), [4]);
+    assert!(!channel.withholding());
+    channel.send(done("snap-5"), &mut wire).expect("send");
+    assert_eq!(seqs(&mut wire), [5]);
+}
+
+#[test]
+fn a_backlog_saved_before_a_restart_is_held_at_the_welcome_and_goes_out_paced() {
+    let saved: SupervisorChannelState = serde_json::from_value(json!({
+        "received": 0,
+        "sent": 3,
+        "unacked": [
+            {"type": "Frame", "seq": 1, "ack": 0, "message": {"type": "TurnDone", "turnId": "turn-1"}},
+            {"type": "Frame", "seq": 2, "ack": 0, "message": {"type": "TurnDone", "turnId": "turn-2"}},
+            {"type": "Frame", "seq": 3, "ack": 0, "message": {"type": "TurnDone", "turnId": "turn-3"}}
+        ]
+    }))
+    .expect("channel.json");
+    let mut channel = HostChannel::new(
+        saved,
+        Disk::default(),
+        Recorder::default(),
+        "host-1".try_into().expect("host id"),
+        "0.1.0".to_string(),
+    );
+    assert!(channel.withholding());
+    let mut wire = Wire::default();
+    let quiet = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION});
+    let Ok(Event::Welcomed) = welcome(&mut channel, &mut wire, &quiet) else {
+        panic!("the welcome opens the channel");
+    };
+    assert!(
+        wire.sent().is_empty(),
+        "the welcome replays nothing while the backlog is held"
+    );
+    channel.release(2, &mut wire).expect("release");
+    let seqs = |wire: &mut Wire| {
+        wire.sent()
+            .iter()
+            .map(|frame| frame["seq"].as_i64().expect("seq"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(seqs(&mut wire), [1, 2]);
+    channel.release(2, &mut wire).expect("release");
+    assert_eq!(seqs(&mut wire), [3]);
+    assert!(!channel.withholding());
 }
