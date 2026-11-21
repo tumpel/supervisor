@@ -41,7 +41,7 @@ use crate::lifecycle::{
 };
 use crate::pool::{memory_budget_mib, mib, Held, Size, TapPool};
 use crate::store::HttpStore;
-use crate::telemetry::{Telemetry, FLUSH_INTERVAL};
+use crate::telemetry::Telemetry;
 use crate::update::{self, HttpSource, Layout, Limits, Outcome, Startup, Updater};
 use crate::usage;
 
@@ -182,6 +182,7 @@ struct Usage {
     holdings: watch::Receiver<Held>,
     data_dir: PathBuf,
     telemetry: Telemetry,
+    telemetry_interval: Duration,
 }
 
 impl Usage {
@@ -365,6 +366,7 @@ fn start_boxes(
         holdings: lifecycle.holdings(),
         data_dir: PathBuf::from(&*runtime.data_dir),
         telemetry,
+        telemetry_interval: Duration::from_secs(u64::from(runtime.telemetry_interval_seconds.get())),
     };
     let answers = lifecycle.answers();
     let cancels = lifecycle.cancels();
@@ -1089,7 +1091,7 @@ async fn session(
                 } else if channel.phase() == Phase::Open && channel.withholding() && !limit.paused(now) {
                     channel.release(limit.release_budget(TICK), &mut outbox).err().map(|error| Err(store_lost(&error)))
                 } else if channel.phase() == Phase::Open {
-                    flush(channel, &usage.telemetry, FLUSH_INTERVAL, &mut outbox).err().map(Err)
+                    flush(channel, &usage.telemetry, usage.telemetry_interval, &mut outbox).err().map(Err)
                 } else {
                     None
                 }
