@@ -41,7 +41,7 @@ use crate::lifecycle::{
 };
 use crate::pool::{memory_budget_mib, mib, Held, Size, TapPool};
 use crate::store::HttpStore;
-use crate::telemetry::{Telemetry, BATCH_POINTS};
+use crate::telemetry::{Telemetry, FLUSH_INTERVAL};
 use crate::update::{self, HttpSource, Layout, Limits, Outcome, Startup, Updater};
 use crate::usage;
 
@@ -213,12 +213,11 @@ fn beat(
     }
     channel
         .heartbeat(chrono::Utc::now().fixed_offset(), usage.sample()?, held, health, outbox)
-        .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))?;
-    flush(channel, &usage.telemetry, outbox)
+        .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
 }
 
 fn flush(channel: &mut Channel, telemetry: &Telemetry, outbox: &mut Outbox) -> Result<(), Failure> {
-    for batch in telemetry.drain(BATCH_POINTS) {
+    for batch in telemetry.flush_due(FLUSH_INTERVAL) {
         channel
             .send(ChannelHostMessage::TelemetryBatch(batch), outbox)
             .map_err(|error| store_lost(&error))?;
@@ -816,12 +815,21 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     if let Err(failure) = &stopped {
         abandon(&commands, abandoned(failure)).await;
     }
+    store_unsent(&mut channel, &mut from_box, &usage.telemetry)?;
+    stopped
+}
+
+fn store_unsent(
+    channel: &mut Channel,
+    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    telemetry: &Telemetry,
+) -> Result<(), Failure> {
     while let Ok(message) = from_box.try_recv() {
         channel
             .send(message, &mut Outbox::default())
             .map_err(|error| store_lost(&error))?;
     }
-    stopped
+    flush(channel, telemetry, &mut Outbox::default())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1080,7 +1088,7 @@ async fn session(
                     beat(channel, usage, from_box, limit.health(now), &mut outbox).err().map(Err)
                 } else if channel.phase() == Phase::Open && channel.withholding() && !limit.paused(now) {
                     channel.release(limit.release_budget(TICK), &mut outbox).err().map(|error| Err(store_lost(&error)))
-                } else if channel.phase() == Phase::Open && usage.telemetry.full(BATCH_POINTS) {
+                } else if channel.phase() == Phase::Open {
                     flush(channel, &usage.telemetry, &mut outbox).err().map(Err)
                 } else {
                     None
