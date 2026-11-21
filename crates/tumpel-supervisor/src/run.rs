@@ -22,7 +22,9 @@ use tumpel_api::types::{
     HostUsage, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
 };
-use tumpel_channel::{Backoff, ChannelError, Event, HostChannel, Phase, Port, Signer, HEARTBEAT_DEADLINE, MAX_REPLAYS};
+use tumpel_channel::{
+    Backoff, ChannelError, Event, HostChannel, Phase, Port, Signer, HEARTBEAT_DEADLINE, MAX_RECONNECTS,
+};
 
 use crate::boot::BootOrder;
 use crate::dir::{self, ChannelFile, CHANNEL_FILE, CONFIG_FILE, KEY_FILE, RUNTIME_FILE};
@@ -843,7 +845,12 @@ async fn serve(
                 return Err(fail(SupervisorFailure::ProtocolError, reason));
             }
             Ended::Dropped { welcomed, reason } => {
-                let wait = backoff.next(welcomed && channel.delivered(), jitter());
+                let Some(wait) = backoff.next(welcomed, welcomed && channel.delivered(), jitter()) else {
+                    return Err(fail(
+                        SupervisorFailure::ChannelUnreachable,
+                        format!("no Welcome from {url} on {MAX_RECONNECTS} connections in a row, the last dropped with: {reason}; check the network and the control plane"),
+                    ));
+                };
                 eprintln!(
                     "channel to {url} dropped: {reason}; reconnecting in {:.1}s",
                     wait.as_secs_f64()
@@ -921,10 +928,7 @@ async fn session(
                     last_received = Instant::now();
                     match channel.receive(text.as_str(), &mut outbox) {
                         Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, &mut outbox).err().map(Err),
-                        Ok(Event::Welcomed { abandoned }) => {
-                            for frame in abandoned {
-                                eprintln!("tumpel-supervisor: FrameAbandoned: the control plane did not acknowledge {frame} across {MAX_REPLAYS} reconnects; dropped it from channel.json");
-                            }
+                        Ok(Event::Welcomed) => {
                             welcomed = true;
                             eprintln!("connected to {url}");
                             last_beat = Instant::now();
@@ -962,6 +966,7 @@ async fn session(
                             let _ = sink.send(Message::Close(Some(close))).await;
                             Some(Ok(dropped(welcomed, reason)))
                         }
+                        Err(ChannelError::Undelivered(reason)) => Some(Err(fail(SupervisorFailure::FrameUndelivered, reason))),
                         Err(error) => Some(Err(fail(SupervisorFailure::ChannelStateLost, error.to_string()))),
                     }
                 }
