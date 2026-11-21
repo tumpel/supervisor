@@ -2175,6 +2175,21 @@ fn a_snapshot_larger_than_the_box_disk_names_both_sizes_and_the_persona_setting(
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_turn_on_a_host_disk_under_its_headroom_fails_box_disk_full_naming_the_host_disk() {
+    let mut host = host("disk-full", 3, Harness::Echo, Boot::Works);
+    host.vmm.free_disk_mib.store(5000, Ordering::SeqCst);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    let seen = host.settle(SETTLE).await;
+    assert!(
+        seen.iter().any(
+            |line| line.starts_with(&format!("failed {}", TurnFailureReason::BoxDiskFull))
+                && line.contains("the host's disk has 5000 MiB free, under the 10000 MiB it keeps free")
+        ),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_a_teardown_frees_disk() {
     let mut host = host("disk", 3, Harness::Echo, Boot::Works);
     host.vmm.free_disk_mib.store(30_000, Ordering::SeqCst);
@@ -2189,7 +2204,7 @@ async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_a_teardown_free
         refused.len() == 1
             && refused[0].starts_with(&format!("failed {}", TurnFailureReason::PoolExhausted))
             && refused[0].contains(
-                "this host gives box disks 20000 MiB, its 30000 MiB of free disk and the 0 MiB its boxes wrote less the 10000 MiB it keeps free; its 2 boxes wrote 0 MiB and keep 16384 MiB more to grow into, so the 8192 MiB a box disk of 32768 MiB keeps does not fit"
+                "this host has 30000 MiB of free disk and keeps 10000 MiB of it free; its 2 boxes keep 16384 MiB to grow into, so the 8192 MiB a box disk of 32768 MiB keeps does not fit"
             ),
         "{refused:?}"
     );

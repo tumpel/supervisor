@@ -38,7 +38,7 @@ use crate::exchange::{part_number, Answer, Answers, Ask, Cancels, Key, Waiting, 
 use crate::harness_result::{error_result, exit_result, turn_end};
 use crate::images;
 use crate::layers::LayerCache;
-use crate::pool::{mib, Disk, Held, Size, Tap, TapPool};
+use crate::pool::{mib, restore_charge_mib, Charge, Disk, Held, Size, Staging, Tap, TapPool};
 use crate::snapshot::{
     assemble, cut, decode, decode_root, draft_digests, fetches, fresh, lacking, restore_parts, stage, unpack,
     write_restore, Base, Births, ChunkCache, Cut, Fetch, Kind, Manifest, PackFile, Place, Places, Span,
@@ -55,6 +55,7 @@ const TRANSFERS: usize = 16;
 const CHUNKS: &str = "chunks";
 const HANDOVER_REPORT_ALLOWANCE: Duration = Duration::from_secs(60);
 const CANCEL_END: Duration = Duration::from_secs(10);
+const DISK_CHECK: Duration = Duration::from_secs(5);
 const RESTORE_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
 const RESTORE_ENTRIES_PER_SECOND: u64 = 2_000;
 const OVERLAY_BYTES_PER_INODE: u64 = 16 * 1024;
@@ -724,6 +725,8 @@ impl Drop for Asking {
     }
 }
 
+type Restored = (PathBuf, Base, u64, Charge);
+
 struct Runner<V: Vmm, S: Store> {
     vmm: Arc<V>,
     store: Arc<S>,
@@ -736,6 +739,7 @@ struct Runner<V: Vmm, S: Store> {
     parking: watch::Receiver<bool>,
     standing: Standing,
     cancels: Cancels,
+    staging: Staging,
 }
 
 impl<V: Vmm, S: Store> Clone for Runner<V, S> {
@@ -752,6 +756,7 @@ impl<V: Vmm, S: Store> Clone for Runner<V, S> {
             parking: self.parking.clone(),
             standing: self.standing.clone(),
             cancels: self.cancels.clone(),
+            staging: self.staging.clone(),
         }
     }
 }
@@ -880,8 +885,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
         let restored = match timeout_at(instant_at(turn.credential.expires_at), self.restore(turn, &tap)).await {
             Ok(Ok(restored)) => restored,
-            Ok(Err(detail)) => {
-                turn_failed(&self.out, &turn.turn_id, TurnFailureReason::SnapshotUnreadable, detail);
+            Ok(Err((reason, detail))) => {
+                turn_failed(&self.out, &turn.turn_id, reason, detail);
                 return Outcome::Gone(tap, Ok(()));
             }
             Err(_) => {
@@ -897,7 +902,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let (image, hold) = match self.image(turn).await {
             Ok(booted) => booted,
             Err(refusal) => {
-                let detail = match restored.as_ref().map(|(path, _, _)| remove_file(path)) {
+                let detail = match restored.as_ref().map(|(path, _, _, _)| remove_file(path)) {
                     Some(Err(error)) => format!("{}; then {error}", refusal.detail),
                     _ => refusal.detail,
                 };
@@ -917,14 +922,16 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 return Outcome::Gone(tap, Ok(()));
             }
         };
-        let (restore, base, archived) = restored.map_or((None, Base::default(), 0), |(path, base, archived)| {
-            (Some(path), base, archived)
-        });
+        let (restore, base, archived, charge) = restored
+            .map_or((None, Base::default(), 0, None), |(path, base, archived, charge)| {
+                (Some(path), base, archived, Some(charge))
+            });
         let entries = base.manifest.len() as u64;
         let budget = restore_budget(self.settings.budgets.boot, archived, entries);
         let booting = telemetry::timed(Phase::Boot, machine.start(&image, restore.as_deref()), Result::is_ok);
         let started = timeout(budget, booting).await;
         let cleaned = restore.as_deref().map_or(Ok(()), remove_file);
+        drop(charge);
         let failed = match (started, cleaned) {
             (Ok(Ok((guest, hello))), Ok(())) => match mismatch(&hello, &image) {
                 None => {
@@ -1152,14 +1159,79 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
-    async fn restore(&self, turn: &BoxTurn, tap: &Tap) -> Result<Option<(PathBuf, Base, u64)>, String> {
+    async fn restore(&self, turn: &BoxTurn, tap: &Tap) -> Result<Option<Restored>, (TurnFailureReason, String)> {
         telemetry::timed(Phase::Restore, self.restore_snapshot(turn, tap), |restored| {
             matches!(restored, Ok(Some(_)))
         })
         .await
+        .map_err(|(reason, detail)| match self.host_disk_full() {
+            Some(full) if reason == TurnFailureReason::SnapshotUnreadable => {
+                (TurnFailureReason::BoxDiskFull, format!("{full}; {detail}"))
+            }
+            _ => (reason, detail),
+        })
     }
 
-    async fn restore_snapshot(&self, turn: &BoxTurn, tap: &Tap) -> Result<Option<(PathBuf, Base, u64)>, String> {
+    fn host_disk_full(&self) -> Option<String> {
+        match self.vmm.disk(&[]) {
+            Ok(disk) => disk.full(),
+            Err(error) => Some(format!(
+                "reading the host's free disk failed: {error}, so the box stopped rather than risk filling it"
+            )),
+        }
+    }
+
+    async fn download_root(&self, snapshot: &ChannelSnapshotDownload, file: &Path, named: &str) -> Result<(), String> {
+        let expires = snapshot.download_expires_at;
+        match timeout_at(instant_at(expires), self.store.download(&snapshot.download_url, file)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                Err(format!(
+                    "{named} is unreadable: {error}; offer the turn again for fresh download URLs"
+                ))
+            }
+            Err(_) => {
+                Err(format!(
+                    "the root of {named} did not download before its URL expired at {}; check the host's bandwidth to object storage and offer the turn again",
+                    expires.to_rfc3339()
+                ))
+            }
+        }
+    }
+
+    fn charge_restore(&self, named: &str, bytes: u64, tap: &Tap) -> Result<Charge, (TurnFailureReason, String)> {
+        let charge_mib = restore_charge_mib(bytes, tap.disk_mib());
+        self.vmm
+            .disk(&[])
+            .map_err(|error| format!("reading the host's free disk failed: {error}"))
+            .and_then(|disk| disk.stages(self.staging.mib(), charge_mib))
+            .map_err(|detail| {
+                (
+                    TurnFailureReason::BoxDiskFull,
+                    format!("restoring {named} of {bytes} bytes: {detail}"),
+                )
+            })?;
+        Ok(self.staging.charge(charge_mib))
+    }
+
+    async fn disk_full(&self) -> Failure {
+        loop {
+            if let Some(full) = self.host_disk_full() {
+                return Failure::turn(
+                    TurnFailureReason::BoxDiskFull,
+                    format!("The turn stopped before the host disk filled under the box: {full}."),
+                );
+            }
+            tokio::time::sleep(DISK_CHECK).await;
+        }
+    }
+
+    async fn restore_snapshot(
+        &self,
+        turn: &BoxTurn,
+        tap: &Tap,
+    ) -> Result<Option<Restored>, (TurnFailureReason, String)> {
+        let unreadable = |detail: String| (TurnFailureReason::SnapshotUnreadable, detail);
         let Some(snapshot) = turn.snapshots.last() else {
             return Ok(None);
         };
@@ -1167,26 +1239,15 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             "snapshot {} (seq {}) of session {}",
             *snapshot.snapshot_id, snapshot.snapshot_seq.0, *turn.session_id
         );
-        let dir = self.vmm.staging(&turn.session_id)?;
-        std::fs::create_dir_all(&dir).map_err(|error| format!("creating {}: {error}", dir.display()))?;
+        let dir = self.vmm.staging(&turn.session_id).map_err(unreadable)?;
+        std::fs::create_dir_all(&dir).map_err(|error| unreadable(format!("creating {}: {error}", dir.display())))?;
         let expires = snapshot.download_expires_at;
         let file = dir.join("restore-root.json");
-        match timeout_at(instant_at(expires), self.store.download(&snapshot.download_url, &file)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                return Err(format!(
-                    "{named} is unreadable: {error}; offer the turn again for fresh download URLs"
-                ))
-            }
-            Err(_) => {
-                return Err(format!(
-                    "the root of {named} did not download before its URL expired at {}; check the host's bandwidth to object storage and offer the turn again",
-                    expires.to_rfc3339()
-                ))
-            }
-        }
+        self.download_root(snapshot, &file, &named).await.map_err(unreadable)?;
         let damaged = |error: String| {
-            format!("{named} is unreadable: {error}; the stored snapshot is damaged, so start a new session")
+            unreadable(format!(
+                "{named} is unreadable: {error}; the stored snapshot is damaged, so start a new session"
+            ))
         };
         let cache = Arc::new(ChunkCache::new(dir.join(CHUNKS)));
         let reading = Arc::clone(&cache);
@@ -1200,10 +1261,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Ok((root, wanted))
         })
         .await
-        .map_err(|error| format!("reading the root of {named} stopped: {error}"))?;
-        remove_file(&file)?;
+        .map_err(|error| unreadable(format!("reading the root of {named} stopped: {error}")))?;
+        remove_file(&file).map_err(unreadable)?;
         let (root, wanted) = read.map_err(damaged)?;
-        self.fetch_within(turn, wanted, &cache, &dir, &named, expires).await?;
+        self.fetch_within(turn, wanted, &cache, &dir, &named, expires)
+            .await
+            .map_err(unreadable)?;
         let reading = Arc::clone(&cache);
         let manifest_places = root.clone();
         let read = tokio::task::spawn_blocking(move || -> Result<(Manifest, Vec<Place>), String> {
@@ -1212,11 +1275,14 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Ok((manifest, wanted))
         })
         .await
-        .map_err(|error| format!("reading the manifest of {named} stopped: {error}"))?;
+        .map_err(|error| unreadable(format!("reading the manifest of {named} stopped: {error}")))?;
         let (manifest, wanted) = read.map_err(damaged)?;
         let overlay = u64::from(tap.disk_mib().get()) * 1024 * 1024;
-        let (bytes, entries) = restore_size(&named, &manifest, overlay)?;
-        self.fetch_within(turn, wanted, &cache, &dir, &named, expires).await?;
+        let (bytes, entries) = restore_size(&named, &manifest, overlay).map_err(unreadable)?;
+        let charge = self.charge_restore(&named, bytes, tap)?;
+        self.fetch_within(turn, wanted, &cache, &dir, &named, expires)
+            .await
+            .map_err(unreadable)?;
         let target = dir.join("restore.tar");
         let output = target.clone();
         let chunks = dir.join(CHUNKS);
@@ -1229,7 +1295,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let outcome = timeout(budget, rebuild).await;
         if outcome.is_err() {
             cancel.store(true, Ordering::Relaxed);
-            remove_file(&target)?;
+            remove_file(&target).map_err(unreadable)?;
         }
         match outcome {
             Ok(Ok(Ok((manifest, archived)))) => Ok(Some((
@@ -1240,14 +1306,15 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     births: Births::new(),
                 },
                 archived,
+                charge,
             ))),
-            Ok(Ok(Err(error))) => Err(format!(
+            Ok(Ok(Err(error))) => Err(unreadable(format!(
                 "reassembling the files of {named} failed: {error}; the stored snapshot is damaged, so start a new session"
-            )),
-            Ok(Err(error)) => Err(format!("reassembling the files of {named} stopped: {error}")),
-            Err(_) => Err(format!(
+            ))),
+            Ok(Err(error)) => Err(unreadable(format!("reassembling the files of {named} stopped: {error}"))),
+            Err(_) => Err(unreadable(format!(
                 "reassembling the files of {named} took longer than {seconds} s for {bytes} bytes in {entries} entries; send the turn again"
-            )),
+            ))),
         }
     }
 
@@ -1505,8 +1572,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     ) -> Followed {
         let clone = Duration::from_secs(u64::from(live.image.harness().clone_seconds.get()));
         let protocol = live.image.harness().protocol;
-        let (mut cloning, mut first_output) = phases;
-        let mut parking = self.parking.clone();
+        let ((mut cloning, mut first_output), mut parking) = (phases, self.parking.clone());
         let mut cancelling = false;
         loop {
             let waiting_for_first = !state.seen_line && state.first_line < state.end;
@@ -1515,6 +1581,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 biased;
                 () = self.cancels.cancelled(turn_id), if !cancelling => None,
                 Ok(_) = parking.wait_for(|parking| *parking) => return Followed::Parked(state.park()),
+                failure = self.disk_full() => return Followed::Ended(Err(failure)),
                 received = timeout_at(deadline, live.guest.receive()) => Some(received),
             };
             let Some(received) = received else {
@@ -1654,7 +1721,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             .map_err(unreadable)?
             .join(format!("snapshot-{:08}", order.snapshot_seq.0));
         std::fs::create_dir_all(&dir).map_err(|error| unreadable(format!("creating {}: {error}", dir.display())))?;
-        let stored = self.stage_snapshot(drive, base, order, &dir).await;
+        let stored = self
+            .stage_snapshot(drive, base, order, &dir)
+            .await
+            .map_err(|(reason, detail)| match self.host_disk_full() {
+                Some(full) => (reason, format!("{full}; {detail}")),
+                None => (reason, detail),
+            });
         let removed = remove_dir(&dir).map_err(unreadable);
         let stored = stored?;
         removed?;
@@ -1958,6 +2031,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     boxes: Arc::default(),
                 },
                 cancels: Cancels::default(),
+                staging: Staging::default(),
             },
             pool,
             slots: HashMap::new(),
@@ -2809,6 +2883,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.runner
             .vmm
             .disk(&self.current_holdings().drives)
+            .map(|disk| Disk {
+                free_mib: disk.free_mib.saturating_sub(self.runner.staging.mib()),
+                ..disk
+            })
             .map_err(|error| format!("reading the disk this host has free failed: {error}"))
     }
 
