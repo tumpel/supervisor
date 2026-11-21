@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use tokio::time::Instant;
 use tracing::field::{Field, Visit};
@@ -19,6 +20,7 @@ use crate::usage::{CpuTimes, HostStats};
 
 pub const BUFFER_POINTS: usize = 5_000;
 pub const BATCH_POINTS: usize = 500;
+pub const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 const TARGET: &str = "tumpel_supervisor::telemetry";
 const TURN: &str = "turn";
@@ -173,19 +175,11 @@ enum Point {
     Turn(TurnPoint),
 }
 
-impl Point {
-    fn metric(&self) -> &MetricName {
-        match self {
-            Self::Sample(point) => &point.metric,
-            Self::Turn(point) => &point.metric,
-        }
-    }
-}
-
 struct Buffer {
     points: VecDeque<Point>,
     capacity: usize,
     dropped: u64,
+    flushed: Instant,
     cpu: Option<CpuTimes>,
     declared: HashMap<MetricName, MetricInstrument>,
 }
@@ -218,6 +212,7 @@ impl Telemetry {
             points: VecDeque::with_capacity(capacity),
             capacity,
             dropped: 0,
+            flushed: Instant::now(),
             cpu: None,
             declared: HashMap::new(),
         })))
@@ -270,32 +265,37 @@ impl Telemetry {
     }
 
     #[must_use]
-    pub fn full(&self, batch: usize) -> bool {
-        self.buffer().points.len() >= batch
-    }
-
-    #[must_use]
-    pub fn drain(&self, batch: usize) -> Vec<ChannelTelemetryBatch> {
+    pub fn flush_due(&self, interval: Duration) -> Vec<ChannelTelemetryBatch> {
         let (points, declared) = {
             let mut buffer = self.buffer();
+            if buffer.points.is_empty() || buffer.flushed.elapsed() < interval {
+                return Vec::new();
+            }
+            buffer.flushed = Instant::now();
             let points: Vec<Point> = buffer.points.drain(..).collect();
             (points, buffer.declared.clone())
         };
-        points
-            .chunks(batch.max(1))
-            .map(|chunk| {
-                let metrics: BTreeSet<&MetricName> = chunk.iter().map(Point::metric).collect();
-                let (samples, turns) =
-                    chunk
-                        .iter()
-                        .cloned()
-                        .fold((Vec::new(), Vec::new()), |(mut samples, mut turns), point| {
-                            match point {
-                                Point::Sample(sample) => samples.push(sample),
-                                Point::Turn(turn) => turns.push(turn),
-                            }
-                            (samples, turns)
-                        });
+        let (samples, turns) = points
+            .into_iter()
+            .fold((Vec::new(), Vec::new()), |(mut samples, mut turns), point| {
+                match point {
+                    Point::Sample(sample) => samples.push(sample),
+                    Point::Turn(turn) => turns.push(turn),
+                }
+                (samples, turns)
+            });
+        let frames = samples.len().max(turns.len()).div_ceil(BATCH_POINTS);
+        let mut samples = samples.chunks(BATCH_POINTS);
+        let mut turns = turns.chunks(BATCH_POINTS);
+        (0..frames)
+            .map(|_| {
+                let samples = samples.next().unwrap_or_default().to_vec();
+                let turns = turns.next().unwrap_or_default().to_vec();
+                let metrics: BTreeSet<&MetricName> = samples
+                    .iter()
+                    .map(|point| &point.metric)
+                    .chain(turns.iter().map(|point| &point.metric))
+                    .collect();
                 ChannelTelemetryBatch {
                     instruments: metrics
                         .into_iter()
@@ -554,7 +554,7 @@ mod tests {
         ChannelTurnComplete, ChannelTurnCompleteType, MetricKind, SamplePoint, Sequence, ShortText, TurnPoint,
     };
 
-    use super::{instrument, metric, Phase, Point, Telemetry, TelemetryLayer, INSTRUMENTS};
+    use super::{instrument, metric, Phase, Point, Telemetry, TelemetryLayer, FLUSH_INTERVAL, INSTRUMENTS};
 
     #[test]
     fn guest_metrics_land_as_turn_points_with_the_turn_dimensions_and_declare_their_instruments() {
@@ -584,7 +584,7 @@ mod tests {
         );
         assert_eq!(tokens.dimensions.len(), 3, "{:?}", tokens.dimensions);
         assert_eq!(tokens.turn_id.as_str(), "turn-1");
-        let batch = telemetry.drain(500).pop().expect("a batch");
+        let batch = telemetry.flush_due(Duration::ZERO).pop().expect("a batch");
         let mut declared: Vec<(String, String)> = batch
             .instruments
             .iter()
@@ -639,23 +639,86 @@ mod tests {
         assert_eq!(telemetry.buffer().dropped, 2);
     }
 
+    fn turn(value: f64) -> Point {
+        Point::Turn(TurnPoint {
+            at: super::now(),
+            dimensions: std::collections::HashMap::new(),
+            metric: metric("turn.end").expect("metric"),
+            session_id: "session-1".try_into().expect("session id"),
+            turn_id: "turn-1".try_into().expect("turn id"),
+            value,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_thousand_points_in_one_interval_make_one_frame_two_intervals_make_two_and_shutdown_sends_the_rest() {
+        let telemetry = Telemetry::new(5_000);
+        let mut frames = Vec::new();
+        for value in 0..500 {
+            telemetry.push(sample(f64::from(value)));
+            telemetry.push(turn(f64::from(value)));
+        }
+        for _ in 0..59 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            frames.extend(telemetry.flush_due(FLUSH_INTERVAL));
+        }
+        assert_eq!(frames.len(), 0);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        frames.extend(telemetry.flush_due(FLUSH_INTERVAL));
+        assert_eq!(frames.len(), 1);
+        assert_eq!((frames[0].samples.len(), frames[0].turns.len()), (500, 500));
+
+        for value in 0..500 {
+            telemetry.push(sample(f64::from(value)));
+            telemetry.push(turn(f64::from(value)));
+            tokio::time::advance(Duration::from_millis(60)).await;
+            frames.extend(telemetry.flush_due(FLUSH_INTERVAL));
+        }
+        assert_eq!(frames.len(), 2);
+        assert_eq!((frames[1].samples.len(), frames[1].turns.len()), (500, 500));
+
+        telemetry.push(sample(1.0));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(telemetry.flush_due(FLUSH_INTERVAL).len(), 0);
+        let shutdown = telemetry.flush_due(Duration::ZERO);
+        assert_eq!(shutdown.len(), 1);
+        assert_eq!(shutdown[0].samples.len(), 1);
+    }
+
     #[test]
-    fn drain_splits_the_buffer_into_batches_that_declare_only_their_own_metrics() {
-        let telemetry = Telemetry::new(10);
-        for value in 1..=4 {
+    fn a_flush_splits_into_frames_of_at_most_500_samples_and_500_turns_that_declare_only_their_own_metrics() {
+        let telemetry = Telemetry::new(5_000);
+        for value in 0..1_200 {
             telemetry.push(sample(f64::from(value)));
         }
-        assert!(!telemetry.full(5));
-        assert!(telemetry.full(4));
-        let batches = telemetry.drain(3);
+        for value in 0..300 {
+            telemetry.push(turn(f64::from(value)));
+        }
+        let frames = telemetry.flush_due(Duration::ZERO);
         assert_eq!(
-            batches.iter().map(|batch| batch.samples.len()).collect::<Vec<_>>(),
-            [3, 1]
+            frames
+                .iter()
+                .map(|frame| (frame.samples.len(), frame.turns.len()))
+                .collect::<Vec<_>>(),
+            [(500, 300), (500, 0), (200, 0)]
         );
-        assert!(batches.iter().all(|batch| batch.instruments.len() == 1
-            && batch.instruments[0].metric.as_str() == "host.load.1m"
-            && batch.instruments[0].kind == MetricKind::Sample));
-        assert_eq!(telemetry.drain(3).len(), 0);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame
+                    .instruments
+                    .iter()
+                    .map(|instrument| instrument.metric.to_string())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            [
+                vec!["host.load.1m".to_string(), "turn.end".to_string()],
+                vec!["host.load.1m".to_string()],
+                vec!["host.load.1m".to_string()]
+            ]
+        );
+        assert_eq!(frames[1].instruments[0].kind, MetricKind::Sample);
+        assert_eq!(telemetry.flush_due(Duration::ZERO).len(), 0);
     }
 
     fn turn_points(telemetry: &Telemetry) -> Vec<TurnPoint> {
