@@ -17,13 +17,16 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
-    BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
-    HostUsage, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
-    SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
+    BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxFailed,
+    ChannelClaudeSetupBoxFailedType, ChannelClaudeSetupBoxOffer, ChannelCloseCode, ChannelControlMessage,
+    ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupFailureReason, ClaudeSetupHarness,
+    EntityId, HostReportedHealth, HostUsage, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure,
+    SupervisorHandover, SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending,
+    TurnFailureReason,
 };
 use tumpel_channel::{
-    Backoff, ChannelError, Event, HostChannel, Phase, Port, Signer, HEARTBEAT_DEADLINE, MAX_RECONNECTS,
+    Backoff, ChannelError, Event, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer, HEARTBEAT_DEADLINE,
+    MAX_RATE_BACKOFFS, MAX_RECONNECTS,
 };
 
 use crate::boot::BootOrder;
@@ -33,8 +36,8 @@ use crate::fd_store;
 use crate::firecracker::Firecracker;
 use crate::guest_drive;
 use crate::lifecycle::{
-    turn_failed, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder, Taken,
-    TeardownOrder,
+    turn_failed, Abandoned, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder,
+    Taken, TeardownOrder,
 };
 use crate::pool::{memory_budget_mib, mib, Held, Size, TapPool};
 use crate::store::HttpStore;
@@ -201,6 +204,7 @@ fn beat(
     channel: &mut Channel,
     usage: &Usage,
     from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    health: HostReportedHealth,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
     let held = usage.sessions.borrow().clone();
@@ -208,7 +212,7 @@ fn beat(
         channel.send(message, outbox).map_err(|error| store_lost(&error))?;
     }
     channel
-        .heartbeat(chrono::Utc::now().fixed_offset(), usage.sample()?, held, outbox)
+        .heartbeat(chrono::Utc::now().fixed_offset(), usage.sample()?, held, health, outbox)
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))?;
     flush(channel, &usage.telemetry, outbox)
 }
@@ -231,7 +235,7 @@ enum BoxCommand {
     Cancel(EntityId),
     Setup(SetupCommand),
     HandOver(oneshot::Sender<SupervisorHandover>),
-    Abandon(oneshot::Sender<()>),
+    Abandon(oneshot::Sender<()>, Abandoned),
 }
 
 fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> SetupCommand {
@@ -315,8 +319,8 @@ async fn boxes(
                 let _ = lifecycle.send(Input::HandOver(reply));
                 continue;
             }
-            BoxCommand::Abandon(reply) => {
-                let _ = lifecycle.send(Input::Abandon(reply));
+            BoxCommand::Abandon(reply, abandoned) => {
+                let _ = lifecycle.send(Input::Abandon(reply, abandoned));
                 continue;
             }
         };
@@ -432,12 +436,28 @@ async fn terminate(
 }
 
 fn restarts(kind: SupervisorFailure) -> bool {
-    !matches!(kind, SupervisorFailure::NotEnrolled | SupervisorFailure::HostRevoked)
+    !matches!(
+        kind,
+        SupervisorFailure::NotEnrolled | SupervisorFailure::HostRevoked | SupervisorFailure::RateLimited
+    )
 }
 
-async fn abandon(commands: &UnboundedSender<BoxCommand>) {
+fn abandoned(failure: &Failure) -> Abandoned {
+    if failure.kind == SupervisorFailure::RateLimited {
+        return Abandoned {
+            reason: TurnFailureReason::RateLimited,
+            cause: format!("this supervisor stopped because {}", failure.detail),
+        };
+    }
+    Abandoned {
+        reason: TurnFailureReason::HarnessExited,
+        cause: "this supervisor binary stopped before it reached the control plane".to_string(),
+    }
+}
+
+async fn abandon(commands: &UnboundedSender<BoxCommand>, abandoned: Abandoned) {
     let (reply, answer) = oneshot::channel();
-    if commands.send(BoxCommand::Abandon(reply)).is_ok() {
+    if commands.send(BoxCommand::Abandon(reply, abandoned)).is_ok() {
         let _ = answer.await;
     }
 }
@@ -793,8 +813,8 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         }
         Ok(Served::BoxesStopped(failure)) | Err(failure) => Err(failure),
     };
-    if stopped.is_err() {
-        abandon(&commands).await;
+    if let Err(failure) = &stopped {
+        abandon(&commands, abandoned(failure)).await;
     }
     while let Ok(message) = from_box.try_recv() {
         channel
@@ -817,8 +837,9 @@ async fn serve(
     updates: &mut Updates,
 ) -> Result<Served, Failure> {
     let mut backoff = Backoff::default();
+    let mut limit = RateLimit::default();
     loop {
-        match session(channel, url, heartbeat, usage, commands, from_box, updates).await? {
+        match session(channel, url, heartbeat, usage, commands, from_box, updates, &mut limit).await? {
             Ended::Revoked(reason) => {
                 let key = dir.join(KEY_FILE);
                 std::fs::remove_file(&key).map_err(|error| {
@@ -892,6 +913,87 @@ fn closed_by_peer(frame: Option<&CloseFrame>, progressed: bool) -> Result<Ended,
     }
 }
 
+fn box_command(message: ChannelControlMessage) -> BoxCommand {
+    match message {
+        ChannelControlMessage::TurnOffer(offer) => BoxCommand::Turn(Box::new(offer)),
+        ChannelControlMessage::SnapshotRequest(request) => BoxCommand::Snapshot(request),
+        ChannelControlMessage::BoxTeardown(teardown) => BoxCommand::Teardown(teardown),
+        ChannelControlMessage::BoxDiscard(discard) => BoxCommand::Discard(discard),
+        ChannelControlMessage::SnapshotChunksHeld(held) => BoxCommand::Answer(Answer::ChunksHeld(held)),
+        ChannelControlMessage::SnapshotPackUploads(uploads) => BoxCommand::Answer(Answer::PackUploads(uploads)),
+        ChannelControlMessage::RestoreDownloads(downloads) => BoxCommand::Answer(Answer::Downloads(downloads)),
+        ChannelControlMessage::TurnWithdrawn(withdrawn) => BoxCommand::Answer(Answer::Withdrawn(withdrawn)),
+        ChannelControlMessage::TurnClaimed(claimed) => BoxCommand::Answer(Answer::Claimed(claimed)),
+        ChannelControlMessage::TurnCancel(cancel) => BoxCommand::Cancel(cancel.turn_id),
+        ChannelControlMessage::ClaudeSetupBoxOffer(offer) => BoxCommand::Setup(setup_order(offer)),
+        ChannelControlMessage::ClaudeSetupBoxCode(code) => BoxCommand::Setup(SetupCommand::Code {
+            claude_setup_id: code.claude_setup_id,
+            code: code.code,
+            mint_budget_seconds: code.mint_budget_seconds,
+        }),
+        ChannelControlMessage::ClaudeSetupBoxDiscard(discard) => BoxCommand::Setup(SetupCommand::Discard {
+            claude_setup_id: discard.claude_setup_id,
+        }),
+    }
+}
+
+fn rate_limited(
+    channel: &mut Channel,
+    limit: &mut RateLimit,
+    url: &str,
+    reason: &str,
+    frames_per_minute: u32,
+    retry_after: chrono::DateTime<chrono::Utc>,
+) -> Option<Result<Ended, Failure>> {
+    match limit.limited(chrono::Utc::now(), retry_after, frames_per_minute, jitter()) {
+        RateBackoff::Paused => None,
+        RateBackoff::Until(until) => {
+            channel.withhold();
+            eprintln!(
+                "tumpel-supervisor: RateLimited: {url} refused a frame: {reason}; backoff {} of {MAX_RATE_BACKOFFS}: this host reports RateLimited, takes no new turns or setup boxes and holds its frames until {}",
+                limit.backoffs(),
+                until.to_rfc3339()
+            );
+            None
+        }
+        RateBackoff::Exhausted => Some(Err(fail(
+            SupervisorFailure::RateLimited,
+            format!("{url} still refused this host's frames ({reason}) after {MAX_RATE_BACKOFFS} backoffs in a row; find what floods the channel, then start the unit by hand"),
+        ))),
+    }
+}
+
+fn refused_offer(
+    message: ChannelControlMessage,
+    out: &UnboundedSender<ChannelHostMessage>,
+) -> Option<ChannelControlMessage> {
+    let detail = "this host is rate limited by the control plane and takes no new work until it is Healthy again";
+    match message {
+        ChannelControlMessage::TurnOffer(offer) => {
+            turn_failed(
+                out,
+                &offer.turn_id,
+                TurnFailureReason::RateLimited,
+                format!("{detail}; send the turn again"),
+            );
+            None
+        }
+        ChannelControlMessage::ClaudeSetupBoxOffer(offer) => {
+            let failed = ChannelClaudeSetupBoxFailed {
+                claude_setup_id: offer.claude_setup_id,
+                detail: format!("{detail}; start the Claude setup again").try_into().ok()?,
+                failed_at: chrono::Utc::now().fixed_offset(),
+                reason: ClaudeSetupFailureReason::RateLimited,
+                type_: ChannelClaudeSetupBoxFailedType::ClaudeSetupBoxFailed,
+            };
+            let _ = out.send(failed.into());
+            None
+        }
+        other => Some(other),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn session(
     channel: &mut Channel,
     url: &str,
@@ -900,6 +1002,7 @@ async fn session(
     commands: &UnboundedSender<BoxCommand>,
     from_box: &mut UnboundedReceiver<ChannelHostMessage>,
     updates: &mut Updates,
+    limit: &mut RateLimit,
 ) -> Result<Ended, Failure> {
     let stream = match tokio::time::timeout(CONNECT_DEADLINE, tokio_tungstenite::connect_async(url)).await {
         Ok(Ok((stream, _))) => stream,
@@ -933,26 +1036,20 @@ async fn session(
                             updates.welcomed().await.err().map(Err)
                         }
                         Ok(Event::Message(message)) => {
-                            let command = match *message {
-                                ChannelControlMessage::TurnOffer(offer) => Some(BoxCommand::Turn(Box::new(offer))),
-                                ChannelControlMessage::SnapshotRequest(request) => Some(BoxCommand::Snapshot(request)),
-                                ChannelControlMessage::BoxTeardown(teardown) => Some(BoxCommand::Teardown(teardown)),
-                                ChannelControlMessage::BoxDiscard(discard) => Some(BoxCommand::Discard(discard)),
-                                ChannelControlMessage::SnapshotChunksHeld(held) => Some(BoxCommand::Answer(Answer::ChunksHeld(held))),
-                                ChannelControlMessage::SnapshotPackUploads(uploads) => Some(BoxCommand::Answer(Answer::PackUploads(uploads))),
-                                ChannelControlMessage::RestoreDownloads(downloads) => Some(BoxCommand::Answer(Answer::Downloads(downloads))),
-                                ChannelControlMessage::TurnWithdrawn(withdrawn) => Some(BoxCommand::Answer(Answer::Withdrawn(withdrawn))),
-                                ChannelControlMessage::TurnClaimed(claimed) => Some(BoxCommand::Answer(Answer::Claimed(claimed))),
-                                ChannelControlMessage::TurnCancel(cancel) => Some(BoxCommand::Cancel(cancel.turn_id)),
-                                ChannelControlMessage::ClaudeSetupBoxOffer(offer) => Some(BoxCommand::Setup(setup_order(offer))),
-                                ChannelControlMessage::ClaudeSetupBoxCode(code) => Some(BoxCommand::Setup(SetupCommand::Code { claude_setup_id: code.claude_setup_id, code: code.code, mint_budget_seconds: code.mint_budget_seconds })),
-                                ChannelControlMessage::ClaudeSetupBoxDiscard(discard) => Some(BoxCommand::Setup(SetupCommand::Discard { claude_setup_id: discard.claude_setup_id })),
+                            let message = if limit.health(chrono::Utc::now()) == HostReportedHealth::RateLimited {
+                                refused_offer(*message, &updates.out)
+                            } else {
+                                Some(*message)
                             };
+                            let command = message.map(box_command);
                             command.and_then(|command| commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))))
                         }
                         Ok(Event::FrameRefused { seq, reason }) => {
                             eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
                             None
+                        }
+                        Ok(Event::FrameRateLimited { seq: _, reason, frames_per_minute, retry_after }) => {
+                            rate_limited(channel, limit, url, &reason, frames_per_minute, retry_after)
                         }
                         Ok(Event::ReleasePublished) => {
                             updates.announced();
@@ -972,11 +1069,17 @@ async fn session(
             },
             Some(message) = from_box.recv() => channel.send(message, &mut outbox).err().map(|error| Err(store_lost(&error))),
             _ = tick.tick() => {
+                let now = chrono::Utc::now();
+                if limit.recovered(now) {
+                    eprintln!("tumpel-supervisor: Healthy: {url} refused no frame for a full minute; this host takes new work again");
+                }
                 if last_received.elapsed() >= HEARTBEAT_DEADLINE {
                     Some(Ok(dropped(channel.progressed(), format!("nothing arrived for {} seconds", HEARTBEAT_DEADLINE.as_secs()))))
                 } else if channel.phase() == Phase::Open && last_beat.elapsed() >= heartbeat {
                     last_beat = Instant::now();
-                    beat(channel, usage, from_box, &mut outbox).err().map(Err)
+                    beat(channel, usage, from_box, limit.health(now), &mut outbox).err().map(Err)
+                } else if channel.phase() == Phase::Open && channel.withholding() && !limit.paused(now) {
+                    channel.release(limit.release_budget(TICK), &mut outbox).err().map(|error| Err(store_lost(&error)))
                 } else if channel.phase() == Phase::Open && usage.telemetry.full(BATCH_POINTS) {
                     flush(channel, &usage.telemetry, &mut outbox).err().map(Err)
                 } else {

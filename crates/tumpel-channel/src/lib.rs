@@ -5,11 +5,11 @@ use std::time::Duration;
 use chrono::{DateTime, FixedOffset, Utc};
 use serde_json::Value;
 use tumpel_api::types::{
-    ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRefused, ChannelHello,
-    ChannelHelloType, ChannelHostEnvelope, ChannelHostFrame, ChannelHostFrameType, ChannelHostHeartbeat,
+    ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
+    ChannelHello, ChannelHelloType, ChannelHostEnvelope, ChannelHostFrame, ChannelHostFrameType, ChannelHostHeartbeat,
     ChannelHostHeartbeatType, ChannelHostMessage, ChannelProtocol, ChannelSnapshotDone, ChannelSnapshotFailed,
     ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelStoredHostFrame, ChannelStoredHostFrameType,
-    EntityId, HostUsage, Sequence, SupervisorChannelReplay, SupervisorChannelState,
+    EntityId, HostReportedHealth, HostUsage, Sequence, SupervisorChannelReplay, SupervisorChannelState,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
@@ -17,6 +17,9 @@ pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
 pub const MAX_REPLAYS: u32 = 10;
 pub const MAX_RECONNECTS: u32 = 10;
+pub const RATE_WINDOW: Duration = Duration::from_secs(60);
+pub const MAX_RATE_BACKOFFS: u32 = 10;
+pub const LAST_RATE_BACKOFF: Duration = Duration::from_mins(15);
 
 const HELLO_CONTEXT: &[u8] = b"tumpel-channel-hello-v1";
 
@@ -118,6 +121,83 @@ impl Backoff {
     }
 }
 
+#[derive(Default)]
+pub struct RateLimit {
+    backoffs: u32,
+    paused_until: Option<DateTime<Utc>>,
+    last_limited: Option<DateTime<Utc>>,
+    frames_per_minute: u32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum RateBackoff {
+    Until(DateTime<Utc>),
+    Paused,
+    Exhausted,
+}
+
+impl RateLimit {
+    pub fn limited(
+        &mut self,
+        now: DateTime<Utc>,
+        retry_after: DateTime<Utc>,
+        frames_per_minute: u32,
+        jitter: u16,
+    ) -> RateBackoff {
+        self.last_limited = Some(now);
+        self.frames_per_minute = frames_per_minute;
+        if self.paused(now) {
+            return RateBackoff::Paused;
+        }
+        self.backoffs += 1;
+        if self.backoffs > MAX_RATE_BACKOFFS {
+            return RateBackoff::Exhausted;
+        }
+        let first = (retry_after - now).to_std().unwrap_or_default().max(FIRST_BACKOFF);
+        let wait = first
+            .saturating_mul(1 << (self.backoffs - 1).min(16))
+            .min(LAST_RATE_BACKOFF);
+        let jittered = wait + (wait / 2).mul_f64(f64::from(jitter) / f64::from(u16::MAX));
+        let until = now + chrono::Duration::from_std(jittered).unwrap_or(chrono::Duration::MAX);
+        self.paused_until = Some(until);
+        RateBackoff::Until(until)
+    }
+
+    #[must_use]
+    pub fn paused(&self, now: DateTime<Utc>) -> bool {
+        self.paused_until.is_some_and(|until| now < until)
+    }
+
+    #[must_use]
+    pub fn release_budget(&self, tick: Duration) -> usize {
+        let per_tick = u128::from(self.frames_per_minute / 2) * tick.as_millis() / RATE_WINDOW.as_millis();
+        usize::try_from(per_tick).unwrap_or(usize::MAX).max(1)
+    }
+
+    #[must_use]
+    pub fn backoffs(&self) -> u32 {
+        self.backoffs
+    }
+
+    #[must_use]
+    pub fn health(&self, now: DateTime<Utc>) -> HostReportedHealth {
+        let window = chrono::Duration::from_std(RATE_WINDOW).unwrap_or(chrono::Duration::MAX);
+        let recent = self.last_limited.is_some_and(|at| now < at + window);
+        if recent || self.paused(now) {
+            return HostReportedHealth::RateLimited;
+        }
+        HostReportedHealth::Healthy
+    }
+
+    pub fn recovered(&mut self, now: DateTime<Utc>) -> bool {
+        if self.last_limited.is_none() || self.health(now) == HostReportedHealth::RateLimited {
+            return false;
+        }
+        *self = Self::default();
+        true
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
     None,
@@ -125,7 +205,16 @@ pub enum Event {
     Welcomed,
     Heartbeat,
     ReleasePublished,
-    FrameRefused { seq: i64, reason: String },
+    FrameRefused {
+        seq: i64,
+        reason: String,
+    },
+    FrameRateLimited {
+        seq: i64,
+        reason: String,
+        frames_per_minute: u32,
+        retry_after: DateTime<Utc>,
+    },
     Message(Box<ChannelControlMessage>),
 }
 
@@ -137,6 +226,7 @@ pub struct HostChannel<S: Store, K: Signer> {
     supervisor_version: String,
     phase: Phase,
     progressed: bool,
+    withheld: Option<i64>,
 }
 
 fn encode(envelope: &ChannelHostEnvelope) -> Result<String, ChannelError> {
@@ -198,6 +288,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             supervisor_version,
             phase: Phase::Closed,
             progressed: false,
+            withheld: None,
         }
     }
 
@@ -244,9 +335,44 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             type_: ChannelStoredHostFrameType::Frame,
         });
         self.store.save(&self.state)?;
-        if self.phase == Phase::Open {
+        if self.phase == Phase::Open && self.withheld.is_none() {
             port.send(encode(&frame.into())?)?;
         }
+        Ok(())
+    }
+
+    pub fn withhold(&mut self) {
+        if self.withheld.is_none() {
+            self.withheld = Some(self.state.sent.0 + 1);
+        }
+    }
+
+    #[must_use]
+    pub fn withholding(&self) -> bool {
+        self.withheld.is_some()
+    }
+
+    /// # Errors
+    /// Fails when the port refuses a frame.
+    pub fn release(&mut self, budget: usize, port: &mut impl Port) -> Result<(), ChannelError> {
+        let Some(from) = self.withheld else {
+            return Ok(());
+        };
+        if self.phase != Phase::Open {
+            return Ok(());
+        }
+        let waiting: Vec<&ChannelStoredHostFrame> = self.state.unacked.iter().filter(|own| own.seq.0 >= from).collect();
+        for frame in waiting.iter().take(budget) {
+            let resent = ChannelStoredHostFrame {
+                ack: Sequence(self.state.received.0),
+                ..(*frame).clone()
+            };
+            port.send(
+                serde_json::to_string(&resent)
+                    .map_err(|error| protocol(format!("encoding a stored frame: {error}")))?,
+            )?;
+        }
+        self.withheld = waiting.get(budget).map(|next| next.seq.0);
         Ok(())
     }
 
@@ -257,10 +383,12 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         now: DateTime<FixedOffset>,
         usage: HostUsage,
         held_session_ids: Vec<EntityId>,
+        health: HostReportedHealth,
         port: &mut impl Port,
     ) -> Result<(), ChannelError> {
         port.send(encode(
             &ChannelHostHeartbeat {
+                health: Some(health),
                 held_session_ids,
                 sent_at: now,
                 type_: ChannelHostHeartbeatType::Heartbeat,
@@ -340,6 +468,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             (Phase::AwaitingWelcome | Phase::Open, ChannelControlEnvelope::Heartbeat(_)) => Ok(Event::Heartbeat),
             (Phase::Open, ChannelControlEnvelope::ReleasePublished(_)) => Ok(Event::ReleasePublished),
             (Phase::Open, ChannelControlEnvelope::FrameRefused(refused)) => self.refused(refused),
+            (Phase::Open, ChannelControlEnvelope::FrameRateLimited(limited)) => self.rate_limited(limited),
             (phase, other) => Err(protocol(format!("{} arrived in phase {phase:?}", kind(&other)))),
         }
     }
@@ -350,6 +479,11 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         }
         self.count_replay()?;
         self.store.save(&self.state)?;
+        self.phase = Phase::Open;
+        if let Some(first) = self.state.unacked.first().filter(|_| self.withheld.is_some()) {
+            self.withheld = Some(first.seq.0);
+            return Ok(Event::Welcomed);
+        }
         for frame in &self.state.unacked {
             let resent = ChannelStoredHostFrame {
                 ack: Sequence(self.state.received.0),
@@ -411,6 +545,19 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         })
     }
 
+    fn rate_limited(&mut self, limited: ChannelFrameRateLimited) -> Result<Event, ChannelError> {
+        self.progressed = true;
+        self.state.unacked.retain(|own| own.seq.0 != limited.seq.0);
+        self.state.replays.retain(|replay| replay.seq.0 != limited.seq.0);
+        self.store.save(&self.state)?;
+        Ok(Event::FrameRateLimited {
+            seq: limited.seq.0,
+            reason: String::from(limited.reason),
+            frames_per_minute: limited.frames_per_minute.get(),
+            retry_after: limited.retry_after.with_timezone(&Utc),
+        })
+    }
+
     fn accept(&mut self, frame: ChannelControlFrame) -> Result<Event, ChannelError> {
         let received = self.state.received.0;
         if frame.seq.0 <= received {
@@ -438,6 +585,7 @@ fn kind(envelope: &ChannelControlEnvelope) -> &'static str {
         ChannelControlEnvelope::Heartbeat(_) => "Heartbeat",
         ChannelControlEnvelope::ReleasePublished(_) => "ReleasePublished",
         ChannelControlEnvelope::FrameRefused(_) => "FrameRefused",
+        ChannelControlEnvelope::FrameRateLimited(_) => "FrameRateLimited",
         ChannelControlEnvelope::ControlFrame(_) => "Frame",
     }
 }
