@@ -12,8 +12,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    announced_release, confirm, named, refresh_unit, sha256_hex, startup, Idle, Layout, Limits, Outcome, Release,
-    Source, Startup, Updater, PENDING_FILE, REFUSAL_FILE, ROLLED_BACK_FILE, TRIAL_FILE,
+    announced_release, confirm, named, refresh_unit, sha256_hex, startup, version_refusal, Idle, Layout, Limits,
+    Outcome, Release, Source, Startup, Updater, PENDING_FILE, REFUSAL_FILE, ROLLED_BACK_FILE, TRIAL_FILE,
 };
 use crate::install::supervisor_unit_text;
 
@@ -48,7 +48,7 @@ impl Idle for &FakeIdle {
 struct FakeSource {
     bytes: Vec<u8>,
     sha256: String,
-    supervisor_version: Option<&'static str>,
+    supervisor_version: &'static str,
     channel_protocol_version: u32,
     downloads: AtomicU32,
 }
@@ -58,7 +58,7 @@ impl FakeSource {
         Self {
             bytes: script.as_bytes().to_vec(),
             sha256: sha256_hex(script.as_bytes()),
-            supervisor_version: None,
+            supervisor_version: "0.4.0",
             channel_protocol_version: u32::from(ChannelProtocol::VERSION),
             downloads: AtomicU32::new(0),
         }
@@ -70,9 +70,7 @@ impl Source for FakeSource {
         std::future::ready(Ok(Release {
             version: RELEASE_VERSION.parse().expect("a release version"),
             sha256: digest(&self.sha256),
-            supervisor_version: self
-                .supervisor_version
-                .map(|version| version.parse().expect("a supervisor version")),
+            supervisor_version: self.supervisor_version.parse().expect("a supervisor version"),
             channel_protocol_version: self.channel_protocol_version,
         }))
     }
@@ -135,7 +133,7 @@ fn updater<'a>(layout: &Layout, source: FakeSource, idle: &'a FakeIdle, limits: 
     let (out, events) = unbounded_channel();
     let running = digest(&sha256_hex(OLD_BINARY.as_bytes()));
     Run {
-        updater: Updater::new(source, layout.clone(), limits, running, idle, out),
+        updater: Updater::new(source, layout.clone(), limits, running, "0.3.0-rc.5", idle, out),
         events,
     }
 }
@@ -261,7 +259,7 @@ async fn a_dry_run_killed_by_a_signal_names_the_version_and_the_signal() {
     let idle = FakeIdle::default();
     let script = "#!/bin/sh\nkill -FPE $$\n";
     let source = FakeSource {
-        supervisor_version: Some("0.1.0"),
+        supervisor_version: "0.3.1",
         ..FakeSource::binary(script)
     };
     let short = source.sha256[..12].to_string();
@@ -273,7 +271,7 @@ async fn a_dry_run_killed_by_a_signal_names_the_version_and_the_signal() {
     let (detail, _) = failure(&mut run.events);
     assert!(
         detail.starts_with(&format!(
-            "the check of supervisor 0.1.0 ({short}) exited with signal: 8 (SIGFPE)"
+            "the check of supervisor 0.3.1 ({short}) exited with signal: 8 (SIGFPE)"
         )),
         "{detail}"
     );
@@ -534,38 +532,6 @@ async fn a_release_notice_to_a_busy_host_updates_once_its_turns_finish_inside_th
 }
 
 #[test]
-fn a_release_manifest_from_a_control_plane_that_serves_no_supervisor_version_is_read() {
-    let body = br#"{
-        "releaseVersion": "0.0.0-2a2e3f8c1d9b",
-        "commit": "2a2e3f8c1d9b2a2e3f8c1d9b2a2e3f8c1d9b2a2e",
-        "channelProtocolVersion": 19,
-        "supervisors": [
-            {
-                "architecture": "Amd64",
-                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-                "sizeBytes": 24000000,
-                "guestProtocolVersion": 3
-            }
-        ],
-        "clis": [],
-        "images": [],
-        "bases": [],
-        "harnessLayers": []
-    }"#;
-
-    let release = announced_release(body, "https://api.example/v1/releases/current", HostArchitecture::Amd64)
-        .expect("the manifest an older control plane serves");
-
-    assert_eq!(release.version.as_str(), "0.0.0-2a2e3f8c1d9b");
-    assert_eq!(
-        release.sha256.as_str(),
-        "1111111111111111111111111111111111111111111111111111111111111111"
-    );
-    assert_eq!(release.channel_protocol_version, 19);
-    assert_eq!(named(&release), "111111111111");
-}
-
-#[test]
 fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
     let body = br#"{
         "releaseVersion": "v1.4.0",
@@ -596,4 +562,48 @@ fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
     );
     assert_eq!(release.channel_protocol_version, 20);
     assert_eq!(named(&release), "0.4.0 (333333333333)");
+}
+
+#[tokio::test]
+async fn an_update_goes_only_to_a_newer_supervisor_version() {
+    assert_eq!(version_refusal("0.3.0-rc.4", "0.3.0-rc.5"), None);
+    assert_eq!(version_refusal("0.3.0-rc.5", "0.3.0"), None);
+    assert_eq!(version_refusal("v0.3.0-rc.5", "0.3.0"), None);
+    assert_eq!(version_refusal("0.3.0-main.1", "0.3.0-rc.5"), None);
+    assert_eq!(
+        version_refusal("0.3.0-rc.5", "0.3.0-rc.4"),
+        Some(
+            "the release names supervisor 0.3.0-rc.4, older than the running 0.3.0-rc.5; publish a newer release"
+                .to_string()
+        )
+    );
+    assert!(version_refusal("0.3.0", "0.3.0-rc.5").is_some());
+    assert!(version_refusal("0.3.0-rc.5", "0.3.0-main.1").is_some());
+    assert!(version_refusal("0.3.0-rc.5", "0.2.1-main.1").is_some());
+    assert_eq!(
+        version_refusal("0.3.0-rc.5", "0.3.0-rc.5"),
+        Some("the release names supervisor 0.3.0-rc.5, the running version 0.3.0-rc.5, with another binary; publish the new binary under a new version".to_string())
+    );
+    assert_eq!(version_refusal("0.0.0-012345678901", "0.3.0-rc.4"), None);
+    assert!(version_refusal("0.3.0-rc.5", "latest").is_some());
+
+    let layout = layout("older-version");
+    let idle = FakeIdle::default();
+    let source = FakeSource {
+        supervisor_version: "0.2.1-main.1",
+        ..FakeSource::binary(&good_script())
+    };
+    let run = updater(&layout, source, &idle, limits());
+    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Refused);
+    assert_eq!(
+        text(&layout.binary),
+        OLD_BINARY,
+        "an announced downgrade leaves the running binary"
+    );
+    assert_eq!(
+        run.updater.now().await,
+        Outcome::Restart,
+        "a downgrade the control plane demands installs"
+    );
+    assert_eq!(text(&layout.binary), good_script());
 }

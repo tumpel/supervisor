@@ -24,6 +24,7 @@ hostname.workspace = true
 libc.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 ring.workspace = true
+semver.workspace = true
 serde.workspace = true
 sd-notify.workspace = true
 sendfd.workspace = true

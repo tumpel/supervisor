@@ -21,6 +21,7 @@ httparse = "1.10.1"
 libc = "0.2.191"
 reqwest = { version = "0.13.4", features = ["json"] }
 ring = "0.17.14"
+semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tar = "0.4.46"
