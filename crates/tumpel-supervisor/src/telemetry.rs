@@ -20,7 +20,6 @@ use crate::usage::{CpuTimes, HostStats};
 
 pub const BUFFER_POINTS: usize = 5_000;
 pub const BATCH_POINTS: usize = 500;
-pub const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 const TARGET: &str = "tumpel_supervisor::telemetry";
 const TURN: &str = "turn";
@@ -554,7 +553,7 @@ mod tests {
         ChannelTurnComplete, ChannelTurnCompleteType, MetricKind, SamplePoint, Sequence, ShortText, TurnPoint,
     };
 
-    use super::{instrument, metric, Phase, Point, Telemetry, TelemetryLayer, FLUSH_INTERVAL, INSTRUMENTS};
+    use super::{instrument, metric, Phase, Point, Telemetry, TelemetryLayer, INSTRUMENTS};
 
     #[test]
     fn guest_metrics_land_as_turn_points_with_the_turn_dimensions_and_declare_their_instruments() {
@@ -660,11 +659,11 @@ mod tests {
         }
         for _ in 0..59 {
             tokio::time::advance(Duration::from_millis(500)).await;
-            frames.extend(telemetry.flush_due(FLUSH_INTERVAL));
+            frames.extend(telemetry.flush_due(Duration::from_secs(30)));
         }
         assert_eq!(frames.len(), 0);
         tokio::time::advance(Duration::from_millis(500)).await;
-        frames.extend(telemetry.flush_due(FLUSH_INTERVAL));
+        frames.extend(telemetry.flush_due(Duration::from_secs(30)));
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].samples.len(), frames[0].turns.len()), (500, 500));
 
@@ -672,14 +671,14 @@ mod tests {
             telemetry.push(sample(f64::from(value)));
             telemetry.push(turn(f64::from(value)));
             tokio::time::advance(Duration::from_millis(60)).await;
-            frames.extend(telemetry.flush_due(FLUSH_INTERVAL));
+            frames.extend(telemetry.flush_due(Duration::from_secs(30)));
         }
         assert_eq!(frames.len(), 2);
         assert_eq!((frames[1].samples.len(), frames[1].turns.len()), (500, 500));
 
         telemetry.push(sample(1.0));
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(telemetry.flush_due(FLUSH_INTERVAL).len(), 0);
+        assert_eq!(telemetry.flush_due(Duration::from_secs(30)).len(), 0);
         let shutdown = telemetry.flush_due(Duration::ZERO);
         assert_eq!(shutdown.len(), 1);
         assert_eq!(shutdown[0].samples.len(), 1);

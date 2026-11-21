@@ -122,7 +122,8 @@ async fn a_shell_box_runs_a_turn_pauses_resumes_warm_and_its_drive_reads_back() 
         "layerCacheMib": 1024,
         "budgets": { "bootSeconds": 30, "firstLineSeconds": 10, "turnSeconds": 30, "snapshotSeconds": 30 },
         "heartbeatIntervalSeconds": 10,
-        "updateGraceSeconds": 600
+        "updateGraceSeconds": 600,
+        "telemetryIntervalSeconds": 30
     }))
     .expect("runtime");
     let settings = Settings {
@@ -235,7 +236,8 @@ fn crash_runtime(data: &std::path::Path, manifest_path: &std::path::Path) -> (Su
         "layerCacheMib": 1024,
         "budgets": { "bootSeconds": 30, "firstLineSeconds": 90, "turnSeconds": 120, "snapshotSeconds": 30 },
         "heartbeatIntervalSeconds": 10,
-        "updateGraceSeconds": 600
+        "updateGraceSeconds": 600,
+        "telemetryIntervalSeconds": 30
     }))
     .expect("runtime");
     let settings = Settings {
