@@ -13,6 +13,7 @@ anyhow = "1.0.104"
 base64 = "0.22.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
+crc = "3.4.0"
 ext4-view = { version = "1.0.0", features = ["std"] }
 fastcdc = "5.0.0"
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
