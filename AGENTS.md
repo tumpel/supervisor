@@ -8,7 +8,7 @@ Always follow `rules/errors.md` and `rules/coding-standards.md`.
 - When writing text a user reads, docs, an issue or a PR body, follow `rules/writing.md`.
 - No comments in code.
 - The API types come from `tumpel-api`, pinned exactly. Change them in tumpel/protocol, release it, then bump the pin.
-- Consume a tumpel/protocol release candidate from crates.io, pinned exactly as `tumpel-api = "=X.Y.Z-rc.N"`, with the `@tumpel/schemas` tarball of the same release. Never use a git dependency: `npm run crates:check` refuses it.
+- Consume a tumpel/protocol release candidate from crates.io, pinned exactly as `tumpel-api = "=X.Y.Z-rc.N"`, with the `@tumpel/schemas` tarball of the same release. Never use a git dependency: `npm run pins:check` refuses it.
 
 ## Commands
 

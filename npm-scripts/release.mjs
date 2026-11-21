@@ -17,9 +17,8 @@ const cargoVersion = (cargo) =>
   cargo.match(/^version = "([^"]+)"$/m)?.[1] ?? die("Cargo.toml names no workspace version");
 
 export const tumpelApiPin = (cargo) =>
-  cargo.match(
-    /^tumpel-api = (?:"=|\{ git = "https:\/\/github\.com\/tumpel\/protocol", tag = "v)([^"]+)"(?: \})?$/m,
-  )?.[1] ?? die('Cargo.toml pins no tumpel-api = "=X.Y.Z" or protocol tag "vX.Y.Z-rc.N"');
+  cargo.match(/^tumpel-api = "=(\d+\.\d+\.\d+(?:-rc\.\d+)?)"$/m)?.[1] ??
+  die('Cargo.toml pins no tumpel-api = "=X.Y.Z[-rc.N]" from crates.io; a git dependency is refused');
 
 export const schemasPin = (packageJson) =>
   JSON.parse(packageJson).dependencies?.["@tumpel/schemas"]?.match(
