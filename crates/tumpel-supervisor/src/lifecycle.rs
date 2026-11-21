@@ -38,7 +38,7 @@ use crate::exchange::{part_number, Answer, Answers, Ask, Cancels, Key, Waiting, 
 use crate::harness_result::{error_result, exit_result, turn_end};
 use crate::images;
 use crate::layers::LayerCache;
-use crate::pool::{mib, restore_charge_mib, Charge, Disk, Held, Size, Staging, Tap, TapPool};
+use crate::pool::{mib, restore_charge_mib, Charge, Disk, Held, Size, Tally, Tap, TapPool};
 use crate::snapshot::{
     assemble, cut, decode, decode_root, draft_digests, fetches, fresh, lacking, restore_parts, stage, unpack,
     write_restore, Base, Births, ChunkCache, Cut, Fetch, Kind, Manifest, PackFile, Place, Places, Span,
@@ -55,7 +55,7 @@ const TRANSFERS: usize = 16;
 const CHUNKS: &str = "chunks";
 const HANDOVER_REPORT_ALLOWANCE: Duration = Duration::from_secs(60);
 const CANCEL_END: Duration = Duration::from_secs(10);
-const DISK_CHECK: Duration = Duration::from_secs(5);
+const DISK_CHECK: Duration = Duration::from_secs(1);
 const RESTORE_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
 const RESTORE_ENTRIES_PER_SECOND: u64 = 2_000;
 const OVERLAY_BYTES_PER_INODE: u64 = 16 * 1024;
@@ -622,6 +622,14 @@ fn remove_file(path: &Path) -> Result<(), String> {
     }
 }
 
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 fn rebuild_archive(
     manifest: Manifest,
     cache: &ChunkCache,
@@ -739,7 +747,8 @@ struct Runner<V: Vmm, S: Store> {
     parking: watch::Receiver<bool>,
     standing: Standing,
     cancels: Cancels,
-    staging: Staging,
+    staging: Tally,
+    reserves: Tally,
 }
 
 impl<V: Vmm, S: Store> Clone for Runner<V, S> {
@@ -757,6 +766,7 @@ impl<V: Vmm, S: Store> Clone for Runner<V, S> {
             standing: self.standing.clone(),
             cancels: self.cancels.clone(),
             staging: self.staging.clone(),
+            reserves: self.reserves.clone(),
         }
     }
 }
@@ -1204,7 +1214,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         self.vmm
             .disk(&[])
             .map_err(|error| format!("reading the host's free disk failed: {error}"))
-            .and_then(|disk| disk.stages(self.staging.mib(), charge_mib))
+            .and_then(|disk| disk.stages(self.reserves.mib(), self.staging.mib(), charge_mib))
             .map_err(|detail| {
                 (
                     TurnFailureReason::BoxDiskFull,
@@ -1286,15 +1296,15 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let target = dir.join("restore.tar");
         let output = target.clone();
         let chunks = dir.join(CHUNKS);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancelled = Arc::clone(&cancel);
+        let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+        let cancelled = Arc::clone(&cancel.0);
         let rebuild =
             tokio::task::spawn_blocking(move || rebuild_archive(manifest, &cache, &output, &chunks, &cancelled));
         let budget = restore_budget(self.settings.budgets.boot, bytes, entries);
         let seconds = budget.as_secs();
         let outcome = timeout(budget, rebuild).await;
         if outcome.is_err() {
-            cancel.store(true, Ordering::Relaxed);
+            cancel.0.store(true, Ordering::Relaxed);
             remove_file(&target).map_err(unreadable)?;
         }
         match outcome {
@@ -2031,7 +2041,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     boxes: Arc::default(),
                 },
                 cancels: Cancels::default(),
-                staging: Staging::default(),
+                staging: Tally::default(),
+                reserves: pool.reserves(),
             },
             pool,
             slots: HashMap::new(),
