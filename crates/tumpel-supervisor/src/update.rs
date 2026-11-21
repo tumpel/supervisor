@@ -239,6 +239,35 @@ fn announced_release(body: &[u8], url: &str, architecture: HostArchitecture) -> 
     })
 }
 
+fn version_refusal(running: &str, announced: &str) -> Option<String> {
+    let parse = |version: &str| semver::Version::parse(version.trim_start_matches('v'));
+    let running_version = match parse(running) {
+        Ok(version) => version,
+        Err(error) => {
+            return Some(format!(
+                "the running supervisor version {running} is no semver version ({error}), so it cannot tell whether {announced} is newer; install a released supervisor"
+            ))
+        }
+    };
+    let announced_version = match parse(announced) {
+        Ok(version) => version,
+        Err(error) => {
+            return Some(format!(
+                "the release names supervisor version {announced}, which is no semver version ({error}); publish a release with a semver supervisor version"
+            ))
+        }
+    };
+    match announced_version.cmp_precedence(&running_version) {
+        std::cmp::Ordering::Greater => None,
+        std::cmp::Ordering::Less => Some(format!(
+            "the release names supervisor {announced}, older than the running {running}; publish a newer release"
+        )),
+        std::cmp::Ordering::Equal => Some(format!(
+            "the release names supervisor {announced}, the running version {running}, with another binary; publish the new binary under a new version"
+        )),
+    }
+}
+
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(digest(&SHA256, bytes).as_ref())
@@ -421,6 +450,17 @@ impl<S: Source, I: Idle> Updater<S, I> {
         };
         if release.sha256 == self.running {
             return Err(Outcome::Current);
+        }
+        if let Some(announced) = &release.supervisor_version {
+            if let Some(refusal) = version_refusal(env!("TUMPEL_RELEASE_VERSION"), announced) {
+                eprintln!(
+                    "tumpel-supervisor: refusing supervisor update to {}: {refusal}; supervisor {} ({}) keeps running",
+                    named(&release),
+                    env!("TUMPEL_RELEASE_VERSION"),
+                    short(&self.running)
+                );
+                return Err(Outcome::Refused);
+            }
         }
         match read::<SupervisorUpdateRefusal>(&self.layout.refusal(), "SupervisorUpdateRefusal") {
             Ok(Some(refusal)) if refusal.to_sha256 == release.sha256 => Err(Outcome::Refused),

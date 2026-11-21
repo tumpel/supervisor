@@ -12,8 +12,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    announced_release, confirm, named, refresh_unit, sha256_hex, startup, Idle, Layout, Limits, Outcome, Release,
-    Source, Startup, Updater, PENDING_FILE, REFUSAL_FILE, ROLLED_BACK_FILE, TRIAL_FILE,
+    announced_release, confirm, named, refresh_unit, sha256_hex, startup, version_refusal, Idle, Layout, Limits,
+    Outcome, Release, Source, Startup, Updater, PENDING_FILE, REFUSAL_FILE, ROLLED_BACK_FILE, TRIAL_FILE,
 };
 use crate::install::supervisor_unit_text;
 
@@ -596,4 +596,26 @@ fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
     );
     assert_eq!(release.channel_protocol_version, 20);
     assert_eq!(named(&release), "0.4.0 (333333333333)");
+}
+
+#[test]
+fn an_update_goes_only_to_a_newer_supervisor_version() {
+    assert_eq!(version_refusal("0.3.0-rc.4", "0.3.0-rc.5"), None);
+    assert_eq!(version_refusal("0.3.0-rc.5", "0.3.0"), None);
+    assert_eq!(version_refusal("v0.3.0-rc.5", "0.3.0"), None);
+    assert_eq!(version_refusal("0.3.0-main.1", "0.3.0-rc.5"), None);
+    assert_eq!(
+        version_refusal("0.3.0-rc.5", "0.3.0-rc.4"),
+        Some(
+            "the release names supervisor 0.3.0-rc.4, older than the running 0.3.0-rc.5; publish a newer release"
+                .to_string()
+        )
+    );
+    assert!(version_refusal("0.3.0", "0.3.0-rc.5").is_some());
+    assert!(version_refusal("0.3.0-rc.5", "0.3.0-main.1").is_some());
+    assert!(version_refusal("0.3.0-rc.5", "0.2.1-main.1").is_some());
+    assert_eq!(
+        version_refusal("0.3.0-rc.5", "0.3.0-rc.5"),
+        Some("the release names supervisor 0.3.0-rc.5, the running version 0.3.0-rc.5, with another binary; publish the new binary under a new version".to_string())
+    );
 }
