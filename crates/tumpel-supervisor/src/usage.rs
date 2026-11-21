@@ -144,7 +144,7 @@ fn stats(boxes_warm: u32, disk: Disk, held: &Held, procs: [&str; 3]) -> Result<H
             load_average: loads[0],
             memory_available_mib: i64::try_from(meminfo_kib(meminfo, "MemAvailable")? / 1024).unwrap_or(i64::MAX),
             disk_budget_mib: Some(i64::try_from(disk.budget_mib()).unwrap_or(i64::MAX)),
-            disk_held_mib: Some(i64::try_from(held.disk_held_mib).unwrap_or(i64::MAX)),
+            disk_held_mib: Some(i64::try_from(disk.written_mib + held.disk_held_mib).unwrap_or(i64::MAX)),
             memory_budget_mib: Some(i64::try_from(held.memory_budget_mib).unwrap_or(i64::MAX)),
             memory_held_mib: Some(i64::try_from(held.memory_held_mib).unwrap_or(i64::MAX)),
         },
@@ -213,12 +213,12 @@ mod tests {
     fn stats_read_memory_in_mib_and_the_load_averages_from_captured_proc_files() {
         let disk = Disk {
             total_mib: 100_000,
-            free_mib: 80_000,
-            written_mib: 0,
+            free_mib: 78_000,
+            written_mib: 2000,
         };
         let held = Held {
             drives: Vec::new(),
-            disk_held_mib: 32_768,
+            disk_held_mib: 8192,
             memory_budget_mib: 33_792,
             memory_held_mib: 6144,
         };
@@ -231,7 +231,7 @@ mod tests {
         .expect("stats");
         assert_eq!(
             (sampled.usage.disk_budget_mib, sampled.usage.disk_held_mib),
-            (Some(70_000), Some(32_768))
+            (Some(70_000), Some(10_192))
         );
         assert_eq!(
             (sampled.usage.memory_budget_mib, sampled.usage.memory_held_mib),

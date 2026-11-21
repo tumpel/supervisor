@@ -4,6 +4,13 @@ use std::num::NonZeroU32;
 
 pub const TAP_POOL: u8 = 64;
 
+pub const BOX_DISK_RESERVE_MIB: u32 = 8192;
+
+#[must_use]
+pub fn reserve_mib(disk_mib: NonZeroU32) -> u64 {
+    u64::from(disk_mib.get().min(BOX_DISK_RESERVE_MIB))
+}
+
 #[must_use]
 pub fn headroom_mib(total_mib: u64) -> u64 {
     (total_mib / 4).max(4096)
@@ -144,11 +151,14 @@ impl fmt::Display for PoolExhausted {
                 requested_mib,
             } => write!(
                 formatter,
-                "this host gives box disks {} MiB, its {} MiB of free disk and the {} MiB its boxes wrote less the {} MiB it keeps free; its {boxes} boxes hold {held_mib} MiB of it, so a box disk of {requested_mib} MiB does not fit; free disk on the host, or lower the persona's boxDiskMib",
+                "this host gives box disks {} MiB, its {} MiB of free disk and the {} MiB its boxes wrote less the {} MiB it keeps free; its {boxes} boxes wrote {} MiB and keep {} MiB more to grow into, so the {} MiB a box disk of {requested_mib} MiB keeps does not fit; free disk on the host",
                 disk.budget_mib(),
                 disk.free_mib,
                 disk.written_mib,
-                disk.headroom_mib()
+                disk.headroom_mib(),
+                disk.written_mib,
+                held_mib,
+                reserve_mib(*requested_mib)
             ),
         }
     }
@@ -213,7 +223,7 @@ impl TapPool {
         if self.held_mib == 0 {
             return Ok(());
         }
-        if self.held_disk_mib + u64::from(size.disk_mib.get()) > disk.budget_mib() {
+        if disk.written_mib + self.held_disk_mib + reserve_mib(size.disk_mib) > disk.budget_mib() {
             return Err(PoolExhausted::Disk {
                 boxes: self.held.len(),
                 held_mib: self.held_disk_mib,
@@ -245,13 +255,13 @@ impl TapPool {
 
     fn hold(&mut self, size: Size) {
         self.held_mib += u64::from(size.memory_mib.get());
-        self.held_disk_mib += u64::from(size.disk_mib.get());
+        self.held_disk_mib += reserve_mib(size.disk_mib);
     }
 
     pub fn release(&mut self, tap: Tap) {
         let (index, size) = tap.into_parts();
         self.held_mib -= u64::from(size.memory_mib.get());
-        self.held_disk_mib -= u64::from(size.disk_mib.get());
+        self.held_disk_mib -= reserve_mib(size.disk_mib);
         self.held.remove(&index);
     }
 
@@ -267,7 +277,7 @@ impl TapPool {
 mod tests {
     use std::num::NonZeroU32;
 
-    use super::{headroom_mib, memory_budget_mib, Disk, PoolExhausted, Size, TapPool};
+    use super::{headroom_mib, memory_budget_mib, reserve_mib, Disk, PoolExhausted, Size, TapPool};
 
     fn memory(memory_mib: u32) -> Size {
         Size {
@@ -406,38 +416,45 @@ mod tests {
     }
 
     #[test]
-    fn box_disks_are_admitted_by_their_full_size_not_by_what_they_wrote() {
+    fn box_disks_are_admitted_by_what_they_wrote_and_a_reserve_not_by_their_full_size() {
         let mut pool = TapPool::new(1_048_576, BOX);
-        let fresh = Disk {
-            total_mib: 512_000,
-            free_mib: 200_000,
-            written_mib: 0,
+        let sparse = Disk {
+            total_mib: 395_700,
+            free_mib: 344_398,
+            written_mib: 9059,
         };
-        assert_eq!(fresh.budget_mib(), 148_800);
-        let taps: Vec<_> = (0..4).map(|_| pool.claim(BOX, fresh).expect("a box disk")).collect();
-        let written = Disk {
-            total_mib: 512_000,
-            free_mib: 150_000,
-            written_mib: 50_000,
+        assert_eq!(sparse.budget_mib(), 313_887);
+        let taps: Vec<_> = (0..10)
+            .map(|_| pool.claim(BOX, sparse).expect("a sparse box disk"))
+            .collect();
+        assert_eq!(pool.held_disk_mib(), 81_920);
+        let full = Disk {
+            total_mib: 395_700,
+            free_mib: 123_457,
+            written_mib: 230_000,
         };
         assert_eq!(
-            pool.claim(BOX, written),
+            pool.claim(BOX, full),
             Err(PoolExhausted::Disk {
-                boxes: 4,
-                held_mib: 131_072,
-                disk: written,
+                boxes: 10,
+                held_mib: 81_920,
+                disk: full,
                 requested_mib: BOX.disk_mib
             })
         );
         assert_eq!(
-            pool.claim(BOX, written).map_err(|refused| refused.to_string()),
-            Err("this host gives box disks 148800 MiB, its 150000 MiB of free disk and the 50000 MiB its boxes wrote less the 51200 MiB it keeps free; its 4 boxes hold 131072 MiB of it, so a box disk of 32768 MiB does not fit; free disk on the host, or lower the persona's boxDiskMib".to_string())
+            pool.claim(BOX, full).map_err(|refused| refused.to_string()),
+            Err("this host gives box disks 313887 MiB, its 123457 MiB of free disk and the 230000 MiB its boxes wrote less the 39570 MiB it keeps free; its 10 boxes wrote 230000 MiB and keep 81920 MiB more to grow into, so the 8192 MiB a box disk of 32768 MiB keeps does not fit; free disk on the host".to_string())
         );
-        assert_eq!(pool.held_disk_mib(), 131_072);
         let mut taps = taps.into_iter();
         pool.release(taps.next().expect("the first box"));
-        assert_eq!(pool.held_disk_mib(), 98_304);
-        assert!(pool.claim(BOX, written).is_ok());
+        assert_eq!(pool.held_disk_mib(), 73_728);
+        assert!(pool.claim(BOX, full).is_ok());
+        assert_eq!(
+            reserve_mib(NonZeroU32::new(4096).expect("4096")),
+            4096,
+            "a box disk smaller than the reserve keeps only its own size"
+        );
     }
 
     #[test]

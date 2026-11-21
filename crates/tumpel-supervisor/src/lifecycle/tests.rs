@@ -2177,7 +2177,7 @@ fn a_snapshot_larger_than_the_box_disk_names_both_sizes_and_the_persona_setting(
 #[tokio::test(start_paused = true)]
 async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_a_teardown_frees_disk() {
     let mut host = host("disk", 3, Harness::Echo, Boot::Works);
-    host.vmm.free_disk_mib.store(80_000, Ordering::SeqCst);
+    host.vmm.free_disk_mib.store(30_000, Ordering::SeqCst);
     host.turn("turn-1", "session-1", "one", Vec::new());
     host.settle(SETTLE).await;
     host.turn("turn-2", "session-2", "two", Vec::new());
@@ -2189,7 +2189,7 @@ async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_a_teardown_free
         refused.len() == 1
             && refused[0].starts_with(&format!("failed {}", TurnFailureReason::PoolExhausted))
             && refused[0].contains(
-                "this host gives box disks 70000 MiB, its 80000 MiB of free disk and the 0 MiB its boxes wrote less the 10000 MiB it keeps free; its 2 boxes hold 65536 MiB of it, so a box disk of 32768 MiB does not fit"
+                "this host gives box disks 20000 MiB, its 30000 MiB of free disk and the 0 MiB its boxes wrote less the 10000 MiB it keeps free; its 2 boxes wrote 0 MiB and keep 16384 MiB more to grow into, so the 8192 MiB a box disk of 32768 MiB keeps does not fit"
             ),
         "{refused:?}"
     );
@@ -2197,7 +2197,7 @@ async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_a_teardown_free
     let held = host.holdings.borrow().clone();
     assert_eq!(
         (held.disk_held_mib, held.memory_budget_mib, held.memory_held_mib),
-        (65_536, 3 * 4096, 2 * u64::from(BOX.memory_mib.get()))
+        (16_384, 3 * 4096, 2 * u64::from(BOX.memory_mib.get()))
     );
     host.snapshot("session-1");
     host.settle(SETTLE).await;
@@ -2206,7 +2206,7 @@ async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_a_teardown_free
     drives.sort();
     assert_eq!(
         (drives, held.disk_held_mib),
-        (vec!["session-1".to_string(), "session-2".to_string()], 65_536),
+        (vec!["session-1".to_string(), "session-2".to_string()], 16_384),
         "a clean paused box still holds its disk"
     );
     host.teardown("session-1");
