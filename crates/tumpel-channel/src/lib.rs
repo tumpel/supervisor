@@ -19,6 +19,7 @@ pub const MAX_REPLAYS: u32 = 10;
 pub const MAX_RECONNECTS: u32 = 10;
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 pub const MAX_RATE_BACKOFFS: u32 = 10;
+const ASSUMED_FRAMES_PER_MINUTE: u32 = 600;
 pub const LAST_RATE_BACKOFF: Duration = Duration::from_mins(15);
 
 const HELLO_CONTEXT: &[u8] = b"tumpel-channel-hello-v1";
@@ -170,7 +171,12 @@ impl RateLimit {
 
     #[must_use]
     pub fn release_budget(&self, tick: Duration) -> usize {
-        let per_tick = u128::from(self.frames_per_minute / 2) * tick.as_millis() / RATE_WINDOW.as_millis();
+        let limit = if self.frames_per_minute == 0 {
+            ASSUMED_FRAMES_PER_MINUTE
+        } else {
+            self.frames_per_minute
+        };
+        let per_tick = u128::from(limit / 2) * tick.as_millis() / RATE_WINDOW.as_millis();
         usize::try_from(per_tick).unwrap_or(usize::MAX).max(1)
     }
 
@@ -280,6 +286,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         host_id: EntityId,
         supervisor_version: String,
     ) -> Self {
+        let withheld = state.unacked.first().map(|first| first.seq.0);
         Self {
             state,
             store,
@@ -288,7 +295,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             supervisor_version,
             phase: Phase::Closed,
             progressed: false,
-            withheld: None,
+            withheld,
         }
     }
 

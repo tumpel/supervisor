@@ -168,6 +168,7 @@ fn open(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) {
     let Ok(Event::Welcomed) = welcome(channel, wire, &quiet) else {
         panic!("the welcome opens the channel");
     };
+    channel.release(usize::MAX, wire).expect("release");
 }
 
 struct ControlPlane {
@@ -212,6 +213,7 @@ impl ControlPlane {
     fn reconnect(&mut self, channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) -> Result<Event, ChannelError> {
         channel.disconnect();
         let event = welcome(channel, wire, &self.welcome())?;
+        channel.release(usize::MAX, wire)?;
         Ok(event)
     }
 }
@@ -825,4 +827,46 @@ fn a_frame_refused_over_the_rate_is_dropped_and_frames_sent_while_withheld_go_ou
     assert!(!channel.withholding());
     channel.send(done("snap-5"), &mut wire).expect("send");
     assert_eq!(seqs(&mut wire), [5]);
+}
+
+#[test]
+fn a_backlog_saved_before_a_restart_is_held_at_the_welcome_and_goes_out_paced() {
+    let saved: SupervisorChannelState = serde_json::from_value(json!({
+        "received": 0,
+        "sent": 3,
+        "unacked": [
+            {"type": "Frame", "seq": 1, "ack": 0, "message": {"type": "TurnDone", "turnId": "turn-1"}},
+            {"type": "Frame", "seq": 2, "ack": 0, "message": {"type": "TurnDone", "turnId": "turn-2"}},
+            {"type": "Frame", "seq": 3, "ack": 0, "message": {"type": "TurnDone", "turnId": "turn-3"}}
+        ]
+    }))
+    .expect("channel.json");
+    let mut channel = HostChannel::new(
+        saved,
+        Disk::default(),
+        Recorder::default(),
+        "host-1".try_into().expect("host id"),
+        "0.1.0".to_string(),
+    );
+    assert!(channel.withholding());
+    let mut wire = Wire::default();
+    let quiet = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION});
+    let Ok(Event::Welcomed) = welcome(&mut channel, &mut wire, &quiet) else {
+        panic!("the welcome opens the channel");
+    };
+    assert!(
+        wire.sent().is_empty(),
+        "the welcome replays nothing while the backlog is held"
+    );
+    channel.release(2, &mut wire).expect("release");
+    let seqs = |wire: &mut Wire| {
+        wire.sent()
+            .iter()
+            .map(|frame| frame["seq"].as_i64().expect("seq"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(seqs(&mut wire), [1, 2]);
+    channel.release(2, &mut wire).expect("release");
+    assert_eq!(seqs(&mut wire), [3]);
+    assert!(!channel.withholding());
 }
