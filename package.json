@@ -21,7 +21,7 @@
     "supervisor:build": "npm run guest:build && npm run guest:drive && TUMPEL_GUEST_DRIVE=\"$PWD/.tmp/guest-drive/${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}.squashfs\" RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p tumpel-supervisor --target ${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}"
   },
   "dependencies": {
-    "@tumpel/schemas": "https://github.com/tumpel/protocol/releases/download/v0.21.0-rc.14/tumpel-schemas-0.21.0-rc.14.tgz"
+    "@tumpel/schemas": "https://github.com/tumpel/protocol/releases/download/v0.21.0-rc.24/tumpel-schemas-0.21.0-rc.24.tgz"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.8"

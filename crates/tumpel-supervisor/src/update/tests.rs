@@ -50,6 +50,7 @@ struct FakeSource {
     sha256: String,
     supervisor_version: &'static str,
     channel_protocol_version: u32,
+    rollback: bool,
     downloads: AtomicU32,
 }
 
@@ -60,6 +61,7 @@ impl FakeSource {
             sha256: sha256_hex(script.as_bytes()),
             supervisor_version: "0.4.0",
             channel_protocol_version: u32::from(ChannelProtocol::VERSION),
+            rollback: false,
             downloads: AtomicU32::new(0),
         }
     }
@@ -72,6 +74,7 @@ impl Source for FakeSource {
             sha256: digest(&self.sha256),
             supervisor_version: self.supervisor_version.parse().expect("a supervisor version"),
             channel_protocol_version: self.channel_protocol_version,
+            rollback: self.rollback,
         }))
     }
 
@@ -488,6 +491,60 @@ async fn a_release_notice_updates_an_idle_host_at_once() {
 }
 
 #[tokio::test]
+async fn an_announced_rollback_installs_an_older_supervisor_version() {
+    assert_eq!(version_refusal("0.3.0-rc.5", "0.3.0-rc.4", true), None);
+    assert!(version_refusal("0.3.0-rc.5", "0.3.0-rc.5", true).is_some());
+
+    let layout = layout("rollback");
+    let idle = FakeIdle::default();
+    let source = FakeSource {
+        supervisor_version: "0.2.1-main.1",
+        rollback: true,
+        ..FakeSource::binary(&good_script())
+    };
+    let run = updater(&layout, source, &idle, limits());
+    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
+    assert_eq!(text(&layout.binary), good_script());
+}
+
+#[test]
+fn a_release_manifest_reads_its_rollback_flag_and_defaults_to_none() {
+    let manifest = |rollback: &str| {
+        format!(
+            r#"{{
+        "releaseVersion": "v1.4.0",
+        "commit": "2a2e3f8c1d9b2a2e3f8c1d9b2a2e3f8c1d9b2a2e",
+        "channelProtocolVersion": 20,
+        "supervisors": [
+            {{
+                "architecture": "Amd64",
+                "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+                "sizeBytes": 24000000,
+                "supervisorVersion": "0.4.0",
+                "guestProtocolVersion": 3
+            }}
+        ],
+        "clis": [],
+        "images": [],
+        "bases": [],
+        "harnessLayers": []{rollback}
+    }}"#
+        )
+    };
+    let read = |body: String| {
+        announced_release(
+            body.as_bytes(),
+            "https://api.example/v1/releases/current",
+            HostArchitecture::Amd64,
+        )
+        .expect("a release manifest")
+        .rollback
+    };
+    assert!(read(manifest(r#", "rollback": true"#)));
+    assert!(!read(manifest("")));
+}
+
+#[tokio::test]
 async fn a_release_notice_to_a_busy_host_waits_out_the_grace_period_then_updates() {
     let layout = layout("notice-busy");
     let busy = FakeIdle(watch::Sender::new(1));
@@ -566,26 +623,26 @@ fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
 
 #[tokio::test]
 async fn an_update_goes_only_to_a_newer_supervisor_version() {
-    assert_eq!(version_refusal("0.3.0-rc.4", "0.3.0-rc.5"), None);
-    assert_eq!(version_refusal("0.3.0-rc.5", "0.3.0"), None);
-    assert_eq!(version_refusal("v0.3.0-rc.5", "0.3.0"), None);
-    assert_eq!(version_refusal("0.3.0-main.1", "0.3.0-rc.5"), None);
+    assert_eq!(version_refusal("0.3.0-rc.4", "0.3.0-rc.5", false), None);
+    assert_eq!(version_refusal("0.3.0-rc.5", "0.3.0", false), None);
+    assert_eq!(version_refusal("v0.3.0-rc.5", "0.3.0", false), None);
+    assert_eq!(version_refusal("0.3.0-main.1", "0.3.0-rc.5", false), None);
     assert_eq!(
-        version_refusal("0.3.0-rc.5", "0.3.0-rc.4"),
+        version_refusal("0.3.0-rc.5", "0.3.0-rc.4", false),
         Some(
-            "the release names supervisor 0.3.0-rc.4, older than the running 0.3.0-rc.5; publish a newer release"
+            "the release names supervisor 0.3.0-rc.4, older than the running 0.3.0-rc.5, and is no rollback; publish a newer release or a rollback"
                 .to_string()
         )
     );
-    assert!(version_refusal("0.3.0", "0.3.0-rc.5").is_some());
-    assert!(version_refusal("0.3.0-rc.5", "0.3.0-main.1").is_some());
-    assert!(version_refusal("0.3.0-rc.5", "0.2.1-main.1").is_some());
+    assert!(version_refusal("0.3.0", "0.3.0-rc.5", false).is_some());
+    assert!(version_refusal("0.3.0-rc.5", "0.3.0-main.1", false).is_some());
+    assert!(version_refusal("0.3.0-rc.5", "0.2.1-main.1", false).is_some());
     assert_eq!(
-        version_refusal("0.3.0-rc.5", "0.3.0-rc.5"),
+        version_refusal("0.3.0-rc.5", "0.3.0-rc.5", false),
         Some("the release names supervisor 0.3.0-rc.5, the running version 0.3.0-rc.5, with another binary; publish the new binary under a new version".to_string())
     );
-    assert_eq!(version_refusal("0.0.0-012345678901", "0.3.0-rc.4"), None);
-    assert!(version_refusal("0.3.0-rc.5", "latest").is_some());
+    assert_eq!(version_refusal("0.0.0-012345678901", "0.3.0-rc.4", false), None);
+    assert!(version_refusal("0.3.0-rc.5", "latest", false).is_some());
 
     let layout = layout("older-version");
     let idle = FakeIdle::default();
