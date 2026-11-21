@@ -507,43 +507,6 @@ async fn an_announced_rollback_installs_an_older_supervisor_version() {
     assert_eq!(text(&layout.binary), good_script());
 }
 
-#[test]
-fn a_release_manifest_reads_its_rollback_flag_and_defaults_to_none() {
-    let manifest = |rollback: &str| {
-        format!(
-            r#"{{
-        "releaseVersion": "v1.4.0",
-        "commit": "2a2e3f8c1d9b2a2e3f8c1d9b2a2e3f8c1d9b2a2e",
-        "channelProtocolVersion": 20,
-        "supervisors": [
-            {{
-                "architecture": "Amd64",
-                "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
-                "sizeBytes": 24000000,
-                "supervisorVersion": "0.4.0",
-                "guestProtocolVersion": 3
-            }}
-        ],
-        "clis": [],
-        "images": [],
-        "bases": [],
-        "harnessLayers": []{rollback}
-    }}"#
-        )
-    };
-    let read = |body: String| {
-        announced_release(
-            body.as_bytes(),
-            "https://api.example/v1/releases/current",
-            HostArchitecture::Amd64,
-        )
-        .expect("a release manifest")
-        .rollback
-    };
-    assert!(read(manifest(r#", "rollback": true"#)));
-    assert!(!read(manifest("")));
-}
-
 #[tokio::test]
 async fn a_release_notice_to_a_busy_host_waits_out_the_grace_period_then_updates() {
     let layout = layout("notice-busy");
@@ -619,6 +582,20 @@ fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
     );
     assert_eq!(release.channel_protocol_version, 20);
     assert_eq!(named(&release), "0.4.0 (333333333333)");
+    assert!(!release.rollback);
+
+    let rollback = String::from_utf8(body.to_vec()).expect("a utf-8 manifest").replacen(
+        "\"releaseVersion\"",
+        "\"rollback\": true,\n        \"releaseVersion\"",
+        1,
+    );
+    let release = announced_release(
+        rollback.as_bytes(),
+        "https://api.example/v1/releases/current",
+        HostArchitecture::Amd64,
+    )
+    .expect("the manifest of a rollback");
+    assert!(release.rollback);
 }
 
 #[tokio::test]
