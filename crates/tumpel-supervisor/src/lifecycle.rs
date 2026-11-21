@@ -15,23 +15,23 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{timeout, timeout_at, Instant};
 use tracing::Instrument;
 use tumpel_api::types::{
-    BoxBudgets, ChannelBoxGone, ChannelBoxGoneType, ChannelBoxTeardownFailed, ChannelBoxTeardownFailedType,
-    ChannelBoxTeardownFailureReason, ChannelDispatchGrant, ChannelHostMessage, ChannelPack, ChannelPersonaFileDownload,
-    ChannelRestoreChunks, ChannelRestoreChunksType, ChannelSnapshotChunks, ChannelSnapshotChunksType,
-    ChannelSnapshotDone, ChannelSnapshotDoneType, ChannelSnapshotDownload, ChannelSnapshotFailed,
-    ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPacks, ChannelSnapshotPacksType,
-    ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete, ChannelTurnCompleteType,
-    ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnImageFetching,
-    ChannelTurnImageFetchingType, ChannelTurnLine, ChannelTurnLineType, ChannelTurnRepositoryCloneFailed,
-    ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady, ChannelTurnRepositoryReadyType, CredentialText,
-    DisplayName, EmailAddress, EntityId, GuestHello, GuestInput, GuestMessage, GuestPersonaFile, GuestProtocol,
-    GuestTurnCancel, GuestTurnCancelType, GuestTurnStart, GuestTurnStartPrebuildCommitSha, GuestTurnStartType,
-    ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl, Sequence, Sha256Digest, SupervisorHandover,
-    SupervisorHandoverBox, SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverDiscard,
-    SupervisorHandoverDiscardKind, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
-    SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, SupervisorHandoverTurn,
-    SupervisorHandoverTurnError, SupervisorHandoverTurnKind, SupervisorHandoverWarm, SupervisorHandoverWarmKind,
-    TurnFailureReason,
+    BoxBudgets, BoxRetention, ChannelBoxGone, ChannelBoxGoneType, ChannelBoxTeardownFailed,
+    ChannelBoxTeardownFailedType, ChannelBoxTeardownFailureReason, ChannelDispatchGrant, ChannelHostMessage,
+    ChannelPack, ChannelPersonaFileDownload, ChannelRestoreChunks, ChannelRestoreChunksType, ChannelSnapshotChunks,
+    ChannelSnapshotChunksType, ChannelSnapshotDone, ChannelSnapshotDoneType, ChannelSnapshotDownload,
+    ChannelSnapshotFailed, ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPacks,
+    ChannelSnapshotPacksType, ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete,
+    ChannelTurnCompleteType, ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType,
+    ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLine, ChannelTurnLineType,
+    ChannelTurnRepositoryCloneFailed, ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady,
+    ChannelTurnRepositoryReadyType, CredentialText, DisplayName, EmailAddress, EntityId, GuestHello, GuestInput,
+    GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnStart,
+    GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl,
+    Sequence, Sha256Digest, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
+    SupervisorHandoverCommand, SupervisorHandoverDiscard, SupervisorHandoverDiscardKind, SupervisorHandoverMachine,
+    SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown,
+    SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
+    SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
 };
 
 use crate::boot::{self, Boot, BootOrder, Caches, Hold, Holds};
@@ -57,7 +57,14 @@ const TRANSFERS: usize = 16;
 const CHUNKS: &str = "chunks";
 const HANDOVER_REPORT_ALLOWANCE: Duration = Duration::from_secs(60);
 const CANCEL_END: Duration = Duration::from_secs(10);
-const IDLE_TEARDOWN: Duration = Duration::from_mins(15);
+const AUTO_IDLE_TEARDOWN: Duration = Duration::from_mins(15);
+
+fn idle_teardown(retention: BoxRetention) -> Option<Duration> {
+    match retention {
+        BoxRetention::Auto => Some(AUTO_IDLE_TEARDOWN),
+        BoxRetention::Warm | BoxRetention::Off => None,
+    }
+}
 const DISK_CHECK: Duration = Duration::from_secs(1);
 const RESTORE_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
 const RESTORE_ENTRIES_PER_SECOND: u64 = 2_000;
@@ -100,7 +107,6 @@ fn restore_size(named: &str, manifest: &Manifest, overlay: u64) -> Result<(u64, 
 pub struct Budgets {
     pub boot: Duration,
     pub first_line: Duration,
-    pub turn: Duration,
     pub snapshot: Duration,
 }
 
@@ -110,7 +116,6 @@ impl From<&BoxBudgets> for Budgets {
         Self {
             boot: seconds(budgets.boot_seconds),
             first_line: seconds(budgets.first_line_seconds),
-            turn: seconds(budgets.turn_seconds),
             snapshot: seconds(budgets.snapshot_seconds),
         }
     }
@@ -184,6 +189,8 @@ pub struct BoxTurn {
     pub prebuild_commit_sha: Option<String>,
     pub box_memory_mib: Option<i32>,
     pub box_disk_mib: Option<i32>,
+    pub turn_seconds: NonZeroU32,
+    pub box_retention: BoxRetention,
 }
 
 pub struct SnapshotOrder {
@@ -287,6 +294,7 @@ struct LiveBox<M: Machine> {
     _hold: Hold,
     dirty: bool,
     credential_file: Option<String>,
+    idle_teardown: Option<Duration>,
 }
 
 impl<M: Machine> LiveBox<M> {
@@ -302,6 +310,7 @@ impl<M: Machine> LiveBox<M> {
             _hold: hold,
             dirty: false,
             credential_file: None,
+            idle_teardown: idle_teardown(turn.box_retention),
         }
     }
 }
@@ -877,6 +886,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     async fn warm_turn(&self, mut live: LiveBox<V::Machine>, turn: &BoxTurn) -> Outcome<V::Machine> {
+        live.idle_teardown = idle_teardown(turn.box_retention);
         let claiming = self.claim(turn);
         let Some(files) = self.files(turn).await else {
             return Outcome::Kept(live);
@@ -1374,7 +1384,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         live.machine.clear_console();
         let clone = Duration::from_secs(u64::from(live.image.harness().clone_seconds.get()));
         let state = Follow {
-            end: started + self.settings.budgets.turn,
+            end: started + Duration::from_secs(u64::from(turn.turn_seconds.get())),
             first_line: started + clone + self.settings.budgets.first_line,
             repository_ready: false,
             seen_line: false,
@@ -1419,7 +1429,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 turn_id: turn.turn_id.clone(),
                 type_: GuestTurnStartType::TurnStart,
                 prebuild_commit_sha,
-                turn_seconds: NonZeroU32::new(u32::try_from(self.settings.budgets.turn.as_secs()).unwrap_or(u32::MAX)),
+                turn_seconds: Some(turn.turn_seconds),
             })
             .map_err(|error| {
                 Failure::turn(
@@ -1597,13 +1607,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         Failure::turn(TurnFailureReason::NoFirstOutput, detail)
     }
 
-    fn timed_out(&self, turn_id: &EntityId) -> Failure {
+    fn timed_out(turn_id: &EntityId) -> Failure {
         Failure::turn(
             TurnFailureReason::TurnTimedOut,
             format!(
-                "turn {} ran past its {} s budget (budgets.turnSeconds in runtime.json).",
-                **turn_id,
-                self.settings.budgets.turn.as_secs()
+                "turn {} ran past the turnSeconds of its offer; send a smaller prompt or raise turnTotalBudgetSeconds.",
+                **turn_id
             ),
         )
     }
@@ -1645,7 +1654,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 } else if waiting_for_first {
                     self.no_first_output(turn_id, clone, state.repository_ready)
                 } else {
-                    self.timed_out(turn_id)
+                    Self::timed_out(turn_id)
                 }));
             };
             match received {
@@ -2567,6 +2576,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             _hold: hold,
             dirty: handed.dirty,
             credential_file: handed.credential_file.map(String::from),
+            idle_teardown: None,
         });
         match (handed.state, taken) {
             (SupervisorHandoverBoxState::Warm(_), _) => slot.paused = true,
@@ -3009,30 +3019,31 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    fn idle_box(&self, session: &str) -> Option<&EntityId> {
+    fn idle_box(&self, session: &str) -> Option<(&EntityId, Duration)> {
         let slot = self.slots.get(session)?;
         if self.mode != Mode::TakingTurns || slot.busy || slot.parked.is_some() || !slot.queue.is_empty() {
             return None;
         }
-        slot.live.as_ref().filter(|live| !live.dirty).map(|live| &live.box_id)
+        let live = slot.live.as_ref().filter(|live| !live.dirty)?;
+        live.idle_teardown.map(|after| (&live.box_id, after))
     }
 
     fn arm_idle(&mut self, session: &str) {
-        let box_id = self.idle_box(session).cloned();
+        let idle = self.idle_box(session).map(|(box_id, after)| (box_id.clone(), after));
         let Some(slot) = self.slots.get_mut(session) else {
             return;
         };
         if let Some(armed) = slot.idle.take() {
             armed.abort();
         }
-        let Some(box_id) = box_id else {
+        let Some((box_id, after)) = idle else {
             return;
         };
         let events = self.events.clone();
         let session = session.to_string();
         slot.idle = Some(
             tokio::spawn(async move {
-                tokio::time::sleep(IDLE_TEARDOWN).await;
+                tokio::time::sleep(after).await;
                 let _ = events.send(Event::IdleExpired { session, box_id });
             })
             .abort_handle(),
@@ -3040,7 +3051,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     async fn idle_expired(&mut self, session: &str, box_id: EntityId) -> Result<(), String> {
-        if self.idle_box(session) != Some(&box_id) {
+        if self.idle_box(session).map(|(idle, _)| idle) != Some(&box_id) {
             return Ok(());
         }
         self.teardown(session).await?;

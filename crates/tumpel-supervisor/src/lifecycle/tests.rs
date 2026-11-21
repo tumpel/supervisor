@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tumpel_api::types::{
-    ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
+    BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
     ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld, ChannelSnapshotChunksHeldType,
     ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType,
     ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId,
@@ -551,7 +551,6 @@ fn settings() -> Settings {
         budgets: Budgets {
             boot: Duration::from_millis(300),
             first_line: Duration::from_millis(200),
-            turn: Duration::from_millis(400),
             snapshot: Duration::from_secs(5),
         },
         layer_cache_mib: std::num::NonZeroU32::MIN,
@@ -604,6 +603,7 @@ struct Host {
     log: Log,
     seq: i64,
     clone_seconds: u32,
+    turn_seconds: NonZeroU32,
     images: PathBuf,
     vmm: MemoryVmm,
     capacity: u32,
@@ -829,6 +829,7 @@ fn start_host(
         log,
         seq: 0,
         clone_seconds,
+        turn_seconds: NonZeroU32::MIN,
         images,
         vmm,
         capacity,
@@ -1051,6 +1052,8 @@ impl Host {
             prebuild_commit_sha: None,
             box_memory_mib: None,
             box_disk_mib: None,
+            turn_seconds: self.turn_seconds,
+            box_retention: BoxRetention::Auto,
         }
     }
 
@@ -1202,10 +1205,14 @@ async fn a_turn_the_control_plane_withdraws_at_its_claim_never_reaches_the_harne
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_paused_box_no_snapshot_holds_outlives_any_delay() {
+async fn a_warm_box_outlives_any_delay_once_a_snapshot_holds_it() {
     let mut host = host("outlives", 1, Harness::Echo, Boot::Works);
-    host.turn("turn-1", "session-1", "one", Vec::new());
+    let mut turn = host.box_turn("turn-1", "session-1", "one", Vec::new(), 300);
+    turn.box_retention = BoxRetention::Warm;
+    host.send(Command::Turn(Box::new(turn)));
     host.settle(SETTLE).await;
+    host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
     host.log();
     host.settle(Duration::from_hours(720)).await;
     assert_eq!(host.log(), Vec::<String>::new());
@@ -1771,7 +1778,7 @@ async fn a_turn_that_runs_out_its_budget_names_its_failure_and_keeps_its_box_unt
     for (index, (harness, reason, budget, console)) in cases.into_iter().enumerate() {
         let mut host = host(&format!("budget-{index}"), 1, harness, Boot::Works);
         host.turn("turn-1", "session-1", "one\ntwo", Vec::new());
-        let seen = host.settle(Duration::from_millis(600)).await;
+        let seen = host.settle(Duration::from_millis(1200)).await;
         let last = seen.last().expect("a failure");
         assert!(last.starts_with(&format!("failed {reason}")), "{seen:?}");
         assert!(last.contains(budget) && last.ends_with(console), "{last}");
@@ -1818,9 +1825,8 @@ async fn a_boot_that_runs_out_its_budget_fails_box_boot_failed_and_returns_the_t
 
 #[tokio::test]
 async fn a_clone_that_hangs_fails_no_first_output_after_clone_seconds_and_the_first_line_budget() {
-    let mut settings = settings();
-    settings.budgets.turn = Duration::from_secs(5);
-    let mut host = host_with("hangs-cloning", 1, Harness::HangsCloning, Boot::Works, settings, 1);
+    let mut host = host_with("hangs-cloning", 1, Harness::HangsCloning, Boot::Works, settings(), 1);
+    host.turn_seconds = NonZeroU32::new(5).expect("five seconds");
     host.turn("turn-1", "session-1", "one", Vec::new());
     let seen = host.settle(Duration::from_millis(1500)).await;
     let last = seen.last().expect("a failure");
