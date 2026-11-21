@@ -1,7 +1,10 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::error::Error;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+
+use ext4_view::Ext4Read;
 
 const EXT4_MAGIC: u16 = 0xEF53;
 const ROOT_INODE: u32 = 2;
@@ -55,6 +58,7 @@ struct Drive {
     inodes_per_group: u64,
     inode_tables: Vec<u64>,
     journal: HashMap<u64, u64>,
+    log: HashSet<u64>,
 }
 
 impl Drive {
@@ -103,9 +107,12 @@ impl Drive {
             inodes_per_group,
             inode_tables,
             journal: HashMap::new(),
+            log: HashSet::new(),
         };
         if le32(&superblock, 0x5C) & COMPAT_HAS_JOURNAL != 0 {
-            drive.journal = drive.replay(le32(&superblock, 0xE0))?;
+            let journal_inode = le32(&superblock, 0xE0);
+            drive.journal = drive.replay(journal_inode)?;
+            drive.log = drive.log_blocks(journal_inode)?;
         }
         Ok(drive)
     }
@@ -174,6 +181,16 @@ impl Drive {
         Ok(extents
             .into_iter()
             .flat_map(|(logical, len, start)| (0..len).map(move |step| (logical + step, start + step)))
+            .collect())
+    }
+
+    fn log_blocks(&self, journal_inode: u32) -> Result<HashSet<u64>, String> {
+        let inode = self.inode(journal_inode)?;
+        Ok(self
+            .block_map(journal_inode, &inode)?
+            .into_iter()
+            .filter(|(logical, _)| *logical != 0)
+            .map(|(_, physical)| physical)
             .collect())
     }
 
@@ -358,6 +375,47 @@ fn opaque_in(bytes: &[u8], first: usize, values: usize, place: &str) -> Result<b
             }
         }
         at += (16 + name_len + 3) & !3;
+    }
+}
+
+pub struct Replayed {
+    file: File,
+    block_size: u64,
+    journal: HashMap<u64, u64>,
+    log: HashSet<u64>,
+}
+
+impl Replayed {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let drive = Drive::open(path)?;
+        Ok(Self {
+            file: drive.file,
+            block_size: drive.block_size,
+            journal: drive.journal,
+            log: drive.log,
+        })
+    }
+}
+
+impl Ext4Read for Replayed {
+    fn read(&mut self, start_byte: u64, dst: &mut [u8]) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        let mut at = start_byte;
+        let mut filled = 0;
+        while filled < dst.len() {
+            let block = at / self.block_size;
+            let offset = at % self.block_size;
+            let len = usize::try_from(self.block_size - offset)?.min(dst.len() - filled);
+            let part = &mut dst[filled..filled + len];
+            if self.log.contains(&block) {
+                part.fill(0);
+            } else {
+                let physical = self.journal.get(&block).copied().unwrap_or(block);
+                self.file.read_exact_at(part, physical * self.block_size + offset)?;
+            }
+            filled += len;
+            at += u64::try_from(len)?;
+        }
+        Ok(())
     }
 }
 

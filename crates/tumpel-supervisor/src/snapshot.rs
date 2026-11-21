@@ -18,7 +18,7 @@ use tumpel_api::types::{
 
 use cache::sha256;
 pub use cache::{hex, ChunkCache};
-use opaque::opaque_dirs;
+use opaque::{opaque_dirs, Replayed};
 
 pub const MIN_CHUNK_BYTES: usize = 16 * 1024;
 pub const AVERAGE_CHUNK_BYTES: usize = 64 * 1024;
@@ -900,7 +900,7 @@ pub struct Ext4Upper {
 
 impl Ext4Upper {
     pub fn load(drive: &Path) -> Result<Self, String> {
-        let fs = Ext4::load_from_path(drive)
+        let fs = Ext4::load(Box::new(Replayed::open(drive)?))
             .map_err(|error| format!("reading the overlay drive {} as ext4: {error}", drive.display()))?;
         let opaque = opaque_dirs(drive, UPPER_ON_DRIVE.as_bytes())?;
         Ok(Self { fs, opaque })
