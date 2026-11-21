@@ -166,7 +166,7 @@ pub(crate) async fn refresh_unit(layout: &Layout, fix: &str) -> Result<(), Failu
 enum Ended {
     Revoked(String),
     Refused(String),
-    Dropped { welcomed: bool, reason: String },
+    Dropped { progressed: bool, reason: String },
 }
 
 type Channel = HostChannel<ChannelFile, HostKey>;
@@ -844,11 +844,11 @@ async fn serve(
                 }
                 return Err(fail(SupervisorFailure::ProtocolError, reason));
             }
-            Ended::Dropped { welcomed, reason } => {
-                let Some(wait) = backoff.next(welcomed, welcomed && channel.delivered(), jitter()) else {
+            Ended::Dropped { progressed, reason } => {
+                let Some(wait) = backoff.next(progressed, jitter()) else {
                     return Err(fail(
                         SupervisorFailure::ChannelUnreachable,
-                        format!("no Welcome from {url} on {MAX_RECONNECTS} connections in a row, the last dropped with: {reason}; check the network and the control plane"),
+                        format!("{MAX_RECONNECTS} connections in a row to {url} ended with no frame from the control plane and no ack of the host frames, the last with: {reason}; check the network and the control plane"),
                     ));
                 };
                 eprintln!(
@@ -872,23 +872,23 @@ fn jitter() -> u16 {
     u16::from_le_bytes([low, high])
 }
 
-fn dropped(welcomed: bool, reason: impl Into<String>) -> Ended {
+fn dropped(progressed: bool, reason: impl Into<String>) -> Ended {
     Ended::Dropped {
-        welcomed,
+        progressed,
         reason: reason.into(),
     }
 }
 
-fn closed_by_peer(frame: Option<&CloseFrame>, welcomed: bool) -> Result<Ended, Failure> {
+fn closed_by_peer(frame: Option<&CloseFrame>, progressed: bool) -> Result<Ended, Failure> {
     let Some(frame) = frame else {
-        return Ok(dropped(welcomed, "the control plane closed the connection"));
+        return Ok(dropped(progressed, "the control plane closed the connection"));
     };
     let reason = frame.reason.to_string();
     match u16::from(frame.code) {
         ChannelCloseCode::BAD_SIGNATURE => Err(fail(SupervisorFailure::ProtocolError, reason)),
         ChannelCloseCode::UNSUPPORTED_VERSION => Ok(Ended::Refused(reason)),
         ChannelCloseCode::REVOKED => Ok(Ended::Revoked(reason)),
-        code => Ok(dropped(welcomed, format!("closed with {code}: {reason}"))),
+        code => Ok(dropped(progressed, format!("closed with {code}: {reason}"))),
     }
 }
 
@@ -914,22 +914,20 @@ async fn session(
     let (mut sink, mut source) = stream.split();
     channel.connect();
     let mut outbox = Outbox::default();
-    let mut welcomed = false;
     let mut last_received = Instant::now();
     let mut last_beat = Instant::now();
     let mut tick = tokio::time::interval(TICK);
     loop {
         let ended = tokio::select! {
             message = source.next() => match message {
-                None => Some(Ok(dropped(welcomed, "the connection ended"))),
-                Some(Err(error)) => Some(Ok(dropped(welcomed, error.to_string()))),
-                Some(Ok(Message::Close(frame))) => Some(closed_by_peer(frame.as_ref(), welcomed)),
+                None => Some(Ok(dropped(channel.progressed(), "the connection ended"))),
+                Some(Err(error)) => Some(Ok(dropped(channel.progressed(), error.to_string()))),
+                Some(Ok(Message::Close(frame))) => Some(closed_by_peer(frame.as_ref(), channel.progressed())),
                 Some(Ok(Message::Text(text))) => {
                     last_received = Instant::now();
                     match channel.receive(text.as_str(), &mut outbox) {
                         Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, &mut outbox).err().map(Err),
                         Ok(Event::Welcomed) => {
-                            welcomed = true;
                             eprintln!("connected to {url}");
                             last_beat = Instant::now();
                             updates.welcomed().await.err().map(Err)
@@ -964,7 +962,7 @@ async fn session(
                         Err(ChannelError::Protocol(reason)) => {
                             let close = CloseFrame { code: CloseCode::from(ChannelCloseCode::PROTOCOL_ERROR), reason: reason.chars().take(120).collect::<String>().into() };
                             let _ = sink.send(Message::Close(Some(close))).await;
-                            Some(Ok(dropped(welcomed, reason)))
+                            Some(Ok(dropped(channel.progressed(), reason)))
                         }
                         Err(ChannelError::Undelivered(reason)) => Some(Err(fail(SupervisorFailure::FrameUndelivered, reason))),
                         Err(error) => Some(Err(fail(SupervisorFailure::ChannelStateLost, error.to_string()))),
@@ -975,7 +973,7 @@ async fn session(
             Some(message) = from_box.recv() => channel.send(message, &mut outbox).err().map(|error| Err(store_lost(&error))),
             _ = tick.tick() => {
                 if last_received.elapsed() >= HEARTBEAT_DEADLINE {
-                    Some(Ok(dropped(welcomed, format!("nothing arrived for {} seconds", HEARTBEAT_DEADLINE.as_secs()))))
+                    Some(Ok(dropped(channel.progressed(), format!("nothing arrived for {} seconds", HEARTBEAT_DEADLINE.as_secs()))))
                 } else if channel.phase() == Phase::Open && last_beat.elapsed() >= heartbeat {
                     last_beat = Instant::now();
                     beat(channel, usage, from_box, &mut outbox).err().map(Err)
@@ -993,7 +991,7 @@ async fn session(
         for text in outbox.0.drain(..) {
             if let Err(error) = sink.send(Message::Text(text.into())).await {
                 channel.disconnect();
-                return Ok(dropped(welcomed, format!("sending failed: {error}")));
+                return Ok(dropped(channel.progressed(), format!("sending failed: {error}")));
             }
         }
     }

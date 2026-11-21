@@ -89,26 +89,27 @@ pub enum Phase {
 
 pub struct Backoff {
     wait: Duration,
-    unwelcomed: u32,
+    fruitless: u32,
 }
 
 impl Default for Backoff {
     fn default() -> Self {
         Self {
             wait: FIRST_BACKOFF,
-            unwelcomed: 0,
+            fruitless: 0,
         }
     }
 }
 
 impl Backoff {
-    pub fn next(&mut self, welcomed: bool, delivered: bool, jitter: u16) -> Option<Duration> {
-        self.unwelcomed = if welcomed { 0 } else { self.unwelcomed + 1 };
-        if self.unwelcomed > MAX_RECONNECTS {
-            return None;
-        }
-        if delivered {
+    pub fn next(&mut self, progressed: bool, jitter: u16) -> Option<Duration> {
+        if progressed {
+            self.fruitless = 0;
             self.wait = FIRST_BACKOFF;
+        }
+        self.fruitless += 1;
+        if self.fruitless > MAX_RECONNECTS {
+            return None;
         }
         let half = self.wait / 2;
         let wait = half + half.mul_f64(f64::from(jitter) / f64::from(u16::MAX));
@@ -135,7 +136,7 @@ pub struct HostChannel<S: Store, K: Signer> {
     host_id: EntityId,
     supervisor_version: String,
     phase: Phase,
-    replayed_through: Option<i64>,
+    progressed: bool,
 }
 
 fn encode(envelope: &ChannelHostEnvelope) -> Result<String, ChannelError> {
@@ -194,7 +195,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             host_id,
             supervisor_version,
             phase: Phase::Closed,
-            replayed_through: None,
+            progressed: false,
         }
     }
 
@@ -209,14 +210,13 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     }
 
     #[must_use]
-    pub fn delivered(&self) -> bool {
-        self.replayed_through
-            .is_some_and(|through| self.state.unacked.iter().all(|frame| frame.seq.0 > through))
+    pub fn progressed(&self) -> bool {
+        self.progressed
     }
 
     pub fn connect(&mut self) {
         self.phase = Phase::AwaitingChallenge;
-        self.replayed_through = None;
+        self.progressed = false;
     }
 
     pub fn disconnect(&mut self) {
@@ -345,10 +345,9 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     fn welcomed(&mut self, ack: Option<Sequence>, port: &mut impl Port) -> Result<Event, ChannelError> {
         if let Some(ack) = ack {
             self.drop_acked(ack.0);
-            self.count_replay()?;
-            self.store.save(&self.state)?;
         }
-        self.replayed_through = Some(self.state.unacked.last().map_or(0, |frame| frame.seq.0));
+        self.count_replay()?;
+        self.store.save(&self.state)?;
         for frame in &self.state.unacked {
             let resent = ChannelStoredHostFrame {
                 ack: Sequence(self.state.received.0),
@@ -392,11 +391,15 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     }
 
     fn drop_acked(&mut self, ack: i64) {
+        if self.state.unacked.first().is_some_and(|first| first.seq.0 <= ack) {
+            self.progressed = true;
+        }
         self.state.unacked.retain(|own| own.seq.0 > ack);
         self.state.replays.retain(|replay| replay.seq.0 > ack);
     }
 
     fn refused(&mut self, refused: ChannelFrameRefused) -> Result<Event, ChannelError> {
+        self.progressed = true;
         self.state.unacked.retain(|own| own.seq.0 != refused.seq.0);
         self.state.replays.retain(|replay| replay.seq.0 != refused.seq.0);
         self.store.save(&self.state)?;
@@ -419,6 +422,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             )));
         }
         self.state.received = Sequence(frame.seq.0);
+        self.progressed = true;
         self.drop_acked(frame.ack.0);
         self.store.save(&self.state)?;
         Ok(Event::Message(Box::new(frame.message)))
