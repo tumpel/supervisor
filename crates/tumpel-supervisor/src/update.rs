@@ -124,6 +124,7 @@ pub struct Release {
     pub sha256: Sha256Digest,
     pub supervisor_version: ReleaseSupervisorSupervisorVersion,
     pub channel_protocol_version: u32,
+    pub rollback: bool,
 }
 
 pub trait Source: Send + Sync {
@@ -204,6 +205,8 @@ struct AnnouncedRelease {
     release_version: ReleaseManifestReleaseVersion,
     channel_protocol_version: NonZeroU32,
     supervisors: Vec<AnnouncedSupervisor>,
+    #[serde(default)]
+    rollback: bool,
 }
 
 #[derive(Deserialize)]
@@ -236,10 +239,11 @@ fn announced_release(body: &[u8], url: &str, architecture: HostArchitecture) -> 
         sha256: supervisor.sha256,
         supervisor_version: supervisor.supervisor_version,
         channel_protocol_version: manifest.channel_protocol_version.get(),
+        rollback: manifest.rollback,
     })
 }
 
-fn version_refusal(running: &str, announced: &str) -> Option<String> {
+fn version_refusal(running: &str, announced: &str, rollback: bool) -> Option<String> {
     let parse = |version: &str| semver::Version::parse(version.trim_start_matches('v'));
     let Ok(running_version) = parse(running) else {
         return None;
@@ -254,8 +258,9 @@ fn version_refusal(running: &str, announced: &str) -> Option<String> {
     };
     match announced_version.cmp_precedence(&running_version) {
         std::cmp::Ordering::Greater => None,
+        std::cmp::Ordering::Less if rollback => None,
         std::cmp::Ordering::Less => Some(format!(
-            "the release names supervisor {announced}, older than the running {running}; publish a newer release"
+            "the release names supervisor {announced}, older than the running {running}, and is no rollback; publish a newer release or a rollback"
         )),
         std::cmp::Ordering::Equal => Some(format!(
             "the release names supervisor {announced}, the running version {running}, with another binary; publish the new binary under a new version"
@@ -411,7 +416,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
             Ok(release) => release,
             Err(outcome) => return outcome,
         };
-        if let Some(refusal) = version_refusal(self.version, &release.supervisor_version) {
+        if let Some(refusal) = version_refusal(self.version, &release.supervisor_version, release.rollback) {
             eprintln!(
                 "tumpel-supervisor: refusing supervisor update to {}: {refusal}; supervisor {} ({}) keeps running",
                 named(&release),
