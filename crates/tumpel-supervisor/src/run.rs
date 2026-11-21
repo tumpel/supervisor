@@ -216,8 +216,8 @@ fn beat(
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
 }
 
-fn flush(channel: &mut Channel, telemetry: &Telemetry, outbox: &mut Outbox) -> Result<(), Failure> {
-    for batch in telemetry.flush_due(FLUSH_INTERVAL) {
+fn flush(channel: &mut Channel, telemetry: &Telemetry, interval: Duration, outbox: &mut Outbox) -> Result<(), Failure> {
+    for batch in telemetry.flush_due(interval) {
         channel
             .send(ChannelHostMessage::TelemetryBatch(batch), outbox)
             .map_err(|error| store_lost(&error))?;
@@ -829,7 +829,7 @@ fn store_unsent(
             .send(message, &mut Outbox::default())
             .map_err(|error| store_lost(&error))?;
     }
-    flush(channel, telemetry, &mut Outbox::default())
+    flush(channel, telemetry, Duration::ZERO, &mut Outbox::default())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1089,7 +1089,7 @@ async fn session(
                 } else if channel.phase() == Phase::Open && channel.withholding() && !limit.paused(now) {
                     channel.release(limit.release_budget(TICK), &mut outbox).err().map(|error| Err(store_lost(&error)))
                 } else if channel.phase() == Phase::Open {
-                    flush(channel, &usage.telemetry, &mut outbox).err().map(Err)
+                    flush(channel, &usage.telemetry, FLUSH_INTERVAL, &mut outbox).err().map(Err)
                 } else {
                     None
                 }

@@ -651,7 +651,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_thousand_points_in_one_interval_make_one_frame_and_two_intervals_make_two() {
+    async fn a_thousand_points_in_one_interval_make_one_frame_two_intervals_make_two_and_shutdown_sends_the_rest() {
         let telemetry = Telemetry::new(5_000);
         let mut frames = Vec::new();
         for value in 0..500 {
@@ -676,6 +676,13 @@ mod tests {
         }
         assert_eq!(frames.len(), 2);
         assert_eq!((frames[1].samples.len(), frames[1].turns.len()), (500, 500));
+
+        telemetry.push(sample(1.0));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(telemetry.flush_due(FLUSH_INTERVAL).len(), 0);
+        let shutdown = telemetry.flush_due(Duration::ZERO);
+        assert_eq!(shutdown.len(), 1);
+        assert_eq!(shutdown[0].samples.len(), 1);
     }
 
     #[test]
