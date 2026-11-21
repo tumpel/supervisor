@@ -1091,17 +1091,38 @@ fn prompt_input(protocol: GuestHarnessProtocol, setup: bool, prompt: &str, marke
 }
 
 fn send_line(host: &mut impl Write, turn_id: &EntityId, line_seq: i64, text: String) -> Result<(), String> {
-    let text = LongText::try_from(text)
-        .or_else(|error| LongText::try_from(format!("tumpel: harness line {line_seq} was left out: {error}")))
-        .map_err(|error| format!("harness line {line_seq}: {error}"))?;
-    let line = GuestTurnLine {
-        line_seq: Sequence(line_seq),
-        text,
-        turn_id: turn_id.clone(),
-        type_: GuestTurnLineType::TurnLine,
+    let line = |text: LongText| -> GuestMessage {
+        GuestTurnLine {
+            line_seq: Sequence(line_seq),
+            text,
+            turn_id: turn_id.clone(),
+            type_: GuestTurnLineType::TurnLine,
+        }
+        .into()
     };
-    send(host, &line.into())
+    let too_long = match LongText::try_from(text) {
+        Err(error) => error.to_string(),
+        Ok(text) => match encode(&line(text)) {
+            Ok(frame) if frame.len() <= LINE_FRAME_BYTES => {
+                return host
+                    .write_all(&frame)
+                    .map_err(|error| format!("sending to the host: {error}"));
+            }
+            Ok(frame) => format!(
+                "its frame of {} bytes leaves no room for its envelope under the control plane's {CONTROL_PLANE_FRAME_BYTES}-byte frame cap",
+                frame.len()
+            ),
+            Err(error) => error.to_string(),
+        },
+    };
+    let notice = LongText::try_from(format!("tumpel: harness line {line_seq} was left out: {too_long}"))
+        .map_err(|error| format!("harness line {line_seq}: {error}"))?;
+    send(host, &line(notice))
 }
+
+const CONTROL_PLANE_FRAME_BYTES: usize = 4_000_000;
+const HOST_ENVELOPE_BYTES: usize = 4096;
+const LINE_FRAME_BYTES: usize = CONTROL_PLANE_FRAME_BYTES - HOST_ENVELOPE_BYTES;
 
 fn send(host: &mut impl Write, message: &GuestMessage) -> Result<(), String> {
     let frame = encode(message).map_err(|error| error.to_string())?;
