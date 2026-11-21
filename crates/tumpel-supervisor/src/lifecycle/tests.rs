@@ -1202,12 +1202,10 @@ async fn a_turn_the_control_plane_withdraws_at_its_claim_never_reaches_the_harne
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_paused_box_outlives_any_delay() {
+async fn a_paused_box_no_snapshot_holds_outlives_any_delay() {
     let mut host = host("outlives", 1, Harness::Echo, Boot::Works);
     host.turn("turn-1", "session-1", "one", Vec::new());
     host.settle(SETTLE).await;
-    host.snapshot("session-1");
-    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
     host.log();
     host.settle(Duration::from_hours(720)).await;
     assert_eq!(host.log(), Vec::<String>::new());
@@ -1880,6 +1878,24 @@ async fn an_expired_grant_is_refused_before_any_box_boots() {
         "{seen:?}"
     );
     assert_eq!(host.log(), Vec::<String>::new());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshotted_box_idle_for_fifteen_minutes_is_stopped_and_answers_box_gone() {
+    let mut host = host("idle-teardown", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    let first = host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    host.log();
+    assert_eq!(host.settle(Duration::from_mins(14)).await, Vec::<String>::new());
+    assert_eq!(host.settle(Duration::from_mins(2)).await, ["box gone session-1"]);
+    assert_eq!(host.log(), ["stop session-1"]);
+    assert!(!host.vmm.staging.join("session-1").exists());
+
+    host.turn("turn-2", "session-1", "two", vec![first]);
+    assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
+    assert_eq!(host.log()[0], "restore session-1 root/turn-1");
 }
 
 #[tokio::test]

@@ -57,6 +57,7 @@ const TRANSFERS: usize = 16;
 const CHUNKS: &str = "chunks";
 const HANDOVER_REPORT_ALLOWANCE: Duration = Duration::from_secs(60);
 const CANCEL_END: Duration = Duration::from_secs(10);
+const IDLE_TEARDOWN: Duration = Duration::from_mins(15);
 const DISK_CHECK: Duration = Duration::from_secs(1);
 const RESTORE_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
 const RESTORE_ENTRIES_PER_SECOND: u64 = 2_000;
@@ -514,6 +515,10 @@ enum Event<M: Machine> {
         tap: Tap,
     },
     HandoverExpired,
+    IdleExpired {
+        session: String,
+        box_id: EntityId,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -529,6 +534,7 @@ struct Slot<M: Machine> {
     parked: Option<Box<Parked>>,
     task: Option<(Running, JoinHandle<()>)>,
     queue: VecDeque<Command>,
+    idle: Option<AbortHandle>,
 }
 
 impl<M: Machine> Default for Slot<M> {
@@ -540,6 +546,7 @@ impl<M: Machine> Default for Slot<M> {
             parked: None,
             task: None,
             queue: VecDeque::new(),
+            idle: None,
         }
     }
 }
@@ -2155,6 +2162,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         for session in adopted {
             self.drain(session).await?;
         }
+        let held: Vec<String> = self.slots.keys().cloned().collect();
+        for session in held {
+            self.arm_idle(&session);
+        }
         self.publish();
         loop {
             tokio::select! {
@@ -2994,7 +3005,50 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 self.free_disk(&claude_setup_id)
             }
             Event::HandoverExpired => self.handover_expired().await,
+            Event::IdleExpired { session, box_id } => self.idle_expired(&session, box_id).await,
         }
+    }
+
+    fn idle_box(&self, session: &str) -> Option<&EntityId> {
+        let slot = self.slots.get(session)?;
+        if self.mode != Mode::TakingTurns || slot.busy || slot.parked.is_some() || !slot.queue.is_empty() {
+            return None;
+        }
+        slot.live.as_ref().filter(|live| !live.dirty).map(|live| &live.box_id)
+    }
+
+    fn arm_idle(&mut self, session: &str) {
+        let box_id = self.idle_box(session).cloned();
+        let Some(slot) = self.slots.get_mut(session) else {
+            return;
+        };
+        if let Some(armed) = slot.idle.take() {
+            armed.abort();
+        }
+        let Some(box_id) = box_id else {
+            return;
+        };
+        let events = self.events.clone();
+        let session = session.to_string();
+        slot.idle = Some(
+            tokio::spawn(async move {
+                tokio::time::sleep(IDLE_TEARDOWN).await;
+                let _ = events.send(Event::IdleExpired { session, box_id });
+            })
+            .abort_handle(),
+        );
+    }
+
+    async fn idle_expired(&mut self, session: &str, box_id: EntityId) -> Result<(), String> {
+        if self.idle_box(session) != Some(&box_id) {
+            return Ok(());
+        }
+        self.teardown(session).await?;
+        self.box_gone(TeardownOrder {
+            session_id: held_session(session),
+            box_id,
+        });
+        Ok(())
     }
 
     async fn finished(&mut self, session: String, work: Work, outcome: Outcome<V::Machine>) -> Result<(), String> {
@@ -3041,6 +3095,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             self.dispatch(session.clone(), command).await?;
         }
         self.prune(&session);
+        self.arm_idle(&session);
         Ok(())
     }
 
