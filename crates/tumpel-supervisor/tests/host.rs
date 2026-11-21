@@ -25,6 +25,7 @@ fn home() -> PathBuf {
 fn turn(image: &GuestImageManifest, turn_id: &str, prompt: &str, last_line_seq: i64) -> Input {
     let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
     Input::Command(Command::Turn(Box::new(BoxTurn {
+        turn_seconds: std::num::NonZeroU32::new(120).expect("turn budget"),
         turn_id: turn_id.try_into().expect("turn id"),
         session_id: "host-test-session".try_into().expect("session id"),
         box_id: "host-test-box".try_into().expect("box id"),

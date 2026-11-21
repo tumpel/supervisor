@@ -113,6 +113,7 @@ fn offer(seq: i64, credential: &str) -> String {
         "ack": 0,
         "message": {
             "type": "TurnOffer",
+            "turnTotalBudgetSeconds": 14400,
             "turnId": "turn-1",
             "sessionId": "session-1",
             "boxId": "box-1",

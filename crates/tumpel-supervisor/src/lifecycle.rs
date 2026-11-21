@@ -97,7 +97,6 @@ fn restore_size(named: &str, manifest: &Manifest, overlay: u64) -> Result<(u64, 
 pub struct Budgets {
     pub boot: Duration,
     pub first_line: Duration,
-    pub turn: Duration,
     pub snapshot: Duration,
 }
 
@@ -107,7 +106,6 @@ impl From<&BoxBudgets> for Budgets {
         Self {
             boot: seconds(budgets.boot_seconds),
             first_line: seconds(budgets.first_line_seconds),
-            turn: seconds(budgets.turn_seconds),
             snapshot: seconds(budgets.snapshot_seconds),
         }
     }
@@ -164,6 +162,7 @@ pub trait Vmm: Send + Sync + 'static {
 }
 
 pub struct BoxTurn {
+    pub turn_seconds: NonZeroU32,
     pub turn_id: EntityId,
     pub session_id: EntityId,
     pub box_id: EntityId,
@@ -1353,7 +1352,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         live.machine.clear_console();
         let clone = Duration::from_secs(u64::from(live.image.harness().clone_seconds.get()));
         let state = Follow {
-            end: started + self.settings.budgets.turn,
+            end: started + Duration::from_secs(u64::from(turn.turn_seconds.get())),
             first_line: started + clone + self.settings.budgets.first_line,
             repository_ready: false,
             seen_line: false,
@@ -1398,7 +1397,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 turn_id: turn.turn_id.clone(),
                 type_: GuestTurnStartType::TurnStart,
                 prebuild_commit_sha,
-                turn_seconds: NonZeroU32::new(u32::try_from(self.settings.budgets.turn.as_secs()).unwrap_or(u32::MAX)),
+                turn_seconds: Some(turn.turn_seconds),
             })
             .map_err(|error| {
                 Failure::turn(
@@ -1576,13 +1575,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         Failure::turn(TurnFailureReason::NoFirstOutput, detail)
     }
 
-    fn timed_out(&self, turn_id: &EntityId) -> Failure {
+    fn timed_out(turn_id: &EntityId) -> Failure {
         Failure::turn(
             TurnFailureReason::TurnTimedOut,
             format!(
-                "turn {} ran past its {} s budget (budgets.turnSeconds in runtime.json).",
-                **turn_id,
-                self.settings.budgets.turn.as_secs()
+                "turn {} ran past its resolved time limit; increase the turn budget and send it again.",
+                **turn_id
             ),
         )
     }
@@ -1624,7 +1622,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 } else if waiting_for_first {
                     self.no_first_output(turn_id, clone, state.repository_ready)
                 } else {
-                    self.timed_out(turn_id)
+                    Self::timed_out(turn_id)
                 }));
             };
             match received {

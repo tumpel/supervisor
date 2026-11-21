@@ -501,8 +501,8 @@ fn a_harness_that_fails_on_a_full_box_disk_fails_box_disk_full_and_a_completed_t
 #[test]
 fn the_box_limits_note_names_the_memory_disk_cpus_and_turn_limit_the_box_got() {
     assert_eq!(
-        super::constraints(4096, 32_096, 2, std::num::NonZeroU32::new(3600)),
-        "# Box limits\n\n- Memory: 4096 MiB\n- Disk: 32096 MiB\n- CPUs: 2\n- Turn time limit: 3600 seconds\n\nA turn fails BoxDiskFull when the harness fails on a full disk and otherwise completes with a warning; it fails HarnessOutOfMemory when memory runs out and TurnTimedOut past its time limit.\n"
+        super::constraints(4096, 32_096, 2, std::num::NonZeroU32::new(14400)),
+        "# Box limits\n\n- Memory: 4096 MiB\n- Disk: 32096 MiB\n- CPUs: 2\n- Turn time limit: 14400 seconds\n\nA turn fails BoxDiskFull when the harness fails on a full disk and otherwise completes with a warning; it fails HarnessOutOfMemory when memory runs out and TurnTimedOut past its time limit.\n"
     );
     assert_eq!(
         super::constraints(4096, 32_096, 2, None),

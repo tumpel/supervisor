@@ -110,6 +110,16 @@ impl MemoryGuest {
         if start.turn_id.starts_with("late") {
             note(&self.log, format!("start {}", *start.turn_id));
         }
+        if start.turn_id.starts_with("stalled-budget-") {
+            note(
+                &self.log,
+                format!(
+                    "limit {} {}",
+                    *start.turn_id,
+                    start.turn_seconds.expect("the guest receives the turn budget")
+                ),
+            );
+        }
         self.lines = start.last_line_seq.0;
         self.ready_at = Some(tokio::time::Instant::now() + SLOW_CLONE);
         if self.harness == Harness::HangsCloning {
@@ -551,7 +561,6 @@ fn settings() -> Settings {
         budgets: Budgets {
             boot: Duration::from_millis(300),
             first_line: Duration::from_millis(200),
-            turn: Duration::from_millis(400),
             snapshot: Duration::from_secs(5),
         },
         layer_cache_mib: std::num::NonZeroU32::MIN,
@@ -1028,6 +1037,7 @@ impl Host {
         expires_in: i64,
     ) -> BoxTurn {
         BoxTurn {
+            turn_seconds: NonZeroU32::new(5).expect("turn budget"),
             turn_id: turn_id.try_into().expect("turn id"),
             session_id: session_id.try_into().expect("session id"),
             box_id: format!("box-{session_id}").try_into().expect("box id"),
@@ -1766,14 +1776,16 @@ async fn a_turn_that_runs_out_its_budget_names_its_failure_and_keeps_its_box_unt
         (
             Harness::StallsAfterFirstLine,
             TurnFailureReason::TurnTimedOut,
-            "turnSeconds",
+            "resolved time limit",
             "The box's console printed nothing during the turn.",
         ),
     ];
     for (index, (harness, reason, budget, console)) in cases.into_iter().enumerate() {
         let mut host = host(&format!("budget-{index}"), 1, harness, Boot::Works);
-        host.turn("turn-1", "session-1", "one\ntwo", Vec::new());
-        let seen = host.settle(Duration::from_millis(600)).await;
+        let mut turn = host.box_turn("turn-1", "session-1", "one\ntwo", Vec::new(), 300);
+        turn.turn_seconds = NonZeroU32::MIN;
+        host.send(Command::Turn(Box::new(turn)));
+        let seen = host.settle(Duration::from_millis(1200)).await;
         let last = seen.last().expect("a failure");
         assert!(last.starts_with(&format!("failed {reason}")), "{seen:?}");
         assert!(last.contains(budget) && last.ends_with(console), "{last}");
@@ -1793,6 +1805,30 @@ async fn a_turn_that_runs_out_its_budget_names_its_failure_and_keeps_its_box_unt
         );
         host.snapshot("session-1");
         assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_turn_gets_its_own_budget_after_waiting_for_its_claim_including_on_a_warm_box() {
+    let mut host = host("resolved-budgets", 1, Harness::StallsAfterFirstLine, Boot::Works);
+    for (turn_id, seconds) in [("stalled-budget-1", 2), ("stalled-budget-2", 14_400)] {
+        let mut turn = host.box_turn(turn_id, "session-1", "one", Vec::new(), 3600);
+        turn.turn_seconds = NonZeroU32::new(seconds).expect("turn budget");
+        host.send(Command::Turn(Box::new(turn)));
+        assert_eq!(
+            host.settle(STALLED_CLAIM + SETTLE).await,
+            [format!("claim {turn_id}"), "line 1 one".to_string()]
+        );
+        assert!(host.log().contains(&format!("limit {turn_id} {seconds}")));
+        assert_eq!(
+            host.settle(Duration::from_secs(u64::from(seconds - 1))).await,
+            Vec::<String>::new()
+        );
+        let seen = host.settle(Duration::from_secs(1)).await;
+        assert!(
+            seen.len() == 1 && seen[0].starts_with("failed TurnTimedOut"),
+            "{seen:?}"
+        );
     }
 }
 
@@ -1820,9 +1856,7 @@ async fn a_boot_that_runs_out_its_budget_fails_box_boot_failed_and_returns_the_t
 
 #[tokio::test]
 async fn a_clone_that_hangs_fails_no_first_output_after_clone_seconds_and_the_first_line_budget() {
-    let mut settings = settings();
-    settings.budgets.turn = Duration::from_secs(5);
-    let mut host = host_with("hangs-cloning", 1, Harness::HangsCloning, Boot::Works, settings, 1);
+    let mut host = host_with("hangs-cloning", 1, Harness::HangsCloning, Boot::Works, settings(), 1);
     host.turn("turn-1", "session-1", "one", Vec::new());
     let seen = host.settle(Duration::from_millis(1500)).await;
     let last = seen.last().expect("a failure");
