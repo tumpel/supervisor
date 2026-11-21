@@ -2211,7 +2211,7 @@ async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_a_teardown_free
     assert!(host.log().is_empty(), "a refused box never boots");
     let held = host.holdings.borrow().clone();
     assert_eq!(
-        (held.disk_held_mib, held.memory_budget_mib, held.memory_held_mib),
+        (held.disk_reserved_mib, held.memory_budget_mib, held.memory_held_mib),
         (16_384, 3 * 4096, 2 * u64::from(BOX.memory_mib.get()))
     );
     host.snapshot("session-1");
@@ -2220,7 +2220,7 @@ async fn a_box_whose_disk_does_not_fit_the_host_is_refused_until_a_teardown_free
     let mut drives = held.drives.clone();
     drives.sort();
     assert_eq!(
-        (drives, held.disk_held_mib),
+        (drives, held.disk_reserved_mib),
         (vec!["session-1".to_string(), "session-2".to_string()], 16_384),
         "a clean paused box still holds its disk"
     );
@@ -2263,6 +2263,27 @@ fn release(archive: &Path) {
             .open(archive)
             .expect("releasing the stuck writer"),
     );
+}
+
+#[tokio::test]
+async fn a_restore_without_host_disk_for_its_staging_fails_box_disk_full_and_releases_its_charge() {
+    let (mut host, snapshot) = restoring("restore-disk", settings()).await;
+    host.vmm.free_disk_mib.store(10_001, Ordering::SeqCst);
+    let mut turn = host.box_turn("turn-2", "session-1", "two", vec![snapshot.clone()], 300);
+    turn.box_disk_mib = Some(1);
+    host.send(Command::Turn(Box::new(turn)));
+    let refused = host.settle(Duration::from_secs(2)).await;
+    assert!(
+        refused.iter().any(|line| line.starts_with(&format!("failed {}", TurnFailureReason::BoxDiskFull))
+            && line.contains("staging it needs 1 MiB of host disk beyond the box's reserve, but the host has 10001 MiB free, keeps 10000 MiB free, its boxes keep 1 MiB to grow into and other restores hold 0 MiB")),
+        "{refused:?}"
+    );
+    host.vmm.free_disk_mib.store(10_002, Ordering::SeqCst);
+    let mut again = host.box_turn("turn-3", "session-1", "three", vec![snapshot], 300);
+    again.box_disk_mib = Some(1);
+    host.send(Command::Turn(Box::new(again)));
+    let restored = host.settle_until("complete 1").await;
+    assert!(!restored.iter().any(|line| line.starts_with("failed")), "{restored:?}");
 }
 
 #[tokio::test]

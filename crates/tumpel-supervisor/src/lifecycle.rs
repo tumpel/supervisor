@@ -622,6 +622,23 @@ fn remove_file(path: &Path) -> Result<(), String> {
     }
 }
 
+fn disk_checks() -> tokio::time::Interval {
+    let mut checks = tokio::time::interval(DISK_CHECK);
+    checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    checks
+}
+
+fn cancel_unanswered(turn_id: &EntityId) -> Failure {
+    Failure::turn(
+        TurnFailureReason::Cancelled,
+        format!(
+            "the guest did not end cancelled turn {} within {} s, so the host closed its connection, which stops the harness.",
+            **turn_id,
+            CANCEL_END.as_secs()
+        ),
+    )
+}
+
 struct CancelOnDrop(Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
@@ -1224,16 +1241,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         Ok(self.staging.charge(charge_mib))
     }
 
-    async fn disk_full(&self) -> Failure {
-        loop {
-            if let Some(full) = self.host_disk_full() {
-                return Failure::turn(
-                    TurnFailureReason::BoxDiskFull,
-                    format!("The turn stopped before the host disk filled under the box: {full}."),
-                );
-            }
-            tokio::time::sleep(DISK_CHECK).await;
-        }
+    fn disk_failure(&self) -> Option<Failure> {
+        self.host_disk_full().map(|full| {
+            Failure::turn(
+                TurnFailureReason::BoxDiskFull,
+                format!("The turn stopped before the host disk filled under the box: {full}."),
+            )
+        })
     }
 
     async fn restore_snapshot(
@@ -1583,7 +1597,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let clone = Duration::from_secs(u64::from(live.image.harness().clone_seconds.get()));
         let protocol = live.image.harness().protocol;
         let ((mut cloning, mut first_output), mut parking) = (phases, self.parking.clone());
-        let mut cancelling = false;
+        let (mut cancelling, mut disk_check) = (false, disk_checks());
         loop {
             let waiting_for_first = !state.seen_line && state.first_line < state.end;
             let deadline = if waiting_for_first { state.first_line } else { state.end };
@@ -1591,7 +1605,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 biased;
                 () = self.cancels.cancelled(turn_id), if !cancelling => None,
                 Ok(_) = parking.wait_for(|parking| *parking) => return Followed::Parked(state.park()),
-                failure = self.disk_full() => return Followed::Ended(Err(failure)),
+                _ = disk_check.tick() => match self.disk_failure() {
+                    Some(failure) => return Followed::Ended(Err(failure)),
+                    None => continue,
+                },
                 received = timeout_at(deadline, live.guest.receive()) => Some(received),
             };
             let Some(received) = received else {
@@ -1603,14 +1620,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             };
             let Ok(received) = received else {
                 return Followed::Ended(Err(if cancelling {
-                    Failure::turn(
-                        TurnFailureReason::Cancelled,
-                        format!(
-                            "the guest did not end cancelled turn {} within {} s, so the host closed its connection, which stops the harness.",
-                            **turn_id,
-                            CANCEL_END.as_secs()
-                        ),
-                    )
+                    cancel_unanswered(turn_id)
                 } else if waiting_for_first {
                     self.no_first_output(turn_id, clone, state.repository_ready)
                 } else {
@@ -2884,7 +2894,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     fn current_holdings(&self) -> Held {
         Held {
             drives: self.slots.keys().chain(self.setups.keys()).cloned().collect(),
-            disk_held_mib: self.pool.held_disk_mib(),
+            disk_reserved_mib: self.pool.disk_reserved_mib(),
             memory_budget_mib: self.pool.budget_mib(),
             memory_held_mib: self.pool.held_mib(),
         }

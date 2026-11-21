@@ -144,7 +144,7 @@ fn stats(boxes_warm: u32, disk: Disk, held: &Held, procs: [&str; 3]) -> Result<H
             load_average: loads[0],
             memory_available_mib: i64::try_from(meminfo_kib(meminfo, "MemAvailable")? / 1024).unwrap_or(i64::MAX),
             disk_budget_mib: Some(i64::try_from(disk.budget_mib()).unwrap_or(i64::MAX)),
-            disk_held_mib: Some(i64::try_from(disk.written_mib + held.disk_held_mib).unwrap_or(i64::MAX)),
+            disk_held_mib: Some(i64::try_from(disk.written_mib + held.disk_reserved_mib).unwrap_or(i64::MAX)),
             memory_budget_mib: Some(i64::try_from(held.memory_budget_mib).unwrap_or(i64::MAX)),
             memory_held_mib: Some(i64::try_from(held.memory_held_mib).unwrap_or(i64::MAX)),
         },
@@ -218,7 +218,7 @@ mod tests {
         };
         let held = Held {
             drives: Vec::new(),
-            disk_held_mib: 8192,
+            disk_reserved_mib: 8192,
             memory_budget_mib: 33_792,
             memory_held_mib: 6144,
         };

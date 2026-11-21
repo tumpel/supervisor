@@ -67,7 +67,7 @@ pub fn mib(value: i64) -> Option<NonZeroU32> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Held {
     pub drives: Vec<String>,
-    pub disk_held_mib: u64,
+    pub disk_reserved_mib: u64,
     pub memory_budget_mib: u64,
     pub memory_held_mib: u64,
 }
@@ -225,7 +225,7 @@ pub struct TapPool {
     budget_mib: u64,
     box_size: Size,
     held_mib: u64,
-    held_disk: Tally,
+    reserved_disk: Tally,
 }
 
 impl TapPool {
@@ -236,7 +236,7 @@ impl TapPool {
             budget_mib,
             box_size,
             held_mib: 0,
-            held_disk: Tally::default(),
+            reserved_disk: Tally::default(),
         }
     }
 
@@ -249,13 +249,13 @@ impl TapPool {
     }
 
     #[must_use]
-    pub fn held_disk_mib(&self) -> u64 {
-        self.held_disk.mib()
+    pub fn disk_reserved_mib(&self) -> u64 {
+        self.reserved_disk.mib()
     }
 
     #[must_use]
     pub fn reserves(&self) -> Tally {
-        self.held_disk.clone()
+        self.reserved_disk.clone()
     }
 
     #[must_use]
@@ -284,10 +284,10 @@ impl TapPool {
         if self.held_mib == 0 {
             return Ok(());
         }
-        if self.held_disk_mib() + reserve_mib(size.disk_mib) + disk.headroom_mib() > disk.free_mib {
+        if self.disk_reserved_mib() + reserve_mib(size.disk_mib) + disk.headroom_mib() > disk.free_mib {
             return Err(PoolExhausted::Disk {
                 boxes: self.held.len(),
-                held_mib: self.held_disk_mib(),
+                held_mib: self.disk_reserved_mib(),
                 disk,
                 requested_mib: size.disk_mib,
             });
@@ -316,13 +316,17 @@ impl TapPool {
 
     fn hold(&mut self, size: Size) {
         self.held_mib += u64::from(size.memory_mib.get());
-        self.held_disk.0.fetch_add(reserve_mib(size.disk_mib), Ordering::SeqCst);
+        self.reserved_disk
+            .0
+            .fetch_add(reserve_mib(size.disk_mib), Ordering::SeqCst);
     }
 
     pub fn release(&mut self, tap: Tap) {
         let (index, size) = tap.into_parts();
         self.held_mib -= u64::from(size.memory_mib.get());
-        self.held_disk.0.fetch_sub(reserve_mib(size.disk_mib), Ordering::SeqCst);
+        self.reserved_disk
+            .0
+            .fetch_sub(reserve_mib(size.disk_mib), Ordering::SeqCst);
         self.held.remove(&index);
     }
 
@@ -338,9 +342,7 @@ impl TapPool {
 mod tests {
     use std::num::NonZeroU32;
 
-    use super::{
-        headroom_mib, memory_budget_mib, reserve_mib, restore_charge_mib, Disk, PoolExhausted, Size, Tally, TapPool,
-    };
+    use super::{headroom_mib, memory_budget_mib, reserve_mib, Disk, PoolExhausted, Size, TapPool};
 
     fn memory(memory_mib: u32) -> Size {
         Size {
@@ -490,7 +492,7 @@ mod tests {
         let taps: Vec<_> = (0..10)
             .map(|_| pool.claim(BOX, sparse).expect("a sparse box disk"))
             .collect();
-        assert_eq!(pool.held_disk_mib(), 81_920);
+        assert_eq!(pool.disk_reserved_mib(), 81_920);
         let full = Disk {
             total_mib: 395_700,
             free_mib: 123_457,
@@ -511,38 +513,13 @@ mod tests {
         );
         let mut taps = taps.into_iter();
         pool.release(taps.next().expect("the first box"));
-        assert_eq!(pool.held_disk_mib(), 73_728);
+        assert_eq!(pool.disk_reserved_mib(), 73_728);
         assert!(pool.claim(BOX, full).is_ok());
         assert_eq!(
             reserve_mib(NonZeroU32::new(4096).expect("4096")),
             4096,
             "a box disk smaller than the reserve keeps only its own size"
         );
-    }
-
-    #[test]
-    fn a_restore_is_charged_twice_its_files_beyond_the_reserve_and_released_when_staging_ends() {
-        let small = NonZeroU32::new(4).expect("4");
-        assert_eq!(restore_charge_mib(3 * 1024 * 1024, small), 2);
-        assert_eq!(restore_charge_mib(1024 * 1024, small), 0);
-        assert_eq!(restore_charge_mib(1, small), 0);
-        let disk = Disk {
-            total_mib: 40_000,
-            free_mib: 8200,
-            written_mib: 0,
-        };
-        let staging = Tally::default();
-        assert_eq!(disk.stages(0, staging.mib(), 8), Ok(()));
-        assert!(disk.stages(1, staging.mib(), 8).is_err());
-        let charge = staging.charge(8);
-        assert_eq!(staging.mib(), 8);
-        assert_eq!(
-            disk.stages(0, staging.mib(), 1),
-            Err("staging it needs 1 MiB of host disk beyond the box's reserve, but the host has 8200 MiB free, keeps 8192 MiB free, its boxes keep 0 MiB to grow into and other restores hold 8 MiB; free disk on the host".to_string())
-        );
-        drop(charge);
-        assert_eq!(staging.mib(), 0);
-        assert_eq!(disk.stages(0, staging.mib(), 1), Ok(()));
     }
 
     #[test]
