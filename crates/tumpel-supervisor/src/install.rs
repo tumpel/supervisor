@@ -581,6 +581,8 @@ pub(crate) fn supervisor_unit_text(binary: &Path) -> String {
     format!(
         "[Unit]
 Description=tumpel supervisor
+StartLimitIntervalSec=3h
+StartLimitBurst=11
 
 [Service]
 ExecStartPre=/bin/sh -c '{rollback}' {binary} {previous}
@@ -588,7 +590,9 @@ ExecStart={binary} run
 ExecStopPost=/bin/sh -c 'if [ \"$$EXIT_CODE\" = exited ] && [ \"$$EXIT_STATUS\" = 6 ]; then sleep 60; fi'
 Restart=on-failure
 RestartSec=5
-RestartPreventExitStatus=3 5
+RestartSteps=10
+RestartMaxDelaySec=30min
+RestartPreventExitStatus=3 5 12
 NotifyAccess=main
 FileDescriptorStoreMax={descriptors}
 FileDescriptorStorePreserve=yes
