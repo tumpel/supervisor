@@ -20,7 +20,7 @@ use tumpel_api::types::{
     EntityId, GuestHarness, GuestHarnessProtocol, GuestInput, GuestMessage, GuestMetric, GuestPersonaFile,
     GuestTurnEnd, GuestTurnEndReason, GuestTurnEndType, GuestTurnLine, GuestTurnLineType,
     GuestTurnRepositoryCloneFailed, GuestTurnRepositoryCloneFailedType, GuestTurnRepositoryReady,
-    GuestTurnRepositoryReadyType, GuestTurnStart, Sequence,
+    GuestTurnRepositoryReadyType, GuestTurnStart, LongText, Sequence,
 };
 use tumpel_guest::disk::{self, Space};
 use tumpel_guest::{credential_file, encode, Decoder};
@@ -1091,11 +1091,12 @@ fn prompt_input(protocol: GuestHarnessProtocol, setup: bool, prompt: &str, marke
 }
 
 fn send_line(host: &mut impl Write, turn_id: &EntityId, line_seq: i64, text: String) -> Result<(), String> {
+    let text = LongText::try_from(text)
+        .or_else(|error| LongText::try_from(format!("tumpel: harness line {line_seq} was left out: {error}")))
+        .map_err(|error| format!("harness line {line_seq}: {error}"))?;
     let line = GuestTurnLine {
         line_seq: Sequence(line_seq),
-        text: text
-            .try_into()
-            .map_err(|error| format!("harness line {line_seq}: {error}"))?,
+        text,
         turn_id: turn_id.clone(),
         type_: GuestTurnLineType::TurnLine,
     };

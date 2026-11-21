@@ -509,3 +509,22 @@ fn the_box_limits_note_names_the_memory_disk_cpus_and_turn_limit_the_box_got() {
         "# Box limits\n\n- Memory: 4096 MiB\n- Disk: 32096 MiB\n- CPUs: 2\n\nA turn fails BoxDiskFull when the harness fails on a full disk and otherwise completes with a warning; it fails HarnessOutOfMemory when memory runs out and TurnTimedOut past its time limit.\n"
     );
 }
+
+#[test]
+fn a_harness_line_over_the_limit_is_sent_as_a_notice_under_its_own_sequence() {
+    let mut host = Vec::new();
+    let turn_id = tumpel_api::types::EntityId::try_from("turn-1").expect("a turn id");
+    super::send_line(&mut host, &turn_id, 7, "x".repeat(1_048_577)).expect("the notice is sent");
+    let mut decoder = tumpel_guest::Decoder::default();
+    decoder.push(&host);
+    let Some(tumpel_api::types::GuestMessage::TurnLine(line)) = decoder.take().expect("a frame") else {
+        panic!("a turn line");
+    };
+    assert_eq!(line.line_seq.0, 7);
+    assert!(
+        line.text.starts_with("tumpel: harness line 7 was left out"),
+        "{}",
+        line.text.as_str()
+    );
+    assert!(line.text.contains("1048576"), "{}", line.text.as_str());
+}
