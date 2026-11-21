@@ -1460,6 +1460,18 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_box_still_busy_past_the_handover_limit_is_kept_and_handed_over_once_it_parks() {
+    let mut old = host("handover-past-limit", 1, Harness::Echo, Boot::Works);
+    old.turn("stalled-1", "session-1", "one", Vec::new());
+    assert_eq!(old.settle_until("claim stalled-1").await, ["claim stalled-1"]);
+    let handover = old.ask_handover().await.expect("the boxes are handed over");
+    assert_eq!(old.settle(SETTLE).await, Vec::<String>::new(), "nothing failed");
+    assert_eq!(handover.boxes.len(), 1);
+    let mut new = old.successor(&handover);
+    assert_eq!(new.settle_until("complete 1").await, ["line 1 one", "complete 1"]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_supervisor_started_after_a_crash_keeps_every_box_and_fails_only_the_cut_turn() {
     let mut old = host("crash-keeps-boxes", 2, Harness::SlowClone, Boot::Works);
     old.turn("turn-1", "session-1", "one", Vec::new());
