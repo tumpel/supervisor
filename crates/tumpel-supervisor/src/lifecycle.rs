@@ -374,6 +374,7 @@ fn standing_record(handed: &SupervisorHandoverBox) -> Result<SupervisorHandoverB
 struct Standing {
     path: PathBuf,
     boxes: Arc<std::sync::Mutex<BTreeMap<i32, SupervisorHandoverBox>>>,
+    idle_ends: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
 }
 
 impl Standing {
@@ -383,6 +384,16 @@ impl Standing {
             .lock()
             .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?;
         change(&mut boxes);
+        let idle_ends = self.idle_ends.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let written = Instant::now();
+        for record in boxes.values_mut() {
+            if let (SupervisorHandoverBoxState::Warm(_), Some(end)) =
+                (&record.state, idle_ends.get(record.session_id.as_str()))
+            {
+                record.idle_milliseconds = milliseconds(end.saturating_duration_since(written));
+            }
+        }
+        drop(idle_ends);
         let record = SupervisorHandover {
             boxes: boxes.values().cloned().collect(),
             handed_at: now(),
@@ -392,6 +403,14 @@ impl Standing {
         std::fs::write(&staged, text)
             .and_then(|()| std::fs::rename(&staged, &self.path))
             .map_err(|error| format!("writing {}: {error}", self.path.display()))
+    }
+
+    fn idle_until(&self, session: &str, end: Option<Instant>) {
+        let mut idle_ends = self.idle_ends.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match end {
+            Some(end) => idle_ends.insert(session.to_string(), end),
+            None => idle_ends.remove(session),
+        };
     }
 
     fn put<M: Machine>(&self, live: &LiveBox<M>, turn_id: Option<&EntityId>) -> Result<(), String> {
@@ -2091,6 +2110,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 standing: Standing {
                     path: standing,
                     boxes: Arc::default(),
+                    idle_ends: Arc::default(),
                 },
                 cancels: Cancels::default(),
                 staging: Tally::default(),
@@ -2613,6 +2633,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             (SupervisorHandoverBoxState::Warm(_), _) => {
                 slot.paused = true;
                 slot.idle_end = Some(Instant::now() + duration(handed.idle_milliseconds));
+                self.runner.standing.idle_until(&session, slot.idle_end);
             }
             (SupervisorHandoverBoxState::Turn(turn), Taken::Crashed) => {
                 turn_failed(
@@ -2805,6 +2826,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             slot.busy = true;
             Some(live)
         });
+        self.runner.standing.idle_until(&session, None);
         let runner = self.runner.clone();
         telemetry::start_kind(&root, warm.is_some());
         if let Some(live) = warm {
@@ -3118,6 +3140,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 if matches!(work, Work::Turn) {
                     slot.paused = true;
                     slot.idle_end = Some(Instant::now() + live.idle);
+                    self.runner.standing.idle_until(&session, slot.idle_end);
                 }
                 slot.live = Some(live);
             }
