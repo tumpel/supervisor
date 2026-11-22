@@ -11,7 +11,7 @@ use tumpel_api::types::{
 
 use super::{
     empty_state, hello_bytes, Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit,
-    Signer, Store, MAX_RATE_BACKOFFS,
+    Signer, Store,
 };
 
 #[derive(Default)]
@@ -776,20 +776,19 @@ fn at(seconds: i64) -> chrono::DateTime<chrono::Utc> {
 }
 
 #[test]
-fn rate_limit_backoffs_start_at_the_retry_after_double_each_time_up_to_fifteen_minutes_and_give_up_after_ten() {
+fn every_rate_limit_pauses_until_its_retry_after_and_never_gives_up() {
     let mut limit = RateLimit::default();
     let mut now = 0;
     let mut waits = Vec::new();
-    for _ in 0..MAX_RATE_BACKOFFS {
+    for _ in 0..50 {
         let RateBackoff::Until(until) = limit.limited(at(now), at(now + 20), 600, 0) else {
-            panic!("a refusal after the pause ended backs off again");
+            panic!("a refusal after the pause ended pauses again");
         };
         waits.push((until - at(now)).num_seconds());
         assert_eq!(limit.limited(at(now + 1), at(now + 20), 600, 0), RateBackoff::Paused);
         now = (until - at(0)).num_seconds();
     }
-    assert_eq!(waits, [20, 40, 80, 160, 320, 640, 900, 900, 900, 900]);
-    assert_eq!(limit.limited(at(now), at(now + 20), 600, 0), RateBackoff::Exhausted);
+    assert!(waits.iter().all(|wait| *wait == 20), "{waits:?}");
 }
 
 #[test]
@@ -802,18 +801,16 @@ fn jitter_only_lengthens_a_rate_limit_backoff_by_up_to_half() {
 }
 
 #[test]
-fn a_rate_limited_host_reports_rate_limited_until_a_full_minute_passes_with_no_refusal_then_healthy_with_its_backoffs_reset(
-) {
+fn a_rate_limited_host_reports_rate_limited_until_a_full_minute_passes_with_no_refusal_then_healthy() {
     let mut limit = RateLimit::default();
     assert_eq!(limit.health(at(0)), HostReportedHealth::Healthy);
     assert_eq!(limit.limited(at(0), at(20), 600, 0), RateBackoff::Until(at(20)));
-    assert_eq!(limit.limited(at(30), at(60), 600, 0), RateBackoff::Until(at(90)));
+    assert_eq!(limit.limited(at(30), at(60), 600, 0), RateBackoff::Until(at(60)));
     assert_eq!(limit.health(at(80)), HostReportedHealth::RateLimited);
     assert!(!limit.recovered(at(89)));
     assert_eq!(limit.health(at(90)), HostReportedHealth::Healthy);
     assert!(limit.recovered(at(90)));
     assert!(!limit.recovered(at(91)), "it turns Healthy once");
-    assert_eq!(limit.backoffs(), 0);
     assert_eq!(limit.limited(at(100), at(120), 600, 0), RateBackoff::Until(at(120)));
 }
 
@@ -899,4 +896,196 @@ fn a_backlog_saved_before_a_restart_is_held_at_the_welcome_and_goes_out_paced() 
     channel.release(2, &mut wire).expect("release");
     assert_eq!(seqs(&mut wire), [3]);
     assert!(!channel.withholding());
+}
+
+fn line(turn: &str, line_seq: i64) -> ChannelHostMessage {
+    serde_json::from_value(
+        json!({"type": "TurnLine", "turnId": turn, "lineSeq": line_seq, "text": format!("line {line_seq}")}),
+    )
+    .expect("line")
+}
+
+fn claim(turn: &str) -> ChannelHostMessage {
+    serde_json::from_value(json!({"type": "TurnClaim", "turnId": turn, "boxId": "box-1"})).expect("claim")
+}
+
+fn unacked_seqs(disk: &Disk) -> Vec<i64> {
+    disk.0
+        .borrow()
+        .as_ref()
+        .map_or_default(|state| state.unacked.iter().map(|frame| frame.seq.0).collect())
+}
+
+#[test]
+fn an_offer_is_held_from_its_receipt_until_the_box_or_a_frame_names_its_turn() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    channel.receive(&offer(1, "grant-1"), &mut wire).expect("offer");
+    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
+    let beat = |channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire, turn_ids: Vec<EntityId>| {
+        let held = HeldIds {
+            turn_ids,
+            ..HeldIds::default()
+        };
+        channel
+            .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, wire)
+            .expect("heartbeat");
+        let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
+        heartbeat["heldTurnIds"].clone()
+    };
+    assert_eq!(beat(&mut channel, &mut wire, Vec::new()), json!(["turn-1"]));
+    let turn = EntityId::try_from("turn-1").expect("id");
+    assert_eq!(beat(&mut channel, &mut wire, vec![turn]), json!(["turn-1"]));
+    assert_eq!(
+        beat(&mut channel, &mut wire, Vec::new()),
+        json!([]),
+        "once the box held the turn and let it go, the offer no longer holds it"
+    );
+}
+
+#[test]
+fn a_socket_closed_mid_turn_keeps_the_turn_held_and_resends_its_unacked_output_after_the_reconnect() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    let mut control = ControlPlane::new(true);
+    open(&mut channel, &mut wire);
+    channel.receive(&offer(1, "grant-1"), &mut wire).expect("offer");
+    channel.send(claim("turn-1"), &mut wire).expect("send");
+    control.read(&mut wire);
+    channel.send(line("turn-1", 1), &mut wire).expect("send");
+    wire.sent();
+    channel.disconnect();
+    channel.send(line("turn-1", 2), &mut wire).expect("send");
+    channel.send(line("turn-1", 3), &mut wire).expect("send");
+    assert!(wire.sent().is_empty(), "nothing goes out on a closed socket");
+    assert_eq!(unacked_seqs(&disk), [1, 2, 3, 4]);
+
+    channel.connect();
+    let challenge = json!({"type": "Challenge", "nonce": NONCE}).to_string();
+    let Ok(Event::Challenged(nonce)) = channel.receive(&challenge, &mut wire) else {
+        panic!("the challenge asks for a Hello");
+    };
+    channel
+        .hello(&nonce, capacity(), usage(), Vec::new(), &mut wire)
+        .expect("hello");
+    let [hello] = wire.sent().try_into().expect("one hello");
+    assert_eq!(hello["heldTurnIds"], json!(["turn-1"]));
+    let Ok(Event::Welcomed) = channel.receive(&control.welcome().to_string(), &mut wire) else {
+        panic!("the welcome opens the channel");
+    };
+    let resent: Vec<(i64, i64)> = wire
+        .sent()
+        .iter()
+        .map(|frame| {
+            (
+                frame["seq"].as_i64().expect("seq"),
+                frame["message"]["lineSeq"].as_i64().expect("line seq"),
+            )
+        })
+        .collect();
+    assert_eq!(resent, [(2, 1), (3, 2), (4, 3)]);
+    assert_eq!(unacked_seqs(&disk), [2, 3, 4]);
+}
+
+#[test]
+fn twenty_failed_reconnects_wait_thirty_seconds_apart_and_keep_every_unacked_frame_for_the_next_welcome() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    let mut control = ControlPlane::new(true);
+    open(&mut channel, &mut wire);
+    channel.send(claim("turn-1"), &mut wire).expect("send");
+    control.read(&mut wire);
+    channel.disconnect();
+
+    let mut backoff = Backoff::default();
+    let mut waited = Duration::ZERO;
+    for line_seq in 1..=20 {
+        waited += backoff.next(channel.progressed(), u16::MAX);
+        channel.connect();
+        channel.send(line("turn-1", line_seq), &mut wire).expect("send");
+        channel.disconnect();
+    }
+    assert_eq!(waited, Duration::from_secs(1 + 2 + 4 + 8 + 16 + 30 * 15));
+    assert_eq!(wire.sent(), Vec::<Value>::new());
+    assert_eq!(unacked_seqs(&disk), (1..=21).collect::<Vec<_>>());
+
+    let Ok(Event::Welcomed) = control.reconnect(&mut channel, &mut wire) else {
+        panic!("the twenty-first reconnect is welcomed");
+    };
+    let resent: Vec<i64> = wire
+        .sent()
+        .iter()
+        .map(|frame| frame["message"]["lineSeq"].as_i64().expect("line seq"))
+        .collect();
+    assert_eq!(resent, (1..=20).collect::<Vec<_>>());
+    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
+    channel
+        .heartbeat(
+            sent_at,
+            usage(),
+            HeldIds::default(),
+            HostReportedHealth::Healthy,
+            &mut wire,
+        )
+        .expect("heartbeat");
+    let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
+    assert_eq!(heartbeat["heldTurnIds"], json!(["turn-1"]));
+}
+
+#[test]
+fn a_host_rate_limited_for_five_windows_holds_its_output_until_each_retry_after_then_sends_it() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
+    let mut limit = RateLimit::default();
+    let mut released = Vec::new();
+    let mut now = 0;
+    let mut line_seq = 0;
+    for _ in 0..5 {
+        line_seq += 1;
+        channel.send(line("turn-1", line_seq), &mut wire).expect("send");
+        let [refused] = wire.sent().try_into().expect("one frame");
+        let limited = json!({"type": "FrameRateLimited", "seq": refused["seq"], "reason": "host host-1 sent more than 600 frames a minute", "framesPerMinute": 600, "retryAfter": at(now + 60).to_rfc3339()});
+        let Ok(Event::FrameRateLimited { retry_after, .. }) = channel.receive(&limited.to_string(), &mut wire) else {
+            panic!("the refusal names the limit");
+        };
+        assert_eq!(
+            limit.limited(at(now), retry_after, 600, 0),
+            RateBackoff::Until(at(now + 60))
+        );
+        channel.withhold();
+        for _ in 0..3 {
+            line_seq += 1;
+            channel.send(line("turn-1", line_seq), &mut wire).expect("send");
+        }
+        let held = HeldIds {
+            turn_ids: vec![EntityId::try_from("turn-1").expect("id")],
+            ..HeldIds::default()
+        };
+        channel
+            .heartbeat(sent_at, usage(), held, limit.health(at(now + 30)), &mut wire)
+            .expect("heartbeat");
+        let [heartbeat] = wire.sent().try_into().expect("only the heartbeat while paused");
+        assert_eq!(heartbeat["health"], "RateLimited");
+        assert_eq!(heartbeat["heldTurnIds"], json!(["turn-1"]));
+        now += 60;
+        assert!(!limit.paused(at(now)));
+        channel.release(usize::MAX, &mut wire).expect("release");
+        released.extend(
+            wire.sent()
+                .iter()
+                .map(|frame| frame["message"]["lineSeq"].as_i64().expect("line seq")),
+        );
+    }
+    assert_eq!(released, [2, 3, 4, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 20]);
+    assert_eq!(
+        unacked_seqs(&disk),
+        [2, 3, 4, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 20]
+    );
 }

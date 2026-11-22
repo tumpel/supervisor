@@ -25,8 +25,7 @@ use tumpel_api::types::{
     TurnFailureReason,
 };
 use tumpel_channel::{
-    Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer,
-    HEARTBEAT_DEADLINE, MAX_RATE_BACKOFFS,
+    Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer, HEARTBEAT_DEADLINE,
 };
 
 use crate::boot::BootOrder;
@@ -466,19 +465,10 @@ async fn terminate(
 }
 
 fn restarts(kind: SupervisorFailure) -> bool {
-    !matches!(
-        kind,
-        SupervisorFailure::NotEnrolled | SupervisorFailure::HostRevoked | SupervisorFailure::RateLimited
-    )
+    !matches!(kind, SupervisorFailure::NotEnrolled | SupervisorFailure::HostRevoked)
 }
 
-fn abandoned(failure: &Failure) -> Abandoned {
-    if failure.kind == SupervisorFailure::RateLimited {
-        return Abandoned {
-            reason: TurnFailureReason::RateLimited,
-            cause: format!("this supervisor stopped because {}", failure.detail),
-        };
-    }
+fn abandoned() -> Abandoned {
     Abandoned {
         reason: TurnFailureReason::HarnessExited,
         cause: "this supervisor binary stopped before it reached the control plane".to_string(),
@@ -843,8 +833,8 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         }
         Ok(Served::BoxesStopped(failure)) | Err(failure) => Err(failure),
     };
-    if let Err(failure) = &stopped {
-        abandon(&commands, abandoned(failure)).await;
+    if stopped.is_err() {
+        abandon(&commands, abandoned()).await;
     }
     store_unsent(&mut channel, &mut from_box, &usage.telemetry)?;
     stopped
@@ -978,22 +968,13 @@ fn rate_limited(
     reason: &str,
     frames_per_minute: u32,
     retry_after: chrono::DateTime<chrono::Utc>,
-) -> Option<Result<Ended, Failure>> {
-    match limit.limited(chrono::Utc::now(), retry_after, frames_per_minute, jitter()) {
-        RateBackoff::Paused => None,
-        RateBackoff::Until(until) => {
-            channel.withhold();
-            eprintln!(
-                "tumpel-supervisor: RateLimited: {url} refused a frame: {reason}; backoff {} of {MAX_RATE_BACKOFFS}: this host reports RateLimited, takes no new turns or setup boxes and holds its frames until {}",
-                limit.backoffs(),
-                until.to_rfc3339()
-            );
-            None
-        }
-        RateBackoff::Exhausted => Some(Err(fail(
-            SupervisorFailure::RateLimited,
-            format!("{url} still refused this host's frames ({reason}) after {MAX_RATE_BACKOFFS} backoffs in a row; find what floods the channel, then start the unit by hand"),
-        ))),
+) {
+    if let RateBackoff::Until(until) = limit.limited(chrono::Utc::now(), retry_after, frames_per_minute, jitter()) {
+        channel.withhold();
+        eprintln!(
+            "tumpel-supervisor: RateLimited: {url} refused a frame: {reason}; this host reports RateLimited, takes no new turns or setup boxes and holds its frames until {}, then sends them again",
+            until.to_rfc3339()
+        );
     }
 }
 
@@ -1083,7 +1064,8 @@ async fn session(
                             None
                         }
                         Ok(Event::FrameRateLimited { seq: _, reason, frames_per_minute, retry_after }) => {
-                            rate_limited(channel, limit, url, &reason, frames_per_minute, retry_after)
+                            rate_limited(channel, limit, url, &reason, frames_per_minute, retry_after);
+                            None
                         }
                         Ok(Event::ReleasePublished) => {
                             updates.announced();

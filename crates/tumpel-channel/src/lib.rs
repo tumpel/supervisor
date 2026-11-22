@@ -17,9 +17,7 @@ pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
 pub const MAX_REPLAYS: u32 = 10;
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
-pub const MAX_RATE_BACKOFFS: u32 = 10;
 const ASSUMED_FRAMES_PER_MINUTE: u32 = 600;
-pub const LAST_RATE_BACKOFF: Duration = Duration::from_mins(15);
 
 const HELLO_CONTEXT: &[u8] = b"tumpel-channel-hello-v1";
 
@@ -121,7 +119,6 @@ impl Backoff {
 
 #[derive(Default)]
 pub struct RateLimit {
-    backoffs: u32,
     paused_until: Option<DateTime<Utc>>,
     last_limited: Option<DateTime<Utc>>,
     frames_per_minute: u32,
@@ -131,7 +128,6 @@ pub struct RateLimit {
 pub enum RateBackoff {
     Until(DateTime<Utc>),
     Paused,
-    Exhausted,
 }
 
 impl RateLimit {
@@ -147,14 +143,7 @@ impl RateLimit {
         if self.paused(now) {
             return RateBackoff::Paused;
         }
-        self.backoffs += 1;
-        if self.backoffs > MAX_RATE_BACKOFFS {
-            return RateBackoff::Exhausted;
-        }
-        let first = (retry_after - now).to_std().unwrap_or_default().max(FIRST_BACKOFF);
-        let wait = first
-            .saturating_mul(1 << (self.backoffs - 1).min(16))
-            .min(LAST_RATE_BACKOFF);
+        let wait = (retry_after - now).to_std().unwrap_or_default().max(FIRST_BACKOFF);
         let jittered = wait + (wait / 2).mul_f64(f64::from(jitter) / f64::from(u16::MAX));
         let until = now + chrono::Duration::from_std(jittered).unwrap_or(chrono::Duration::MAX);
         self.paused_until = Some(until);
@@ -175,11 +164,6 @@ impl RateLimit {
         };
         let per_tick = u128::from(limit / 2) * tick.as_millis() / RATE_WINDOW.as_millis();
         usize::try_from(per_tick).unwrap_or(usize::MAX).max(1)
-    }
-
-    #[must_use]
-    pub fn backoffs(&self) -> u32 {
-        self.backoffs
     }
 
     #[must_use]
@@ -230,6 +214,7 @@ pub struct HostChannel<S: Store, K: Signer> {
     phase: Phase,
     progressed: bool,
     withheld: Option<i64>,
+    offered: Vec<EntityId>,
 }
 
 fn encode(envelope: &ChannelHostEnvelope) -> Result<String, ChannelError> {
@@ -293,6 +278,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             phase: Phase::Closed,
             progressed: false,
             withheld,
+            offered: Vec::new(),
         }
     }
 
@@ -380,14 +366,20 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         Ok(())
     }
 
-    fn with_unacked_turns(&self, mut held: Vec<EntityId>) -> Vec<EntityId> {
-        let unacked = self
-            .state
+    fn unacked_turns(&self) -> Vec<EntityId> {
+        self.state
             .unacked
             .iter()
             .filter_map(|frame| frame.message.get("turnId").and_then(Value::as_str))
-            .filter_map(|turn_id| EntityId::try_from(turn_id).ok());
-        for turn_id in unacked {
+            .filter_map(|turn_id| EntityId::try_from(turn_id).ok())
+            .collect()
+    }
+
+    fn held_turns(&mut self, mut held: Vec<EntityId>) -> Vec<EntityId> {
+        let unacked = self.unacked_turns();
+        self.offered
+            .retain(|offered| !held.contains(offered) && !unacked.contains(offered));
+        for turn_id in unacked.into_iter().chain(self.offered.iter().cloned()) {
             if !held.contains(&turn_id) {
                 held.push(turn_id);
             }
@@ -410,7 +402,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                 health: Some(health),
                 held_claude_setup_ids: held.claude_setup_ids,
                 held_session_ids: held.session_ids,
-                held_turn_ids: self.with_unacked_turns(held.turn_ids),
+                held_turn_ids: self.held_turns(held.turn_ids),
                 sent_at: now,
                 type_: ChannelHostHeartbeatType::Heartbeat,
                 usage,
@@ -439,7 +431,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             box_capacity,
             channel_protocol_oldest: None,
             guest_protocol: None,
-            held_turn_ids: self.with_unacked_turns(held_turn_ids),
+            held_turn_ids: self.held_turns(held_turn_ids),
             host_id: self.host_id.clone(),
             protocol_version: NonZeroU32::new(u32::from(ChannelProtocol::VERSION))
                 .ok_or_else(|| protocol("protocol version 0"))?,
@@ -597,6 +589,15 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         self.progressed = true;
         self.drop_acked(frame.ack.0);
         self.store.save(&self.state)?;
+        match &frame.message {
+            ChannelControlMessage::TurnOffer(offer) if !self.offered.contains(&offer.turn_id) => {
+                self.offered.push(offer.turn_id.clone());
+            }
+            ChannelControlMessage::TurnWithdrawn(withdrawn) => {
+                self.offered.retain(|offered| *offered != withdrawn.turn_id);
+            }
+            _ => {}
+        }
         Ok(Event::Message(Box::new(frame.message)))
     }
 }
