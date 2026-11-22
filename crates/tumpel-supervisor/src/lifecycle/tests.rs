@@ -1220,9 +1220,8 @@ async fn a_turn_the_control_plane_withdraws_at_its_claim_never_reaches_the_harne
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_warm_box_outlives_a_delay_shorter_than_its_idle_time() {
+async fn a_warm_box_outlives_any_delay_once_a_snapshot_holds_it() {
     let mut host = host("outlives", 1, Harness::Echo, Boot::Works);
-    host.idle_seconds = NonZeroU32::new(900).expect("fifteen minutes");
     let mut turn = host.box_turn("turn-1", "session-1", "one", Vec::new(), 300);
     turn.box_retention = BoxRetention::Warm;
     host.send(Command::Turn(Box::new(turn)));
@@ -1230,7 +1229,7 @@ async fn a_warm_box_outlives_a_delay_shorter_than_its_idle_time() {
     host.snapshot("session-1");
     assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
     host.log();
-    host.settle(Duration::from_mins(14)).await;
+    host.settle(Duration::from_hours(720)).await;
     assert_eq!(host.log(), Vec::<String>::new());
     host.turn("turn-2", "session-1", "two", Vec::new());
     assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);

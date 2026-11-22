@@ -3056,7 +3056,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let live = slot
             .live
             .as_ref()
-            .filter(|live| !live.dirty && live.box_retention != BoxRetention::Off)?;
+            .filter(|live| !live.dirty && live.box_retention == BoxRetention::Auto)?;
         Some((&live.box_id, live.idle))
     }
 
