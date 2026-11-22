@@ -2520,7 +2520,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let recorded = taken.is_some();
         let mut standing = BTreeMap::new();
         if let Some((handover, taken)) = taken {
-            for handed in handover.boxes {
+            let age = milliseconds((now() - handover.handed_at).to_std().unwrap_or(Duration::ZERO));
+            for mut handed in handover.boxes {
+                if matches!(handed.state, SupervisorHandoverBoxState::Warm(_)) {
+                    handed.idle_milliseconds = handed.idle_milliseconds.saturating_sub(age).max(0);
+                }
                 if let Some(record) = self.adopt(handed, taken) {
                     standing.insert(record.tap_index, record);
                 }

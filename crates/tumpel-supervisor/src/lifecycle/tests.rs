@@ -1934,6 +1934,22 @@ async fn a_box_snapshotted_late_is_stopped_once_the_idle_time_since_its_turn_run
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_time_since_the_handover_counts_against_the_idle_time_left() {
+    let mut old = host("idle-handed-at", 1, Harness::Echo, Boot::Works);
+    old.idle_seconds = NonZeroU32::new(900).expect("fifteen minutes");
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle(SETTLE).await;
+    old.snapshot("session-1");
+    assert_eq!(old.settle_until("snapshot done").await, ["snapshot done"]);
+    assert_eq!(old.settle(Duration::from_mins(5)).await, Vec::<String>::new());
+    let mut handover = old.ask_handover().await.expect("the boxes are handed over");
+    handover.handed_at -= chrono::Duration::minutes(5);
+    let mut new = old.successor(&handover);
+    assert_eq!(new.settle(Duration::from_mins(4)).await, Vec::<String>::new());
+    assert_eq!(new.settle(Duration::from_mins(2)).await, ["box gone session-1"]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_box_handed_over_while_idle_is_stopped_when_the_idle_time_left_runs_out() {
     let mut old = host("idle-handover", 1, Harness::Echo, Boot::Works);
     old.idle_seconds = NonZeroU32::new(900).expect("fifteen minutes");
