@@ -1047,6 +1047,9 @@ async fn session(
                         Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
                         Ok(Event::Welcomed) => {
                             eprintln!("connected to {url}");
+                            if let Some((seq, kind, replays)) = channel.stuck() {
+                                eprintln!("tumpel-supervisor: FrameUnacked: {url} has not acked frame {seq} ({kind}) after {replays} Welcomes; the host keeps it and sends it again after every Welcome; check the control plane logs for this host");
+                            }
                             last_beat = Instant::now();
                             updates.welcomed().await.err().map(Err)
                         }
@@ -1077,7 +1080,6 @@ async fn session(
                             let _ = sink.send(Message::Close(Some(close))).await;
                             Some(Ok(dropped(channel.progressed(), reason)))
                         }
-                        Err(ChannelError::Undelivered(reason)) => Some(Err(fail(SupervisorFailure::FrameUndelivered, reason))),
                         Err(error) => Some(Err(fail(SupervisorFailure::ChannelStateLost, error.to_string()))),
                     }
                 }

@@ -7,15 +7,14 @@ use serde_json::Value;
 use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostEnvelope, ChannelHostFrame, ChannelHostFrameType, ChannelHostHeartbeat,
-    ChannelHostHeartbeatType, ChannelHostMessage, ChannelProtocol, ChannelSnapshotDone, ChannelSnapshotFailed,
-    ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelStoredHostFrame, ChannelStoredHostFrameType,
+    ChannelHostHeartbeatType, ChannelHostMessage, ChannelProtocol, ChannelStoredHostFrame, ChannelStoredHostFrameType,
     EntityId, HostReportedHealth, HostUsage, Sequence, SupervisorChannelReplay, SupervisorChannelState,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
 pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
-pub const MAX_REPLAYS: u32 = 10;
+pub const STUCK_REPLAYS: u32 = 10;
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 const ASSUMED_FRAMES_PER_MINUTE: u32 = 600;
 
@@ -54,7 +53,6 @@ pub enum ChannelError {
     Protocol(String),
     Port(String),
     Store(String),
-    Undelivered(String),
 }
 
 impl fmt::Display for ChannelError {
@@ -63,7 +61,6 @@ impl fmt::Display for ChannelError {
             Self::Protocol(reason) => write!(f, "channel protocol error: {reason}"),
             Self::Port(reason) => write!(f, "sending on the channel failed: {reason}"),
             Self::Store(reason) => write!(f, "saving the channel state failed: {reason}"),
-            Self::Undelivered(reason) => f.write_str(reason),
         }
     }
 }
@@ -227,30 +224,6 @@ fn protocol(reason: impl Into<String>) -> ChannelError {
 
 fn message_type(frame: &ChannelStoredHostFrame) -> &str {
     frame.message.get("type").and_then(Value::as_str).unwrap_or("unknown")
-}
-
-fn snapshot_failed(frame: &ChannelStoredHostFrame) -> Result<Option<Value>, ChannelError> {
-    if message_type(frame) != "SnapshotDone" {
-        return Ok(None);
-    }
-    let done: ChannelSnapshotDone = serde_json::from_value(frame.message.clone())
-        .map_err(|error| protocol(format!("reading saved SnapshotDone frame {}: {error}", frame.seq.0)))?;
-    let failed: ChannelHostMessage = ChannelSnapshotFailed {
-        detail: format!(
-            "the control plane did not ack SnapshotDone for snapshot {} after the host resent it after {MAX_REPLAYS} Welcomes, so the host reports the snapshot failed in its place; check the control plane logs for this snapshot",
-            *done.snapshot_id
-        )
-        .try_into()
-        .map_err(|error| protocol(format!("the SnapshotFailed detail for snapshot {}: {error}", *done.snapshot_id)))?,
-        failed_at: Utc::now().fixed_offset(),
-        reason: ChannelSnapshotFailureReason::NotAnswered,
-        snapshot_id: done.snapshot_id,
-        type_: ChannelSnapshotFailedType::SnapshotFailed,
-    }
-    .into();
-    serde_json::to_value(&failed)
-        .map(Some)
-        .map_err(|error| protocol(format!("encoding SnapshotFailed for channel.json: {error}")))
 }
 
 fn replays_of(replays: &[SupervisorChannelReplay], seq: i64) -> u32 {
@@ -492,7 +465,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         if let Some(ack) = ack {
             self.drop_acked(ack.0);
         }
-        self.count_replay()?;
+        self.count_replay();
         self.store.save(&self.state)?;
         self.phase = Phase::Open;
         if let Some(first) = self.state.unacked.first().filter(|_| self.withheld.is_some()) {
@@ -513,32 +486,24 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         Ok(Event::Welcomed)
     }
 
-    fn count_replay(&mut self) -> Result<(), ChannelError> {
-        let Some(first) = self.state.unacked.first_mut() else {
-            return Ok(());
+    fn count_replay(&mut self) {
+        let Some(first) = self.state.unacked.first() else {
+            return;
         };
         let seq = first.seq.0;
         let replays = replays_of(&self.state.replays, seq);
         self.state.replays.retain(|replay| replay.seq.0 != seq);
-        if replays < MAX_REPLAYS {
-            self.state.replays.push(SupervisorChannelReplay {
-                replays: NonZeroU32::MIN.saturating_add(replays),
-                seq: Sequence(seq),
-            });
-            return Ok(());
-        }
-        let Some(failed) = snapshot_failed(first)? else {
-            return Err(ChannelError::Undelivered(format!(
-                "the control plane did not ack frame {seq} ({}) after the host resent it after {MAX_REPLAYS} Welcomes, and the host cannot skip a frame; check the control plane logs for this host",
-                message_type(first)
-            )));
-        };
-        first.message = failed;
         self.state.replays.push(SupervisorChannelReplay {
-            replays: NonZeroU32::MIN,
+            replays: NonZeroU32::MIN.saturating_add(replays),
             seq: Sequence(seq),
         });
-        Ok(())
+    }
+
+    #[must_use]
+    pub fn stuck(&self) -> Option<(i64, &str, u32)> {
+        let first = self.state.unacked.first()?;
+        let replays = replays_of(&self.state.replays, first.seq.0);
+        (replays >= STUCK_REPLAYS).then(|| (first.seq.0, message_type(first), replays))
     }
 
     fn drop_acked(&mut self, ack: i64) {
