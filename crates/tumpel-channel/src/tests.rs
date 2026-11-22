@@ -148,7 +148,8 @@ fn offer(seq: i64, credential: &str) -> String {
             "gitAuthorName": "Tumpel Agent",
             "gitAuthorEmail": "agent@tumpel.invalid",
             "boxRetention": "Auto",
-            "turnSeconds": 3600
+            "turnSeconds": 3600,
+            "idleSeconds": 900
         }
     })
     .to_string()

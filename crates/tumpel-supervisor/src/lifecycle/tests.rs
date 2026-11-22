@@ -604,6 +604,7 @@ struct Host {
     seq: i64,
     clone_seconds: u32,
     turn_seconds: NonZeroU32,
+    idle_seconds: NonZeroU32,
     images: PathBuf,
     vmm: MemoryVmm,
     capacity: u32,
@@ -830,6 +831,7 @@ fn start_host(
         seq: 0,
         clone_seconds,
         turn_seconds: NonZeroU32::MIN,
+        idle_seconds: NonZeroU32::new(900).expect("fifteen minutes"),
         images,
         vmm,
         capacity,
@@ -1053,6 +1055,7 @@ impl Host {
             box_memory_mib: None,
             box_disk_mib: None,
             turn_seconds: self.turn_seconds,
+            idle_seconds: self.idle_seconds,
             box_retention: BoxRetention::Auto,
         }
     }
@@ -1899,8 +1902,9 @@ async fn an_expired_grant_is_refused_before_any_box_boots() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_snapshotted_box_idle_for_fifteen_minutes_is_stopped_and_answers_box_gone() {
+async fn a_snapshotted_box_idle_for_the_offered_idle_time_is_stopped_and_answers_box_gone() {
     let mut host = host("idle-teardown", 1, Harness::Echo, Boot::Works);
+    host.idle_seconds = NonZeroU32::new(900).expect("fifteen minutes");
     host.turn("turn-1", "session-1", "one", Vec::new());
     host.settle(SETTLE).await;
     let first = host.snapshot("session-1");
@@ -1914,6 +1918,20 @@ async fn a_snapshotted_box_idle_for_fifteen_minutes_is_stopped_and_answers_box_g
     host.turn("turn-2", "session-1", "two", vec![first]);
     assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
     assert_eq!(host.log()[0], "restore session-1 root/turn-1");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_box_handed_over_while_idle_is_stopped_when_the_idle_time_left_runs_out() {
+    let mut old = host("idle-handover", 1, Harness::Echo, Boot::Works);
+    old.idle_seconds = NonZeroU32::new(900).expect("fifteen minutes");
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle(SETTLE).await;
+    old.snapshot("session-1");
+    assert_eq!(old.settle_until("snapshot done").await, ["snapshot done"]);
+    assert_eq!(old.settle(Duration::from_mins(10)).await, Vec::<String>::new());
+    let mut new = old.hand_over().await;
+    assert_eq!(new.settle(Duration::from_mins(4)).await, Vec::<String>::new());
+    assert_eq!(new.settle(Duration::from_mins(2)).await, ["box gone session-1"]);
 }
 
 #[tokio::test]

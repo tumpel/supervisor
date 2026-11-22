@@ -288,6 +288,7 @@ fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Command {
         box_memory_mib: offer.box_memory_mib,
         box_disk_mib: offer.box_disk_mib,
         turn_seconds: offer.turn_seconds,
+        idle_seconds: offer.idle_seconds,
         box_retention: offer.box_retention,
     }))
 }
