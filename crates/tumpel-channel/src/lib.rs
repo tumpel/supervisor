@@ -16,7 +16,6 @@ pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
 pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
 pub const MAX_REPLAYS: u32 = 10;
-pub const MAX_RECONNECTS: u32 = 10;
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 pub const MAX_RATE_BACKOFFS: u32 = 10;
 const ASSUMED_FRAMES_PER_MINUTE: u32 = 600;
@@ -100,32 +99,23 @@ pub enum Phase {
 
 pub struct Backoff {
     wait: Duration,
-    fruitless: u32,
 }
 
 impl Default for Backoff {
     fn default() -> Self {
-        Self {
-            wait: FIRST_BACKOFF,
-            fruitless: 0,
-        }
+        Self { wait: FIRST_BACKOFF }
     }
 }
 
 impl Backoff {
-    pub fn next(&mut self, progressed: bool, jitter: u16) -> Option<Duration> {
+    pub fn next(&mut self, progressed: bool, jitter: u16) -> Duration {
         if progressed {
-            self.fruitless = 0;
             self.wait = FIRST_BACKOFF;
-        }
-        self.fruitless += 1;
-        if self.fruitless > MAX_RECONNECTS {
-            return None;
         }
         let half = self.wait / 2;
         let wait = half + half.mul_f64(f64::from(jitter) / f64::from(u16::MAX));
         self.wait = (self.wait * 2).min(LAST_BACKOFF);
-        Some(wait)
+        wait
     }
 }
 
