@@ -1904,13 +1904,13 @@ async fn an_expired_grant_is_refused_before_any_box_boots() {
 #[tokio::test(start_paused = true)]
 async fn a_snapshotted_box_idle_for_the_offered_idle_time_is_stopped_and_answers_box_gone() {
     let mut host = host("idle-teardown", 1, Harness::Echo, Boot::Works);
-    host.idle_seconds = NonZeroU32::new(900).expect("fifteen minutes");
+    host.idle_seconds = NonZeroU32::new(300).expect("five minutes");
     host.turn("turn-1", "session-1", "one", Vec::new());
     host.settle(SETTLE).await;
     let first = host.snapshot("session-1");
     assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
     host.log();
-    assert_eq!(host.settle(Duration::from_mins(14)).await, Vec::<String>::new());
+    assert_eq!(host.settle(Duration::from_mins(4)).await, Vec::<String>::new());
     assert_eq!(host.settle(Duration::from_mins(2)).await, ["box gone session-1"]);
     assert_eq!(host.log(), ["stop session-1"]);
     assert!(!host.vmm.staging.join("session-1").exists());
