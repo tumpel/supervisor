@@ -158,14 +158,14 @@ fn offer(seq: i64, credential: &str) -> String {
 fn welcome(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire, welcome: &Value) -> Result<Event, ChannelError> {
     channel.connect();
     let challenge = json!({"type": "Challenge", "nonce": NONCE}).to_string();
-    let Ok(Event::Challenged(nonce)) = channel.receive(&challenge, wire) else {
+    let Ok(Event::Challenged(nonce)) = channel.receive(&challenge) else {
         panic!("the challenge asks for a Hello");
     };
     channel
         .hello(&nonce, capacity(), usage(), Vec::new(), wire)
         .expect("hello");
     wire.sent();
-    channel.receive(&welcome.to_string(), wire)
+    channel.receive(&welcome.to_string())
 }
 
 fn open(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) {
@@ -237,7 +237,7 @@ fn hello_signs_the_documented_bytes() {
     let mut wire = Wire::default();
     channel.connect();
     let challenge = json!({"type": "Challenge", "nonce": NONCE}).to_string();
-    let Ok(Event::Challenged(nonce)) = channel.receive(&challenge, &mut wire) else {
+    let Ok(Event::Challenged(nonce)) = channel.receive(&challenge) else {
         panic!("the challenge asks for a Hello");
     };
     assert_eq!(nonce, NONCE);
@@ -253,7 +253,7 @@ fn hello_signs_the_documented_bytes() {
     assert_eq!(
         wire.sent(),
         [
-            json!({"type": "Hello", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION, "supervisorVersion": "0.1.0", "signature": "c2lnbmF0dXJl", "boxCapacity": 8, "usage": {"boxesWarm": 1, "loadAverage": 0.5, "memoryAvailableMib": 4096}, "heldTurnIds": []})
+            json!({"type": "Hello", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION, "channelProtocolOldest": ChannelProtocol::OLDEST, "supervisorVersion": "0.1.0", "signature": "c2lnbmF0dXJl", "boxCapacity": 8, "usage": {"boxesWarm": 1, "loadAverage": 0.5, "memoryAvailableMib": 4096}, "heldTurnIds": []})
         ]
     );
     assert_eq!(channel.phase(), Phase::AwaitingWelcome);
@@ -264,7 +264,7 @@ fn a_frame_before_the_challenge_is_a_protocol_error() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     channel.connect();
-    let outcome = channel.receive(&frame(1, 0, "snap-1"), &mut Wire::default());
+    let outcome = channel.receive(&frame(1, 0, "snap-1"));
     assert!(matches!(outcome, Err(ChannelError::Protocol(reason)) if reason.contains("expected Challenge")));
     assert_eq!(channel.phase(), Phase::Closed);
 }
@@ -275,16 +275,10 @@ fn duplicates_are_dropped_and_a_gap_closes_the_connection() {
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
     open(&mut channel, &mut wire);
-    assert!(matches!(
-        channel.receive(&frame(1, 0, "snap-1"), &mut wire),
-        Ok(Event::Message(_))
-    ));
-    assert!(matches!(
-        channel.receive(&frame(1, 0, "snap-1"), &mut wire),
-        Ok(Event::None)
-    ));
+    assert!(matches!(channel.receive(&frame(1, 0, "snap-1")), Ok(Event::Message(_))));
+    assert!(matches!(channel.receive(&frame(1, 0, "snap-1")), Ok(Event::None)));
     assert_eq!(disk.0.borrow().as_ref().map(|state| state.received.0), Some(1));
-    let gap = channel.receive(&frame(4, 0, "snap-4"), &mut wire);
+    let gap = channel.receive(&frame(4, 0, "snap-4"));
     assert!(matches!(gap, Err(ChannelError::Protocol(reason)) if reason == "frame gap: expected seq 2, got 4"));
     assert_eq!(channel.phase(), Phase::Closed);
 }
@@ -295,7 +289,7 @@ fn frames_sent_while_disconnected_are_saved_and_resent_after_welcome() {
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
     open(&mut channel, &mut wire);
-    channel.receive(&frame(1, 0, "snap-1"), &mut wire).expect("frame");
+    channel.receive(&frame(1, 0, "snap-1")).expect("frame");
     channel.send(done("snap-1"), &mut wire).expect("send");
     assert_eq!(wire.sent().len(), 1);
     channel.disconnect();
@@ -313,9 +307,7 @@ fn frames_sent_while_disconnected_are_saved_and_resent_after_welcome() {
         .collect();
     assert_eq!(resent, [(1, 1), (2, 1)]);
 
-    channel
-        .receive(&frame(2, 1, "snap-2"), &mut wire)
-        .expect("ack of the first");
+    channel.receive(&frame(2, 1, "snap-2")).expect("ack of the first");
     let saved = disk.0.borrow().clone().expect("saved state");
     assert_eq!(saved.unacked.iter().map(|frame| frame.seq.0).collect::<Vec<_>>(), [2]);
 }
@@ -326,7 +318,7 @@ fn the_host_keeps_the_grant_of_the_offer_it_accepted_and_never_saves_one() {
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
     open(&mut channel, &mut wire);
-    let Ok(Event::Message(accepted)) = channel.receive(&offer(1, "grant-1"), &mut wire) else {
+    let Ok(Event::Message(accepted)) = channel.receive(&offer(1, "grant-1")) else {
         panic!("the first offer is delivered");
     };
     let ChannelControlMessage::TurnOffer(accepted) = *accepted else {
@@ -336,10 +328,7 @@ fn the_host_keeps_the_grant_of_the_offer_it_accepted_and_never_saves_one() {
     channel.disconnect();
 
     open(&mut channel, &mut wire);
-    assert!(matches!(
-        channel.receive(&offer(1, "grant-2"), &mut wire),
-        Ok(Event::None)
-    ));
+    assert!(matches!(channel.receive(&offer(1, "grant-2")), Ok(Event::None)));
     let saved = serde_json::to_string(&disk.0.borrow().clone().expect("saved state")).expect("state encodes");
     assert!(!saved.contains("grant-") && !saved.contains("secret-"), "{saved}");
 }
@@ -351,7 +340,7 @@ fn a_heartbeat_keeps_an_open_channel_open() {
     let mut wire = Wire::default();
     open(&mut channel, &mut wire);
     let beat = json!({"type": "Heartbeat", "sentAt": "2026-11-14T10:00:00+01:00"}).to_string();
-    assert!(matches!(channel.receive(&beat, &mut wire), Ok(Event::Heartbeat)));
+    assert!(matches!(channel.receive(&beat), Ok(Event::Heartbeat)));
     assert_eq!(channel.phase(), Phase::Open);
 }
 
@@ -362,10 +351,7 @@ fn a_release_notice_reaches_an_open_channel() {
     let mut wire = Wire::default();
     open(&mut channel, &mut wire);
     let notice = json!({"type": "ReleasePublished", "releaseVersion": "v0.9.0"}).to_string();
-    assert!(matches!(
-        channel.receive(&notice, &mut wire),
-        Ok(Event::ReleasePublished)
-    ));
+    assert!(matches!(channel.receive(&notice), Ok(Event::ReleasePublished)));
     assert_eq!(channel.phase(), Phase::Open);
 }
 
@@ -398,7 +384,7 @@ fn a_saved_frame_no_reader_knows_is_resent_unchanged_and_dropped_once_the_contro
     assert_eq!(sent[0], json!({"type": "Frame", "seq": 7, "ack": 4, "message": step}));
 
     let refused = json!({"type": "FrameRefused", "seq": 7, "reason": "message.phase: Invalid option"}).to_string();
-    let Ok(Event::FrameRefused { seq, reason }) = channel.receive(&refused, &mut wire) else {
+    let Ok(Event::FrameRefused { seq, reason }) = channel.receive(&refused) else {
         panic!("the refusal is reported");
     };
     assert_eq!((seq, reason.as_str()), (7, "message.phase: Invalid option"));
@@ -420,7 +406,7 @@ fn a_frame_and_message_with_fields_this_supervisor_does_not_know_are_read_for_th
     let mut extended: Value = serde_json::from_str(&frame(1, 0, "snap-1")).expect("frame");
     extended["priority"] = json!("High");
     extended["message"]["compression"] = json!("Zstd");
-    let Ok(Event::Message(message)) = channel.receive(&extended.to_string(), &mut wire) else {
+    let Ok(Event::Message(message)) = channel.receive(&extended.to_string()) else {
         panic!("the frame is read");
     };
     let ChannelControlMessage::SnapshotRequest(request) = *message else {
@@ -542,36 +528,16 @@ fn a_control_plane_that_closes_after_every_welcome_is_reconnected_with_growing_g
 }
 
 #[test]
-fn a_frame_the_control_plane_never_acks_is_resent_unchanged_after_every_welcome_and_its_count_survives_a_restart() {
+fn a_frame_the_control_plane_never_acks_is_resent_unchanged_after_every_welcome_and_after_a_restart() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
     let mut control = ControlPlane::new(false);
     open(&mut channel, &mut wire);
     channel.send(done("snap-1"), &mut wire).expect("send");
-    for _ in 0..6 {
-        assert!(matches!(
-            control.reconnect(&mut channel, &mut wire),
-            Ok(Event::Welcomed)
-        ));
-        control.read(&mut wire);
-    }
-    assert_eq!(channel.stuck(), None);
-    let saved = disk.0.borrow().clone().expect("saved state");
-    assert_eq!(
-        serde_json::to_value(&saved.replays).expect("replays encode"),
-        json!([{"seq": 1, "replays": 6}])
-    );
-
-    let mut channel = HostChannel::new(
-        saved,
-        disk.clone(),
-        Recorder::default(),
-        "host-1".try_into().expect("host id"),
-        "0.1.0".to_string(),
-    );
+    control.read(&mut wire);
     let mut resent = Vec::new();
-    for _ in 0..24 {
+    for _ in 0..15 {
         assert!(matches!(
             control.reconnect(&mut channel, &mut wire),
             Ok(Event::Welcomed)
@@ -580,8 +546,24 @@ fn a_frame_the_control_plane_never_acks_is_resent_unchanged_after_every_welcome_
         resent.push((frame["seq"].clone(), frame["message"]["type"].clone()));
         control.read(&mut wire);
     }
-    assert_eq!(resent, vec![(json!(1), json!("SnapshotDone")); 24]);
-    assert_eq!(channel.stuck(), Some((1, "SnapshotDone", 30)));
+    let saved = disk.0.borrow().clone().expect("saved state");
+    let mut channel = HostChannel::new(
+        saved,
+        disk.clone(),
+        Recorder::default(),
+        "host-1".try_into().expect("host id"),
+        "0.1.0".to_string(),
+    );
+    for _ in 0..15 {
+        assert!(matches!(
+            control.reconnect(&mut channel, &mut wire),
+            Ok(Event::Welcomed)
+        ));
+        let frame = first_unacked(&mut wire);
+        resent.push((frame["seq"].clone(), frame["message"]["type"].clone()));
+        control.read(&mut wire);
+    }
+    assert_eq!(resent, vec![(json!(1), json!("SnapshotDone")); 30]);
 
     control.taking = true;
     assert!(matches!(
@@ -594,11 +576,9 @@ fn a_frame_the_control_plane_never_acks_is_resent_unchanged_after_every_welcome_
         Ok(Event::Welcomed)
     ));
     assert_eq!(control.taken, [(1, "SnapshotDone".to_string())]);
-    assert_eq!(channel.stuck(), None);
     let saved = disk.0.borrow().clone().expect("saved state");
     assert!(saved.unacked.is_empty() && saved.replays.is_empty(), "{saved:?}");
 }
-
 #[test]
 fn the_reconnect_wait_starts_over_only_once_a_frame_arrives() {
     let disk = Disk::default();
@@ -615,9 +595,7 @@ fn the_reconnect_wait_starts_over_only_once_a_frame_arrives() {
     assert_eq!(backoff.next(channel.progressed(), u16::MAX), Duration::from_secs(2));
 
     open(&mut channel, &mut wire);
-    channel
-        .receive(&frame(1, 1, "snap-2"), &mut wire)
-        .expect("ack of the replay");
+    channel.receive(&frame(1, 1, "snap-2")).expect("ack of the replay");
     channel.disconnect();
     assert_eq!(backoff.next(channel.progressed(), u16::MAX), Duration::from_secs(1));
 }
@@ -684,7 +662,7 @@ fn a_rate_limited_host_reports_rate_limited_until_a_full_minute_passes_with_no_r
 }
 
 #[test]
-fn a_frame_refused_over_the_rate_is_dropped_and_frames_sent_while_withheld_go_out_paced_after_the_pause() {
+fn a_frame_refused_over_the_rate_stays_saved_and_goes_out_again_paced_with_the_frames_sent_after_it() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
@@ -696,35 +674,34 @@ fn a_frame_refused_over_the_rate_is_dropped_and_frames_sent_while_withheld_go_ou
         seq: 1,
         frames_per_minute: 600,
         ..
-    }) = channel.receive(&limited.to_string(), &mut wire)
+    }) = channel.receive(&limited.to_string())
     else {
         panic!("the refusal names the limit");
     };
-    assert!(channel.state().unacked.is_empty(), "a refused frame is never resent");
-    channel.withhold();
+    assert!(channel.withholding());
     for snapshot in ["snap-2", "snap-3", "snap-4"] {
         channel.send(done(snapshot), &mut wire).expect("send");
     }
-    assert!(
-        wire.sent().is_empty(),
+    assert_eq!(
+        wire.sent(),
+        Vec::<Value>::new(),
         "nothing goes out while the host holds its frames"
     );
-    channel.release(2, &mut wire).expect("release");
     let seqs = |wire: &mut Wire| {
         wire.sent()
             .iter()
             .map(|frame| frame["seq"].as_i64().expect("seq"))
             .collect::<Vec<_>>()
     };
-    assert_eq!(seqs(&mut wire), [2, 3]);
-    assert!(channel.withholding());
     channel.release(2, &mut wire).expect("release");
-    assert_eq!(seqs(&mut wire), [4]);
+    assert_eq!(seqs(&mut wire), [1, 2]);
+    channel.release(2, &mut wire).expect("release");
+    assert_eq!(seqs(&mut wire), [3, 4]);
     assert!(!channel.withholding());
     channel.send(done("snap-5"), &mut wire).expect("send");
     assert_eq!(seqs(&mut wire), [5]);
+    assert_eq!(unacked_seqs(&disk), [1, 2, 3, 4, 5]);
 }
-
 #[test]
 fn a_backlog_saved_before_a_restart_is_held_at_the_welcome_and_goes_out_paced() {
     let saved: SupervisorChannelState = serde_json::from_value(json!({
@@ -791,7 +768,7 @@ fn an_offer_is_held_from_its_receipt_until_the_box_or_a_frame_names_its_turn() {
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
     open(&mut channel, &mut wire);
-    channel.receive(&offer(1, "grant-1"), &mut wire).expect("offer");
+    channel.receive(&offer(1, "grant-1")).expect("offer");
     let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
     let beat = |channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire, turn_ids: Vec<EntityId>| {
         let held = HeldIds {
@@ -821,7 +798,7 @@ fn a_socket_closed_mid_turn_keeps_the_turn_held_and_resends_its_unacked_output_a
     let mut wire = Wire::default();
     let mut control = ControlPlane::new(true);
     open(&mut channel, &mut wire);
-    channel.receive(&offer(1, "grant-1"), &mut wire).expect("offer");
+    channel.receive(&offer(1, "grant-1")).expect("offer");
     channel.send(claim("turn-1"), &mut wire).expect("send");
     control.read(&mut wire);
     channel.send(line("turn-1", 1), &mut wire).expect("send");
@@ -834,7 +811,7 @@ fn a_socket_closed_mid_turn_keeps_the_turn_held_and_resends_its_unacked_output_a
 
     channel.connect();
     let challenge = json!({"type": "Challenge", "nonce": NONCE}).to_string();
-    let Ok(Event::Challenged(nonce)) = channel.receive(&challenge, &mut wire) else {
+    let Ok(Event::Challenged(nonce)) = channel.receive(&challenge) else {
         panic!("the challenge asks for a Hello");
     };
     channel
@@ -842,9 +819,11 @@ fn a_socket_closed_mid_turn_keeps_the_turn_held_and_resends_its_unacked_output_a
         .expect("hello");
     let [hello] = wire.sent().try_into().expect("one hello");
     assert_eq!(hello["heldTurnIds"], json!(["turn-1"]));
-    let Ok(Event::Welcomed) = channel.receive(&control.welcome().to_string(), &mut wire) else {
+    let Ok(Event::Welcomed) = channel.receive(&control.welcome().to_string()) else {
         panic!("the welcome opens the channel");
     };
+    assert_eq!(wire.sent(), Vec::<Value>::new(), "the welcome sends nothing by itself");
+    channel.release(usize::MAX, &mut wire).expect("release");
     let resent: Vec<(i64, i64)> = wire
         .sent()
         .iter()
@@ -921,14 +900,13 @@ fn a_host_rate_limited_for_five_windows_holds_its_output_until_each_retry_after_
         channel.send(line("turn-1", line_seq), &mut wire).expect("send");
         let [refused] = wire.sent().try_into().expect("one frame");
         let limited = json!({"type": "FrameRateLimited", "seq": refused["seq"], "reason": "host host-1 sent more than 600 frames a minute", "framesPerMinute": 600, "retryAfter": at(now + 60).to_rfc3339()});
-        let Ok(Event::FrameRateLimited { retry_after, .. }) = channel.receive(&limited.to_string(), &mut wire) else {
+        let Ok(Event::FrameRateLimited { retry_after, .. }) = channel.receive(&limited.to_string()) else {
             panic!("the refusal names the limit");
         };
         assert_eq!(
             limit.limited(at(now), retry_after, 600, 0),
             RateBackoff::Until(at(now + 60))
         );
-        channel.withhold();
         for _ in 0..3 {
             line_seq += 1;
             channel.send(line("turn-1", line_seq), &mut wire).expect("send");
@@ -952,9 +930,131 @@ fn a_host_rate_limited_for_five_windows_holds_its_output_until_each_retry_after_
                 .map(|frame| frame["message"]["lineSeq"].as_i64().expect("line seq")),
         );
     }
-    assert_eq!(released, [2, 3, 4, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 20]);
-    assert_eq!(
-        unacked_seqs(&disk),
-        [2, 3, 4, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 20]
+    assert_eq!(released, (1..=20).collect::<Vec<_>>(), "no line is lost");
+    assert_eq!(unacked_seqs(&disk), (1..=20).collect::<Vec<_>>());
+}
+
+fn withdrawn(seq: i64) -> String {
+    json!({"type": "Frame", "seq": seq, "ack": 0, "message": {"type": "TurnWithdrawn", "turnId": "turn-1"}}).to_string()
+}
+
+fn held_in_heartbeat(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) -> Value {
+    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
+    channel
+        .heartbeat(sent_at, usage(), HeldIds::default(), HostReportedHealth::Healthy, wire)
+        .expect("heartbeat");
+    let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
+    heartbeat.get("heldTurnIds").cloned().unwrap_or(Value::Null)
+}
+
+#[test]
+fn a_withdrawn_offer_leaves_the_held_turns() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    channel.receive(&offer(1, "grant-1")).expect("offer");
+    assert_eq!(held_in_heartbeat(&mut channel, &mut wire), json!(["turn-1"]));
+    channel.receive(&withdrawn(2)).expect("withdrawn");
+    assert_eq!(held_in_heartbeat(&mut channel, &mut wire), json!([]));
+}
+
+#[test]
+fn an_offer_whose_turn_a_frame_named_leaves_the_held_turns_once_that_frame_is_acked() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    channel.receive(&offer(1, "grant-1")).expect("offer");
+    channel.send(claim("turn-1"), &mut wire).expect("send");
+    wire.sent();
+    channel.receive(&frame(2, 1, "snap-2")).expect("ack of the claim");
+    assert_eq!(unacked_seqs(&disk), Vec::<i64>::new());
+    assert_eq!(held_in_heartbeat(&mut channel, &mut wire), json!([]));
+}
+
+#[test]
+fn a_restarted_channel_holds_the_turns_its_saved_unacked_frames_name() {
+    let saved: SupervisorChannelState = serde_json::from_value(json!({
+        "received": 2,
+        "sent": 2,
+        "unacked": [
+            {"type": "Frame", "seq": 1, "ack": 0, "message": {"type": "TurnClaim", "turnId": "turn-7", "boxId": "box-1"}},
+            {"type": "Frame", "seq": 2, "ack": 0, "message": {"type": "TurnLine", "turnId": "turn-8", "lineSeq": 1, "text": "line 1"}}
+        ],
+        "replays": [{"seq": 1, "replays": 4}]
+    }))
+    .expect("saved state");
+    let disk = Disk::default();
+    let mut channel = HostChannel::new(
+        saved,
+        disk.clone(),
+        Recorder::default(),
+        "host-1".try_into().expect("host id"),
+        "0.1.0".to_string(),
     );
+    let mut wire = Wire::default();
+    channel.connect();
+    let challenge = json!({"type": "Challenge", "nonce": NONCE}).to_string();
+    let Ok(Event::Challenged(nonce)) = channel.receive(&challenge) else {
+        panic!("the challenge asks for a Hello");
+    };
+    channel
+        .hello(&nonce, capacity(), usage(), Vec::new(), &mut wire)
+        .expect("hello");
+    let [hello] = wire.sent().try_into().expect("one hello");
+    assert_eq!(hello["heldTurnIds"], json!(["turn-7", "turn-8"]));
+    assert_eq!(channel.state().replays.len(), 0);
+}
+
+#[test]
+fn a_host_stepped_down_to_the_oldest_protocol_says_hello_in_its_shape() {
+    let mut channel = channel(&Disk::default(), &Recorder::default());
+    let mut wire = Wire::default();
+    let hello = |channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire| {
+        channel.disconnect();
+        channel.connect();
+        let challenge = json!({"type": "Challenge", "nonce": NONCE}).to_string();
+        let Ok(Event::Challenged(nonce)) = channel.receive(&challenge) else {
+            panic!("the challenge asks for a Hello");
+        };
+        let turn = EntityId::try_from("turn-1").expect("id");
+        channel
+            .hello(&nonce, capacity(), usage(), vec![turn], wire)
+            .expect("hello");
+        let [hello] = wire.sent().try_into().expect("one hello");
+        hello
+    };
+    let newest = hello(&mut channel, &mut wire);
+    assert_eq!(newest["protocolVersion"], json!(ChannelProtocol::VERSION));
+    assert_eq!(newest["channelProtocolOldest"], json!(ChannelProtocol::OLDEST));
+    assert_eq!(newest["heldTurnIds"], json!(["turn-1"]));
+
+    let stepped = channel.step_down();
+    let oldest = hello(&mut channel, &mut wire);
+    assert_eq!(stepped.is_some(), ChannelProtocol::OLDEST < ChannelProtocol::VERSION);
+    assert_eq!(oldest["protocolVersion"], json!(ChannelProtocol::OLDEST));
+    assert_eq!(oldest["channelProtocolOldest"], json!(ChannelProtocol::OLDEST));
+    assert_eq!(oldest.get("heldTurnIds").is_some(), ChannelProtocol::OLDEST >= 35);
+    assert_eq!(channel.step_down(), None);
+
+    channel.step_up();
+    let climbed = hello(&mut channel, &mut wire);
+    assert_eq!(climbed["protocolVersion"], json!(ChannelProtocol::VERSION));
+}
+
+#[test]
+fn a_heartbeat_on_a_channel_welcomed_at_protocol_34_names_no_held_turns() {
+    let mut channel = channel(&Disk::default(), &Recorder::default());
+    let mut wire = Wire::default();
+    let at_34 = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 34});
+    let Ok(Event::Welcomed) = welcome(&mut channel, &mut wire, &at_34) else {
+        panic!("the welcome opens the channel");
+    };
+    channel.receive(&offer(1, "grant-1")).expect("offer");
+    assert_eq!(held_in_heartbeat(&mut channel, &mut wire), Value::Null);
+
+    channel.disconnect();
+    open(&mut channel, &mut wire);
+    assert_eq!(held_in_heartbeat(&mut channel, &mut wire), json!(["turn-1"]));
 }

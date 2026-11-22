@@ -8,13 +8,13 @@ use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostEnvelope, ChannelHostFrame, ChannelHostFrameType, ChannelHostHeartbeat,
     ChannelHostHeartbeatType, ChannelHostMessage, ChannelProtocol, ChannelStoredHostFrame, ChannelStoredHostFrameType,
-    EntityId, HostReportedHealth, HostUsage, Sequence, SupervisorChannelReplay, SupervisorChannelState,
+    ChannelWelcome, EntityId, HostReportedHealth, HostUsage, Sequence, SupervisorChannelState,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
 pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
-pub const STUCK_REPLAYS: u32 = 10;
+const HELD_TURNS_SINCE: u16 = 35;
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 const ASSUMED_FRAMES_PER_MINUTE: u32 = 600;
 
@@ -212,25 +212,27 @@ pub struct HostChannel<S: Store, K: Signer> {
     progressed: bool,
     withheld: Option<i64>,
     offered: Vec<EntityId>,
+    hello_version: u16,
+    spoken: u16,
 }
 
 fn encode(envelope: &ChannelHostEnvelope) -> Result<String, ChannelError> {
     serde_json::to_string(envelope).map_err(|error| ChannelError::Protocol(format!("encoding a message: {error}")))
 }
 
+fn encode_for(envelope: &ChannelHostEnvelope, version: u16) -> Result<String, ChannelError> {
+    if version >= HELD_TURNS_SINCE {
+        return encode(envelope);
+    }
+    let mut value = serde_json::to_value(envelope).map_err(|error| protocol(format!("encoding a message: {error}")))?;
+    if let Value::Object(fields) = &mut value {
+        fields.remove("heldTurnIds");
+    }
+    serde_json::to_string(&value).map_err(|error| protocol(format!("encoding a message: {error}")))
+}
+
 fn protocol(reason: impl Into<String>) -> ChannelError {
     ChannelError::Protocol(reason.into())
-}
-
-fn message_type(frame: &ChannelStoredHostFrame) -> &str {
-    frame.message.get("type").and_then(Value::as_str).unwrap_or("unknown")
-}
-
-fn replays_of(replays: &[SupervisorChannelReplay], seq: i64) -> u32 {
-    replays
-        .iter()
-        .find(|replay| replay.seq.0 == seq)
-        .map_or(0, |replay| replay.replays.get())
 }
 
 impl<S: Store, K: Signer> HostChannel<S, K> {
@@ -242,6 +244,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         supervisor_version: String,
     ) -> Self {
         let withheld = state.unacked.first().map(|first| first.seq.0);
+        let state = SupervisorChannelState {
+            replays: Vec::new(),
+            ..state
+        };
         Self {
             state,
             store,
@@ -252,6 +258,8 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             progressed: false,
             withheld,
             offered: Vec::new(),
+            hello_version: ChannelProtocol::VERSION,
+            spoken: ChannelProtocol::VERSION,
         }
     }
 
@@ -279,6 +287,18 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         self.phase = Phase::Closed;
     }
 
+    pub fn step_down(&mut self) -> Option<u16> {
+        if self.hello_version <= ChannelProtocol::OLDEST {
+            return None;
+        }
+        self.hello_version = ChannelProtocol::OLDEST;
+        Some(self.hello_version)
+    }
+
+    pub fn step_up(&mut self) {
+        self.hello_version = ChannelProtocol::VERSION;
+    }
+
     /// # Errors
     /// Fails when the state cannot be saved or the port refuses the frame.
     pub fn send(&mut self, message: ChannelHostMessage, port: &mut impl Port) -> Result<(), ChannelError> {
@@ -290,6 +310,9 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         };
         let message = serde_json::to_value(&frame.message)
             .map_err(|error| protocol(format!("encoding a message for channel.json: {error}")))?;
+        if let Some(turn_id) = message.get("turnId").and_then(Value::as_str) {
+            self.offered.retain(|offered| **offered != *turn_id);
+        }
         self.state.sent = Sequence(frame.seq.0);
         self.state.unacked.push(ChannelStoredHostFrame {
             ack: Sequence(frame.ack.0),
@@ -302,12 +325,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             port.send(encode(&frame.into())?)?;
         }
         Ok(())
-    }
-
-    pub fn withhold(&mut self) {
-        if self.withheld.is_none() {
-            self.withheld = Some(self.state.sent.0 + 1);
-        }
     }
 
     #[must_use]
@@ -349,10 +366,8 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     }
 
     fn held_turns(&mut self, mut held: Vec<EntityId>) -> Vec<EntityId> {
-        let unacked = self.unacked_turns();
-        self.offered
-            .retain(|offered| !held.contains(offered) && !unacked.contains(offered));
-        for turn_id in unacked.into_iter().chain(self.offered.iter().cloned()) {
+        self.offered.retain(|offered| !held.contains(offered));
+        for turn_id in self.unacked_turns().into_iter().chain(self.offered.iter().cloned()) {
             if !held.contains(&turn_id) {
                 held.push(turn_id);
             }
@@ -370,7 +385,8 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         health: HostReportedHealth,
         port: &mut impl Port,
     ) -> Result<(), ChannelError> {
-        port.send(encode(
+        let spoken = self.spoken;
+        port.send(encode_for(
             &ChannelHostHeartbeat {
                 health: Some(health),
                 held_claude_setup_ids: held.claude_setup_ids,
@@ -381,6 +397,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                 usage,
             }
             .into(),
+            spoken,
         )?)
     }
 
@@ -402,11 +419,11 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         }
         let hello = ChannelHello {
             box_capacity,
-            channel_protocol_oldest: None,
+            channel_protocol_oldest: NonZeroU32::new(u32::from(ChannelProtocol::OLDEST)),
             guest_protocol: None,
             held_turn_ids: self.held_turns(held_turn_ids),
             host_id: self.host_id.clone(),
-            protocol_version: NonZeroU32::new(u32::from(ChannelProtocol::VERSION))
+            protocol_version: NonZeroU32::new(u32::from(self.hello_version))
                 .ok_or_else(|| protocol("protocol version 0"))?,
             signature: self
                 .signer
@@ -421,28 +438,28 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             type_: ChannelHelloType::Hello,
             usage,
         };
-        port.send(encode(&hello.into())?)?;
+        port.send(encode_for(&hello.into(), self.hello_version)?)?;
         self.phase = Phase::AwaitingWelcome;
         Ok(())
     }
 
     /// # Errors
     /// Fails on a message the protocol does not allow in the current phase, a frame gap, or when
-    /// the state cannot be saved or the port refuses a message. The connection must be closed then.
-    pub fn receive(&mut self, text: &str, port: &mut impl Port) -> Result<Event, ChannelError> {
+    /// the state cannot be saved. The connection must be closed then.
+    pub fn receive(&mut self, text: &str) -> Result<Event, ChannelError> {
         if self.phase == Phase::Closed {
             return Ok(Event::None);
         }
         let envelope: ChannelControlEnvelope = serde_json::from_str(text)
             .map_err(|error| protocol(format!("the message matches no channel envelope: {error}")))?;
-        let outcome = self.handle(envelope, port);
+        let outcome = self.handle(envelope);
         if outcome.is_err() {
             self.phase = Phase::Closed;
         }
         outcome
     }
 
-    fn handle(&mut self, envelope: ChannelControlEnvelope, port: &mut impl Port) -> Result<Event, ChannelError> {
+    fn handle(&mut self, envelope: ChannelControlEnvelope) -> Result<Event, ChannelError> {
         match (self.phase, envelope) {
             (Phase::AwaitingChallenge, ChannelControlEnvelope::Challenge(challenge)) => {
                 self.phase = Phase::AwaitingHello;
@@ -451,59 +468,25 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             (Phase::AwaitingChallenge, other) => {
                 Err(protocol(format!("expected Challenge first, got {}", kind(&other))))
             }
-            (Phase::AwaitingWelcome, ChannelControlEnvelope::Welcome(welcome)) => self.welcomed(welcome.ack, port),
+            (Phase::AwaitingWelcome, ChannelControlEnvelope::Welcome(welcome)) => self.welcomed(welcome),
             (Phase::Open, ChannelControlEnvelope::ControlFrame(frame)) => self.accept(frame),
             (Phase::AwaitingWelcome | Phase::Open, ChannelControlEnvelope::Heartbeat(_)) => Ok(Event::Heartbeat),
             (Phase::Open, ChannelControlEnvelope::ReleasePublished(_)) => Ok(Event::ReleasePublished),
             (Phase::Open, ChannelControlEnvelope::FrameRefused(refused)) => self.refused(refused),
-            (Phase::Open, ChannelControlEnvelope::FrameRateLimited(limited)) => self.rate_limited(limited),
+            (Phase::Open, ChannelControlEnvelope::FrameRateLimited(limited)) => Ok(self.rate_limited(limited)),
             (phase, other) => Err(protocol(format!("{} arrived in phase {phase:?}", kind(&other)))),
         }
     }
 
-    fn welcomed(&mut self, ack: Option<Sequence>, port: &mut impl Port) -> Result<Event, ChannelError> {
-        if let Some(ack) = ack {
+    fn welcomed(&mut self, welcome: ChannelWelcome) -> Result<Event, ChannelError> {
+        if let Some(ack) = welcome.ack {
             self.drop_acked(ack.0);
         }
-        self.count_replay();
         self.store.save(&self.state)?;
-        self.phase = Phase::Open;
-        if let Some(first) = self.state.unacked.first().filter(|_| self.withheld.is_some()) {
-            self.withheld = Some(first.seq.0);
-            return Ok(Event::Welcomed);
-        }
-        for frame in &self.state.unacked {
-            let resent = ChannelStoredHostFrame {
-                ack: Sequence(self.state.received.0),
-                ..frame.clone()
-            };
-            port.send(
-                serde_json::to_string(&resent)
-                    .map_err(|error| protocol(format!("encoding a stored frame: {error}")))?,
-            )?;
-        }
+        self.spoken = u16::try_from(welcome.protocol_version.get()).unwrap_or(u16::MAX);
+        self.withheld = self.state.unacked.first().map(|first| first.seq.0);
         self.phase = Phase::Open;
         Ok(Event::Welcomed)
-    }
-
-    fn count_replay(&mut self) {
-        let Some(first) = self.state.unacked.first() else {
-            return;
-        };
-        let seq = first.seq.0;
-        let replays = replays_of(&self.state.replays, seq);
-        self.state.replays.retain(|replay| replay.seq.0 != seq);
-        self.state.replays.push(SupervisorChannelReplay {
-            replays: NonZeroU32::MIN.saturating_add(replays),
-            seq: Sequence(seq),
-        });
-    }
-
-    #[must_use]
-    pub fn stuck(&self) -> Option<(i64, &str, u32)> {
-        let first = self.state.unacked.first()?;
-        let replays = replays_of(&self.state.replays, first.seq.0);
-        (replays >= STUCK_REPLAYS).then(|| (first.seq.0, message_type(first), replays))
     }
 
     fn drop_acked(&mut self, ack: i64) {
@@ -511,13 +494,11 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             self.progressed = true;
         }
         self.state.unacked.retain(|own| own.seq.0 > ack);
-        self.state.replays.retain(|replay| replay.seq.0 > ack);
     }
 
     fn refused(&mut self, refused: ChannelFrameRefused) -> Result<Event, ChannelError> {
         self.progressed = true;
         self.state.unacked.retain(|own| own.seq.0 != refused.seq.0);
-        self.state.replays.retain(|replay| replay.seq.0 != refused.seq.0);
         self.store.save(&self.state)?;
         Ok(Event::FrameRefused {
             seq: refused.seq.0,
@@ -525,17 +506,15 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         })
     }
 
-    fn rate_limited(&mut self, limited: ChannelFrameRateLimited) -> Result<Event, ChannelError> {
+    fn rate_limited(&mut self, limited: ChannelFrameRateLimited) -> Event {
         self.progressed = true;
-        self.state.unacked.retain(|own| own.seq.0 != limited.seq.0);
-        self.state.replays.retain(|replay| replay.seq.0 != limited.seq.0);
-        self.store.save(&self.state)?;
-        Ok(Event::FrameRateLimited {
+        self.withheld = Some(self.withheld.map_or(limited.seq.0, |from| from.min(limited.seq.0)));
+        Event::FrameRateLimited {
             seq: limited.seq.0,
             reason: String::from(limited.reason),
             frames_per_minute: limited.frames_per_minute.get(),
             retry_after: limited.retry_after.with_timezone(&Utc),
-        })
+        }
     }
 
     fn accept(&mut self, frame: ChannelControlFrame) -> Result<Event, ChannelError> {
