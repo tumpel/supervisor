@@ -57,14 +57,6 @@ const TRANSFERS: usize = 16;
 const CHUNKS: &str = "chunks";
 const HANDOVER_REPORT_ALLOWANCE: Duration = Duration::from_secs(60);
 const CANCEL_END: Duration = Duration::from_secs(10);
-const AUTO_IDLE_TEARDOWN: Duration = Duration::from_mins(15);
-
-fn idle_teardown(retention: BoxRetention) -> Option<Duration> {
-    match retention {
-        BoxRetention::Auto => Some(AUTO_IDLE_TEARDOWN),
-        BoxRetention::Warm | BoxRetention::Off => None,
-    }
-}
 const DISK_CHECK: Duration = Duration::from_secs(1);
 const RESTORE_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
 const RESTORE_ENTRIES_PER_SECOND: u64 = 2_000;
@@ -190,6 +182,7 @@ pub struct BoxTurn {
     pub box_memory_mib: Option<i32>,
     pub box_disk_mib: Option<i32>,
     pub turn_seconds: NonZeroU32,
+    pub idle_seconds: NonZeroU32,
     pub box_retention: BoxRetention,
 }
 
@@ -295,6 +288,7 @@ struct LiveBox<M: Machine> {
     dirty: bool,
     credential_file: Option<String>,
     box_retention: BoxRetention,
+    idle: Duration,
 }
 
 impl<M: Machine> LiveBox<M> {
@@ -311,6 +305,7 @@ impl<M: Machine> LiveBox<M> {
             dirty: false,
             credential_file: None,
             box_retention: turn.box_retention,
+            idle: Duration::from_secs(u64::from(turn.idle_seconds.get())),
         }
     }
 }
@@ -322,6 +317,7 @@ impl<M: Machine> LiveBox<M> {
             box_retention: self.box_retention,
             credential_file: credential_record(self.credential_file.clone())?,
             dirty: self.dirty || turn_id.is_some(),
+            idle_milliseconds: milliseconds(self.idle),
             image: self.image.record()?,
             machine: self.machine.record()?,
             queued: Vec::new(),
@@ -345,9 +341,7 @@ fn standing_state(turn_id: Option<EntityId>) -> SupervisorHandoverBoxState {
             turn_id,
         }),
         None => SupervisorHandoverBoxState::Warm(SupervisorHandoverWarm {
-            expired: false,
             kind: SupervisorHandoverWarmKind::Warm,
-            warm_milliseconds: 0,
         }),
     }
 }
@@ -380,6 +374,7 @@ fn standing_record(handed: &SupervisorHandoverBox) -> Result<SupervisorHandoverB
 struct Standing {
     path: PathBuf,
     boxes: Arc<std::sync::Mutex<BTreeMap<i32, SupervisorHandoverBox>>>,
+    idle_ends: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
 }
 
 impl Standing {
@@ -389,6 +384,16 @@ impl Standing {
             .lock()
             .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?;
         change(&mut boxes);
+        let idle_ends = self.idle_ends.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let written = Instant::now();
+        for record in boxes.values_mut() {
+            if let (SupervisorHandoverBoxState::Warm(_), Some(end)) =
+                (&record.state, idle_ends.get(record.session_id.as_str()))
+            {
+                record.idle_milliseconds = milliseconds(end.saturating_duration_since(written));
+            }
+        }
+        drop(idle_ends);
         let record = SupervisorHandover {
             boxes: boxes.values().cloned().collect(),
             handed_at: now(),
@@ -398,6 +403,14 @@ impl Standing {
         std::fs::write(&staged, text)
             .and_then(|()| std::fs::rename(&staged, &self.path))
             .map_err(|error| format!("writing {}: {error}", self.path.display()))
+    }
+
+    fn idle_until(&self, session: &str, end: Option<Instant>) {
+        let mut idle_ends = self.idle_ends.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match end {
+            Some(end) => idle_ends.insert(session.to_string(), end),
+            None => idle_ends.remove(session),
+        };
     }
 
     fn put<M: Machine>(&self, live: &LiveBox<M>, turn_id: Option<&EntityId>) -> Result<(), String> {
@@ -545,6 +558,7 @@ struct Slot<M: Machine> {
     task: Option<(Running, JoinHandle<()>)>,
     queue: VecDeque<Command>,
     idle: Option<AbortHandle>,
+    idle_end: Option<Instant>,
 }
 
 impl<M: Machine> Default for Slot<M> {
@@ -557,6 +571,7 @@ impl<M: Machine> Default for Slot<M> {
             task: None,
             queue: VecDeque::new(),
             idle: None,
+            idle_end: None,
         }
     }
 }
@@ -888,6 +903,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
 
     async fn warm_turn(&self, mut live: LiveBox<V::Machine>, turn: &BoxTurn) -> Outcome<V::Machine> {
         live.box_retention = turn.box_retention;
+        live.idle = Duration::from_secs(u64::from(turn.idle_seconds.get()));
         let claiming = self.claim(turn);
         let Some(files) = self.files(turn).await else {
             return Outcome::Kept(live);
@@ -2094,6 +2110,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 standing: Standing {
                     path: standing,
                     boxes: Arc::default(),
+                    idle_ends: Arc::default(),
                 },
                 cancels: Cancels::default(),
                 staging: Tally::default(),
@@ -2276,6 +2293,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
         let mut queued = Vec::new();
         for slot in self.slots.values_mut() {
+            if let Some(armed) = slot.idle.take() {
+                armed.abort();
+            }
             let (turns, rest): (VecDeque<Command>, VecDeque<Command>) = std::mem::take(&mut slot.queue)
                 .into_iter()
                 .partition(|command| matches!(command, Command::Turn(_)));
@@ -2426,11 +2446,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     turn_id: parked.turn_id,
                 }),
                 None => SupervisorHandoverBoxState::Warm(SupervisorHandoverWarm {
-                    expired: false,
                     kind: SupervisorHandoverWarmKind::Warm,
-                    warm_milliseconds: 0,
                 }),
             };
+            let idle = slot
+                .idle_end
+                .map_or(live.idle, |end| end.saturating_duration_since(Instant::now()));
             let queued = Command::records(&queue);
             let LiveBox {
                 session_id,
@@ -2459,6 +2480,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                         box_retention,
                         credential_file,
                         dirty,
+                        idle_milliseconds: milliseconds(idle),
                         image,
                         machine,
                         queued,
@@ -2518,7 +2540,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let recorded = taken.is_some();
         let mut standing = BTreeMap::new();
         if let Some((handover, taken)) = taken {
-            for handed in handover.boxes {
+            let age = milliseconds((now() - handover.handed_at).to_std().unwrap_or(Duration::ZERO));
+            for mut handed in handover.boxes {
+                if matches!(handed.state, SupervisorHandoverBoxState::Warm(_)) {
+                    handed.idle_milliseconds = handed.idle_milliseconds.saturating_sub(age).max(0);
+                }
                 if let Some(record) = self.adopt(handed, taken) {
                     standing.insert(record.tap_index, record);
                 }
@@ -2601,9 +2627,14 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             dirty: handed.dirty,
             credential_file: handed.credential_file.map(String::from),
             box_retention: handed.box_retention,
+            idle: duration(handed.idle_milliseconds),
         });
         match (handed.state, taken) {
-            (SupervisorHandoverBoxState::Warm(_), _) => slot.paused = true,
+            (SupervisorHandoverBoxState::Warm(_), _) => {
+                slot.paused = true;
+                slot.idle_end = Some(Instant::now() + duration(handed.idle_milliseconds));
+                self.runner.standing.idle_until(&session, slot.idle_end);
+            }
             (SupervisorHandoverBoxState::Turn(turn), Taken::Crashed) => {
                 turn_failed(
                     &self.runner.out,
@@ -2786,11 +2817,16 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             self.teardown(&session).await?;
         }
         let warm = self.slots.get_mut(&session).and_then(|slot| {
+            if let Some(armed) = slot.idle.take() {
+                armed.abort();
+            }
+            slot.idle_end = None;
             let live = slot.live.take()?;
             slot.paused = false;
             slot.busy = true;
             Some(live)
         });
+        self.runner.standing.idle_until(&session, None);
         let runner = self.runner.clone();
         telemetry::start_kind(&root, warm.is_some());
         if let Some(live) = warm {
@@ -3043,31 +3079,34 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    fn idle_box(&self, session: &str) -> Option<(&EntityId, Duration)> {
+    fn idle_box(&self, session: &str) -> Option<(&EntityId, Instant)> {
         let slot = self.slots.get(session)?;
         if self.mode != Mode::TakingTurns || slot.busy || slot.parked.is_some() || !slot.queue.is_empty() {
             return None;
         }
-        let live = slot.live.as_ref().filter(|live| !live.dirty)?;
-        idle_teardown(live.box_retention).map(|after| (&live.box_id, after))
+        let live = slot
+            .live
+            .as_ref()
+            .filter(|live| !live.dirty && live.box_retention == BoxRetention::Auto)?;
+        Some((&live.box_id, slot.idle_end?))
     }
 
     fn arm_idle(&mut self, session: &str) {
-        let idle = self.idle_box(session).map(|(box_id, after)| (box_id.clone(), after));
+        let idle = self.idle_box(session).map(|(box_id, end)| (box_id.clone(), end));
         let Some(slot) = self.slots.get_mut(session) else {
             return;
         };
         if let Some(armed) = slot.idle.take() {
             armed.abort();
         }
-        let Some((box_id, after)) = idle else {
+        let Some((box_id, end)) = idle else {
             return;
         };
         let events = self.events.clone();
         let session = session.to_string();
         slot.idle = Some(
             tokio::spawn(async move {
-                tokio::time::sleep(after).await;
+                tokio::time::sleep_until(end).await;
                 let _ = events.send(Event::IdleExpired { session, box_id });
             })
             .abort_handle(),
@@ -3100,6 +3139,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             Outcome::Kept(live) => {
                 if matches!(work, Work::Turn) {
                     slot.paused = true;
+                    slot.idle_end = Some(Instant::now() + live.idle);
+                    self.runner.standing.idle_until(&session, slot.idle_end);
                 }
                 slot.live = Some(live);
             }
