@@ -538,7 +538,8 @@ struct Slot<M: Machine> {
     parked: Option<Box<Parked>>,
     task: Option<(Running, JoinHandle<()>)>,
     queue: VecDeque<Command>,
-    idle: Option<(AbortHandle, Instant)>,
+    idle: Option<AbortHandle>,
+    idle_end: Option<Instant>,
 }
 
 impl<M: Machine> Default for Slot<M> {
@@ -551,16 +552,8 @@ impl<M: Machine> Default for Slot<M> {
             task: None,
             queue: VecDeque::new(),
             idle: None,
+            idle_end: None,
         }
-    }
-}
-
-impl<M: Machine> Slot<M> {
-    fn idle_left(&mut self, budget: Duration) -> Duration {
-        self.idle.take().map_or(budget, |(armed, end)| {
-            armed.abort();
-            end.saturating_duration_since(Instant::now())
-        })
     }
 }
 
@@ -2280,6 +2273,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
         let mut queued = Vec::new();
         for slot in self.slots.values_mut() {
+            if let Some(armed) = slot.idle.take() {
+                armed.abort();
+            }
             let (turns, rest): (VecDeque<Command>, VecDeque<Command>) = std::mem::take(&mut slot.queue)
                 .into_iter()
                 .partition(|command| matches!(command, Command::Turn(_)));
@@ -2433,7 +2429,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     kind: SupervisorHandoverWarmKind::Warm,
                 }),
             };
-            let idle = slot.idle_left(live.idle);
+            let idle = slot
+                .idle_end
+                .map_or(live.idle, |end| end.saturating_duration_since(Instant::now()));
             let queued = Command::records(&queue);
             let LiveBox {
                 session_id,
@@ -2608,7 +2606,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             idle: duration(handed.idle_milliseconds),
         });
         match (handed.state, taken) {
-            (SupervisorHandoverBoxState::Warm(_), _) => slot.paused = true,
+            (SupervisorHandoverBoxState::Warm(_), _) => {
+                slot.paused = true;
+                slot.idle_end = Some(Instant::now() + duration(handed.idle_milliseconds));
+            }
             (SupervisorHandoverBoxState::Turn(turn), Taken::Crashed) => {
                 turn_failed(
                     &self.runner.out,
@@ -2791,6 +2792,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             self.teardown(&session).await?;
         }
         let warm = self.slots.get_mut(&session).and_then(|slot| {
+            if let Some(armed) = slot.idle.take() {
+                armed.abort();
+            }
+            slot.idle_end = None;
             let live = slot.live.take()?;
             slot.paused = false;
             slot.busy = true;
@@ -3048,7 +3053,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    fn idle_box(&self, session: &str) -> Option<(&EntityId, Duration)> {
+    fn idle_box(&self, session: &str) -> Option<(&EntityId, Instant)> {
         let slot = self.slots.get(session)?;
         if self.mode != Mode::TakingTurns || slot.busy || slot.parked.is_some() || !slot.queue.is_empty() {
             return None;
@@ -3057,30 +3062,29 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .live
             .as_ref()
             .filter(|live| !live.dirty && live.box_retention == BoxRetention::Auto)?;
-        Some((&live.box_id, live.idle))
+        Some((&live.box_id, slot.idle_end?))
     }
 
     fn arm_idle(&mut self, session: &str) {
-        let idle = self.idle_box(session).map(|(box_id, after)| (box_id.clone(), after));
+        let idle = self.idle_box(session).map(|(box_id, end)| (box_id.clone(), end));
         let Some(slot) = self.slots.get_mut(session) else {
             return;
         };
-        if let Some((armed, _)) = slot.idle.take() {
+        if let Some(armed) = slot.idle.take() {
             armed.abort();
         }
-        let Some((box_id, after)) = idle else {
+        let Some((box_id, end)) = idle else {
             return;
         };
         let events = self.events.clone();
         let session = session.to_string();
-        slot.idle = Some((
+        slot.idle = Some(
             tokio::spawn(async move {
-                tokio::time::sleep(after).await;
+                tokio::time::sleep_until(end).await;
                 let _ = events.send(Event::IdleExpired { session, box_id });
             })
             .abort_handle(),
-            Instant::now() + after,
-        ));
+        );
     }
 
     async fn idle_expired(&mut self, session: &str, box_id: EntityId) -> Result<(), String> {
@@ -3109,6 +3113,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             Outcome::Kept(live) => {
                 if matches!(work, Work::Turn) {
                     slot.paused = true;
+                    slot.idle_end = Some(Instant::now() + live.idle);
                 }
                 slot.live = Some(live);
             }

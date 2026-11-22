@@ -1921,6 +1921,19 @@ async fn a_snapshotted_box_idle_for_the_offered_idle_time_is_stopped_and_answers
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_box_snapshotted_late_is_stopped_once_the_idle_time_since_its_turn_runs_out() {
+    let mut host = host("idle-late-snapshot", 1, Harness::Echo, Boot::Works);
+    host.idle_seconds = NonZeroU32::new(900).expect("fifteen minutes");
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    assert_eq!(host.settle(Duration::from_mins(10)).await, Vec::<String>::new());
+    host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    assert_eq!(host.settle(Duration::from_mins(4)).await, Vec::<String>::new());
+    assert_eq!(host.settle(Duration::from_mins(2)).await, ["box gone session-1"]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_box_handed_over_while_idle_is_stopped_when_the_idle_time_left_runs_out() {
     let mut old = host("idle-handover", 1, Harness::Echo, Boot::Works);
     old.idle_seconds = NonZeroU32::new(900).expect("fifteen minutes");
