@@ -10,8 +10,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    empty_state, hello_bytes, Backoff, ChannelError, Event, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer,
-    Store, MAX_RATE_BACKOFFS, MAX_RECONNECTS,
+    empty_state, hello_bytes, Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit,
+    Signer, Store, MAX_RATE_BACKOFFS,
 };
 
 #[derive(Default)]
@@ -161,7 +161,9 @@ fn welcome(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire, welcome: 
     let Ok(Event::Challenged(nonce)) = channel.receive(&challenge, wire) else {
         panic!("the challenge asks for a Hello");
     };
-    channel.hello(&nonce, capacity(), usage(), wire).expect("hello");
+    channel
+        .hello(&nonce, capacity(), usage(), Vec::new(), wire)
+        .expect("hello");
     wire.sent();
     channel.receive(&welcome.to_string(), wire)
 }
@@ -240,7 +242,9 @@ fn hello_signs_the_documented_bytes() {
     };
     assert_eq!(nonce, NONCE);
     assert_eq!(channel.phase(), Phase::AwaitingHello);
-    channel.hello(&nonce, capacity(), usage(), &mut wire).expect("hello");
+    channel
+        .hello(&nonce, capacity(), usage(), Vec::new(), &mut wire)
+        .expect("hello");
     let mut expected = b"tumpel-channel-hello-v1\0".to_vec();
     expected.extend_from_slice(NONCE.as_bytes());
     expected.extend_from_slice(b"\0host-1");
@@ -249,7 +253,7 @@ fn hello_signs_the_documented_bytes() {
     assert_eq!(
         wire.sent(),
         [
-            json!({"type": "Hello", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION, "supervisorVersion": "0.1.0", "signature": "c2lnbmF0dXJl", "boxCapacity": 8, "usage": {"boxesWarm": 1, "loadAverage": 0.5, "memoryAvailableMib": 4096}})
+            json!({"type": "Hello", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION, "supervisorVersion": "0.1.0", "signature": "c2lnbmF0dXJl", "boxCapacity": 8, "usage": {"boxesWarm": 1, "loadAverage": 0.5, "memoryAvailableMib": 4096}, "heldTurnIds": []})
         ]
     );
     assert_eq!(channel.phase(), Phase::AwaitingWelcome);
@@ -434,17 +438,19 @@ fn a_heartbeat_names_every_held_session_and_setup_and_an_empty_list_when_none() 
     open(&mut channel, &mut wire);
     wire.sent();
     let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
-    let held = vec![EntityId::try_from("session-1").expect("id")];
-    let setups = vec![EntityId::try_from("setup-1").expect("id")];
+    let held = HeldIds {
+        session_ids: vec![EntityId::try_from("session-1").expect("id")],
+        claude_setup_ids: vec![EntityId::try_from("setup-1").expect("id")],
+        turn_ids: vec![EntityId::try_from("turn-1").expect("id")],
+    };
     channel
-        .heartbeat(sent_at, usage(), held, setups, HostReportedHealth::Healthy, &mut wire)
+        .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, &mut wire)
         .expect("heartbeat");
     channel
         .heartbeat(
             sent_at,
             usage(),
-            Vec::new(),
-            Vec::new(),
+            HeldIds::default(),
             HostReportedHealth::RateLimited,
             &mut wire,
         )
@@ -453,10 +459,35 @@ fn a_heartbeat_names_every_held_session_and_setup_and_an_empty_list_when_none() 
     assert_eq!(
         wire.sent(),
         [
-            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": ["session-1"], "heldClaudeSetupIds": ["setup-1"], "health": "Healthy"}),
-            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": [], "heldClaudeSetupIds": [], "health": "RateLimited"}),
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": ["session-1"], "heldClaudeSetupIds": ["setup-1"], "heldTurnIds": ["turn-1"], "health": "Healthy"}),
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": [], "heldClaudeSetupIds": [], "heldTurnIds": [], "health": "RateLimited"}),
         ]
     );
+}
+
+#[test]
+fn a_heartbeat_names_the_turn_of_every_unacked_frame_besides_the_held_turns_once_each() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    let claim = |turn: &str| -> ChannelHostMessage {
+        serde_json::from_value(json!({"type": "TurnClaim", "turnId": turn, "boxId": "box-1"})).expect("claim")
+    };
+    channel.send(claim("turn-1"), &mut wire).expect("send");
+    channel.send(claim("turn-2"), &mut wire).expect("send");
+    channel.send(done("snap-1"), &mut wire).expect("send");
+    wire.sent();
+    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
+    let held = HeldIds {
+        turn_ids: vec![EntityId::try_from("turn-1").expect("id")],
+        ..HeldIds::default()
+    };
+    channel
+        .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, &mut wire)
+        .expect("heartbeat");
+    let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
+    assert_eq!(heartbeat["heldTurnIds"], json!(["turn-1", "turn-2"]));
 }
 
 #[test]
@@ -473,7 +504,8 @@ fn a_snapshot_done_the_control_plane_never_takes_is_resent_ten_times_with_growin
 
     let mut gaps = Vec::new();
     let mut resent = Vec::new();
-    while let Some(wait) = backoff.next(channel.progressed(), u16::MAX) {
+    for _ in 0..10 {
+        let wait = backoff.next(channel.progressed(), u16::MAX);
         gaps.push(wait.as_secs());
         assert!(matches!(
             control.reconnect(&mut channel, &mut wire),
@@ -593,10 +625,7 @@ fn a_control_plane_that_takes_every_frame_but_sends_nothing_fails_none_over_twel
             Vec::<Value>::new(),
             "Welcome acked the frame, so nothing is resent"
         );
-        assert_eq!(
-            backoff.next(channel.progressed(), u16::MAX),
-            Some(Duration::from_secs(1))
-        );
+        assert_eq!(backoff.next(channel.progressed(), u16::MAX), Duration::from_secs(1));
     }
     assert_eq!(control.taken.len(), 12);
     let saved = disk.0.borrow().clone().expect("saved state");
@@ -604,7 +633,7 @@ fn a_control_plane_that_takes_every_frame_but_sends_nothing_fails_none_over_twel
 }
 
 #[test]
-fn a_control_plane_that_closes_after_every_welcome_exhausts_the_reconnects_with_growing_gaps() {
+fn a_control_plane_that_closes_after_every_welcome_is_reconnected_with_growing_gaps() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
@@ -612,7 +641,8 @@ fn a_control_plane_that_closes_after_every_welcome_exhausts_the_reconnects_with_
     let mut backoff = Backoff::default();
     open(&mut channel, &mut wire);
     let mut gaps = Vec::new();
-    while let Some(wait) = backoff.next(channel.progressed(), u16::MAX) {
+    for _ in 0..10 {
+        let wait = backoff.next(channel.progressed(), u16::MAX);
         gaps.push(wait.as_secs());
         assert!(matches!(
             control.reconnect(&mut channel, &mut wire),
@@ -625,7 +655,7 @@ fn a_control_plane_that_closes_after_every_welcome_exhausts_the_reconnects_with_
 }
 
 #[test]
-fn a_control_plane_that_sends_no_ack_still_hits_the_resend_and_reconnect_limits() {
+fn a_control_plane_that_sends_no_ack_still_hits_the_resend_limit() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
@@ -634,7 +664,8 @@ fn a_control_plane_that_sends_no_ack_still_hits_the_resend_and_reconnect_limits(
     channel.send(done("snap-1"), &mut wire).expect("send");
     wire.sent();
     let mut resent = Vec::new();
-    while backoff.next(channel.progressed(), 0).is_some() {
+    for _ in 0..10 {
+        backoff.next(channel.progressed(), 0);
         channel.disconnect();
         open(&mut channel, &mut wire);
         resent.push(wire.sent()[0]["message"]["type"].clone());
@@ -708,48 +739,36 @@ fn the_reconnect_wait_starts_over_only_once_a_frame_arrives() {
     open(&mut channel, &mut wire);
     channel.send(done("snap-1"), &mut wire).expect("send");
     channel.disconnect();
-    assert_eq!(
-        backoff.next(channel.progressed(), u16::MAX),
-        Some(Duration::from_secs(1))
-    );
+    assert_eq!(backoff.next(channel.progressed(), u16::MAX), Duration::from_secs(1));
 
     open(&mut channel, &mut wire);
     channel.disconnect();
-    assert_eq!(
-        backoff.next(channel.progressed(), u16::MAX),
-        Some(Duration::from_secs(2))
-    );
+    assert_eq!(backoff.next(channel.progressed(), u16::MAX), Duration::from_secs(2));
 
     open(&mut channel, &mut wire);
     channel
         .receive(&frame(1, 1, "snap-2"), &mut wire)
         .expect("ack of the replay");
     channel.disconnect();
-    assert_eq!(
-        backoff.next(channel.progressed(), u16::MAX),
-        Some(Duration::from_secs(1))
-    );
+    assert_eq!(backoff.next(channel.progressed(), u16::MAX), Duration::from_secs(1));
 }
 
 #[test]
-fn ten_connections_in_a_row_without_progress_exhaust_the_reconnects_and_progress_starts_the_count_over() {
+fn a_host_that_never_reaches_the_control_plane_keeps_reconnecting_every_thirty_seconds_and_progress_starts_the_wait_over(
+) {
     let mut backoff = Backoff::default();
-    for _ in 0..MAX_RECONNECTS {
-        assert!(backoff.next(false, 0).is_some());
-    }
-    assert!(backoff.next(true, 0).is_some());
-    for _ in 1..MAX_RECONNECTS {
-        assert!(backoff.next(false, 0).is_some());
-    }
-    assert_eq!(backoff.next(false, 0), None);
+    let gaps: Vec<u64> = (0..100).map(|_| backoff.next(false, u16::MAX).as_secs()).collect();
+    assert_eq!(gaps[..6], [1, 2, 4, 8, 16, 30]);
+    assert!(gaps[6..].iter().all(|gap| *gap == 30), "{gaps:?}");
+    assert_eq!(backoff.next(true, u16::MAX), Duration::from_secs(1));
 }
 
 #[test]
 fn jitter_takes_up_to_half_off_each_reconnect_wait() {
     let mut backoff = Backoff::default();
-    assert_eq!(backoff.next(false, 0), Some(Duration::from_millis(500)));
-    assert_eq!(backoff.next(false, u16::MAX), Some(Duration::from_secs(2)));
-    assert_eq!(backoff.next(false, 0), Some(Duration::from_secs(2)));
+    assert_eq!(backoff.next(false, 0), Duration::from_millis(500));
+    assert_eq!(backoff.next(false, u16::MAX), Duration::from_secs(2));
+    assert_eq!(backoff.next(false, 0), Duration::from_secs(2));
 }
 
 fn at(seconds: i64) -> chrono::DateTime<chrono::Utc> {

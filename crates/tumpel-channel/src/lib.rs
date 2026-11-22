@@ -16,13 +16,19 @@ pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
 pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
 pub const MAX_REPLAYS: u32 = 10;
-pub const MAX_RECONNECTS: u32 = 10;
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 pub const MAX_RATE_BACKOFFS: u32 = 10;
 const ASSUMED_FRAMES_PER_MINUTE: u32 = 600;
 pub const LAST_RATE_BACKOFF: Duration = Duration::from_mins(15);
 
 const HELLO_CONTEXT: &[u8] = b"tumpel-channel-hello-v1";
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeldIds {
+    pub session_ids: Vec<EntityId>,
+    pub claude_setup_ids: Vec<EntityId>,
+    pub turn_ids: Vec<EntityId>,
+}
 
 #[must_use]
 pub fn hello_bytes(nonce: &str, host_id: &str) -> Vec<u8> {
@@ -93,32 +99,23 @@ pub enum Phase {
 
 pub struct Backoff {
     wait: Duration,
-    fruitless: u32,
 }
 
 impl Default for Backoff {
     fn default() -> Self {
-        Self {
-            wait: FIRST_BACKOFF,
-            fruitless: 0,
-        }
+        Self { wait: FIRST_BACKOFF }
     }
 }
 
 impl Backoff {
-    pub fn next(&mut self, progressed: bool, jitter: u16) -> Option<Duration> {
+    pub fn next(&mut self, progressed: bool, jitter: u16) -> Duration {
         if progressed {
-            self.fruitless = 0;
             self.wait = FIRST_BACKOFF;
-        }
-        self.fruitless += 1;
-        if self.fruitless > MAX_RECONNECTS {
-            return None;
         }
         let half = self.wait / 2;
         let wait = half + half.mul_f64(f64::from(jitter) / f64::from(u16::MAX));
         self.wait = (self.wait * 2).min(LAST_BACKOFF);
-        Some(wait)
+        wait
     }
 }
 
@@ -383,22 +380,37 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         Ok(())
     }
 
+    fn with_unacked_turns(&self, mut held: Vec<EntityId>) -> Vec<EntityId> {
+        let unacked = self
+            .state
+            .unacked
+            .iter()
+            .filter_map(|frame| frame.message.get("turnId").and_then(Value::as_str))
+            .filter_map(|turn_id| EntityId::try_from(turn_id).ok());
+        for turn_id in unacked {
+            if !held.contains(&turn_id) {
+                held.push(turn_id);
+            }
+        }
+        held
+    }
+
     /// # Errors
     /// Fails when the port refuses the heartbeat.
     pub fn heartbeat(
         &mut self,
         now: DateTime<FixedOffset>,
         usage: HostUsage,
-        held_session_ids: Vec<EntityId>,
-        held_claude_setup_ids: Vec<EntityId>,
+        held: HeldIds,
         health: HostReportedHealth,
         port: &mut impl Port,
     ) -> Result<(), ChannelError> {
         port.send(encode(
             &ChannelHostHeartbeat {
                 health: Some(health),
-                held_claude_setup_ids,
-                held_session_ids,
+                held_claude_setup_ids: held.claude_setup_ids,
+                held_session_ids: held.session_ids,
+                held_turn_ids: self.with_unacked_turns(held.turn_ids),
                 sent_at: now,
                 type_: ChannelHostHeartbeatType::Heartbeat,
                 usage,
@@ -414,6 +426,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         nonce: &str,
         box_capacity: NonZeroU32,
         usage: HostUsage,
+        held_turn_ids: Vec<EntityId>,
         port: &mut impl Port,
     ) -> Result<(), ChannelError> {
         if self.phase != Phase::AwaitingHello {
@@ -426,6 +439,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             box_capacity,
             channel_protocol_oldest: None,
             guest_protocol: None,
+            held_turn_ids: self.with_unacked_turns(held_turn_ids),
             host_id: self.host_id.clone(),
             protocol_version: NonZeroU32::new(u32::from(ChannelProtocol::VERSION))
                 .ok_or_else(|| protocol("protocol version 0"))?,

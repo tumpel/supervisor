@@ -25,8 +25,8 @@ use tumpel_api::types::{
     TurnFailureReason,
 };
 use tumpel_channel::{
-    Backoff, ChannelError, Event, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer, HEARTBEAT_DEADLINE,
-    MAX_RATE_BACKOFFS, MAX_RECONNECTS,
+    Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer,
+    HEARTBEAT_DEADLINE, MAX_RATE_BACKOFFS,
 };
 
 use crate::boot::BootOrder;
@@ -180,6 +180,7 @@ struct Usage {
     running: watch::Receiver<u32>,
     sessions: watch::Receiver<Vec<EntityId>>,
     claude_setups: watch::Receiver<Vec<EntityId>>,
+    turns: watch::Receiver<Vec<EntityId>>,
     holdings: watch::Receiver<Held>,
     data_dir: PathBuf,
     telemetry: Telemetry,
@@ -196,10 +197,29 @@ impl Usage {
     }
 }
 
-fn hello(channel: &mut Channel, nonce: &str, usage: &Usage, outbox: &mut Outbox) -> Result<(), Failure> {
+fn hello(
+    channel: &mut Channel,
+    nonce: &str,
+    usage: &Usage,
+    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    outbox: &mut Outbox,
+) -> Result<(), Failure> {
+    let turns = usage.turns.borrow().clone();
+    drain(channel, from_box, outbox)?;
     channel
-        .hello(nonce, usage.box_capacity, usage.sample()?, outbox)
+        .hello(nonce, usage.box_capacity, usage.sample()?, turns, outbox)
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
+}
+
+fn drain(
+    channel: &mut Channel,
+    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    outbox: &mut Outbox,
+) -> Result<(), Failure> {
+    while let Ok(message) = from_box.try_recv() {
+        channel.send(message, outbox).map_err(|error| store_lost(&error))?;
+    }
+    Ok(())
 }
 
 fn beat(
@@ -209,20 +229,14 @@ fn beat(
     health: HostReportedHealth,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
-    let held = usage.sessions.borrow().clone();
-    let setups = usage.claude_setups.borrow().clone();
-    while let Ok(message) = from_box.try_recv() {
-        channel.send(message, outbox).map_err(|error| store_lost(&error))?;
-    }
+    let held = HeldIds {
+        session_ids: usage.sessions.borrow().clone(),
+        claude_setup_ids: usage.claude_setups.borrow().clone(),
+        turn_ids: usage.turns.borrow().clone(),
+    };
+    drain(channel, from_box, outbox)?;
     channel
-        .heartbeat(
-            chrono::Utc::now().fixed_offset(),
-            usage.sample()?,
-            held,
-            setups,
-            health,
-            outbox,
-        )
+        .heartbeat(chrono::Utc::now().fixed_offset(), usage.sample()?, held, health, outbox)
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
 }
 
@@ -377,6 +391,7 @@ fn start_boxes(
         running: lifecycle.boxes(),
         sessions: lifecycle.sessions(),
         claude_setups: lifecycle.claude_setups(),
+        turns: lifecycle.turns(),
         holdings: lifecycle.holdings(),
         data_dir: PathBuf::from(&*runtime.data_dir),
         telemetry,
@@ -890,12 +905,7 @@ async fn serve(
                 return Err(fail(SupervisorFailure::ProtocolError, reason));
             }
             Ended::Dropped { progressed, reason } => {
-                let Some(wait) = backoff.next(progressed, jitter()) else {
-                    return Err(fail(
-                        SupervisorFailure::ChannelUnreachable,
-                        format!("{MAX_RECONNECTS} connections in a row to {url} ended with no frame from the control plane and no ack of the host frames, the last with: {reason}; check the network and the control plane"),
-                    ));
-                };
+                let wait = backoff.next(progressed, jitter());
                 eprintln!(
                     "channel to {url} dropped: {reason}; reconnecting in {:.1}s",
                     wait.as_secs_f64()
@@ -1053,7 +1063,7 @@ async fn session(
                 Some(Ok(Message::Text(text))) => {
                     last_received = Instant::now();
                     match channel.receive(text.as_str(), &mut outbox) {
-                        Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, &mut outbox).err().map(Err),
+                        Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
                         Ok(Event::Welcomed) => {
                             eprintln!("connected to {url}");
                             last_beat = Instant::now();
