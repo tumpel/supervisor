@@ -1,8 +1,8 @@
 use std::num::NonZeroU32;
+use std::time::Duration;
 
-use chrono::{DateTime, FixedOffset};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::time::{sleep_until, timeout};
+use tokio::time::{sleep_until, timeout, Instant};
 use tumpel_api::types::{
     ChannelClaudeSetupBoxFailed, ChannelClaudeSetupBoxFailedType, ChannelClaudeSetupBoxOfferTokenCredential,
     ChannelClaudeSetupBoxUrl, ChannelClaudeSetupBoxUrlType, ClaudeSetupCodeText, ClaudeSetupFailureReason, EntityId,
@@ -10,11 +10,46 @@ use tumpel_api::types::{
     GuestClaudeSetupStartTokenCredential, GuestClaudeSetupStartType, GuestInput, GuestMessage, HttpUrl,
 };
 
-use super::{emit, instant_at, mismatch, now, Guest, Machine, Runner, Vmm};
+use super::{emit, mismatch, now, Guest, Machine, Runner, Vmm};
 use crate::boot::{BootOrder, Hold};
 use crate::bounded::reported;
 use crate::pool::Tap;
 use crate::store::Store;
+
+const MINT_GRACE: Duration = Duration::from_secs(10);
+
+fn url_missing(id: &EntityId, url: Duration) -> Stop {
+    stop(
+        ClaudeSetupFailureReason::SetupUrlMissing,
+        format!(
+            "the box of Claude setup {} printed no sign-in URL within urlSeconds {} of its offer; check that the host fetched the pinned image and can reach its sign-in page, then start the Claude setup again",
+            **id,
+            url.as_secs()
+        ),
+    )
+}
+
+fn code_missing(id: &EntityId, code: Duration) -> Stop {
+    stop(
+        ClaudeSetupFailureReason::SetupTimedOut,
+        format!(
+            "the sign-in of Claude setup {} did not finish within codeSeconds {} of its sign-in URL; start the Claude setup again, open the new URL and enter the new code",
+            **id,
+            code.as_secs()
+        ),
+    )
+}
+
+fn mint_missing(id: &EntityId, seconds: NonZeroU32) -> Stop {
+    stop(
+        ClaudeSetupFailureReason::SetupTimedOut,
+        format!(
+            "the box of Claude setup {} reported nothing within mintBudgetSeconds {seconds} plus {} s of the code; start the Claude setup again",
+            **id,
+            MINT_GRACE.as_secs()
+        ),
+    )
+}
 
 pub struct SetupOrder {
     pub claude_setup_id: EntityId,
@@ -23,7 +58,8 @@ pub struct SetupOrder {
     pub image: BootOrder,
     pub token_url: HttpUrl,
     pub token_credential: ChannelClaudeSetupBoxOfferTokenCredential,
-    pub expires_at: DateTime<FixedOffset>,
+    pub url: Duration,
+    pub code: Duration,
 }
 
 pub enum SetupCommand {
@@ -96,9 +132,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         inputs: UnboundedReceiver<SetupInput>,
     ) -> (Tap, Result<(), String>) {
         let id = order.claude_setup_id.clone();
+        let offered = Instant::now();
         let (failure, stopped) = match self.boot_setup(&tap, &order).await {
             Ok((machine, guest, hold)) => {
-                let (machine, ended) = self.follow_setup(machine, guest, &order, inputs).await;
+                let (machine, ended) = self.follow_setup(machine, guest, &order, inputs, offered).await;
                 let tail = machine.console_tail();
                 let stopped = machine.stop().await;
                 drop(hold);
@@ -209,28 +246,24 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         mut guest: <V::Machine as Machine>::Guest,
         order: &SetupOrder,
         mut inputs: UnboundedReceiver<SetupInput>,
+        offered: Instant,
     ) -> (V::Machine, Ended) {
-        let deadline = instant_at(order.expires_at);
         let id = &order.claude_setup_id;
+        let (mut phase_end, mut on_expiry) = (offered + order.url, url_missing(id, order.url));
         loop {
             let next = tokio::select! {
-                () = sleep_until(deadline) => Next::Deadline,
+                () = sleep_until(phase_end) => Next::Deadline,
                 input = inputs.recv() => Next::Input(input),
                 received = guest.receive() => Next::Received(received),
             };
             let ended = match next {
-                Next::Deadline => Some(Ended::Failed(stop(
-                    ClaudeSetupFailureReason::SetupTimedOut,
-                    format!(
-                        "Claude setup {} ran past {}, the end of its box; start the Claude setup again",
-                        **id,
-                        order.expires_at.to_rfc3339()
-                    ),
-                ))),
+                Next::Deadline => return (machine, Ended::Failed(on_expiry)),
                 Next::Input(Some(SetupInput::Code {
                     code,
                     mint_budget_seconds,
                 })) => {
+                    phase_end = Instant::now() + Duration::from_secs(u64::from(mint_budget_seconds.get())) + MINT_GRACE;
+                    on_expiry = mint_missing(id, mint_budget_seconds);
                     let message = GuestInput::ClaudeSetupCode(GuestClaudeSetupCode {
                         claude_setup_id: id.clone(),
                         code,
@@ -249,6 +282,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 }
                 Next::Input(Some(SetupInput::Discard) | None) => Some(Ended::Discarded),
                 Next::Received(Ok(GuestMessage::ClaudeSetupUrl(printed))) if printed.claude_setup_id == *id => {
+                    phase_end = Instant::now() + order.code;
+                    on_expiry = code_missing(id, order.code);
                     emit(
                         &self.out,
                         ChannelClaudeSetupBoxUrl {

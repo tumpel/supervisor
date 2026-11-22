@@ -390,12 +390,14 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         now: DateTime<FixedOffset>,
         usage: HostUsage,
         held_session_ids: Vec<EntityId>,
+        held_claude_setup_ids: Vec<EntityId>,
         health: HostReportedHealth,
         port: &mut impl Port,
     ) -> Result<(), ChannelError> {
         port.send(encode(
             &ChannelHostHeartbeat {
                 health: Some(health),
+                held_claude_setup_ids,
                 held_session_ids,
                 sent_at: now,
                 type_: ChannelHostHeartbeatType::Heartbeat,

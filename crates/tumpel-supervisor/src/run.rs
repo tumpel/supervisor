@@ -179,6 +179,7 @@ struct Usage {
     warm: watch::Receiver<u32>,
     running: watch::Receiver<u32>,
     sessions: watch::Receiver<Vec<EntityId>>,
+    claude_setups: watch::Receiver<Vec<EntityId>>,
     holdings: watch::Receiver<Held>,
     data_dir: PathBuf,
     telemetry: Telemetry,
@@ -209,11 +210,19 @@ fn beat(
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
     let held = usage.sessions.borrow().clone();
+    let setups = usage.claude_setups.borrow().clone();
     while let Ok(message) = from_box.try_recv() {
         channel.send(message, outbox).map_err(|error| store_lost(&error))?;
     }
     channel
-        .heartbeat(chrono::Utc::now().fixed_offset(), usage.sample()?, held, health, outbox)
+        .heartbeat(
+            chrono::Utc::now().fixed_offset(),
+            usage.sample()?,
+            held,
+            setups,
+            health,
+            outbox,
+        )
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
 }
 
@@ -250,7 +259,8 @@ fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> SetupCommand {
         ),
         token_url: offer.token_url,
         token_credential: offer.token_credential,
-        expires_at: offer.expires_at,
+        url: Duration::from_secs(u64::from(offer.url_seconds.get())),
+        code: Duration::from_secs(u64::from(offer.code_seconds.get())),
     }))
 }
 
@@ -277,6 +287,8 @@ fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Command {
         prebuild_commit_sha: offer.prebuild_commit_sha.map(String::from),
         box_memory_mib: offer.box_memory_mib,
         box_disk_mib: offer.box_disk_mib,
+        turn_seconds: offer.turn_seconds,
+        box_retention: offer.box_retention,
     }))
 }
 
@@ -363,6 +375,7 @@ fn start_boxes(
         warm: lifecycle.warm(),
         running: lifecycle.boxes(),
         sessions: lifecycle.sessions(),
+        claude_setups: lifecycle.claude_setups(),
         holdings: lifecycle.holdings(),
         data_dir: PathBuf::from(&*runtime.data_dir),
         telemetry,
@@ -1135,6 +1148,8 @@ mod tests {
             },
             "tokenUrl": "https://api.example.test/v1/claude-setups/setup-1/token",
             "tokenCredential": "t".repeat(43),
+            "urlSeconds": 300,
+            "codeSeconds": 600,
             "expiresAt": "2026-11-19T00:15:00Z"
         });
         let booted = |frame: &serde_json::Value| {

@@ -15,23 +15,23 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{timeout, timeout_at, Instant};
 use tracing::Instrument;
 use tumpel_api::types::{
-    BoxBudgets, ChannelBoxGone, ChannelBoxGoneType, ChannelBoxTeardownFailed, ChannelBoxTeardownFailedType,
-    ChannelBoxTeardownFailureReason, ChannelDispatchGrant, ChannelHostMessage, ChannelPack, ChannelPersonaFileDownload,
-    ChannelRestoreChunks, ChannelRestoreChunksType, ChannelSnapshotChunks, ChannelSnapshotChunksType,
-    ChannelSnapshotDone, ChannelSnapshotDoneType, ChannelSnapshotDownload, ChannelSnapshotFailed,
-    ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPacks, ChannelSnapshotPacksType,
-    ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete, ChannelTurnCompleteType,
-    ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnImageFetching,
-    ChannelTurnImageFetchingType, ChannelTurnLine, ChannelTurnLineType, ChannelTurnRepositoryCloneFailed,
-    ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady, ChannelTurnRepositoryReadyType, CredentialText,
-    DisplayName, EmailAddress, EntityId, GuestHello, GuestInput, GuestMessage, GuestPersonaFile, GuestProtocol,
-    GuestTurnCancel, GuestTurnCancelType, GuestTurnStart, GuestTurnStartPrebuildCommitSha, GuestTurnStartType,
-    ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl, Sequence, Sha256Digest, SupervisorHandover,
-    SupervisorHandoverBox, SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverDiscard,
-    SupervisorHandoverDiscardKind, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
-    SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, SupervisorHandoverTurn,
-    SupervisorHandoverTurnError, SupervisorHandoverTurnKind, SupervisorHandoverWarm, SupervisorHandoverWarmKind,
-    TurnFailureReason,
+    BoxBudgets, BoxRetention, ChannelBoxGone, ChannelBoxGoneType, ChannelBoxTeardownFailed,
+    ChannelBoxTeardownFailedType, ChannelBoxTeardownFailureReason, ChannelDispatchGrant, ChannelHostMessage,
+    ChannelPack, ChannelPersonaFileDownload, ChannelRestoreChunks, ChannelRestoreChunksType, ChannelSnapshotChunks,
+    ChannelSnapshotChunksType, ChannelSnapshotDone, ChannelSnapshotDoneType, ChannelSnapshotDownload,
+    ChannelSnapshotFailed, ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPacks,
+    ChannelSnapshotPacksType, ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete,
+    ChannelTurnCompleteType, ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType,
+    ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLine, ChannelTurnLineType,
+    ChannelTurnRepositoryCloneFailed, ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady,
+    ChannelTurnRepositoryReadyType, CredentialText, DisplayName, EmailAddress, EntityId, GuestHello, GuestInput,
+    GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnStart,
+    GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl,
+    Sequence, Sha256Digest, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
+    SupervisorHandoverCommand, SupervisorHandoverDiscard, SupervisorHandoverDiscardKind, SupervisorHandoverMachine,
+    SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown,
+    SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
+    SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
 };
 
 use crate::boot::{self, Boot, BootOrder, Caches, Hold, Holds};
@@ -57,6 +57,14 @@ const TRANSFERS: usize = 16;
 const CHUNKS: &str = "chunks";
 const HANDOVER_REPORT_ALLOWANCE: Duration = Duration::from_secs(60);
 const CANCEL_END: Duration = Duration::from_secs(10);
+const AUTO_IDLE_TEARDOWN: Duration = Duration::from_mins(15);
+
+fn idle_teardown(retention: BoxRetention) -> Option<Duration> {
+    match retention {
+        BoxRetention::Auto => Some(AUTO_IDLE_TEARDOWN),
+        BoxRetention::Warm | BoxRetention::Off => None,
+    }
+}
 const DISK_CHECK: Duration = Duration::from_secs(1);
 const RESTORE_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
 const RESTORE_ENTRIES_PER_SECOND: u64 = 2_000;
@@ -99,7 +107,6 @@ fn restore_size(named: &str, manifest: &Manifest, overlay: u64) -> Result<(u64, 
 pub struct Budgets {
     pub boot: Duration,
     pub first_line: Duration,
-    pub turn: Duration,
     pub snapshot: Duration,
 }
 
@@ -109,7 +116,6 @@ impl From<&BoxBudgets> for Budgets {
         Self {
             boot: seconds(budgets.boot_seconds),
             first_line: seconds(budgets.first_line_seconds),
-            turn: seconds(budgets.turn_seconds),
             snapshot: seconds(budgets.snapshot_seconds),
         }
     }
@@ -183,6 +189,8 @@ pub struct BoxTurn {
     pub prebuild_commit_sha: Option<String>,
     pub box_memory_mib: Option<i32>,
     pub box_disk_mib: Option<i32>,
+    pub turn_seconds: NonZeroU32,
+    pub box_retention: BoxRetention,
 }
 
 pub struct SnapshotOrder {
@@ -286,6 +294,7 @@ struct LiveBox<M: Machine> {
     _hold: Hold,
     dirty: bool,
     credential_file: Option<String>,
+    box_retention: BoxRetention,
 }
 
 impl<M: Machine> LiveBox<M> {
@@ -301,6 +310,7 @@ impl<M: Machine> LiveBox<M> {
             _hold: hold,
             dirty: false,
             credential_file: None,
+            box_retention: turn.box_retention,
         }
     }
 }
@@ -309,6 +319,7 @@ impl<M: Machine> LiveBox<M> {
     fn record(&self, turn_id: Option<&EntityId>) -> Result<SupervisorHandoverBox, String> {
         Ok(SupervisorHandoverBox {
             box_id: self.box_id.clone(),
+            box_retention: self.box_retention,
             credential_file: credential_record(self.credential_file.clone())?,
             dirty: self.dirty || turn_id.is_some(),
             image: self.image.record()?,
@@ -514,6 +525,10 @@ enum Event<M: Machine> {
         tap: Tap,
     },
     HandoverExpired,
+    IdleExpired {
+        session: String,
+        box_id: EntityId,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -529,6 +544,7 @@ struct Slot<M: Machine> {
     parked: Option<Box<Parked>>,
     task: Option<(Running, JoinHandle<()>)>,
     queue: VecDeque<Command>,
+    idle: Option<AbortHandle>,
 }
 
 impl<M: Machine> Default for Slot<M> {
@@ -540,6 +556,7 @@ impl<M: Machine> Default for Slot<M> {
             parked: None,
             task: None,
             queue: VecDeque::new(),
+            idle: None,
         }
     }
 }
@@ -870,6 +887,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     async fn warm_turn(&self, mut live: LiveBox<V::Machine>, turn: &BoxTurn) -> Outcome<V::Machine> {
+        live.box_retention = turn.box_retention;
         let claiming = self.claim(turn);
         let Some(files) = self.files(turn).await else {
             return Outcome::Kept(live);
@@ -1367,7 +1385,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         live.machine.clear_console();
         let clone = Duration::from_secs(u64::from(live.image.harness().clone_seconds.get()));
         let state = Follow {
-            end: started + self.settings.budgets.turn,
+            end: started + Duration::from_secs(u64::from(turn.turn_seconds.get())),
             first_line: started + clone + self.settings.budgets.first_line,
             repository_ready: false,
             seen_line: false,
@@ -1412,7 +1430,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 turn_id: turn.turn_id.clone(),
                 type_: GuestTurnStartType::TurnStart,
                 prebuild_commit_sha,
-                turn_seconds: NonZeroU32::new(u32::try_from(self.settings.budgets.turn.as_secs()).unwrap_or(u32::MAX)),
+                turn_seconds: Some(turn.turn_seconds),
             })
             .map_err(|error| {
                 Failure::turn(
@@ -1590,13 +1608,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         Failure::turn(TurnFailureReason::NoFirstOutput, detail)
     }
 
-    fn timed_out(&self, turn_id: &EntityId) -> Failure {
+    fn timed_out(turn_id: &EntityId) -> Failure {
         Failure::turn(
             TurnFailureReason::TurnTimedOut,
             format!(
-                "turn {} ran past its {} s budget (budgets.turnSeconds in runtime.json).",
-                **turn_id,
-                self.settings.budgets.turn.as_secs()
+                "turn {} ran past the turnSeconds of its offer; send a smaller prompt or raise turnTotalBudgetSeconds.",
+                **turn_id
             ),
         )
     }
@@ -1638,7 +1655,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 } else if waiting_for_first {
                     self.no_first_output(turn_id, clone, state.repository_ready)
                 } else {
-                    self.timed_out(turn_id)
+                    Self::timed_out(turn_id)
                 }));
             };
             match received {
@@ -2020,6 +2037,14 @@ fn held_session(session: &str) -> EntityId {
     EntityId::try_from(session).expect("a slot key is an EntityId")
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "every setup key is the to_string of the claudeSetupId of its SetupOrder"
+)]
+fn held_setup(claude_setup_id: &str) -> EntityId {
+    EntityId::try_from(claude_setup_id).expect("a setup key is an EntityId")
+}
+
 pub struct Lifecycle<V: Vmm, S: Store> {
     runner: Runner<V, S>,
     pool: TapPool,
@@ -2030,6 +2055,7 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     boxes: watch::Sender<u32>,
     busy: watch::Sender<u32>,
     sessions: watch::Sender<Vec<EntityId>>,
+    claude_setups: watch::Sender<Vec<EntityId>>,
     holdings: watch::Sender<Held>,
     setups: HashMap<String, UnboundedSender<SetupInput>>,
     setup_tasks: HashMap<String, JoinHandle<()>>,
@@ -2081,6 +2107,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             boxes: watch::Sender::new(0),
             busy: watch::Sender::new(0),
             sessions: watch::Sender::new(Vec::new()),
+            claude_setups: watch::Sender::new(Vec::new()),
             holdings,
             setups: HashMap::new(),
             setup_tasks: HashMap::new(),
@@ -2111,6 +2138,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     #[must_use]
+    pub fn claude_setups(&self) -> watch::Receiver<Vec<EntityId>> {
+        self.claude_setups.subscribe()
+    }
+
+    #[must_use]
     pub fn holdings(&self) -> watch::Receiver<Held> {
         self.holdings.subscribe()
     }
@@ -2133,6 +2165,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.busy.send_replace(u32::try_from(boxes - warm).unwrap_or(u32::MAX));
         self.sessions
             .send_replace(self.slots.keys().map(|session| held_session(session)).collect());
+        self.claude_setups.send_replace(
+            self.setups
+                .keys()
+                .map(|claude_setup_id| held_setup(claude_setup_id))
+                .collect(),
+        );
         self.holdings.send_replace(self.current_holdings());
     }
 
@@ -2154,6 +2192,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .collect();
         for session in adopted {
             self.drain(session).await?;
+        }
+        let held: Vec<String> = self.slots.keys().cloned().collect();
+        for session in held {
+            self.arm_idle(&session);
         }
         self.publish();
         loop {
@@ -2399,6 +2441,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 image,
                 dirty,
                 credential_file,
+                box_retention,
                 ..
             } = live;
             let tap_index = i32::from(tap.index());
@@ -2413,6 +2456,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 Ok((machine, queued, credential_file, image)) => {
                     boxes.push(SupervisorHandoverBox {
                         box_id,
+                        box_retention,
                         credential_file,
                         dirty,
                         image,
@@ -2556,6 +2600,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             _hold: hold,
             dirty: handed.dirty,
             credential_file: handed.credential_file.map(String::from),
+            box_retention: handed.box_retention,
         });
         match (handed.state, taken) {
             (SupervisorHandoverBoxState::Warm(_), _) => slot.paused = true,
@@ -2994,7 +3039,51 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 self.free_disk(&claude_setup_id)
             }
             Event::HandoverExpired => self.handover_expired().await,
+            Event::IdleExpired { session, box_id } => self.idle_expired(&session, box_id).await,
         }
+    }
+
+    fn idle_box(&self, session: &str) -> Option<(&EntityId, Duration)> {
+        let slot = self.slots.get(session)?;
+        if self.mode != Mode::TakingTurns || slot.busy || slot.parked.is_some() || !slot.queue.is_empty() {
+            return None;
+        }
+        let live = slot.live.as_ref().filter(|live| !live.dirty)?;
+        idle_teardown(live.box_retention).map(|after| (&live.box_id, after))
+    }
+
+    fn arm_idle(&mut self, session: &str) {
+        let idle = self.idle_box(session).map(|(box_id, after)| (box_id.clone(), after));
+        let Some(slot) = self.slots.get_mut(session) else {
+            return;
+        };
+        if let Some(armed) = slot.idle.take() {
+            armed.abort();
+        }
+        let Some((box_id, after)) = idle else {
+            return;
+        };
+        let events = self.events.clone();
+        let session = session.to_string();
+        slot.idle = Some(
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                let _ = events.send(Event::IdleExpired { session, box_id });
+            })
+            .abort_handle(),
+        );
+    }
+
+    async fn idle_expired(&mut self, session: &str, box_id: EntityId) -> Result<(), String> {
+        if self.idle_box(session).map(|(idle, _)| idle) != Some(&box_id) {
+            return Ok(());
+        }
+        self.teardown(session).await?;
+        self.box_gone(TeardownOrder {
+            session_id: held_session(session),
+            box_id,
+        });
+        Ok(())
     }
 
     async fn finished(&mut self, session: String, work: Work, outcome: Outcome<V::Machine>) -> Result<(), String> {
@@ -3041,6 +3130,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             self.dispatch(session.clone(), command).await?;
         }
         self.prune(&session);
+        self.arm_idle(&session);
         Ok(())
     }
 
