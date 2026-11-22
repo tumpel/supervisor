@@ -26,7 +26,7 @@ use tumpel_api::types::{
 };
 use tumpel_channel::{
     Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer,
-    HEARTBEAT_DEADLINE, MAX_RATE_BACKOFFS, MAX_RECONNECTS,
+    HEARTBEAT_DEADLINE, MAX_RATE_BACKOFFS,
 };
 
 use crate::boot::BootOrder;
@@ -905,12 +905,7 @@ async fn serve(
                 return Err(fail(SupervisorFailure::ProtocolError, reason));
             }
             Ended::Dropped { progressed, reason } => {
-                let Some(wait) = backoff.next(progressed, jitter()) else {
-                    return Err(fail(
-                        SupervisorFailure::ChannelUnreachable,
-                        format!("{MAX_RECONNECTS} connections in a row to {url} ended with no frame from the control plane and no ack of the host frames, the last with: {reason}; check the network and the control plane"),
-                    ));
-                };
+                let wait = backoff.next(progressed, jitter());
                 eprintln!(
                     "channel to {url} dropped: {reason}; reconnecting in {:.1}s",
                     wait.as_secs_f64()
