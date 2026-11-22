@@ -45,7 +45,6 @@ pub fn empty_state() -> SupervisorChannelState {
         received: Sequence(0),
         sent: Sequence(0),
         unacked: Vec::new(),
-        replays: Vec::new(),
     }
 }
 
@@ -248,10 +247,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         host_id: EntityId,
         supervisor_version: String,
     ) -> Self {
-        let state = SupervisorChannelState {
-            replays: Vec::new(),
-            ..state
-        };
         Self {
             state,
             store,

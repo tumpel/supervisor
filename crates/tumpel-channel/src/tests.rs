@@ -502,7 +502,7 @@ fn a_control_plane_that_takes_every_frame_but_sends_nothing_fails_none_over_twel
     }
     assert_eq!(control.taken.len(), 12);
     let saved = disk.0.borrow().clone().expect("saved state");
-    assert!(saved.unacked.is_empty() && saved.replays.is_empty(), "{saved:?}");
+    assert!(saved.unacked.is_empty(), "{saved:?}");
 }
 
 #[test]
@@ -577,7 +577,7 @@ fn a_frame_the_control_plane_never_acks_is_resent_unchanged_after_every_welcome_
     ));
     assert_eq!(control.taken, [(1, "SnapshotDone".to_string())]);
     let saved = disk.0.borrow().clone().expect("saved state");
-    assert!(saved.unacked.is_empty() && saved.replays.is_empty(), "{saved:?}");
+    assert!(saved.unacked.is_empty(), "{saved:?}");
 }
 #[test]
 fn the_reconnect_wait_starts_over_only_once_a_frame_arrives() {
@@ -1011,7 +1011,6 @@ fn a_restarted_channel_holds_the_turns_its_saved_unacked_frames_name() {
         .expect("hello");
     let [hello] = wire.sent().try_into().expect("one hello");
     assert_eq!(hello["heldTurnIds"], json!(["turn-7", "turn-8"]));
-    assert_eq!(channel.state().replays.len(), 0);
 }
 
 #[test]
