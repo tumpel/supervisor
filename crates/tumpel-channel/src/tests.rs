@@ -10,8 +10,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    empty_state, hello_bytes, Backoff, ChannelError, Event, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer,
-    Store, MAX_RATE_BACKOFFS, MAX_RECONNECTS,
+    empty_state, hello_bytes, Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit,
+    Signer, Store, MAX_RATE_BACKOFFS, MAX_RECONNECTS,
 };
 
 #[derive(Default)]
@@ -161,7 +161,9 @@ fn welcome(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire, welcome: 
     let Ok(Event::Challenged(nonce)) = channel.receive(&challenge, wire) else {
         panic!("the challenge asks for a Hello");
     };
-    channel.hello(&nonce, capacity(), usage(), wire).expect("hello");
+    channel
+        .hello(&nonce, capacity(), usage(), Vec::new(), wire)
+        .expect("hello");
     wire.sent();
     channel.receive(&welcome.to_string(), wire)
 }
@@ -240,7 +242,9 @@ fn hello_signs_the_documented_bytes() {
     };
     assert_eq!(nonce, NONCE);
     assert_eq!(channel.phase(), Phase::AwaitingHello);
-    channel.hello(&nonce, capacity(), usage(), &mut wire).expect("hello");
+    channel
+        .hello(&nonce, capacity(), usage(), Vec::new(), &mut wire)
+        .expect("hello");
     let mut expected = b"tumpel-channel-hello-v1\0".to_vec();
     expected.extend_from_slice(NONCE.as_bytes());
     expected.extend_from_slice(b"\0host-1");
@@ -249,7 +253,7 @@ fn hello_signs_the_documented_bytes() {
     assert_eq!(
         wire.sent(),
         [
-            json!({"type": "Hello", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION, "supervisorVersion": "0.1.0", "signature": "c2lnbmF0dXJl", "boxCapacity": 8, "usage": {"boxesWarm": 1, "loadAverage": 0.5, "memoryAvailableMib": 4096}})
+            json!({"type": "Hello", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION, "supervisorVersion": "0.1.0", "signature": "c2lnbmF0dXJl", "boxCapacity": 8, "usage": {"boxesWarm": 1, "loadAverage": 0.5, "memoryAvailableMib": 4096}, "heldTurnIds": []})
         ]
     );
     assert_eq!(channel.phase(), Phase::AwaitingWelcome);
@@ -434,17 +438,19 @@ fn a_heartbeat_names_every_held_session_and_setup_and_an_empty_list_when_none() 
     open(&mut channel, &mut wire);
     wire.sent();
     let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
-    let held = vec![EntityId::try_from("session-1").expect("id")];
-    let setups = vec![EntityId::try_from("setup-1").expect("id")];
+    let held = HeldIds {
+        session_ids: vec![EntityId::try_from("session-1").expect("id")],
+        claude_setup_ids: vec![EntityId::try_from("setup-1").expect("id")],
+        turn_ids: vec![EntityId::try_from("turn-1").expect("id")],
+    };
     channel
-        .heartbeat(sent_at, usage(), held, setups, HostReportedHealth::Healthy, &mut wire)
+        .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, &mut wire)
         .expect("heartbeat");
     channel
         .heartbeat(
             sent_at,
             usage(),
-            Vec::new(),
-            Vec::new(),
+            HeldIds::default(),
             HostReportedHealth::RateLimited,
             &mut wire,
         )
@@ -453,10 +459,35 @@ fn a_heartbeat_names_every_held_session_and_setup_and_an_empty_list_when_none() 
     assert_eq!(
         wire.sent(),
         [
-            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": ["session-1"], "heldClaudeSetupIds": ["setup-1"], "health": "Healthy"}),
-            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": [], "heldClaudeSetupIds": [], "health": "RateLimited"}),
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": ["session-1"], "heldClaudeSetupIds": ["setup-1"], "heldTurnIds": ["turn-1"], "health": "Healthy"}),
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": [], "heldClaudeSetupIds": [], "heldTurnIds": [], "health": "RateLimited"}),
         ]
     );
+}
+
+#[test]
+fn a_heartbeat_names_the_turn_of_every_unacked_frame_besides_the_held_turns_once_each() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    let claim = |turn: &str| -> ChannelHostMessage {
+        serde_json::from_value(json!({"type": "TurnClaim", "turnId": turn, "boxId": "box-1"})).expect("claim")
+    };
+    channel.send(claim("turn-1"), &mut wire).expect("send");
+    channel.send(claim("turn-2"), &mut wire).expect("send");
+    channel.send(done("snap-1"), &mut wire).expect("send");
+    wire.sent();
+    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
+    let held = HeldIds {
+        turn_ids: vec![EntityId::try_from("turn-1").expect("id")],
+        ..HeldIds::default()
+    };
+    channel
+        .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, &mut wire)
+        .expect("heartbeat");
+    let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
+    assert_eq!(heartbeat["heldTurnIds"], json!(["turn-1", "turn-2"]));
 }
 
 #[test]
