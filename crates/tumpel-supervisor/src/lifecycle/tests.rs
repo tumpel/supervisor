@@ -1130,6 +1130,18 @@ impl Host {
         seen
     }
 
+    async fn settle_until_starts(&mut self, prefix: &str) -> Vec<String> {
+        let mut seen = Vec::new();
+        while !seen.last().is_some_and(|last: &String| last.starts_with(prefix)) {
+            let message = tokio::time::timeout(Duration::from_secs(5), self.received.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no {prefix} within five seconds, saw {seen:?}"))
+                .expect("an open channel");
+            seen.extend(describe(message));
+        }
+        seen
+    }
+
     fn log(&self) -> Vec<String> {
         std::mem::take(&mut *self.log.lock().expect("log"))
     }
@@ -1778,7 +1790,7 @@ async fn a_turn_that_runs_out_its_budget_names_its_failure_and_keeps_its_box_unt
     for (index, (harness, reason, budget, console)) in cases.into_iter().enumerate() {
         let mut host = host(&format!("budget-{index}"), 1, harness, Boot::Works);
         host.turn("turn-1", "session-1", "one\ntwo", Vec::new());
-        let seen = host.settle(Duration::from_millis(1200)).await;
+        let seen = host.settle_until_starts("failed ").await;
         let last = seen.last().expect("a failure");
         assert!(last.starts_with(&format!("failed {reason}")), "{seen:?}");
         assert!(last.contains(budget) && last.ends_with(console), "{last}");
