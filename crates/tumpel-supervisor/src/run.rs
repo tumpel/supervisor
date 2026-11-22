@@ -179,6 +179,7 @@ struct Usage {
     warm: watch::Receiver<u32>,
     running: watch::Receiver<u32>,
     sessions: watch::Receiver<Vec<EntityId>>,
+    claude_setups: watch::Receiver<Vec<EntityId>>,
     holdings: watch::Receiver<Held>,
     data_dir: PathBuf,
     telemetry: Telemetry,
@@ -209,11 +210,19 @@ fn beat(
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
     let held = usage.sessions.borrow().clone();
+    let setups = usage.claude_setups.borrow().clone();
     while let Ok(message) = from_box.try_recv() {
         channel.send(message, outbox).map_err(|error| store_lost(&error))?;
     }
     channel
-        .heartbeat(chrono::Utc::now().fixed_offset(), usage.sample()?, held, health, outbox)
+        .heartbeat(
+            chrono::Utc::now().fixed_offset(),
+            usage.sample()?,
+            held,
+            setups,
+            health,
+            outbox,
+        )
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
 }
 
@@ -366,6 +375,7 @@ fn start_boxes(
         warm: lifecycle.warm(),
         running: lifecycle.boxes(),
         sessions: lifecycle.sessions(),
+        claude_setups: lifecycle.claude_setups(),
         holdings: lifecycle.holdings(),
         data_dir: PathBuf::from(&*runtime.data_dir),
         telemetry,

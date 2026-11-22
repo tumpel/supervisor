@@ -294,7 +294,7 @@ struct LiveBox<M: Machine> {
     _hold: Hold,
     dirty: bool,
     credential_file: Option<String>,
-    idle_teardown: Option<Duration>,
+    box_retention: BoxRetention,
 }
 
 impl<M: Machine> LiveBox<M> {
@@ -310,7 +310,7 @@ impl<M: Machine> LiveBox<M> {
             _hold: hold,
             dirty: false,
             credential_file: None,
-            idle_teardown: idle_teardown(turn.box_retention),
+            box_retention: turn.box_retention,
         }
     }
 }
@@ -319,6 +319,7 @@ impl<M: Machine> LiveBox<M> {
     fn record(&self, turn_id: Option<&EntityId>) -> Result<SupervisorHandoverBox, String> {
         Ok(SupervisorHandoverBox {
             box_id: self.box_id.clone(),
+            box_retention: self.box_retention,
             credential_file: credential_record(self.credential_file.clone())?,
             dirty: self.dirty || turn_id.is_some(),
             image: self.image.record()?,
@@ -886,7 +887,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     async fn warm_turn(&self, mut live: LiveBox<V::Machine>, turn: &BoxTurn) -> Outcome<V::Machine> {
-        live.idle_teardown = idle_teardown(turn.box_retention);
+        live.box_retention = turn.box_retention;
         let claiming = self.claim(turn);
         let Some(files) = self.files(turn).await else {
             return Outcome::Kept(live);
@@ -2036,6 +2037,14 @@ fn held_session(session: &str) -> EntityId {
     EntityId::try_from(session).expect("a slot key is an EntityId")
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "every setup key is the to_string of the claudeSetupId of its SetupOrder"
+)]
+fn held_setup(claude_setup_id: &str) -> EntityId {
+    EntityId::try_from(claude_setup_id).expect("a setup key is an EntityId")
+}
+
 pub struct Lifecycle<V: Vmm, S: Store> {
     runner: Runner<V, S>,
     pool: TapPool,
@@ -2046,6 +2055,7 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     boxes: watch::Sender<u32>,
     busy: watch::Sender<u32>,
     sessions: watch::Sender<Vec<EntityId>>,
+    claude_setups: watch::Sender<Vec<EntityId>>,
     holdings: watch::Sender<Held>,
     setups: HashMap<String, UnboundedSender<SetupInput>>,
     setup_tasks: HashMap<String, JoinHandle<()>>,
@@ -2097,6 +2107,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             boxes: watch::Sender::new(0),
             busy: watch::Sender::new(0),
             sessions: watch::Sender::new(Vec::new()),
+            claude_setups: watch::Sender::new(Vec::new()),
             holdings,
             setups: HashMap::new(),
             setup_tasks: HashMap::new(),
@@ -2127,6 +2138,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     #[must_use]
+    pub fn claude_setups(&self) -> watch::Receiver<Vec<EntityId>> {
+        self.claude_setups.subscribe()
+    }
+
+    #[must_use]
     pub fn holdings(&self) -> watch::Receiver<Held> {
         self.holdings.subscribe()
     }
@@ -2149,6 +2165,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.busy.send_replace(u32::try_from(boxes - warm).unwrap_or(u32::MAX));
         self.sessions
             .send_replace(self.slots.keys().map(|session| held_session(session)).collect());
+        self.claude_setups.send_replace(
+            self.setups
+                .keys()
+                .map(|claude_setup_id| held_setup(claude_setup_id))
+                .collect(),
+        );
         self.holdings.send_replace(self.current_holdings());
     }
 
@@ -2419,6 +2441,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 image,
                 dirty,
                 credential_file,
+                box_retention,
                 ..
             } = live;
             let tap_index = i32::from(tap.index());
@@ -2433,6 +2456,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 Ok((machine, queued, credential_file, image)) => {
                     boxes.push(SupervisorHandoverBox {
                         box_id,
+                        box_retention,
                         credential_file,
                         dirty,
                         image,
@@ -2576,7 +2600,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             _hold: hold,
             dirty: handed.dirty,
             credential_file: handed.credential_file.map(String::from),
-            idle_teardown: None,
+            box_retention: handed.box_retention,
         });
         match (handed.state, taken) {
             (SupervisorHandoverBoxState::Warm(_), _) => slot.paused = true,
@@ -3025,7 +3049,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             return None;
         }
         let live = slot.live.as_ref().filter(|live| !live.dirty)?;
-        live.idle_teardown.map(|after| (&live.box_id, after))
+        idle_teardown(live.box_retention).map(|after| (&live.box_id, after))
     }
 
     fn arm_idle(&mut self, session: &str) {

@@ -426,7 +426,7 @@ fn a_frame_and_message_with_fields_this_supervisor_does_not_know_are_read_for_th
 }
 
 #[test]
-fn a_heartbeat_names_every_held_session_and_an_empty_list_when_none() {
+fn a_heartbeat_names_every_held_session_and_setup_and_an_empty_list_when_none() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
@@ -434,18 +434,26 @@ fn a_heartbeat_names_every_held_session_and_an_empty_list_when_none() {
     wire.sent();
     let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
     let held = vec![EntityId::try_from("session-1").expect("id")];
+    let setups = vec![EntityId::try_from("setup-1").expect("id")];
     channel
-        .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, &mut wire)
+        .heartbeat(sent_at, usage(), held, setups, HostReportedHealth::Healthy, &mut wire)
         .expect("heartbeat");
     channel
-        .heartbeat(sent_at, usage(), Vec::new(), HostReportedHealth::RateLimited, &mut wire)
+        .heartbeat(
+            sent_at,
+            usage(),
+            Vec::new(),
+            Vec::new(),
+            HostReportedHealth::RateLimited,
+            &mut wire,
+        )
         .expect("heartbeat");
     let usage = json!({"boxesWarm": 1, "loadAverage": 0.5, "memoryAvailableMib": 4096});
     assert_eq!(
         wire.sent(),
         [
-            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": ["session-1"], "health": "Healthy"}),
-            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": [], "health": "RateLimited"}),
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": ["session-1"], "heldClaudeSetupIds": ["setup-1"], "health": "Healthy"}),
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": [], "heldClaudeSetupIds": [], "health": "RateLimited"}),
         ]
     );
 }
