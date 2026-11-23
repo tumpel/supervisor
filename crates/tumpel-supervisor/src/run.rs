@@ -19,9 +19,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
     ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
-    HostReportedHealth, HostUsage, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure,
-    SupervisorHandover, SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending,
-    TurnFailureReason,
+    HostReportedHealth, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
 };
 use tumpel_channel::{
     Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer, Store,
@@ -187,12 +186,15 @@ struct Usage {
 }
 
 impl Usage {
-    fn sample(&self) -> Result<HostUsage, Failure> {
+    fn sample(&self) -> Result<tumpel_channel::Usage, Failure> {
         let held = self.holdings.borrow().clone();
         let stats = usage::sample(*self.warm.borrow(), &self.data_dir, &held)
             .map_err(|error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}")))?;
         self.telemetry.host(&stats, *self.running.borrow());
-        Ok(stats.usage)
+        Ok(tumpel_channel::Usage {
+            host: stats.usage,
+            boxes_warm: stats.boxes_warm,
+        })
     }
 }
 
@@ -235,11 +237,21 @@ fn beat(
     };
     drain(channel, from_box, outbox)?;
     channel
-        .heartbeat(chrono::Utc::now().fixed_offset(), usage.sample()?, held, health, outbox)
+        .heartbeat(
+            chrono::Utc::now().fixed_offset(),
+            usage.sample()?,
+            held,
+            health,
+            || usage.telemetry.heartbeat_batch(),
+            outbox,
+        )
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
 }
 
 fn flush(channel: &mut Channel, telemetry: &Telemetry, interval: Duration, outbox: &mut Outbox) -> Result<(), Failure> {
+    if !channel.sends_telemetry_frames() {
+        return Ok(());
+    }
     for batch in telemetry.flush_due(interval) {
         channel
             .send(ChannelHostMessage::TelemetryBatch(batch), outbox)
@@ -1086,7 +1098,10 @@ async fn session(
                 } else if channel.phase() == Phase::Open && channel.withholding() && !limit.paused(now) {
                     channel.release(limit.release_budget(TICK), &mut outbox).err().map(|error| Err(store_lost(&error)))
                 } else if channel.phase() == Phase::Open {
-                    flush(channel, &usage.telemetry, usage.telemetry_interval, &mut outbox).err().map(Err)
+                    flush(channel, &usage.telemetry, usage.telemetry_interval, &mut outbox)
+                        .and_then(|()| channel.transmit_due(Instant::now(), &mut outbox).map_err(|error| store_lost(&error)))
+                        .err()
+                        .map(Err)
                 } else {
                     None
                 }
@@ -1169,9 +1184,11 @@ mod tests {
         let Ok(Event::Challenged(nonce)) = channel.receive(&challenge) else {
             panic!("the challenge asks for a Hello");
         };
-        let usage =
-            serde_json::from_value(serde_json::json!({"boxesWarm": 0, "loadAverage": 0.0, "memoryAvailableMib": 1024}))
-                .expect("usage");
+        let usage = tumpel_channel::Usage {
+            host: serde_json::from_value(serde_json::json!({"loadAverage": 0.0, "memoryAvailableMib": 1024, "diskBudgetMib": 0, "diskHeldMib": 0, "memoryBudgetMib": 0, "memoryHeldMib": 0}))
+                .expect("usage"),
+            boxes_warm: 0,
+        };
         let mut outbox = Outbox::default();
         channel
             .hello(&nonce, std::num::NonZeroU32::MIN, usage, Vec::new(), &mut outbox)
@@ -1183,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_protocol_reconnects_at_once_at_34_and_a_dropped_connection_goes_back_to_36() {
+    fn a_refused_protocol_steps_down_one_version_at_a_time_and_a_dropped_connection_goes_back_to_37() {
         let mut channel = HostChannel::new(
             tumpel_channel::empty_state(),
             Unsaved,
@@ -1193,7 +1210,7 @@ mod tests {
         );
         let mut backoff = Backoff::default();
         let url = "wss://control.example.test/v1/channel";
-        assert_eq!(hello_version(&mut channel), serde_json::json!(36));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(37));
 
         let refusal = CloseFrame {
             code: CloseCode::from(4426),
@@ -1206,7 +1223,16 @@ mod tests {
             panic!("a refusal of the newest protocol reconnects");
         };
         assert_eq!(wait, Duration::ZERO);
-        assert_eq!(hello_version(&mut channel), serde_json::json!(34));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(36));
+
+        let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
+            panic!("a refusal ends the session");
+        };
+        let Next::Reconnect(wait) = next(&mut channel, &mut backoff, url, ended, 0) else {
+            panic!("a refusal of 36 reconnects at the oldest");
+        };
+        assert_eq!(wait, Duration::ZERO);
+        assert_eq!(hello_version(&mut channel), serde_json::json!(35));
 
         let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
             panic!("a refusal ends the session");
@@ -1226,6 +1252,6 @@ mod tests {
             panic!("a dropped connection reconnects");
         };
         assert_eq!(wait, Duration::from_secs(1));
-        assert_eq!(hello_version(&mut channel), serde_json::json!(36));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(37));
     }
 }

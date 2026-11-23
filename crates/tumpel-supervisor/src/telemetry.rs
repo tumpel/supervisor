@@ -11,8 +11,8 @@ use tracing::{Event, Instrument, Span, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::{LookupSpan, Registry};
 use tumpel_api::types::{
-    ChannelHostMessage, ChannelTelemetryBatch, ChannelTelemetryBatchType, EntityId, GuestMetric, MetricInstrument,
-    MetricKind, MetricName, SamplePoint, ShortText, TurnPoint,
+    ChannelHostMessage, ChannelTelemetryBatch, ChannelTelemetryBatchType, EntityId, GuestMetric, MetricBatch,
+    MetricInstrument, MetricKind, MetricName, SamplePoint, ShortText, TurnPoint,
 };
 
 use crate::bounded::bounded;
@@ -259,7 +259,7 @@ impl Telemetry {
         self.sample("host.memory.available", stats.usage.memory_available_mib as f64);
         self.sample("host.memory.total", stats.memory_total_mib as f64);
         self.sample("host.boxes.running", f64::from(running));
-        self.sample("host.boxes.warm", f64::from(stats.usage.boxes_warm));
+        self.sample("host.boxes.warm", f64::from(stats.boxes_warm));
         self.sample("telemetry.dropped", dropped as f64);
     }
 
@@ -274,38 +274,69 @@ impl Telemetry {
             let points: Vec<Point> = buffer.points.drain(..).collect();
             (points, buffer.declared.clone())
         };
-        let (samples, turns) = points
-            .into_iter()
-            .fold((Vec::new(), Vec::new()), |(mut samples, mut turns), point| {
-                match point {
-                    Point::Sample(sample) => samples.push(sample),
-                    Point::Turn(turn) => turns.push(turn),
-                }
-                (samples, turns)
-            });
+        let (samples, turns) = split(points);
         let frames = samples.len().max(turns.len()).div_ceil(BATCH_POINTS);
         let mut samples = samples.chunks(BATCH_POINTS);
         let mut turns = turns.chunks(BATCH_POINTS);
         (0..frames)
             .map(|_| {
-                let samples = samples.next().unwrap_or_default().to_vec();
-                let turns = turns.next().unwrap_or_default().to_vec();
-                let metrics: BTreeSet<&MetricName> = samples
-                    .iter()
-                    .map(|point| &point.metric)
-                    .chain(turns.iter().map(|point| &point.metric))
-                    .collect();
+                let batch = metric_batch(
+                    samples.next().unwrap_or_default().to_vec(),
+                    turns.next().unwrap_or_default().to_vec(),
+                    &declared,
+                );
                 ChannelTelemetryBatch {
-                    instruments: metrics
-                        .into_iter()
-                        .filter_map(|metric| instrument(metric).or_else(|| declared.get(metric).cloned()))
-                        .collect(),
-                    samples,
-                    turns,
+                    instruments: batch.instruments,
+                    samples: batch.samples,
+                    turns: batch.turns,
                     type_: ChannelTelemetryBatchType::TelemetryBatch,
                 }
             })
             .collect()
+    }
+
+    #[must_use]
+    pub fn heartbeat_batch(&self) -> MetricBatch {
+        let (points, declared) = {
+            let mut buffer = self.buffer();
+            let take = buffer.points.len().min(BATCH_POINTS);
+            let points: Vec<Point> = buffer.points.drain(..take).collect();
+            (points, buffer.declared.clone())
+        };
+        let (samples, turns) = split(points);
+        metric_batch(samples, turns, &declared)
+    }
+}
+
+fn split(points: Vec<Point>) -> (Vec<SamplePoint>, Vec<TurnPoint>) {
+    points
+        .into_iter()
+        .fold((Vec::new(), Vec::new()), |(mut samples, mut turns), point| {
+            match point {
+                Point::Sample(sample) => samples.push(sample),
+                Point::Turn(turn) => turns.push(turn),
+            }
+            (samples, turns)
+        })
+}
+
+fn metric_batch(
+    samples: Vec<SamplePoint>,
+    turns: Vec<TurnPoint>,
+    declared: &HashMap<MetricName, MetricInstrument>,
+) -> MetricBatch {
+    let metrics: BTreeSet<&MetricName> = samples
+        .iter()
+        .map(|point| &point.metric)
+        .chain(turns.iter().map(|point| &point.metric))
+        .collect();
+    MetricBatch {
+        instruments: metrics
+            .into_iter()
+            .filter_map(|metric| instrument(metric).or_else(|| declared.get(metric).cloned()))
+            .collect(),
+        samples,
+        turns,
     }
 }
 

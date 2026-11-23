@@ -566,7 +566,8 @@ fn describe(message: ChannelHostMessage) -> Option<String> {
         | ChannelHostMessage::RestoreChunks(_)
         | ChannelHostMessage::SupervisorUpdateStep(_)
         | ChannelHostMessage::SupervisorUpdateFailed(_)
-        | ChannelHostMessage::TelemetryBatch(_) => return None,
+        | ChannelHostMessage::TelemetryBatch(_)
+        | ChannelHostMessage::TurnLines(_) => return None,
         ChannelHostMessage::TurnImageFetching(fetching) => format!("fetching {}", *fetching.image_digest),
         ChannelHostMessage::TurnLine(line) => format!("line {} {}", line.line_seq.0, line.text),
         ChannelHostMessage::TurnComplete(done) => format!("complete {}", done.last_line_seq.0),

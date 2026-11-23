@@ -9,6 +9,7 @@ readme = "../../README.md"
 
 [dependencies]
 chrono.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tumpel-api.workspace = true
 
