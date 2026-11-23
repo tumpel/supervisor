@@ -20,8 +20,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SnapshotOrder, Taken,
-    TeardownOrder, Vmm,
+    restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SnapshotOrder, Stopped,
+    Taken, TeardownOrder, Vmm,
 };
 use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
@@ -293,10 +293,13 @@ impl Machine for MemoryMachine {
         self.drive.clone()
     }
 
-    fn stop(self) -> impl Future<Output = Result<(), String>> + Send {
+    fn stop(self) -> impl Future<Output = Stopped> + Send {
         self.drives.lock().expect("drives").remove(&self.drive);
         note(&self.log, format!("stop {}", self.session));
-        std::future::ready(Ok(()))
+        std::future::ready(Stopped {
+            exit: "was stopped".to_string(),
+            cleared: Ok(()),
+        })
     }
 
     fn console_tail(&self) -> String {

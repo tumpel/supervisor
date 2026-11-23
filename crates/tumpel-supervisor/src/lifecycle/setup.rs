@@ -10,7 +10,7 @@ use tumpel_api::types::{
     GuestClaudeSetupStartTokenCredential, GuestClaudeSetupStartType, GuestInput, GuestMessage, HttpUrl,
 };
 
-use super::{emit, mismatch, now, Guest, Machine, Runner, Vmm};
+use super::{emit, end_box, mismatch, now, BoxEnd, Guest, Machine, Runner, Vmm};
 use crate::boot::{BootOrder, Hold};
 use crate::bounded::reported;
 use crate::pool::Tap;
@@ -137,7 +137,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Ok((machine, guest, hold)) => {
                 let (machine, ended) = self.follow_setup(machine, guest, &order, inputs, offered).await;
                 let tail = machine.console_tail();
-                let stopped = machine.stop().await;
+                let stopped = end_box(machine, tap.index(), &id, &order.box_id, BoxEnd::SetupEnded).await;
                 drop(hold);
                 let failure = match ended {
                     Ended::Stored | Ended::Discarded => None,
@@ -184,7 +184,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Ok(Ok((guest, hello))) => match mismatch(&hello, &image) {
                 None => {
                     return self
-                        .hand_setup(machine, guest, order)
+                        .hand_setup(machine, guest, tap.index(), order)
                         .await
                         .map(|(machine, guest)| (machine, guest, hold))
                 }
@@ -197,7 +197,14 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             ),
         };
         let tail = machine.console_tail();
-        let stopped = machine.stop().await;
+        let stopped = end_box(
+            machine,
+            tap.index(),
+            &order.claude_setup_id,
+            &order.box_id,
+            BoxEnd::SetupBootFailed,
+        )
+        .await;
         Err(missing(then(format!("{failed}. Console: {tail}"), stopped)))
     }
 
@@ -205,12 +212,20 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         &self,
         machine: V::Machine,
         mut guest: <V::Machine as Machine>::Guest,
+        index: u8,
         order: &SetupOrder,
     ) -> Result<(V::Machine, <V::Machine as Machine>::Guest), Stop> {
         let token_credential: Result<GuestClaudeSetupStartTokenCredential, _> =
             order.token_credential.to_string().try_into();
         let Ok(token_credential) = token_credential else {
-            let stopped = machine.stop().await;
+            let stopped = end_box(
+                machine,
+                index,
+                &order.claude_setup_id,
+                &order.box_id,
+                BoxEnd::SetupNotHanded,
+            )
+            .await;
             return Err(stop(
                 ClaudeSetupFailureReason::SetupUrlMissing,
                 then(format!("the offer of Claude setup {} carried a token credential the guest protocol refuses; update the supervisor and the control plane together", *order.claude_setup_id), stopped),
@@ -225,7 +240,14 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         });
         if let Err(error) = guest.send(&start).await {
             let tail = machine.console_tail();
-            let stopped = machine.stop().await;
+            let stopped = end_box(
+                machine,
+                index,
+                &order.claude_setup_id,
+                &order.box_id,
+                BoxEnd::SetupNotHanded,
+            )
+            .await;
             return Err(stop(
                 ClaudeSetupFailureReason::SetupUrlMissing,
                 then(

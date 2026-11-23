@@ -2,18 +2,21 @@ use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
 use tokio::net::unix::pipe;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
+use tokio::task::AbortHandle;
 use tumpel_api::types::{EntityId, GuestHello, GuestInput, GuestMessage, SupervisorHandoverMachine, SupervisorRuntime};
 use tumpel_guest::setup_output::{redacted, strip_ansi};
 use tumpel_guest::{encode, Decoder, GUEST_CID, GUEST_PORT, READY_PORT};
@@ -22,7 +25,7 @@ use crate::boot::Boot;
 use crate::bounded::bounded;
 use crate::fd_store;
 use crate::guest_drive;
-use crate::lifecycle::{remove_dir, Guest, Machine, Vmm};
+use crate::lifecycle::{remove_dir, Guest, Machine, Stopped, Vmm};
 use crate::pool::{Disk, Tap};
 use crate::snapshot::Ext4Upper;
 
@@ -142,6 +145,12 @@ pub fn remove_leftovers(data: &Path, boxes: &[u8], sessions: &[EntityId]) -> Res
         }
     }
     remove_dir(&data.join(crate::persona_files::DIR))
+}
+
+fn tail_bytes(console: &Mutex<VecDeque<u8>>) -> Vec<u8> {
+    console
+        .lock()
+        .map_or_default(|tail| tail.iter().copied().collect::<Vec<u8>>())
 }
 
 fn console_text(tail: &[u8]) -> String {
@@ -325,18 +334,32 @@ enum Owner {
 
 struct Adopted {
     pid: libc::pid_t,
-    owner: Owner,
+    owner: Option<Owner>,
+}
+
+impl Adopted {
+    fn end(&mut self) -> String {
+        match self.owner.take() {
+            None => "had already been ended".to_string(),
+            Some(Owner::Child) => end_child(self.pid),
+            Some(Owner::Scope(scope)) => match stop_scopes(std::slice::from_ref(&scope)) {
+                Ok(()) => format!(
+                    "was stopped with {scope}; systemd holds its exit status, as this supervisor did not start it"
+                ),
+                Err(error) => error,
+            },
+        }
+    }
 }
 
 impl Drop for Adopted {
     fn drop(&mut self) {
-        match &self.owner {
-            Owner::Child => end_child(self.pid),
-            Owner::Scope(scope) => {
-                if let Err(error) = stop_scopes(std::slice::from_ref(scope)) {
-                    eprintln!("tumpel-supervisor: ending a box: {error}");
-                }
-            }
+        if self.owner.is_some() {
+            let ended = self.end();
+            eprintln!(
+                "tumpel-supervisor: ending a box: Firecracker process {} {ended}",
+                self.pid
+            );
         }
     }
 }
@@ -358,35 +381,106 @@ impl Process {
         std::mem::forget(self);
     }
 
-    async fn kill(self) {
+    async fn kill(self) -> String {
         match self {
-            Self::Spawned(mut child) => {
-                let _ = child.kill().await;
-            }
-            Self::Adopted(adopted) => {
-                let _ = tokio::task::spawn_blocking(move || drop(adopted)).await;
-            }
+            Self::Spawned(mut child) => kill_child(&mut child).await,
+            Self::Adopted(mut adopted) => tokio::task::spawn_blocking(move || adopted.end())
+                .await
+                .unwrap_or_else(|error| format!("could not be ended: {error}")),
         }
     }
 }
 
-fn end_child(pid: libc::pid_t) {
-    let mut status = 0;
-    if unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) } != 0 {
-        return;
+async fn kill_child(child: &mut Child) -> String {
+    if let Ok(Some(status)) = child.try_wait() {
+        return format!("had already ended with {}", exited(status));
     }
-    unsafe { libc::kill(pid, libc::SIGKILL) };
-    unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    if let Err(error) = child.start_kill() {
+        return format!("could not be killed: {error}");
+    }
+    match child.wait().await {
+        Ok(status) => format!("was stopped and ended with {}", exited(status)),
+        Err(error) => format!("was killed and could not be waited for: {error}"),
+    }
 }
 
-fn ended(status: i32) -> String {
-    if libc::WIFEXITED(status) {
-        return format!("exit status {}", libc::WEXITSTATUS(status));
+fn exited(status: ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit status {code}");
     }
-    if libc::WIFSIGNALED(status) {
-        return format!("signal {}", libc::WTERMSIG(status));
+    if let Some(signal) = status.signal() {
+        return format!("signal {signal}");
     }
-    format!("wait status {status}")
+    status.to_string()
+}
+
+fn end_child(pid: libc::pid_t) -> String {
+    let mut status = 0;
+    match unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) } {
+        0 => {}
+        waited if waited == pid => return format!("had already ended with {}", exited(ExitStatus::from_raw(status))),
+        _ => return format!("could not be waited for: {}", std::io::Error::last_os_error()),
+    }
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    if unsafe { libc::waitpid(pid, &raw mut status, 0) } == pid {
+        return format!("was stopped and ended with {}", exited(ExitStatus::from_raw(status)));
+    }
+    format!(
+        "was killed and could not be waited for: {}",
+        std::io::Error::last_os_error()
+    )
+}
+
+fn peek_exit(pidfd: &OwnedFd) -> String {
+    let Ok(id) = libc::id_t::try_from(pidfd.as_raw_fd()) else {
+        return format!("has a pidfd {} no wait can name", pidfd.as_raw_fd());
+    };
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe { libc::waitid(libc::P_PIDFD, id, &raw mut info, libc::WEXITED | libc::WNOWAIT) } < 0 {
+        return format!(
+            "ended with a status this supervisor cannot read: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let status = unsafe { info.si_status() };
+    match info.si_code {
+        libc::CLD_EXITED => format!("ended with exit status {status}"),
+        libc::CLD_KILLED | libc::CLD_DUMPED => format!("ended with signal {status}"),
+        code => format!("ended with wait code {code} and status {status}"),
+    }
+}
+
+fn watch(
+    index: u8,
+    pid: libc::pid_t,
+    session: String,
+    console: &Arc<Mutex<VecDeque<u8>>>,
+    scoped: bool,
+) -> Result<AbortHandle, String> {
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        return Err(format!(
+            "watching Firecracker process {pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let raw = i32::try_from(raw).map_err(|error| format!("watching Firecracker process {pid}: {error}"))?;
+    let pidfd = unsafe { AsyncFd::register_with_interest(OwnedFd::from_raw_fd(raw), Interest::READABLE) }
+        .map_err(|error| format!("watching Firecracker process {pid}: {error}"))?;
+    let console = Arc::clone(console);
+    let watcher = tokio::spawn(async move {
+        let status = match pidfd.readable().await {
+            Ok(_) if scoped => "ended; systemd holds its exit status, as this supervisor did not start it".to_string(),
+            Ok(_) => peek_exit(pidfd.get_ref()),
+            Err(error) => format!("could no longer be watched: {error}"),
+        };
+        eprintln!(
+            "tumpel-supervisor: box {index} ({}) of session {session} ended on its own: Firecracker process {pid} {status}. Console: {}",
+            scope_of(index),
+            console_text(&tail_bytes(&console))
+        );
+    });
+    Ok(watcher.abort_handle())
 }
 
 fn in_scope(pid: libc::pid_t, scope: &str) -> bool {
@@ -426,7 +520,7 @@ fn alive(pid: libc::pid_t, scope: &str) -> Result<Owner, String> {
     if waited == pid {
         return Err(format!(
             "its Firecracker process {pid} ended during the handover with {}",
-            ended(status)
+            exited(ExitStatus::from_raw(status))
         ));
     }
     if in_scope(pid, scope) {
@@ -550,7 +644,18 @@ impl Firecracker {
         }
         machine.stdout = Some(stdout);
         machine.stderr = Some(stderr);
-        machine.process = Some(Process::Adopted(Adopted { pid, owner }));
+        let scoped = matches!(owner, Owner::Scope(_));
+        machine.process = Some(Process::Adopted(Adopted {
+            pid,
+            owner: Some(owner),
+        }));
+        machine.watcher = Some(watch(
+            tap.index(),
+            pid,
+            machine.session_name(),
+            &machine.console,
+            scoped,
+        )?);
         Ok((machine, VsockGuest { stream, decoder }))
     }
 }
@@ -573,6 +678,7 @@ impl Vmm for Firecracker {
             memory_mib: tap.memory_mib(),
             overlay_bytes: u64::from(tap.disk_mib().get()) * 1024 * 1024,
             process: None,
+            watcher: None,
             stdout: None,
             stderr: None,
             console: Arc::new(Mutex::new(VecDeque::with_capacity(CONSOLE_TAIL))),
@@ -697,12 +803,40 @@ pub struct FirecrackerBox {
     memory_mib: NonZeroU32,
     overlay_bytes: u64,
     process: Option<Process>,
+    watcher: Option<AbortHandle>,
     stdout: Option<OwnedFd>,
     stderr: Option<OwnedFd>,
     console: Arc<Mutex<VecDeque<u8>>>,
 }
 
+impl Drop for FirecrackerBox {
+    fn drop(&mut self) {
+        self.unwatch();
+        if self.process.is_some() {
+            eprintln!(
+                "tumpel-supervisor: box {} ({}) of session {} was dropped while its Firecracker process ran, which ends that process unlogged. Console: {}",
+                self.index,
+                scope_of(self.index),
+                self.session_name(),
+                self.console_tail()
+            );
+        }
+    }
+}
+
 impl FirecrackerBox {
+    fn session_name(&self) -> String {
+        self.session
+            .file_name()
+            .map_or_default(|name| name.to_string_lossy().into_owned())
+    }
+
+    fn unwatch(&mut self) {
+        if let Some(watcher) = self.watcher.take() {
+            watcher.abort();
+        }
+    }
+
     fn home(&self, guest: &VsockGuest) -> Result<(), String> {
         let pid = self
             .process
@@ -722,12 +856,6 @@ impl FirecrackerBox {
             }
         }
         Ok(())
-    }
-
-    fn console_bytes(&self) -> Vec<u8> {
-        self.console
-            .lock()
-            .map_or_default(|tail| tail.iter().copied().collect::<Vec<u8>>())
     }
 
     fn api_socket(&self) -> PathBuf {
@@ -799,6 +927,12 @@ impl FirecrackerBox {
             }
             tokio::time::sleep(API_WAIT_STEP).await;
         }
+        let pid = child
+            .id()
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+            .ok_or_else(|| "Firecracker ended right after opening its API socket".to_string())?;
+        self.unwatch();
+        self.watcher = Some(watch(self.index, pid, self.session_name(), &self.console, false)?);
         self.process = Some(Process::Spawned(child));
         Ok(())
     }
@@ -984,17 +1118,21 @@ impl Machine for FirecrackerBox {
         self.session.join(OVERLAY_DRIVE)
     }
 
-    async fn stop(mut self) -> Result<(), String> {
-        if let Some(process) = self.process.take() {
-            process.kill().await;
-        }
-        fd_store::forget_box(self.index)
+    async fn stop(mut self) -> Stopped {
+        self.unwatch();
+        let exit = match self.process.take() {
+            Some(process) => process.kill().await,
+            None => "was not running".to_string(),
+        };
+        let exit = format!("process in {} {exit}", scope_of(self.index));
+        let cleared = fd_store::forget_box(self.index)
             .and_then(|()| remove_dir(&self.dir))
-            .map_err(|error| format!("BoxNotCleared: tearing down box {}: {error}", self.index))
+            .map_err(|error| format!("BoxNotCleared: tearing down box {}: {error}", self.index));
+        Stopped { exit, cleared }
     }
 
     fn console_tail(&self) -> String {
-        console_text(&self.console_bytes())
+        console_text(&tail_bytes(&self.console))
     }
 
     fn clear_console(&mut self) {
@@ -1041,13 +1179,14 @@ impl Machine for FirecrackerBox {
 
     fn hand_over(mut self, guest: VsockGuest) -> Result<SupervisorHandoverMachine, String> {
         let machine = SupervisorHandoverMachine {
-            console_tail: bounded("the console tail", STANDARD.encode(self.console_bytes()))?,
+            console_tail: bounded("the console tail", STANDARD.encode(tail_bytes(&self.console)))?,
             guest_buffer: bounded(
                 "the guest bytes buffered past the last frame",
                 STANDARD.encode(guest.decoder.buffered()),
             )?,
             ..self.record()?
         };
+        self.unwatch();
         if let Some(process) = self.process.take() {
             process.keep();
         }
