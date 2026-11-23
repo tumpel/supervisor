@@ -617,6 +617,7 @@ struct Host {
     holdings: tokio::sync::watch::Receiver<Held>,
     runner: tokio::task::JoinHandle<Result<(), String>>,
     answering: Arc<AtomicBool>,
+    accepting: Arc<AtomicBool>,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -770,6 +771,29 @@ fn control_plane(
     received
 }
 
+fn acking(
+    mut received: UnboundedReceiver<ChannelHostMessage>,
+    accepting: Arc<AtomicBool>,
+    commands: UnboundedSender<Input>,
+) -> UnboundedReceiver<ChannelHostMessage> {
+    let (forward, acked) = unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(message) = received.recv().await {
+            let accepted = match &message {
+                ChannelHostMessage::SnapshotDone(done) if accepting.load(Ordering::SeqCst) => {
+                    Some(Input::SnapshotAccepted(done.snapshot_id.clone()))
+                }
+                _ => None,
+            };
+            let _ = forward.send(message);
+            if let Some(accepted) = accepted {
+                let _ = commands.send(accepted);
+            }
+        }
+    });
+    acked
+}
+
 fn host_on(
     name: &str,
     store: MemoryStore,
@@ -813,6 +837,8 @@ fn start_host(
         vmm.staging.join("boxes.json"),
     );
     let answering = Arc::new(AtomicBool::new(true));
+    let accepting = Arc::new(AtomicBool::new(true));
+    let (commands, from_host) = unbounded_channel();
     let received = control_plane(
         store.clone(),
         lifecycle.answers(),
@@ -820,10 +846,10 @@ fn start_host(
         Arc::clone(&answering),
         from_lifecycle,
     );
+    let received = acking(received, Arc::clone(&accepting), commands.clone());
     lifecycle.start(taken).expect("the lifecycle starts");
     let sessions = lifecycle.sessions();
     let holdings = lifecycle.holdings();
-    let (commands, from_host) = unbounded_channel();
     let cancels = lifecycle.cancels();
     let runner = tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
     Host {
@@ -844,6 +870,7 @@ fn start_host(
         holdings,
         runner,
         answering,
+        accepting,
     }
 }
 
@@ -1683,6 +1710,7 @@ async fn a_warm_box_handed_over_with_a_queued_teardown_is_stopped_and_answers_bo
     old.settle_until("complete 1").await;
     old.snapshot("session-1");
     old.settle_until("snapshot done").await;
+    old.settle(SETTLE).await;
     assert!(
         !old.standing().boxes[0].dirty,
         "a snapshot that holds the turn records the box clean"
@@ -1925,6 +1953,58 @@ async fn a_snapshotted_box_idle_for_the_offered_idle_time_is_stopped_and_answers
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_box_whose_snapshot_done_is_never_accepted_stays_dirty_past_its_idle_time() {
+    let mut host = host("idle-refused", 1, Harness::Echo, Boot::Works);
+    host.idle_seconds = NonZeroU32::new(300).expect("five minutes");
+    host.accepting.store(false, Ordering::SeqCst);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    host.log();
+    assert_eq!(host.settle(Duration::from_mins(20)).await, Vec::<String>::new());
+    assert_eq!(host.log(), Vec::<String>::new());
+    assert!(host.standing().boxes[0].dirty);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_box_is_clean_once_its_snapshot_done_is_accepted_and_then_ends_on_idle() {
+    let mut host = host("idle-accepted", 1, Harness::Echo, Boot::Works);
+    host.idle_seconds = NonZeroU32::new(300).expect("five minutes");
+    host.accepting.store(false, Ordering::SeqCst);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    let first = host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    assert_eq!(host.settle(Duration::from_mins(2)).await, Vec::<String>::new());
+    assert!(host.standing().boxes[0].dirty);
+    host.commands
+        .send(Input::SnapshotAccepted(first.snapshot_id))
+        .expect("send");
+    host.settle(SETTLE).await;
+    assert!(!host.standing().boxes[0].dirty);
+    assert_eq!(host.settle(Duration::from_mins(4)).await, ["box gone session-1"]);
+}
+
+#[tokio::test]
+async fn a_teardown_that_arrives_before_the_ack_of_its_snapshot_done_stops_the_box() {
+    let mut host = host("teardown-before-ack", 1, Harness::Echo, Boot::Works);
+    host.accepting.store(false, Ordering::SeqCst);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    let first = host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    host.log();
+    host.teardown("session-1");
+    assert_eq!(host.settle(SETTLE).await, ["box gone session-1"]);
+    host.commands
+        .send(Input::SnapshotAccepted(first.snapshot_id))
+        .expect("send");
+    assert_eq!(host.settle(SETTLE).await, Vec::<String>::new());
+    assert_eq!(host.log(), ["stop session-1"]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_box_snapshotted_late_is_stopped_once_the_idle_time_since_its_turn_runs_out() {
     let mut host = host("idle-late-snapshot", 1, Harness::Echo, Boot::Works);
     host.idle_seconds = NonZeroU32::new(900).expect("fifteen minutes");
@@ -1946,6 +2026,7 @@ async fn a_box_snapshotted_late_keeps_its_idle_deadline_across_a_crash() {
     assert_eq!(old.settle(Duration::from_mins(10)).await, Vec::<String>::new());
     old.snapshot("session-1");
     assert_eq!(old.settle_until("snapshot done").await, ["snapshot done"]);
+    old.settle(SETTLE).await;
     let mut standing = old.standing();
     old.keep_guest(&mut standing.boxes[0], 40);
     let mut new = old.after_crash(standing);

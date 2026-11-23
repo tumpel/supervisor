@@ -4,15 +4,15 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset, Utc};
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tumpel_api::frozen::v36;
 use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType, ChannelHostMessage,
-    ChannelProtocol, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLine, ChannelTurnLineType,
-    ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch,
-    Sequence, SupervisorChannelState,
+    ChannelProtocol, ChannelSnapshotDone, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLine,
+    ChannelTurnLineType, ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth,
+    HostUsage, MetricBatch, Sequence, SupervisorChannelState,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
@@ -335,6 +335,13 @@ pub struct HostChannel<S: Store, K: Signer> {
     version: u16,
     sealed: i64,
     batch_started: Option<Instant>,
+    accepted: Vec<EntityId>,
+}
+
+fn snapshot_done(message: &Value) -> Option<EntityId> {
+    ChannelSnapshotDone::deserialize(message)
+        .ok()
+        .map(|done| done.snapshot_id)
 }
 
 fn frozen<F: DeserializeOwned + Serialize>(value: Value, what: &str) -> Result<String, ChannelError> {
@@ -382,6 +389,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             phase: Phase::Closed,
             progressed: false,
             withheld: None,
+            accepted: Vec::new(),
             offered: Vec::new(),
             hello_version: ChannelProtocol::VERSION,
             version: ChannelProtocol::VERSION,
@@ -429,6 +437,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     pub fn step_up(&mut self) {
         self.hello_version = ChannelProtocol::VERSION;
+    }
+
+    pub fn take_accepted(&mut self) -> Vec<EntityId> {
+        std::mem::take(&mut self.accepted)
     }
 
     /// # Errors
@@ -772,6 +784,9 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         if self.state.unacked.first().is_some_and(|first| first.seq.0 <= ack) {
             self.progressed = true;
         }
+        let retired = self.state.unacked.iter().filter(|own| own.seq.0 <= ack);
+        let accepted: Vec<EntityId> = retired.filter_map(|own| snapshot_done(&own.message)).collect();
+        self.accepted.extend(accepted);
         self.state.unacked.retain(|own| own.seq.0 > ack);
         Ok(())
     }

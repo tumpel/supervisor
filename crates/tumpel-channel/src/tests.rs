@@ -412,6 +412,32 @@ fn a_saved_frame_no_reader_knows_is_resent_unchanged_and_dropped_once_the_contro
 }
 
 #[test]
+fn an_acked_snapshot_done_is_accepted_and_a_refused_one_retires_without_acceptance() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    channel.send(done("snap-1"), &mut wire).expect("send");
+    channel.send(done("snap-2"), &mut wire).expect("send");
+    let refused = json!({"type": "FrameRefused", "seq": 2, "reason": "the manifest did not parse"}).to_string();
+    let Ok(Event::FrameRefused { seq: 2, .. }) = channel.receive(&refused) else {
+        panic!("the refusal is reported");
+    };
+    assert_eq!(
+        channel.take_accepted(),
+        Vec::<EntityId>::new(),
+        "a refusal accepts nothing"
+    );
+
+    channel
+        .receive(&json!({"type": "Ack", "seq": 2}).to_string())
+        .expect("the ack retires both frames");
+    let accepted: Vec<String> = channel.take_accepted().into_iter().map(|id| id.to_string()).collect();
+    assert_eq!(accepted, ["snap-1"]);
+    assert_eq!(channel.take_accepted(), Vec::<EntityId>::new());
+}
+
+#[test]
 fn a_frame_and_message_with_fields_this_supervisor_does_not_know_are_read_for_the_fields_it_knows() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());

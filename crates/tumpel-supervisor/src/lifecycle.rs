@@ -597,6 +597,12 @@ struct Slot<M: Machine> {
     queue: VecDeque<Command>,
     idle: Option<AbortHandle>,
     idle_end: Option<Instant>,
+    snapshot: Option<Awaited>,
+}
+
+enum Awaited {
+    Pending(EntityId),
+    Accepted,
 }
 
 impl<M: Machine> Slot<M> {
@@ -625,6 +631,7 @@ impl<M: Machine> Default for Slot<M> {
             queue: VecDeque::new(),
             idle: None,
             idle_end: None,
+            snapshot: None,
         }
     }
 }
@@ -1798,16 +1805,15 @@ impl<V: Vmm, S: Store> Runner<V, S> {
 
     async fn snapshot(&self, mut live: LiveBox<V::Machine>, order: &SnapshotOrder) -> Outcome<V::Machine> {
         let drive = live.machine.drive();
-        let (message, stored): (ChannelHostMessage, bool) = match self.store_snapshot(drive, &live.base, order).await {
+        let message: ChannelHostMessage = match self.store_snapshot(drive, &live.base, order).await {
             Ok((uploaded_bytes, base)) => {
                 live.base = Arc::new(base);
-                live.dirty = false;
                 let done = ChannelSnapshotDone {
                     snapshot_id: order.snapshot_id.clone(),
                     type_: ChannelSnapshotDoneType::SnapshotDone,
                     uploaded_bytes,
                 };
-                (done.into(), true)
+                done.into()
             }
             Err((reason, detail)) => {
                 let failed = ChannelSnapshotFailed {
@@ -1817,21 +1823,11 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     snapshot_id: order.snapshot_id.clone(),
                     type_: ChannelSnapshotFailedType::SnapshotFailed,
                 };
-                (failed.into(), false)
+                failed.into()
             }
         };
         emit(&self.out, message);
-        if !stored {
-            return Outcome::Kept(live);
-        }
-        let Err(error) = self.standing.put(&live, None) else {
-            return Outcome::Kept(live);
-        };
-        let (tap, tail, stopped) = stop_box(&self.standing, live, BoxEnd::SnapshotNotRecorded).await;
-        eprintln!(
-            "tumpel-supervisor: recording a snapshotted box as clean for a supervisor restart failed and the box was stopped: {error}. Console: {tail}"
-        );
-        Outcome::Gone(tap, stopped)
+        Outcome::Kept(live)
     }
 
     async fn store_snapshot(
@@ -2070,6 +2066,7 @@ pub enum Input {
     Command(Command),
     HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>, Abandoned),
+    SnapshotAccepted(EntityId),
 }
 
 #[derive(Clone)]
@@ -2289,6 +2286,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     Some(Input::Command(command)) => self.command(command).await?,
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
                     Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
+                    Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id).await?,
                     None => break,
                 },
                 Some(setup) = setups.recv() => self.setup_command(setup),
@@ -2889,6 +2887,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 armed.abort();
             }
             slot.idle_end = None;
+            slot.snapshot = None;
             let live = slot.live.take()?;
             slot.paused = false;
             slot.busy = true;
@@ -2975,6 +2974,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let live = self.slots.get_mut(&session).and_then(|slot| {
             let live = slot.live.take()?;
             slot.busy = true;
+            slot.snapshot = Some(Awaited::Pending(order.snapshot_id.clone()));
             Some(live)
         });
         let Some(live) = live else {
@@ -3029,6 +3029,13 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     async fn start_teardown(&mut self, session: String, order: TeardownOrder) -> Result<(), String> {
+        if let Some(slot) = self.slots.get_mut(&session).filter(|slot| {
+            matches!(slot.snapshot, Some(Awaited::Pending(_)))
+                && slot.live.as_ref().is_some_and(|live| live.box_id == order.box_id)
+        }) {
+            slot.snapshot = Some(Awaited::Accepted);
+            self.clean(&session).await?;
+        }
         let Some(dirty) = self
             .live_box(&session)
             .filter(|live| live.box_id == order.box_id)
@@ -3222,7 +3229,53 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             stopped?;
             self.free_disk(&session)?;
         }
+        self.clean(&session).await?;
         self.drain(session).await
+    }
+
+    async fn snapshot_accepted(&mut self, snapshot_id: &EntityId) -> Result<(), String> {
+        let waiting = self.slots.iter_mut().find_map(|(session, slot)| {
+            if !matches!(&slot.snapshot, Some(Awaited::Pending(pending)) if pending == snapshot_id) {
+                return None;
+            }
+            slot.snapshot = Some(Awaited::Accepted);
+            Some(session.clone())
+        });
+        let Some(session) = waiting else {
+            eprintln!(
+                "tumpel-supervisor: the control plane accepted SnapshotDone {}, but no box here waits on that snapshot; a later turn ran or the box is gone, so nothing is marked clean",
+                **snapshot_id
+            );
+            return Ok(());
+        };
+        self.clean(&session).await?;
+        self.arm_idle(&session);
+        Ok(())
+    }
+
+    async fn clean(&mut self, session: &str) -> Result<(), String> {
+        let Some(slot) = self
+            .slots
+            .get_mut(session)
+            .filter(|slot| matches!(slot.snapshot, Some(Awaited::Accepted)) && !slot.busy)
+        else {
+            return Ok(());
+        };
+        let Some(live) = slot.live.as_mut() else {
+            return Ok(());
+        };
+        slot.snapshot = None;
+        live.dirty = false;
+        let Err(error) = self.runner.standing.put(live, None) else {
+            return Ok(());
+        };
+        let box_id = live.box_id.clone();
+        self.teardown(session, BoxEnd::SnapshotNotRecorded).await?;
+        eprintln!(
+            "tumpel-supervisor: recording session {session} box {} as clean for a supervisor restart failed and the box was stopped: {error}",
+            *box_id
+        );
+        Ok(())
     }
 
     async fn drain(&mut self, session: String) -> Result<(), String> {
