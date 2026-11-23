@@ -366,7 +366,10 @@ async fn boxes(
                 continue;
             }
             BoxCommand::SnapshotRefused(snapshot_id) => {
-                let _ = lifecycle.send(Input::SnapshotRefused(snapshot_id));
+                if lifecycle.send(Input::SnapshotRefused(snapshot_id)).is_err() {
+                    eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
+                    return;
+                }
                 continue;
             }
         };
@@ -1014,12 +1017,6 @@ fn box_command(message: ChannelControlMessage) -> BoxCommand {
     }
 }
 
-fn refused_snapshot(message: Option<&serde_json::Value>) -> Option<EntityId> {
-    let message =
-        message.filter(|message| message.get("type").and_then(serde_json::Value::as_str) == Some("SnapshotDone"))?;
-    EntityId::try_from(message.get("snapshotId")?.as_str()?).ok()
-}
-
 fn rate_limited(
     limit: &mut RateLimit,
     url: &str,
@@ -1078,9 +1075,15 @@ async fn session(
                             updates.welcomed().await.err().map(Err)
                         }
                         Ok(Event::Message(message)) => commands.send(box_command(*message)).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
-                        Ok(Event::FrameRefused { seq, reason, message }) => {
+                        Ok(Event::FrameRefused { seq, reason, snapshot_id }) => {
                             eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
-                            refused_snapshot(message.as_ref()).and_then(|snapshot_id| commands.send(BoxCommand::SnapshotRefused(snapshot_id)).err()).map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
+                            match snapshot_id {
+                                None => None,
+                                Some(snapshot_id) => match commands.send(BoxCommand::SnapshotRefused(snapshot_id)) {
+                                    Ok(()) => None,
+                                    Err(_) => Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
+                                },
+                            }
                         }
                         Ok(Event::FrameRateLimited { seq: _, reason, frames_per_minute, retry_after }) => {
                             rate_limited(limit, url, &reason, frames_per_minute, retry_after);

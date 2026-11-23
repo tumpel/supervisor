@@ -311,7 +311,7 @@ pub enum Event {
     FrameRefused {
         seq: i64,
         reason: String,
-        message: Option<Value>,
+        snapshot_id: Option<EntityId>,
     },
     FrameRateLimited {
         seq: i64,
@@ -779,18 +779,26 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     fn refused(&mut self, refused: ChannelFrameRefused) -> Result<Event, ChannelError> {
         self.progressed = true;
+        let seq = refused.seq.0;
         let message = self
             .state
             .unacked
             .iter()
-            .find(|own| own.seq.0 == refused.seq.0)
+            .find(|own| own.seq.0 == seq)
             .map(|own| own.message.clone());
-        self.state.unacked.retain(|own| own.seq.0 != refused.seq.0);
+        if message.is_none() {
+            eprintln!("tumpel-supervisor: FrameRefused: frame {seq} was no longer held when the control plane refused it, so its message is unknown");
+        }
+        let snapshot_id = match message.map(serde_json::from_value::<ChannelHostMessage>) {
+            Some(Ok(ChannelHostMessage::SnapshotDone(done))) => Some(done.snapshot_id),
+            _ => None,
+        };
+        self.state.unacked.retain(|own| own.seq.0 != seq);
         self.store.save(&self.state)?;
         Ok(Event::FrameRefused {
-            seq: refused.seq.0,
+            seq,
             reason: String::from(refused.reason),
-            message,
+            snapshot_id,
         })
     }
 

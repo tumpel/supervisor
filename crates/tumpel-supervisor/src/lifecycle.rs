@@ -324,6 +324,7 @@ struct LiveBox<M: Machine> {
     image: Box<Boot>,
     _hold: Hold,
     dirty: bool,
+    snapshot_id: Option<EntityId>,
     credential_file: Option<String>,
     box_retention: BoxRetention,
     idle: Duration,
@@ -341,6 +342,7 @@ impl<M: Machine> LiveBox<M> {
             image: Box::new(image),
             _hold: hold,
             dirty: false,
+            snapshot_id: None,
             credential_file: None,
             box_retention: turn.box_retention,
             idle: Duration::from_secs(u64::from(turn.idle_seconds.get())),
@@ -597,7 +599,6 @@ struct Slot<M: Machine> {
     queue: VecDeque<Command>,
     idle: Option<AbortHandle>,
     idle_end: Option<Instant>,
-    snapshot_id: Option<EntityId>,
 }
 
 impl<M: Machine> Slot<M> {
@@ -626,7 +627,6 @@ impl<M: Machine> Default for Slot<M> {
             queue: VecDeque::new(),
             idle: None,
             idle_end: None,
-            snapshot_id: None,
         }
     }
 }
@@ -1804,6 +1804,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Ok((uploaded_bytes, base)) => {
                 live.base = Arc::new(base);
                 live.dirty = false;
+                live.snapshot_id = Some(order.snapshot_id.clone());
                 let done = ChannelSnapshotDone {
                     snapshot_id: order.snapshot_id.clone(),
                     type_: ChannelSnapshotDoneType::SnapshotDone,
@@ -2697,6 +2698,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             image: Box::new(image),
             _hold: hold,
             dirty: handed.dirty,
+            snapshot_id: None,
             credential_file: handed.credential_file.map(String::from),
             box_retention: handed.box_retention,
             idle: duration(handed.idle_milliseconds),
@@ -2979,7 +2981,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let live = self.slots.get_mut(&session).and_then(|slot| {
             let live = slot.live.take()?;
             slot.busy = true;
-            slot.snapshot_id = Some(order.snapshot_id.clone());
             Some(live)
         });
         let Some(live) = live else {
@@ -3012,9 +3013,13 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             let live = slot
                 .live
                 .as_mut()
-                .filter(|_| slot.snapshot_id.as_ref() == Some(snapshot_id))?;
+                .filter(|live| live.snapshot_id.as_ref() == Some(snapshot_id))?;
             Some((session.clone(), live))
         }) else {
+            eprintln!(
+                "tumpel-supervisor: the control plane refused SnapshotDone {}, but no box here holds that snapshot",
+                **snapshot_id
+            );
             return Ok(());
         };
         live.dirty = true;
