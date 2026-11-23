@@ -130,6 +130,7 @@ fn cpu_times(stat: &str) -> Result<CpuTimes> {
 
 pub struct HostStats {
     pub usage: HostUsage,
+    pub boxes_warm: u32,
     pub memory_total_mib: u64,
     pub loads: [f64; 3],
     pub cpu: CpuTimes,
@@ -139,14 +140,14 @@ fn stats(boxes_warm: u32, disk: Disk, held: &Held, procs: [&str; 3]) -> Result<H
     let [meminfo, loadavg, stat] = procs;
     let loads = load_averages(loadavg)?;
     Ok(HostStats {
+        boxes_warm,
         usage: HostUsage {
-            boxes_warm: i32::try_from(boxes_warm).unwrap_or(i32::MAX),
             load_average: loads[0],
             memory_available_mib: i64::try_from(meminfo_kib(meminfo, "MemAvailable")? / 1024).unwrap_or(i64::MAX),
-            disk_budget_mib: Some(i64::try_from(disk.budget_mib()).unwrap_or(i64::MAX)),
-            disk_held_mib: Some(i64::try_from(disk.written_mib + held.disk_reserved_mib).unwrap_or(i64::MAX)),
-            memory_budget_mib: Some(i64::try_from(held.memory_budget_mib).unwrap_or(i64::MAX)),
-            memory_held_mib: Some(i64::try_from(held.memory_held_mib).unwrap_or(i64::MAX)),
+            disk_budget_mib: i64::try_from(disk.budget_mib()).unwrap_or(i64::MAX),
+            disk_held_mib: i64::try_from(disk.written_mib + held.disk_reserved_mib).unwrap_or(i64::MAX),
+            memory_budget_mib: i64::try_from(held.memory_budget_mib).unwrap_or(i64::MAX),
+            memory_held_mib: i64::try_from(held.memory_held_mib).unwrap_or(i64::MAX),
         },
         memory_total_mib: meminfo_kib(meminfo, "MemTotal")? / 1024,
         loads,
@@ -231,11 +232,11 @@ mod tests {
         .expect("stats");
         assert_eq!(
             (sampled.usage.disk_budget_mib, sampled.usage.disk_held_mib),
-            (Some(70_000), Some(10_192))
+            (70_000, 10_192)
         );
         assert_eq!(
             (sampled.usage.memory_budget_mib, sampled.usage.memory_held_mib),
-            (Some(33_792), Some(6144))
+            (33_792, 6144)
         );
         assert_eq!(sampled.usage.memory_available_mib, 12_973_128 / 1024);
         assert_eq!(sampled.memory_total_mib, 16_375_664 / 1024);

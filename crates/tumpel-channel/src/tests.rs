@@ -1,17 +1,17 @@
 use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tumpel_api::types::{
     ChannelControlMessage, ChannelHostMessage, ChannelProtocol, ChannelSnapshotDone, ChannelSnapshotDoneType, EntityId,
-    HostReportedHealth, HostUsage, SupervisorChannelState,
+    HostReportedHealth, HostUsage, MetricBatch, SupervisorChannelState,
 };
 
 use super::{
     empty_state, hello_bytes, Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit,
-    Signer, Store,
+    Signer, Store, Usage, TURN_LINES_WAIT,
 };
 
 #[derive(Default)]
@@ -55,15 +55,25 @@ impl Signer for Recorder {
 
 const NONCE: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-fn usage() -> HostUsage {
-    HostUsage {
+fn usage() -> Usage {
+    Usage {
+        host: HostUsage {
+            load_average: 0.5,
+            memory_available_mib: 4096,
+            disk_budget_mib: 70_000,
+            disk_held_mib: 2000,
+            memory_budget_mib: 30_000,
+            memory_held_mib: 6144,
+        },
         boxes_warm: 1,
-        load_average: 0.5,
-        memory_available_mib: 4096,
-        disk_budget_mib: None,
-        disk_held_mib: None,
-        memory_budget_mib: None,
-        memory_held_mib: None,
+    }
+}
+
+fn no_points() -> MetricBatch {
+    MetricBatch {
+        instruments: Vec::new(),
+        samples: Vec::new(),
+        turns: Vec::new(),
     }
 }
 
@@ -169,7 +179,11 @@ fn welcome(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire, welcome: 
 }
 
 fn open(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) {
-    let quiet = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION});
+    open_at(channel, wire, ChannelProtocol::VERSION);
+}
+
+fn open_at(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire, version: u16) {
+    let quiet = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": version});
     let Ok(Event::Welcomed) = welcome(channel, wire, &quiet) else {
         panic!("the welcome opens the channel");
     };
@@ -192,7 +206,7 @@ impl ControlPlane {
     }
 
     fn welcome(&self) -> Value {
-        json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION, "ack": self.received})
+        json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 36, "ack": self.received})
     }
 
     fn read(&mut self, wire: &mut Wire) {
@@ -253,7 +267,7 @@ fn hello_signs_the_documented_bytes() {
     assert_eq!(
         wire.sent(),
         [
-            json!({"type": "Hello", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION, "channelProtocolOldest": ChannelProtocol::OLDEST, "supervisorVersion": "0.1.0", "signature": "c2lnbmF0dXJl", "boxCapacity": 8, "usage": {"boxesWarm": 1, "loadAverage": 0.5, "memoryAvailableMib": 4096}, "heldTurnIds": []})
+            json!({"type": "Hello", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION, "channelProtocolOldest": ChannelProtocol::OLDEST, "supervisorVersion": "0.1.0", "signature": "c2lnbmF0dXJl", "boxCapacity": 8, "usage": {"loadAverage": 0.5, "memoryAvailableMib": 4096, "diskBudgetMib": 70_000, "diskHeldMib": 2000, "memoryBudgetMib": 30_000, "memoryHeldMib": 6144}, "heldTurnIds": [], "resendFrom": 1})
         ]
     );
     assert_eq!(channel.phase(), Phase::AwaitingWelcome);
@@ -430,7 +444,14 @@ fn a_heartbeat_names_every_held_session_and_setup_and_an_empty_list_when_none() 
         turn_ids: vec![EntityId::try_from("turn-1").expect("id")],
     };
     channel
-        .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, &mut wire)
+        .heartbeat(
+            sent_at,
+            usage(),
+            held,
+            HostReportedHealth::Healthy,
+            no_points,
+            &mut wire,
+        )
         .expect("heartbeat");
     channel
         .heartbeat(
@@ -438,15 +459,17 @@ fn a_heartbeat_names_every_held_session_and_setup_and_an_empty_list_when_none() 
             usage(),
             HeldIds::default(),
             HostReportedHealth::RateLimited,
+            no_points,
             &mut wire,
         )
         .expect("heartbeat");
-    let usage = json!({"boxesWarm": 1, "loadAverage": 0.5, "memoryAvailableMib": 4096});
+    let usage = json!({"loadAverage": 0.5, "memoryAvailableMib": 4096, "diskBudgetMib": 70_000, "diskHeldMib": 2000, "memoryBudgetMib": 30_000, "memoryHeldMib": 6144});
+    let telemetry = json!({"instruments": [], "samples": [], "turns": []});
     assert_eq!(
         wire.sent(),
         [
-            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": ["session-1"], "heldClaudeSetupIds": ["setup-1"], "heldTurnIds": ["turn-1"], "health": "Healthy"}),
-            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": [], "heldClaudeSetupIds": [], "heldTurnIds": [], "health": "RateLimited"}),
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": ["session-1"], "heldClaudeSetupIds": ["setup-1"], "heldTurnIds": ["turn-1"], "health": "Healthy", "ack": 0, "telemetry": telemetry}),
+            json!({"type": "Heartbeat", "sentAt": "2026-11-18T10:00:00+01:00", "usage": usage, "heldSessionIds": [], "heldClaudeSetupIds": [], "heldTurnIds": [], "health": "RateLimited", "ack": 0, "telemetry": telemetry}),
         ]
     );
 }
@@ -470,7 +493,14 @@ fn a_heartbeat_names_the_turn_of_every_unacked_frame_besides_the_held_turns_once
         ..HeldIds::default()
     };
     channel
-        .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, &mut wire)
+        .heartbeat(
+            sent_at,
+            usage(),
+            held,
+            HostReportedHealth::Healthy,
+            no_points,
+            &mut wire,
+        )
         .expect("heartbeat");
     let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
     assert_eq!(heartbeat["heldTurnIds"], json!(["turn-1", "turn-2"]));
@@ -783,7 +813,7 @@ fn an_offer_is_held_from_its_receipt_until_the_box_or_a_frame_names_its_turn() {
             ..HeldIds::default()
         };
         channel
-            .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, wire)
+            .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, no_points, wire)
             .expect("heartbeat");
         let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
         heartbeat["heldTurnIds"].clone()
@@ -804,7 +834,7 @@ fn a_socket_closed_mid_turn_keeps_the_turn_held_and_resends_its_unacked_output_a
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
     let mut control = ControlPlane::new(true);
-    open(&mut channel, &mut wire);
+    open_at(&mut channel, &mut wire, 36);
     channel.receive(&offer(1, "grant-1")).expect("offer");
     channel.send(claim("turn-1"), &mut wire).expect("send");
     control.read(&mut wire);
@@ -851,7 +881,7 @@ fn twenty_failed_reconnects_wait_thirty_seconds_apart_and_keep_every_unacked_fra
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
     let mut control = ControlPlane::new(true);
-    open(&mut channel, &mut wire);
+    open_at(&mut channel, &mut wire, 36);
     channel.send(claim("turn-1"), &mut wire).expect("send");
     control.read(&mut wire);
     channel.disconnect();
@@ -884,6 +914,7 @@ fn twenty_failed_reconnects_wait_thirty_seconds_apart_and_keep_every_unacked_fra
             usage(),
             HeldIds::default(),
             HostReportedHealth::Healthy,
+            no_points,
             &mut wire,
         )
         .expect("heartbeat");
@@ -896,7 +927,7 @@ fn a_host_rate_limited_for_five_windows_holds_its_output_until_each_retry_after_
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
-    open(&mut channel, &mut wire);
+    open_at(&mut channel, &mut wire, 36);
     let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
     let mut limit = RateLimit::default();
     let mut released = Vec::new();
@@ -923,7 +954,7 @@ fn a_host_rate_limited_for_five_windows_holds_its_output_until_each_retry_after_
             ..HeldIds::default()
         };
         channel
-            .heartbeat(sent_at, usage(), held, limit.health(at(now + 30)), &mut wire)
+            .heartbeat(sent_at, usage(), held, limit.health(at(now + 30)), no_points, &mut wire)
             .expect("heartbeat");
         let [heartbeat] = wire.sent().try_into().expect("only the heartbeat while paused");
         assert_eq!(heartbeat["health"], "RateLimited");
@@ -948,7 +979,14 @@ fn withdrawn(seq: i64) -> String {
 fn held_in_heartbeat(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) -> Value {
     let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
     channel
-        .heartbeat(sent_at, usage(), HeldIds::default(), HostReportedHealth::Healthy, wire)
+        .heartbeat(
+            sent_at,
+            usage(),
+            HeldIds::default(),
+            HostReportedHealth::Healthy,
+            no_points,
+            wire,
+        )
         .expect("heartbeat");
     let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
     heartbeat.get("heldTurnIds").cloned().unwrap_or(Value::Null)
@@ -1013,55 +1051,412 @@ fn a_restarted_channel_holds_the_turns_its_saved_unacked_frames_name() {
     assert_eq!(hello["heldTurnIds"], json!(["turn-7", "turn-8"]));
 }
 
-#[test]
-fn a_host_stepped_down_to_the_oldest_protocol_says_hello_in_its_shape() {
-    let mut channel = channel(&Disk::default(), &Recorder::default());
-    let mut wire = Wire::default();
-    let hello = |channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire| {
-        channel.disconnect();
-        channel.connect();
-        let challenge = json!({"type": "Challenge", "nonce": NONCE}).to_string();
-        let Ok(Event::Challenged(nonce)) = channel.receive(&challenge) else {
-            panic!("the challenge asks for a Hello");
-        };
-        let turn = EntityId::try_from("turn-1").expect("id");
-        channel
-            .hello(&nonce, capacity(), usage(), vec![turn], wire)
-            .expect("hello");
-        let [hello] = wire.sent().try_into().expect("one hello");
-        hello
+fn say_hello(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) -> Value {
+    channel.disconnect();
+    channel.connect();
+    let challenge = json!({"type": "Challenge", "nonce": NONCE}).to_string();
+    let Ok(Event::Challenged(nonce)) = channel.receive(&challenge) else {
+        panic!("the challenge asks for a Hello");
     };
-    let newest = hello(&mut channel, &mut wire);
-    assert_eq!(newest["protocolVersion"], json!(36));
-    assert_eq!(newest["channelProtocolOldest"], json!(34));
-    assert_eq!(newest["heldTurnIds"], json!(["turn-1"]));
+    let turn = EntityId::try_from("turn-1").expect("id");
+    channel
+        .hello(&nonce, capacity(), usage(), vec![turn], wire)
+        .expect("hello");
+    let [hello] = wire.sent().try_into().expect("one hello");
+    hello
+}
 
-    assert_eq!(channel.step_down(), Some(34));
-    let oldest = hello(&mut channel, &mut wire);
-    assert_eq!(oldest["protocolVersion"], json!(34));
-    assert_eq!(oldest["channelProtocolOldest"], json!(34));
-    assert_eq!(oldest.get("heldTurnIds"), None);
-    assert_eq!(channel.step_down(), None);
+fn sent_frames(wire: &mut Wire) -> Vec<(i64, Value)> {
+    wire.sent()
+        .into_iter()
+        .map(|frame| (frame["seq"].as_i64().expect("seq"), frame["message"].clone()))
+        .collect()
+}
 
-    channel.step_up();
-    let climbed = hello(&mut channel, &mut wire);
-    assert_eq!(climbed["protocolVersion"], json!(36));
+fn text_line(turn: &str, line_seq: i64, text: &str) -> ChannelHostMessage {
+    serde_json::from_value(json!({"type": "TurnLine", "turnId": turn, "lineSeq": line_seq, "text": text}))
+        .expect("line")
 }
 
 #[test]
-fn a_heartbeat_on_a_channel_welcomed_at_protocol_34_names_no_held_turns() {
-    let mut channel = channel(&Disk::default(), &Recorder::default());
-    let mut wire = Wire::default();
-    let at_34 = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 34});
-    assert_eq!(channel.step_down(), Some(34));
-    let Ok(Event::Welcomed) = welcome(&mut channel, &mut wire, &at_34) else {
-        panic!("the welcome opens the channel");
+fn hello_resends_from_the_oldest_unacked_frame_or_else_the_next_seq_and_never_below_one() {
+    let resend = |state: Value| {
+        let state: SupervisorChannelState = serde_json::from_value(state).expect("state");
+        super::resend_from(&state).expect("resend from").get()
     };
-    channel.receive(&offer(1, "grant-1")).expect("offer");
-    assert_eq!(held_in_heartbeat(&mut channel, &mut wire), Value::Null);
+    let claim = json!({"type": "TurnClaim", "turnId": "turn-1", "boxId": "box-1"});
+    assert_eq!(resend(json!({"received": 0, "sent": 0, "unacked": []})), 1);
+    assert_eq!(resend(json!({"received": 3, "sent": 7, "unacked": []})), 8);
+    assert_eq!(
+        resend(json!({"received": 3, "sent": 7, "unacked": [
+            {"type": "Frame", "seq": 5, "ack": 2, "message": claim},
+            {"type": "Frame", "seq": 7, "ack": 3, "message": claim}
+        ]})),
+        5
+    );
+
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    channel.send(done("snap-1"), &mut wire).expect("send");
+    channel.send(done("snap-2"), &mut wire).expect("send");
+    assert_eq!(say_hello(&mut channel, &mut wire)["resendFrom"], json!(1));
+}
+
+#[test]
+fn a_cumulative_ack_drops_every_frame_up_to_its_seq_and_a_welcome_on_37_drops_none() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    for snapshot in ["snap-1", "snap-2", "snap-3"] {
+        channel.send(done(snapshot), &mut wire).expect("send");
+    }
+    wire.sent();
+    let ack = |seq: i64| json!({"type": "Ack", "seq": seq}).to_string();
+    assert!(matches!(channel.receive(&ack(2)), Ok(Event::None)));
+    assert_eq!(unacked_seqs(&disk), [3]);
+    assert!(matches!(channel.receive(&ack(1)), Ok(Event::None)));
+    assert_eq!(unacked_seqs(&disk), [3]);
 
     channel.disconnect();
-    channel.step_up();
+    assert_eq!(say_hello(&mut channel, &mut wire)["resendFrom"], json!(3));
+    let acked = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 37, "ack": 3}).to_string();
+    let Ok(Event::Welcomed) = channel.receive(&acked) else {
+        panic!("the welcome opens the channel");
+    };
+    channel.release(usize::MAX, &mut wire).expect("release");
+    assert_eq!(unacked_seqs(&disk), [3], "a Welcome on 37 acks nothing");
+    assert_eq!(sent_frames(&mut wire).len(), 1);
+
+    channel
+        .receive(&frame(1, 3, "snap-9"))
+        .expect("a control frame acks the stored cursor");
+    assert_eq!(unacked_seqs(&disk), Vec::<i64>::new());
+    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
+    channel
+        .heartbeat(
+            sent_at,
+            usage(),
+            HeldIds::default(),
+            HostReportedHealth::Healthy,
+            no_points,
+            &mut wire,
+        )
+        .expect("heartbeat");
+    let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
+    assert_eq!(heartbeat["ack"], json!(1));
+}
+
+#[test]
+fn transcript_lines_go_out_two_hundred_to_a_frame_and_the_rest_two_seconds_after_their_first_line() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
     open(&mut channel, &mut wire);
-    assert_eq!(held_in_heartbeat(&mut channel, &mut wire), json!(["turn-1"]));
+    for line_seq in 1..=201 {
+        channel.send(line("turn-1", line_seq), &mut wire).expect("send");
+    }
+    let [(seq, batch)] = sent_frames(&mut wire).try_into().expect("one full frame");
+    assert_eq!(seq, 1);
+    assert_eq!(
+        (batch["type"].clone(), batch["firstLineSeq"].clone()),
+        (json!("TurnLines"), json!(1))
+    );
+    assert_eq!(batch["lines"].as_array().map(Vec::len), Some(200));
+    assert_eq!(batch["lines"][199], json!("line 200"));
+
+    channel.transmit_due(Instant::now(), &mut wire).expect("transmit");
+    assert_eq!(wire.sent(), Vec::<Value>::new(), "a young frame waits for more lines");
+    channel
+        .transmit_due(Instant::now() + TURN_LINES_WAIT, &mut wire)
+        .expect("transmit");
+    let [(seq, batch)] = sent_frames(&mut wire).try_into().expect("the rest");
+    assert_eq!(seq, 2);
+    assert_eq!(batch["firstLineSeq"], json!(201));
+    assert_eq!(batch["lines"], json!(["line 201"]));
+    channel.send(line("turn-1", 202), &mut wire).expect("send");
+    assert_eq!(unacked_seqs(&disk), [1, 2, 3], "a sent frame never grows");
+}
+
+#[test]
+fn transcript_lines_close_a_frame_before_it_passes_256_kb_and_before_any_other_message() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    let text = "x".repeat(100_000);
+    for line_seq in 1..=3 {
+        channel
+            .send(text_line("turn-1", line_seq, &text), &mut wire)
+            .expect("send");
+    }
+    let sent: Vec<(i64, Value, Option<usize>)> = sent_frames(&mut wire)
+        .into_iter()
+        .map(|(seq, message)| {
+            (
+                seq,
+                message["firstLineSeq"].clone(),
+                message["lines"].as_array().map(Vec::len),
+            )
+        })
+        .collect();
+    assert_eq!(sent, [(1, json!(1), Some(2)), (2, json!(3), Some(1))]);
+
+    channel.send(text_line("turn-1", 4, "short"), &mut wire).expect("send");
+    channel.send(claim("turn-2"), &mut wire).expect("send");
+    let sent: Vec<(i64, Value, Value)> = sent_frames(&mut wire)
+        .into_iter()
+        .map(|(seq, message)| (seq, message["type"].clone(), message["firstLineSeq"].clone()))
+        .collect();
+    assert_eq!(
+        sent,
+        [(3, json!("TurnLines"), json!(4)), (4, json!("TurnClaim"), Value::Null)]
+    );
+}
+
+#[test]
+fn on_37_a_rate_limited_frame_and_every_frame_after_it_go_out_again_in_order_once_released() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    for snapshot in ["snap-1", "snap-2", "snap-3"] {
+        channel.send(done(snapshot), &mut wire).expect("send");
+    }
+    assert_eq!(sent_frames(&mut wire).len(), 3);
+    channel
+        .receive(&json!({"type": "Ack", "seq": 1}).to_string())
+        .expect("ack");
+    for seq in [2, 3] {
+        let limited = json!({"type": "FrameRateLimited", "seq": seq, "reason": "host host-1 sent more than 600 frames a minute", "framesPerMinute": 600, "retryAfter": "2026-11-21T11:01:00Z"});
+        let Ok(Event::FrameRateLimited { .. }) = channel.receive(&limited.to_string()) else {
+            panic!("the refusal names the limit");
+        };
+    }
+    channel.send(line("turn-1", 1), &mut wire).expect("send");
+    channel.send(line("turn-1", 2), &mut wire).expect("send");
+    assert_eq!(wire.sent(), Vec::<Value>::new(), "nothing goes out until retryAfter");
+
+    channel.release(usize::MAX, &mut wire).expect("release");
+    let resent: Vec<(i64, Value)> = sent_frames(&mut wire)
+        .into_iter()
+        .map(|(seq, message)| (seq, message["type"].clone()))
+        .collect();
+    assert_eq!(
+        resent,
+        [
+            (2, json!("SnapshotDone")),
+            (3, json!("SnapshotDone")),
+            (4, json!("TurnLines"))
+        ]
+    );
+    assert_eq!(unacked_seqs(&disk), [2, 3, 4]);
+    assert!(!channel.withholding());
+}
+
+#[test]
+fn a_host_refused_at_37_steps_down_to_36_and_35_and_speaks_the_old_shape_there() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    for line_seq in 1..=3 {
+        channel.send(line("turn-1", line_seq), &mut wire).expect("send");
+    }
+    channel.send(done("snap-1"), &mut wire).expect("send");
+    assert_eq!(unacked_seqs(&disk), [1, 2]);
+    let newest = say_hello(&mut channel, &mut wire);
+    assert_eq!(newest["protocolVersion"], json!(37));
+    assert_eq!(newest["channelProtocolOldest"], json!(35));
+
+    assert_eq!(channel.step_down(), Some(36));
+    let hello = say_hello(&mut channel, &mut wire);
+    assert_eq!(hello["protocolVersion"], json!(36));
+    assert_eq!(hello["usage"]["boxesWarm"], json!(1));
+    assert_eq!(hello["heldTurnIds"], json!(["turn-1"]));
+    assert_eq!(hello.get("resendFrom"), None);
+    let at_36 = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 36, "ack": 0}).to_string();
+    let Ok(Event::Welcomed) = channel.receive(&at_36) else {
+        panic!("the welcome opens the channel");
+    };
+    channel.release(usize::MAX, &mut wire).expect("release");
+    let resent: Vec<(i64, Value, Value)> = sent_frames(&mut wire)
+        .into_iter()
+        .map(|(seq, message)| (seq, message["type"].clone(), message["lineSeq"].clone()))
+        .collect();
+    assert_eq!(
+        resent,
+        [
+            (1, json!("TurnLine"), json!(1)),
+            (2, json!("TurnLine"), json!(2)),
+            (3, json!("TurnLine"), json!(3)),
+            (4, json!("SnapshotDone"), Value::Null)
+        ]
+    );
+    assert!(channel.sends_telemetry_frames());
+    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
+    channel
+        .heartbeat(
+            sent_at,
+            usage(),
+            HeldIds::default(),
+            HostReportedHealth::Healthy,
+            || panic!("a 36 Heartbeat takes no telemetry points"),
+            &mut wire,
+        )
+        .expect("heartbeat");
+    let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
+    assert_eq!((heartbeat.get("ack"), heartbeat.get("telemetry")), (None, None));
+    assert_eq!(heartbeat["usage"]["boxesWarm"], json!(1));
+    channel.send(line("turn-1", 4), &mut wire).expect("send");
+    assert_eq!(sent_frames(&mut wire)[0].1["type"], json!("TurnLine"));
+
+    assert_eq!(channel.step_down(), Some(35));
+    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(35));
+    assert_eq!(channel.step_down(), None);
+    channel.step_up();
+    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(37));
+}
+
+#[test]
+fn a_backlog_saved_by_an_older_supervisor_goes_out_on_37_with_each_line_its_own_frame_under_its_own_seq() {
+    let saved: SupervisorChannelState = serde_json::from_value(json!({
+        "received": 0,
+        "sent": 5,
+        "unacked": [
+            {"type": "Frame", "seq": 4, "ack": 0, "message": {"type": "TurnLine", "turnId": "turn-1", "lineSeq": 1, "text": "line 1"}},
+            {"type": "Frame", "seq": 5, "ack": 0, "message": {"type": "TurnLine", "turnId": "turn-1", "lineSeq": 2, "text": "line 2"}}
+        ]
+    }))
+    .expect("channel.json");
+    let disk = Disk::default();
+    let mut channel = HostChannel::new(
+        saved,
+        disk.clone(),
+        Recorder::default(),
+        "host-1".try_into().expect("host id"),
+        "0.1.0".to_string(),
+    );
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    let resent: Vec<(i64, Value)> = sent_frames(&mut wire)
+        .into_iter()
+        .map(|(seq, message)| (seq, json!([message["type"], message["firstLineSeq"], message["lines"]])))
+        .collect();
+    assert_eq!(
+        resent,
+        [
+            (4, json!(["TurnLines", 1, ["line 1"]])),
+            (5, json!(["TurnLines", 2, ["line 2"]]))
+        ]
+    );
+    assert_eq!(unacked_seqs(&disk), [4, 5]);
+}
+
+#[test]
+fn lines_of_turns_streaming_side_by_side_share_one_frame_per_turn_until_another_message_goes_out() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    for line_seq in 1..=3 {
+        channel.send(line("turn-1", line_seq), &mut wire).expect("send");
+        channel.send(line("turn-2", line_seq), &mut wire).expect("send");
+    }
+    assert_eq!(wire.sent(), Vec::<Value>::new(), "young frames wait for more lines");
+    channel
+        .transmit_due(Instant::now() + TURN_LINES_WAIT, &mut wire)
+        .expect("transmit");
+    let sent: Vec<(i64, Value)> = sent_frames(&mut wire)
+        .into_iter()
+        .map(|(seq, message)| {
+            (
+                seq,
+                json!([message["turnId"], message["firstLineSeq"], message["lines"]]),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            (1, json!(["turn-1", 1, ["line 1", "line 2", "line 3"]])),
+            (2, json!(["turn-2", 1, ["line 1", "line 2", "line 3"]]))
+        ]
+    );
+
+    channel.send(line("turn-1", 4), &mut wire).expect("send");
+    channel.send(line("turn-2", 4), &mut wire).expect("send");
+    channel.send(claim("turn-3"), &mut wire).expect("send");
+    let sent: Vec<(i64, Value)> = sent_frames(&mut wire)
+        .into_iter()
+        .map(|(seq, message)| (seq, json!([message["type"], message["turnId"]])))
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            (3, json!(["TurnLines", "turn-1"])),
+            (4, json!(["TurnLines", "turn-2"])),
+            (5, json!(["TurnClaim", "turn-3"]))
+        ]
+    );
+}
+
+#[test]
+fn a_control_plane_rolled_back_to_36_gets_the_unacked_frames_numbered_on_from_its_own_count() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    for snapshot in ["snap-1", "snap-2", "snap-3", "snap-4", "snap-5"] {
+        channel.send(done(snapshot), &mut wire).expect("send");
+    }
+    channel
+        .receive(&json!({"type": "Ack", "seq": 3}).to_string())
+        .expect("ack");
+    assert_eq!(unacked_seqs(&disk), [4, 5]);
+    wire.sent();
+
+    channel.disconnect();
+    assert_eq!(channel.step_down(), Some(36));
+    say_hello(&mut channel, &mut wire);
+    let stale = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 36, "ack": 1}).to_string();
+    let Ok(Event::Welcomed) = channel.receive(&stale) else {
+        panic!("the welcome opens the channel");
+    };
+    channel.release(usize::MAX, &mut wire).expect("release");
+    let resent: Vec<(i64, Value)> = sent_frames(&mut wire)
+        .into_iter()
+        .map(|(seq, message)| (seq, message["snapshotId"].clone()))
+        .collect();
+    assert_eq!(resent, [(2, json!("snap-4")), (3, json!("snap-5"))]);
+    channel.send(done("snap-6"), &mut wire).expect("send");
+    assert_eq!(sent_frames(&mut wire)[0].0, 4);
+    assert_eq!(unacked_seqs(&disk), [2, 3, 4]);
+}
+
+#[test]
+fn an_ack_for_a_seq_this_host_never_sent_closes_the_channel_and_keeps_every_frame() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    channel.send(done("snap-1"), &mut wire).expect("send");
+    channel.send(line("turn-1", 1), &mut wire).expect("send");
+    let Err(ChannelError::Protocol(_)) = channel.receive(&json!({"type": "Ack", "seq": 999_999}).to_string()) else {
+        panic!("an ack past the last sent seq is a protocol error");
+    };
+    assert_eq!(channel.phase(), Phase::Closed);
+    assert_eq!(unacked_seqs(&disk), [1, 2]);
+
+    open(&mut channel, &mut wire);
+    let Err(ChannelError::Protocol(_)) = channel.receive(&frame(1, 3, "snap-9")) else {
+        panic!("a control frame acking past the last sent seq is a protocol error");
+    };
+    assert_eq!(unacked_seqs(&disk), [1, 2]);
+    assert_eq!(channel.state().received.0, 0);
+
+    open(&mut channel, &mut wire);
+    let Ok(Event::Message(_)) = channel.receive(&frame(1, 1, "snap-9")) else {
+        panic!("the resent frame 1 is taken, not dropped as a duplicate");
+    };
 }
