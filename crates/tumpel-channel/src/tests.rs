@@ -1354,6 +1354,8 @@ fn a_snapshot_built_at_38_handed_to_a_session_at_39_goes_out_as_snapshot_failed_
         .receive(&json!({"type": "Ack", "seq": 2}).to_string())
         .expect("the ack retires both frames");
     assert_eq!(channel.take_accepted(), Vec::<EntityId>::new());
+    let failed: Vec<String> = channel.take_failed().into_iter().map(|id| id.to_string()).collect();
+    assert_eq!(failed, ["snap-1", "snap-1"]);
 }
 
 #[test]
@@ -1394,6 +1396,8 @@ fn a_snapshot_built_at_39_offers_39_and_goes_out_as_snapshot_failed_when_the_ses
         .receive(&json!({"type": "Ack", "seq": 2}).to_string())
         .expect("the ack retires both frames");
     assert_eq!(channel.take_accepted(), Vec::<EntityId>::new());
+    let failed: Vec<String> = channel.take_failed().into_iter().map(|id| id.to_string()).collect();
+    assert_eq!(failed, ["snap-1", "snap-1"]);
 }
 
 #[test]

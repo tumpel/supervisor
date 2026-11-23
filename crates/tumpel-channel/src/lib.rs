@@ -155,6 +155,11 @@ fn build_snapshot(message: &ChannelHostMessage, version: u16) -> Result<Value, C
     }
 }
 
+fn snapshot_id(message: &Value) -> Option<EntityId> {
+    let snapshot_id = message.get("snapshotId").and_then(Value::as_str)?;
+    EntityId::try_from(snapshot_id.to_string()).ok()
+}
+
 fn mismatched(message: &Value, built: u16, session: u16) -> Result<Value, ChannelError> {
     let kind = message.get("type").and_then(Value::as_str).unwrap_or_default();
     let failed = serde_json::json!({
@@ -377,6 +382,7 @@ pub struct HostChannel<S: Store, K: Signer> {
     sealed: i64,
     batch_started: Option<Instant>,
     accepted: Vec<EntityId>,
+    failed: Vec<EntityId>,
 }
 
 fn snapshot_done(message: &Value) -> Option<EntityId> {
@@ -417,6 +423,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             progressed: false,
             withheld: None,
             accepted: Vec::new(),
+            failed: Vec::new(),
             offered: Vec::new(),
             hello_version: ChannelProtocol::VERSION,
             offering: ChannelProtocol::VERSION,
@@ -471,6 +478,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         std::mem::take(&mut self.accepted)
     }
 
+    pub fn take_failed(&mut self) -> Vec<EntityId> {
+        std::mem::take(&mut self.failed)
+    }
+
     /// # Errors
     /// Fails when the state cannot be saved or the port refuses the frame.
     pub fn send(&mut self, outgoing: impl Into<Outgoing>, port: &mut impl Port) -> Result<(), ChannelError> {
@@ -485,6 +496,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             Outgoing::Snapshot(message, built) => {
                 let message = build_snapshot(&message, built)?;
                 let message = if self.phase == Phase::Open && reuses_packs(built) != reuses_packs(self.version) {
+                    self.failed.extend(snapshot_id(&message));
                     mismatched(&message, built, self.version)?
                 } else {
                     message
@@ -771,6 +783,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             if let Some(built) =
                 built_for(&frame.message).filter(|built| reuses_packs(*built) != reuses_packs(self.version))
             {
+                self.failed.extend(snapshot_id(&frame.message));
                 frame.message = mismatched(&frame.message, built, self.version)?;
             }
         }

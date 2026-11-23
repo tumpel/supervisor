@@ -1864,8 +1864,11 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         protocol: u16,
     ) -> Outcome<V::Machine> {
         let drive = live.machine.drive();
-        let outgoing = match self.store_snapshot(drive, &live.base, order, protocol).await {
-            Ok((uploaded_bytes, chunk_count, base)) => {
+        let stored = self.store_snapshot(drive, &live.base, order, protocol).await;
+        self.cancels.forget(&order.snapshot_id);
+        let outgoing = match stored {
+            Ok(None) => return Outcome::Kept(live),
+            Ok(Some((uploaded_bytes, chunk_count, base))) => {
                 live.base = Arc::new(base);
                 let done = ChannelSnapshotDone {
                     chunk_count,
@@ -1898,7 +1901,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         base: &Arc<Base>,
         order: &SnapshotOrder,
         protocol: u16,
-    ) -> Result<(i64, i32, Base), (ChannelSnapshotFailureReason, String)> {
+    ) -> Result<Option<(i64, i32, Base)>, (ChannelSnapshotFailureReason, String)> {
         let unreadable = |detail: String| (ChannelSnapshotFailureReason::UpperDirectoryUnreadable, detail);
         let dir = self
             .vmm
@@ -1906,13 +1909,15 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             .map_err(unreadable)?
             .join(format!("snapshot-{:08}", order.snapshot_seq.0));
         std::fs::create_dir_all(&dir).map_err(|error| unreadable(format!("creating {}: {error}", dir.display())))?;
-        let stored =
-            self.stage_snapshot(drive, base, order, &dir, protocol)
-                .await
-                .map_err(|(reason, detail)| match self.host_disk_full() {
-                    Some(full) => (reason, format!("{full}; {detail}")),
-                    None => (reason, detail),
-                });
+        let staged = tokio::select! {
+            biased;
+            () = self.cancels.cancelled(&order.snapshot_id) => Ok(None),
+            staged = self.stage_snapshot(drive, base, order, &dir, protocol) => staged.map(Some),
+        };
+        let stored = staged.map_err(|(reason, detail)| match self.host_disk_full() {
+            Some(full) => (reason, format!("{full}; {detail}")),
+            None => (reason, detail),
+        });
         let removed = remove_dir(&dir).map_err(unreadable);
         let stored = stored?;
         removed?;
@@ -2131,6 +2136,7 @@ pub enum Input {
     HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>, Abandoned),
     SnapshotAccepted(EntityId),
+    SnapshotFailed(EntityId),
     Welcomed(u16),
 }
 
@@ -2363,6 +2369,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
                     Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
                     Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id).await?,
+                    Some(Input::SnapshotFailed(snapshot_id)) => self.snapshot_failed(snapshot_id),
                     Some(Input::Welcomed(protocol)) => self.welcomed(protocol).await?,
                     None => break,
                 },
@@ -3334,6 +3341,19 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         self.clean(&session).await?;
         self.drain(session).await
+    }
+
+    fn snapshot_failed(&mut self, snapshot_id: EntityId) {
+        let running = self.slots.values_mut().find_map(|slot| {
+            if !matches!(&slot.snapshot, Some(Awaited::Pending(pending)) if *pending == snapshot_id) {
+                return None;
+            }
+            slot.snapshot = None;
+            Some(matches!(slot.task, Some((Running::Snapshot, _))))
+        });
+        if running == Some(true) {
+            self.runner.cancels.cancel(snapshot_id);
+        }
     }
 
     async fn snapshot_accepted(&mut self, snapshot_id: &EntityId) -> Result<(), String> {

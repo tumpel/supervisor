@@ -258,6 +258,7 @@ enum BoxCommand {
     HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>, Abandoned),
     SnapshotAccepted(EntityId),
+    SnapshotFailed(EntityId),
     Welcomed(u16),
 }
 
@@ -361,6 +362,13 @@ async fn boxes(
             }
             BoxCommand::SnapshotAccepted(snapshot_id) => {
                 if lifecycle.send(Input::SnapshotAccepted(snapshot_id)).is_err() {
+                    eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
+                    return;
+                }
+                continue;
+            }
+            BoxCommand::SnapshotFailed(snapshot_id) => {
+                if lifecycle.send(Input::SnapshotFailed(snapshot_id)).is_err() {
                     eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
                     return;
                 }
@@ -1015,11 +1023,13 @@ fn box_command(message: ChannelControlMessage) -> Result<BoxCommand, String> {
 }
 
 fn accepted(channel: &mut Channel, commands: &UnboundedSender<BoxCommand>) -> Result<(), Failure> {
-    for snapshot_id in channel.take_accepted() {
-        commands.send(BoxCommand::SnapshotAccepted(snapshot_id)).map_err(|_| {
+    let accepted = channel.take_accepted().into_iter().map(BoxCommand::SnapshotAccepted);
+    let failed = channel.take_failed().into_iter().map(BoxCommand::SnapshotFailed);
+    for command in accepted.chain(failed) {
+        commands.send(command).map_err(|_| {
             fail(
                 SupervisorFailure::ChannelStateLost,
-                "the box runner stopped before it took an accepted snapshot; systemd restarts the supervisor, which takes the running boxes over",
+                "the box runner stopped before it took an accepted or failed snapshot; systemd restarts the supervisor, which takes the running boxes over",
             )
         })?;
     }
@@ -1135,7 +1145,7 @@ async fn session(
                 }
             }
         };
-        if let Some(ended) = ended {
+        if let Some(ended) = ended.or_else(|| accepted(channel, commands).err().map(Err)) {
             channel.disconnect();
             return ended;
         }
