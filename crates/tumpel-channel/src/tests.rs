@@ -1385,6 +1385,10 @@ fn snapshot_frames_saved_before_39_offer_38_until_the_control_plane_acks_them() 
     );
     let mut wire = Wire::default();
     assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(38));
+    assert_eq!(channel.step_down(), Some(37));
+    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(37));
+    channel.step_up();
+    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(38));
     let at_38 = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 38}).to_string();
     let Ok(Event::Welcomed) = channel.receive(&at_38) else {
         panic!("the welcome opens the channel");

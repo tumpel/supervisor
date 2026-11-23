@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io::{Cursor, Read};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -626,6 +626,7 @@ struct Host {
     runner: tokio::task::JoinHandle<Result<(), String>>,
     answering: Arc<AtomicBool>,
     accepting: Arc<AtomicBool>,
+    protocol: Arc<AtomicU16>,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -864,6 +865,7 @@ fn start_host(
     let sessions = lifecycle.sessions();
     let holdings = lifecycle.holdings();
     let cancels = lifecycle.cancels();
+    let protocol = lifecycle.protocol();
     let runner = tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
     Host {
         commands,
@@ -884,6 +886,7 @@ fn start_host(
         runner,
         answering,
         accepting,
+        protocol,
     }
 }
 
@@ -1358,6 +1361,38 @@ async fn a_snapshot_over_a_base_names_each_reused_pack_once_and_counts_every_pla
         .map(|place| place.pack.clone())
         .collect();
     assert_eq!(referenced, written.union(&once).cloned().collect::<BTreeSet<_>>());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_over_a_base_at_38_names_no_reused_packs_and_sends_only_parts_with_chunks() {
+    let mut host = host("reused-packs-38", 1, Harness::Echo, Boot::Works);
+    host.protocol.store(38, Ordering::Relaxed);
+    let mut snapshots = Vec::new();
+    for turn_id in ["turn-1", "turn-2"] {
+        host.turn(turn_id, "session-1", "one", Vec::new());
+        host.settle(SETTLE).await;
+        host.snapshot("session-1");
+        let mut parts = Vec::new();
+        loop {
+            match tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
+                .await
+                .expect("the snapshot ends within its budget")
+                .expect("the lifecycle is running")
+            {
+                ChannelHostMessage::SnapshotPacks(packs) => parts.push(packs),
+                ChannelHostMessage::SnapshotDone(_) => break,
+                _ => {}
+            }
+        }
+        snapshots.push(parts);
+    }
+
+    for parts in &snapshots {
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part.get(), 1);
+        assert_ne!(parts[0].chunks.len(), 0);
+        assert_eq!(parts[0].reused_pack_digests.len(), 0);
+    }
 }
 
 fn pack_uploads(uploads: &[String]) -> usize {

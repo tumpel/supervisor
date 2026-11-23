@@ -418,10 +418,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     }
 
     pub fn step_down(&mut self) -> Option<u16> {
-        if self.hello_version <= ChannelProtocol::OLDEST {
+        if self.offering <= ChannelProtocol::OLDEST {
             return None;
         }
-        self.hello_version -= 1;
+        self.hello_version = self.offering - 1;
         Some(self.hello_version)
     }
 
