@@ -111,6 +111,7 @@ fn append_lines(batch: &mut Value, added: &ChannelTurnLines) -> bool {
     true
 }
 
+#[derive(Debug)]
 pub enum Outgoing {
     Message(ChannelHostMessage),
     Snapshot(ChannelHostMessage, u16),

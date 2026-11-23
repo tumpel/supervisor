@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use tumpel_api::types::{ChannelHostMessage, GuestImageManifest, Sequence, SupervisorRuntime};
+use tumpel_api::types::{BoxRetention, ChannelHostMessage, GuestImageManifest, Sequence, SupervisorRuntime};
 use tumpel_channel::Outgoing;
 use tumpel_supervisor::{
     restored_descriptors, take_notify_socket, BootOrder, BoxTurn, Budgets, Command, Ext4Upper, Firecracker, HttpStore,
@@ -66,6 +66,9 @@ fn turn(image: &GuestImageManifest, turn_id: &str, prompt: &str, last_line_seq: 
         prebuild_commit_sha: None,
         box_memory_mib: None,
         box_disk_mib: None,
+        turn_seconds: std::num::NonZeroU32::new(300).expect("five minutes"),
+        idle_seconds: std::num::NonZeroU32::new(900).expect("fifteen minutes"),
+        box_retention: BoxRetention::Auto,
     })))
 }
 
@@ -77,6 +80,7 @@ async fn until_complete(received: &mut UnboundedReceiver<Outgoing>) -> Vec<Strin
             .await
             .expect("a message within 60 s")
             .expect("the channel stays open");
+        let (Outgoing::Message(message) | Outgoing::Snapshot(message, _)) = message;
         let done = matches!(message, ChannelHostMessage::TurnComplete(_));
         seen.push(match message {
             ChannelHostMessage::TurnClaim(claim) => format!("claim {}", *claim.turn_id),
@@ -192,7 +196,10 @@ async fn a_shell_box_runs_a_turn_pauses_resumes_warm_and_its_drive_reads_back() 
         warm.as_millis()
     );
     drop(commands);
-    running.await.expect("the lifecycle stops");
+    running
+        .await
+        .expect("the lifecycle stops")
+        .expect("the lifecycle ends without an error");
     std::fs::remove_dir_all(&data).expect("removing the test data");
 }
 
@@ -292,7 +299,7 @@ async fn crashing_supervisor() {
         .send(turn(&image, "turn-1", "sleep 60\necho too late", 0))
         .expect("send");
     while let Some(message) = received.recv().await {
-        if matches!(message, ChannelHostMessage::TurnRepositoryReady(_)) {
+        if matches!(message, Outgoing::Message(ChannelHostMessage::TurnRepositoryReady(_))) {
             println!("TURN RUNNING");
             std::future::pending::<()>().await;
         }
@@ -358,7 +365,7 @@ async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_i
         .expect("the next supervisor takes the box over");
     let failed = received.recv().await.expect("the cut turn is reported");
     assert!(
-        matches!(&failed, ChannelHostMessage::TurnFailed(failed) if *failed.turn_id == "turn-1"),
+        matches!(&failed, Outgoing::Message(ChannelHostMessage::TurnFailed(failed)) if *failed.turn_id == "turn-1"),
         "{failed:?}"
     );
     let (commands, from_test) = unbounded_channel();
@@ -379,6 +386,9 @@ async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_i
         "the next turn ran on the same Firecracker"
     );
     drop(commands);
-    running.await.expect("the lifecycle stops");
+    running
+        .await
+        .expect("the lifecycle stops")
+        .expect("the lifecycle ends without an error");
     std::fs::remove_dir_all(&data).expect("removing the test data");
 }
