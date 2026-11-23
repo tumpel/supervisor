@@ -7,6 +7,8 @@ use std::fmt;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde_json::Value;
+use tumpel_api::types::{GuestInput, GuestMessage};
 
 pub const GUEST_PORT: u32 = 1024;
 pub const READY_PORT: u32 = 1025;
@@ -57,6 +59,34 @@ pub fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
+pub trait Frame: DeserializeOwned {
+    fn unrecognised(&self) -> Option<&Value>;
+}
+
+impl Frame for GuestMessage {
+    fn unrecognised(&self) -> Option<&Value> {
+        match self {
+            Self::Unrecognised(message) => Some(message),
+            _ => None,
+        }
+    }
+}
+
+impl Frame for GuestInput {
+    fn unrecognised(&self) -> Option<&Value> {
+        match self {
+            Self::Unrecognised(input) => Some(input),
+            _ => None,
+        }
+    }
+}
+
+impl Frame for Value {
+    fn unrecognised(&self) -> Option<&Value> {
+        None
+    }
+}
+
 #[derive(Default)]
 pub struct Decoder {
     buffer: Vec<u8>,
@@ -72,7 +102,7 @@ impl Decoder {
         &self.buffer
     }
 
-    pub fn take<T: DeserializeOwned>(&mut self) -> Result<Option<T>, FrameError> {
+    pub fn take<T: Frame>(&mut self) -> Result<Option<T>, FrameError> {
         let Some(header) = self.buffer.first_chunk::<4>() else {
             return Ok(None);
         };
@@ -84,9 +114,11 @@ impl Decoder {
             return Ok(None);
         }
         let body: Vec<u8> = self.buffer.drain(..length + 4).skip(4).collect();
-        serde_json::from_slice(&body)
-            .map(Some)
-            .map_err(|error| FrameError::Json(error.to_string()))
+        let frame: T = serde_json::from_slice(&body).map_err(|error| FrameError::Json(error.to_string()))?;
+        if let Some(unknown) = frame.unrecognised() {
+            return Err(FrameError::Json(format!("{unknown} is no message this side knows")));
+        }
+        Ok(Some(frame))
     }
 }
 
