@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io::{Cursor, Read};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,13 +11,15 @@ use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tumpel_api::types::{
     BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
-    ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld, ChannelSnapshotChunksHeldType,
-    ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType,
-    ChannelSnapshotPacks, ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType,
-    EntityId, GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover,
-    SupervisorHandoverBox, SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine,
+    ChannelProtocol, ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld,
+    ChannelSnapshotChunksHeldType, ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads,
+    ChannelSnapshotPackUploadsType, ChannelSnapshotPacks, ChannelTurnClaimed, ChannelTurnClaimedType,
+    ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId, GuestHarnessProtocol, GuestHello, GuestInput,
+    GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
+    SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind,
     SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
 };
+use tumpel_channel::Outgoing;
 
 use super::{
     restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SnapshotOrder, Stopped,
@@ -626,7 +628,6 @@ struct Host {
     runner: tokio::task::JoinHandle<Result<(), String>>,
     answering: Arc<AtomicBool>,
     accepting: Arc<AtomicBool>,
-    protocol: Arc<AtomicU16>,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -683,11 +684,12 @@ fn control_plane(
     answers: Answers,
     log: Log,
     answering: Arc<AtomicBool>,
-    mut from_lifecycle: UnboundedReceiver<ChannelHostMessage>,
+    mut from_lifecycle: UnboundedReceiver<Outgoing>,
 ) -> UnboundedReceiver<ChannelHostMessage> {
     let (sender, received) = unbounded_channel();
     tokio::spawn(async move {
-        while let Some(message) = from_lifecycle.recv().await {
+        while let Some(outgoing) = from_lifecycle.recv().await {
+            let (Outgoing::Message(message) | Outgoing::Snapshot(message, _)) = outgoing;
             let mut index = store.2.lock().expect("index");
             match message {
                 ChannelHostMessage::SnapshotChunks(chunks) => {
@@ -828,7 +830,15 @@ fn host_on(
         hands: Arc::default(),
         free_disk_mib: Arc::new(AtomicU64::new(1 << 30)),
     };
-    start_host(vmm, store, capacity, settings, clone_seconds, None)
+    start_host(
+        vmm,
+        store,
+        capacity,
+        settings,
+        clone_seconds,
+        None,
+        Some(ChannelProtocol::VERSION),
+    )
 }
 
 fn start_host(
@@ -838,6 +848,7 @@ fn start_host(
     settings: Settings,
     clone_seconds: u32,
     taken: Option<(SupervisorHandover, Taken)>,
+    welcome: Option<u16>,
 ) -> Host {
     let log = Arc::clone(&vmm.log);
     let images = vmm.staging.join("images");
@@ -865,7 +876,11 @@ fn start_host(
     let sessions = lifecycle.sessions();
     let holdings = lifecycle.holdings();
     let cancels = lifecycle.cancels();
-    let protocol = lifecycle.protocol();
+    if let Some(protocol) = welcome {
+        commands
+            .send(Input::Welcomed(protocol))
+            .expect("the lifecycle reads its inputs");
+    }
     let runner = tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
     Host {
         commands,
@@ -886,7 +901,6 @@ fn start_host(
         runner,
         answering,
         accepting,
-        protocol,
     }
 }
 
@@ -919,6 +933,10 @@ impl Host {
     }
 
     fn successor(self, handover: &SupervisorHandover) -> Host {
+        self.successor_welcomed(handover, Some(ChannelProtocol::VERSION))
+    }
+
+    fn successor_welcomed(self, handover: &SupervisorHandover, welcome: Option<u16>) -> Host {
         let text = serde_json::to_string(handover).expect("the handover is JSON");
         let record = serde_json::from_str(&text).expect("the handover reads back as a SupervisorHandover");
         let Host {
@@ -936,6 +954,7 @@ impl Host {
             settings,
             clone_seconds,
             Some((record, Taken::Handed)),
+            welcome,
         )
     }
 
@@ -970,6 +989,7 @@ impl Host {
             self.settings,
             self.clone_seconds,
             Some((standing, Taken::Crashed)),
+            Some(ChannelProtocol::VERSION),
         )
     }
 
@@ -980,6 +1000,10 @@ impl Host {
 
     fn send(&self, command: Command) {
         self.commands.send(Input::Command(command)).expect("send");
+    }
+
+    fn welcome(&self, protocol: u16) {
+        self.commands.send(Input::Welcomed(protocol)).expect("send");
     }
 
     fn turn(&self, turn_id: &str, session_id: &str, prompt: &str, snapshots: Vec<ChannelSnapshotDownload>) {
@@ -1366,7 +1390,7 @@ async fn a_snapshot_over_a_base_names_each_reused_pack_once_and_counts_every_pla
 #[tokio::test(start_paused = true)]
 async fn a_snapshot_over_a_base_at_38_names_no_reused_packs_and_sends_only_parts_with_chunks() {
     let mut host = host("reused-packs-38", 1, Harness::Echo, Boot::Works);
-    host.protocol.store(38, Ordering::Relaxed);
+    host.welcome(38);
     let mut snapshots = Vec::new();
     for turn_id in ["turn-1", "turn-2"] {
         host.turn(turn_id, "session-1", "one", Vec::new());
@@ -1848,6 +1872,27 @@ async fn a_warm_box_handed_over_with_a_queued_teardown_is_stopped_and_answers_bo
         ]
     );
     assert_eq!(new.standing().boxes.len(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_handed_over_in_the_queue_waits_for_the_control_plane_welcome() {
+    let mut old = host("handover-queued-snapshot", 1, Harness::Echo, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    let mut handover = old.ask_handover().await.expect("the boxes are handed over");
+    handover.boxes[0]
+        .queued
+        .push(SupervisorHandoverCommand::Snapshot(SupervisorHandoverSnapshot {
+            kind: SupervisorHandoverSnapshotKind::Snapshot,
+            snapshot_id: "snapshot-9".try_into().expect("snapshot id"),
+            snapshot_seq: Sequence(9),
+            upload_expires_at: in_seconds(600),
+            upload_url: "https://store.example/session-1/9".try_into().expect("url"),
+        }));
+    let mut new = old.successor_welcomed(&handover, None);
+    assert_eq!(new.settle(SETTLE).await, Vec::<String>::new());
+    new.welcome(ChannelProtocol::VERSION);
+    assert_eq!(new.settle_until("snapshot done").await, ["snapshot done"]);
 }
 
 #[tokio::test]

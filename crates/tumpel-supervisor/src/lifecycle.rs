@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io::BufWriter;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,15 +17,15 @@ use tracing::Instrument;
 use tumpel_api::types::{
     BoxBudgets, BoxRetention, ChannelBoxGone, ChannelBoxGoneType, ChannelBoxTeardownFailed,
     ChannelBoxTeardownFailedType, ChannelBoxTeardownFailureReason, ChannelDispatchGrant, ChannelHostMessage,
-    ChannelPack, ChannelPersonaFileDownload, ChannelProtocol, ChannelRestoreChunks, ChannelRestoreChunksType,
-    ChannelSnapshotChunks, ChannelSnapshotChunksType, ChannelSnapshotDone, ChannelSnapshotDoneType,
-    ChannelSnapshotDownload, ChannelSnapshotFailed, ChannelSnapshotFailedType, ChannelSnapshotFailureReason,
-    ChannelSnapshotPacks, ChannelSnapshotPacksType, ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType,
-    ChannelTurnComplete, ChannelTurnCompleteType, ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType,
+    ChannelPack, ChannelPersonaFileDownload, ChannelRestoreChunks, ChannelRestoreChunksType, ChannelSnapshotChunks,
+    ChannelSnapshotChunksType, ChannelSnapshotDone, ChannelSnapshotDoneType, ChannelSnapshotDownload,
+    ChannelSnapshotFailed, ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPacks,
+    ChannelSnapshotPacksType, ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete,
+    ChannelTurnCompleteType, ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType,
     ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLines, ChannelTurnLinesType,
     ChannelTurnRepositoryCloneFailed, ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady,
     ChannelTurnRepositoryReadyType, CredentialText, DisplayName, EmailAddress, EntityId, GuestHello, GuestInput,
-    GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnLine, GuestTurnStart,
+    GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnStart,
     GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl,
     Sequence, Sha256Digest, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
     SupervisorHandoverCommand, SupervisorHandoverDiscard, SupervisorHandoverDiscardKind, SupervisorHandoverMachine,
@@ -33,7 +33,7 @@ use tumpel_api::types::{
     SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
     SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
 };
-use tumpel_channel::PACK_REUSE;
+use tumpel_channel::{Outgoing, PACK_REUSE};
 
 use crate::boot::{self, Boot, BootOrder, Caches, Hold, Holds};
 use crate::bounded::{bounded, reported};
@@ -679,16 +679,20 @@ pub fn instant_at(at: DateTime<FixedOffset>) -> Instant {
     Instant::now() + (at - now()).to_std().unwrap_or(Duration::ZERO)
 }
 
-fn emit(out: &UnboundedSender<ChannelHostMessage>, message: impl Into<ChannelHostMessage>) {
+fn emit(out: &UnboundedSender<Outgoing>, message: impl Into<ChannelHostMessage>) {
     let message = message.into();
     telemetry::ended(&message);
-    if out.send(message).is_err() {
+    send_out(out, Outgoing::Message(message));
+}
+
+fn send_out(out: &UnboundedSender<Outgoing>, outgoing: Outgoing) {
+    if out.send(outgoing).is_err() {
         eprintln!("tumpel-supervisor: the channel stopped taking box messages; the supervisor is shutting down");
     }
 }
 
 pub(crate) fn turn_failed(
-    out: &UnboundedSender<ChannelHostMessage>,
+    out: &UnboundedSender<Outgoing>,
     turn_id: &EntityId,
     reason: TurnFailureReason,
     detail: impl AsRef<str>,
@@ -706,7 +710,7 @@ pub(crate) fn turn_failed(
     );
 }
 
-fn report_failure(out: &UnboundedSender<ChannelHostMessage>, turn_id: &EntityId, report: Report, detail: String) {
+fn report_failure(out: &UnboundedSender<Outgoing>, turn_id: &EntityId, report: Report, detail: String) {
     match report {
         Report::Turn(reason) => turn_failed(out, turn_id, reason, detail),
         Report::Clone(cause) => emit(
@@ -883,7 +887,7 @@ struct Runner<V: Vmm, S: Store> {
     vmm: Arc<V>,
     store: Arc<S>,
     settings: Settings,
-    out: UnboundedSender<ChannelHostMessage>,
+    out: UnboundedSender<Outgoing>,
     answers: Answers,
     fetching: Arc<Mutex<()>>,
     layers: LayerCache,
@@ -893,7 +897,6 @@ struct Runner<V: Vmm, S: Store> {
     cancels: Cancels,
     staging: Tally,
     reserves: Tally,
-    protocol: Arc<AtomicU16>,
 }
 
 impl<V: Vmm, S: Store> Clone for Runner<V, S> {
@@ -912,7 +915,6 @@ impl<V: Vmm, S: Store> Clone for Runner<V, S> {
             cancels: self.cancels.clone(),
             staging: self.staging.clone(),
             reserves: self.reserves.clone(),
-            protocol: Arc::clone(&self.protocol),
         }
     }
 }
@@ -1141,8 +1143,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     fn send(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Option<Instant>) -> Asking {
+        self.send_outgoing(key, Outgoing::Message(message.into()), deadline)
+    }
+
+    fn send_outgoing(&self, key: Key, outgoing: Outgoing, deadline: Option<Instant>) -> Asking {
         let Waiting { key, answer } = self.answers.expect(key);
-        emit(&self.out, message);
+        send_out(&self.out, outgoing);
         Asking {
             answers: self.answers.clone(),
             key,
@@ -1152,7 +1158,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     async fn ask(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Instant) -> Result<Answer, String> {
-        let mut asking = self.send(key, message, Some(deadline));
+        self.ask_outgoing(key, Outgoing::Message(message.into()), deadline)
+            .await
+    }
+
+    async fn ask_outgoing(&self, key: Key, outgoing: Outgoing, deadline: Instant) -> Result<Answer, String> {
+        let mut asking = self.send_outgoing(key, outgoing, Some(deadline));
         asking.answer().await.ok_or_else(|| {
             format!(
                 "the control plane did not answer {} before its URLs would expire; check the channel to the control plane",
@@ -1194,11 +1205,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         snapshot_id: &EntityId,
         packs: &[PackFile],
         reused: &[String],
+        protocol: u16,
         deadline: Instant,
     ) -> Result<BTreeMap<String, String>, String> {
         let sizes: BTreeMap<&str, u64> = packs.iter().map(|pack| (pack.digest.as_str(), pack.size)).collect();
         let placed: Vec<&Place> = packs.iter().flat_map(|pack| pack.chunks.iter()).collect();
-        let parts = if self.protocol.load(Ordering::Relaxed) < PACK_REUSE {
+        let parts = if protocol < PACK_REUSE {
             placed.chunks(DIGESTS_PER_PART).map(|part| (part, &[][..])).collect()
         } else {
             pack_parts(&placed, reused, DIGESTS_PER_PART)
@@ -1235,7 +1247,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 snapshot_id: snapshot_id.clone(),
                 type_: ChannelSnapshotPacksType::SnapshotPacks,
             };
-            let Answer::PackUploads(answer) = self.ask(key.clone(), message, deadline).await? else {
+            let outgoing = Outgoing::Snapshot(message.into(), protocol);
+            let Answer::PackUploads(answer) = self.ask_outgoing(key.clone(), outgoing, deadline).await? else {
                 return Err(unexpected(&key));
             };
             urls.extend(
@@ -1727,6 +1740,16 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         )
     }
 
+    fn silent(&self, turn_id: &EntityId, cancelling: bool, first: Option<(Duration, bool)>) -> Failure {
+        if cancelling {
+            return cancel_unanswered(turn_id);
+        }
+        match first {
+            Some((clone, repository_ready)) => self.no_first_output(turn_id, clone, repository_ready),
+            None => Self::timed_out(turn_id),
+        }
+    }
+
     async fn follow(
         &self,
         live: &mut LiveBox<V::Machine>,
@@ -1759,13 +1782,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 continue;
             };
             let Ok(received) = received else {
-                return Followed::Ended(Err(if cancelling {
-                    cancel_unanswered(turn_id)
-                } else if waiting_for_first {
-                    self.no_first_output(turn_id, clone, state.repository_ready)
-                } else {
-                    Self::timed_out(turn_id)
-                }));
+                let first = waiting_for_first.then_some((clone, state.repository_ready));
+                return Followed::Ended(Err(self.silent(turn_id, cancelling, first)));
             };
             match received {
                 Err(error) => {
@@ -1796,10 +1814,24 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                         telemetry::reached(&phase);
                     }
                     state.error = state.error.or_else(|| error_result(&protocol, &output.text));
-                    match turn_lines(output) {
-                        Ok(lines) => emit(&self.out, lines),
-                        Err(failure) => return Followed::Ended(Err(failure)),
-                    }
+                    let Some(first_line_seq) = u64::try_from(output.line_seq.0).ok().and_then(NonZeroU64::new) else {
+                        return Followed::Ended(Err(Failure::turn(
+                            TurnFailureReason::HarnessExited,
+                            format!(
+                                "the guest sent line {} of turn {}, and line numbers start at 1.",
+                                output.line_seq.0, **turn_id
+                            ),
+                        )));
+                    };
+                    emit(
+                        &self.out,
+                        ChannelTurnLines {
+                            first_line_seq,
+                            lines: vec![output.text],
+                            turn_id: output.turn_id,
+                            type_: ChannelTurnLinesType::TurnLines,
+                        },
+                    );
                 }
                 Ok(GuestMessage::TurnEnd(end)) if end.turn_id == *turn_id => {
                     live.credential_file = end.credential_file.as_deref().cloned();
@@ -1825,9 +1857,14 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
-    async fn snapshot(&self, mut live: LiveBox<V::Machine>, order: &SnapshotOrder) -> Outcome<V::Machine> {
+    async fn snapshot(
+        &self,
+        mut live: LiveBox<V::Machine>,
+        order: &SnapshotOrder,
+        protocol: u16,
+    ) -> Outcome<V::Machine> {
         let drive = live.machine.drive();
-        let message: ChannelHostMessage = match self.store_snapshot(drive, &live.base, order).await {
+        let outgoing = match self.store_snapshot(drive, &live.base, order, protocol).await {
             Ok((uploaded_bytes, chunk_count, base)) => {
                 live.base = Arc::new(base);
                 let done = ChannelSnapshotDone {
@@ -1836,7 +1873,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     type_: ChannelSnapshotDoneType::SnapshotDone,
                     uploaded_bytes,
                 };
-                done.into()
+                Outgoing::Snapshot(done.into(), protocol)
             }
             Err((reason, detail)) => {
                 let failed = ChannelSnapshotFailed {
@@ -1846,10 +1883,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     snapshot_id: order.snapshot_id.clone(),
                     type_: ChannelSnapshotFailedType::SnapshotFailed,
                 };
-                failed.into()
+                Outgoing::Message(failed.into())
             }
         };
-        emit(&self.out, message);
+        let (Outgoing::Snapshot(message, _) | Outgoing::Message(message)) = &outgoing;
+        telemetry::ended(message);
+        send_out(&self.out, outgoing);
         Outcome::Kept(live)
     }
 
@@ -1858,6 +1897,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         drive: PathBuf,
         base: &Arc<Base>,
         order: &SnapshotOrder,
+        protocol: u16,
     ) -> Result<(i64, i32, Base), (ChannelSnapshotFailureReason, String)> {
         let unreadable = |detail: String| (ChannelSnapshotFailureReason::UpperDirectoryUnreadable, detail);
         let dir = self
@@ -1866,13 +1906,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             .map_err(unreadable)?
             .join(format!("snapshot-{:08}", order.snapshot_seq.0));
         std::fs::create_dir_all(&dir).map_err(|error| unreadable(format!("creating {}: {error}", dir.display())))?;
-        let stored = self
-            .stage_snapshot(drive, base, order, &dir)
-            .await
-            .map_err(|(reason, detail)| match self.host_disk_full() {
-                Some(full) => (reason, format!("{full}; {detail}")),
-                None => (reason, detail),
-            });
+        let stored =
+            self.stage_snapshot(drive, base, order, &dir, protocol)
+                .await
+                .map_err(|(reason, detail)| match self.host_disk_full() {
+                    Some(full) => (reason, format!("{full}; {detail}")),
+                    None => (reason, detail),
+                });
         let removed = remove_dir(&dir).map_err(unreadable);
         let stored = stored?;
         removed?;
@@ -1920,6 +1960,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         base: &Arc<Base>,
         order: &SnapshotOrder,
         dir: &Path,
+        protocol: u16,
     ) -> Result<(i64, i32, Base), (ChannelSnapshotFailureReason, String)> {
         let unreadable = |detail: String| (ChannelSnapshotFailureReason::UpperDirectoryUnreadable, detail);
         let expired = |detail: String| {
@@ -1961,7 +2002,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Err(_) => return Err(expired("its chunks were still being packed".to_string())),
         };
         let urls = self
-            .pack_uploads(&order.snapshot_id, &staged.packs, &staged.reused, deadline)
+            .pack_uploads(&order.snapshot_id, &staged.packs, &staged.reused, protocol, deadline)
             .await
             .map_err(expired)?;
         let uploads: Vec<(&String, &PackFile)> = staged
@@ -2029,24 +2070,6 @@ async fn download_pack<S: Store>(
     .map_err(|error| format!("unpacking a pack stopped: {error}"))?
 }
 
-fn turn_lines(output: GuestTurnLine) -> Result<ChannelTurnLines, Failure> {
-    let Some(first_line_seq) = u64::try_from(output.line_seq.0).ok().and_then(NonZeroU64::new) else {
-        return Err(Failure::turn(
-            TurnFailureReason::HarnessExited,
-            format!(
-                "the guest sent line {} of turn {}, and line numbers start at 1.",
-                output.line_seq.0, *output.turn_id
-            ),
-        ));
-    };
-    Ok(ChannelTurnLines {
-        first_line_seq,
-        lines: vec![output.text],
-        turn_id: output.turn_id,
-        type_: ChannelTurnLinesType::TurnLines,
-    })
-}
-
 fn sha256_digest(digest: &str) -> Result<Sha256Digest, String> {
     digest
         .to_string()
@@ -2108,6 +2131,7 @@ pub enum Input {
     HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>, Abandoned),
     SnapshotAccepted(EntityId),
+    Welcomed(u16),
 }
 
 #[derive(Clone)]
@@ -2176,6 +2200,8 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     mode: Mode,
     parking: watch::Sender<bool>,
     handing: Option<(oneshot::Sender<SupervisorHandover>, AbortHandle)>,
+    session_protocol: Option<u16>,
+    adopted: Vec<String>,
 }
 
 impl<V: Vmm, S: Store> Lifecycle<V, S> {
@@ -2184,7 +2210,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         store: S,
         settings: Settings,
         pool: TapPool,
-        out: UnboundedSender<ChannelHostMessage>,
+        out: UnboundedSender<Outgoing>,
         standing: PathBuf,
     ) -> Self {
         let (events, finished) = unbounded_channel();
@@ -2213,7 +2239,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 cancels: Cancels::default(),
                 staging: Tally::default(),
                 reserves: pool.reserves(),
-                protocol: Arc::new(AtomicU16::new(ChannelProtocol::VERSION)),
             },
             pool,
             slots: HashMap::new(),
@@ -2231,6 +2256,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             mode: Mode::TakingTurns,
             parking,
             handing: None,
+            session_protocol: None,
+            adopted: Vec::new(),
         }
     }
 
@@ -2275,11 +2302,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     #[must_use]
-    pub fn protocol(&self) -> Arc<AtomicU16> {
-        Arc::clone(&self.runner.protocol)
-    }
-
-    #[must_use]
     pub fn cancels(&self) -> Cancels {
         self.runner.cancels.clone()
     }
@@ -2313,14 +2335,21 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let Some(mut finished) = self.finished.take() else {
             return Ok(());
         };
-        let adopted: Vec<String> = self
+        let queued: Vec<(String, bool)> = self
             .slots
             .iter()
             .filter(|(_, slot)| !slot.queue.is_empty())
-            .map(|(session, _)| session.clone())
+            .map(|(session, slot)| {
+                let snapshot = slot.queue.iter().any(|command| matches!(command, Command::Snapshot(_)));
+                (session.clone(), snapshot)
+            })
             .collect();
-        for session in adopted {
-            self.drain(session).await?;
+        for (session, snapshot) in queued {
+            if snapshot {
+                self.adopted.push(session);
+            } else {
+                self.drain(session).await?;
+            }
         }
         let held: Vec<String> = self.slots.keys().cloned().collect();
         for session in held {
@@ -2334,6 +2363,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
                     Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
                     Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id).await?,
+                    Some(Input::Welcomed(protocol)) => self.welcomed(protocol).await?,
                     None => break,
                 },
                 Some(setup) = setups.recv() => self.setup_command(setup),
@@ -3019,7 +3049,31 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         Ok(())
     }
 
+    async fn welcomed(&mut self, protocol: u16) -> Result<(), String> {
+        self.session_protocol = Some(protocol);
+        for session in std::mem::take(&mut self.adopted) {
+            self.drain(session).await?;
+        }
+        Ok(())
+    }
+
     fn start_snapshot(&mut self, session: String, order: SnapshotOrder) {
+        let Some(protocol) = self.session_protocol else {
+            emit(
+                &self.runner.out,
+                ChannelSnapshotFailed {
+                    detail: reported(
+                        "the snapshot failure detail",
+                        "the snapshot was asked for before the channel to the control plane opened, so no protocol version is negotiated; ask for it again",
+                    ),
+                    failed_at: now(),
+                    reason: ChannelSnapshotFailureReason::NotAnswered,
+                    snapshot_id: order.snapshot_id,
+                    type_: ChannelSnapshotFailedType::SnapshotFailed,
+                },
+            );
+            return;
+        };
         let live = self.slots.get_mut(&session).and_then(|slot| {
             let live = slot.live.take()?;
             slot.busy = true;
@@ -3047,7 +3101,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let runner = self.runner.clone();
         let running = Running::Snapshot;
         self.spawn(session, Work::Snapshot, running, async move {
-            runner.snapshot(live, &order).await
+            runner.snapshot(live, &order, protocol).await
         });
     }
 

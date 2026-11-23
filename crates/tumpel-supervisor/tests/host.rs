@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tumpel_api::types::{ChannelHostMessage, GuestImageManifest, Sequence, SupervisorRuntime};
+use tumpel_channel::Outgoing;
 use tumpel_supervisor::{
     restored_descriptors, take_notify_socket, BootOrder, BoxTurn, Budgets, Command, Ext4Upper, Firecracker, HttpStore,
     ImageOrder, Input, Lifecycle, Settings, Size, Taken, TapPool, Upper,
@@ -69,7 +70,7 @@ fn turn(image: &GuestImageManifest, turn_id: &str, prompt: &str, last_line_seq: 
 }
 
 #[cfg(test)]
-async fn until_complete(received: &mut UnboundedReceiver<ChannelHostMessage>) -> Vec<String> {
+async fn until_complete(received: &mut UnboundedReceiver<Outgoing>) -> Vec<String> {
     let mut seen = Vec::new();
     loop {
         let message = tokio::time::timeout(Duration::from_mins(1), received.recv())

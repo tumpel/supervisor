@@ -10,7 +10,7 @@ use tumpel_api::frozen::{v37, v38};
 use tumpel_api::types::{
     ChannelBootImage, ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited,
     ChannelFrameRefused, ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType,
-    ChannelHostMessage, ChannelProtocol, ChannelSnapshotDone, ChannelStoredHostFrame, ChannelStoredHostFrameType,
+    ChannelHostMessage, ChannelProtocol, ChannelSnapshotFailed, ChannelStoredHostFrame, ChannelStoredHostFrameType,
     ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch,
     Sequence, SupervisorChannelState,
 };
@@ -111,12 +111,62 @@ fn append_lines(batch: &mut Value, added: &ChannelTurnLines) -> bool {
     true
 }
 
-fn predates_pack_reuse(message: &Value) -> bool {
-    match message.get("type").and_then(Value::as_str) {
-        Some("SnapshotPacks") => message.get("reusedPackDigests").is_none(),
-        Some("SnapshotDone") => message.get("chunkCount").is_none(),
-        _ => false,
+pub enum Outgoing {
+    Message(ChannelHostMessage),
+    Snapshot(ChannelHostMessage, u16),
+}
+
+impl From<ChannelHostMessage> for Outgoing {
+    fn from(message: ChannelHostMessage) -> Self {
+        Self::Message(message)
     }
+}
+
+fn reuses_packs(version: u16) -> bool {
+    version >= PACK_REUSE
+}
+
+fn built_for(message: &Value) -> Option<u16> {
+    let field = match message.get("type").and_then(Value::as_str) {
+        Some("SnapshotPacks") => "reusedPackDigests",
+        Some("SnapshotDone") => "chunkCount",
+        _ => return None,
+    };
+    Some(if message.get(field).is_some() {
+        PACK_REUSE
+    } else {
+        PACK_REUSE - 1
+    })
+}
+
+fn build_snapshot(message: &ChannelHostMessage, version: u16) -> Result<Value, ChannelError> {
+    let what = format!("protocol {version} frame");
+    match message {
+        ChannelHostMessage::SnapshotPacks(_) | ChannelHostMessage::SnapshotDone(_) if reuses_packs(version) => {
+            to_value(message)
+        }
+        ChannelHostMessage::SnapshotPacks(packs) if packs.reused_pack_digests.is_empty() => {
+            frozen::<v38::types::ChannelSnapshotPacks>(to_value(message)?, &what)
+        }
+        ChannelHostMessage::SnapshotDone(_) => frozen::<v38::types::ChannelSnapshotDone>(to_value(message)?, &what),
+        _ => Err(protocol(format!(
+            "a {what} must be a SnapshotPacks or SnapshotDone, and below protocol {PACK_REUSE} it names no reused packs"
+        ))),
+    }
+}
+
+fn mismatched(message: &Value, built: u16, session: u16) -> Result<Value, ChannelError> {
+    let kind = message.get("type").and_then(Value::as_str).unwrap_or_default();
+    let failed = serde_json::json!({
+        "type": "SnapshotFailed",
+        "snapshotId": message.get("snapshotId").cloned().unwrap_or(Value::Null),
+        "reason": "NotAnswered",
+        "failedAt": Utc::now().fixed_offset(),
+        "detail": format!("this host built the snapshot's {kind} for channel protocol {built}, but the session speaks {session}; ask for the snapshot again"),
+    });
+    let failed: ChannelSnapshotFailed = serde_json::from_value(failed)
+        .map_err(|error| protocol(format!("failing a {kind} built for protocol {built}: {error}")))?;
+    serde_json::to_value(&failed).map_err(|error| protocol(format!("encoding a SnapshotFailed: {error}")))
 }
 
 fn unrecognised(message: &ChannelControlMessage) -> Option<String> {
@@ -330,9 +380,9 @@ pub struct HostChannel<S: Store, K: Signer> {
 }
 
 fn snapshot_done(message: &Value) -> Option<EntityId> {
-    ChannelSnapshotDone::deserialize(message)
+    v38::types::ChannelSnapshotDone::deserialize(message)
         .ok()
-        .map(|done| done.snapshot_id)
+        .and_then(|done| EntityId::try_from(done.snapshot_id.to_string()).ok())
 }
 
 fn frozen<F: DeserializeOwned + Serialize>(value: Value, what: &str) -> Result<Value, ChannelError> {
@@ -342,18 +392,6 @@ fn frozen<F: DeserializeOwned + Serialize>(value: Value, what: &str) -> Result<V
 
 fn encode(report: &impl Serialize, kind: &str) -> Result<String, ChannelError> {
     serde_json::to_string(report).map_err(|error| protocol(format!("encoding a {kind}: {error}")))
-}
-
-fn encode_message(message: &Value, version: u16) -> Result<Value, ChannelError> {
-    if version >= PACK_REUSE {
-        return Ok(message.clone());
-    }
-    let what = format!("protocol {version} frame");
-    match message.get("type").and_then(Value::as_str) {
-        Some("SnapshotPacks") => frozen::<v38::types::ChannelSnapshotPacks>(message.clone(), &what),
-        Some("SnapshotDone") => frozen::<v38::types::ChannelSnapshotDone>(message.clone(), &what),
-        _ => Ok(message.clone()),
-    }
 }
 
 fn protocol(reason: impl Into<String>) -> ChannelError {
@@ -435,10 +473,24 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     /// # Errors
     /// Fails when the state cannot be saved or the port refuses the frame.
-    pub fn send(&mut self, message: ChannelHostMessage, port: &mut impl Port) -> Result<(), ChannelError> {
-        match message {
-            ChannelHostMessage::TurnLines(lines) => self.store_lines(lines)?,
-            message => self.push(to_value(&message)?),
+    pub fn send(&mut self, outgoing: impl Into<Outgoing>, port: &mut impl Port) -> Result<(), ChannelError> {
+        match outgoing.into() {
+            Outgoing::Message(ChannelHostMessage::TurnLines(lines)) => self.store_lines(lines)?,
+            Outgoing::Message(ChannelHostMessage::SnapshotPacks(_) | ChannelHostMessage::SnapshotDone(_)) => {
+                return Err(protocol(
+                    "a snapshot frame reached the channel built for no protocol version",
+                ));
+            }
+            Outgoing::Message(message) => self.push(to_value(&message)?),
+            Outgoing::Snapshot(message, built) => {
+                let message = build_snapshot(&message, built)?;
+                let message = if self.phase == Phase::Open && reuses_packs(built) != reuses_packs(self.version) {
+                    mismatched(&message, built, self.version)?
+                } else {
+                    message
+                };
+                self.push(message);
+            }
         }
         self.store.save(&self.state)?;
         self.transmit_due(Instant::now(), port)
@@ -503,7 +555,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     fn wire(&self, frame: &ChannelStoredHostFrame) -> Result<String, ChannelError> {
         let sent = ChannelStoredHostFrame {
             ack: Sequence(self.state.received.0),
-            message: encode_message(&frame.message, self.version)?,
             ..frame.clone()
         };
         serde_json::to_string(&sent).map_err(|error| protocol(format!("encoding a stored frame: {error}")))
@@ -620,16 +671,12 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                 self.phase
             )));
         }
-        self.offering = if self
+        self.offering = self
             .state
             .unacked
             .iter()
-            .any(|frame| predates_pack_reuse(&frame.message))
-        {
-            self.hello_version.min(PACK_REUSE - 1)
-        } else {
-            self.hello_version
-        };
+            .filter_map(|frame| built_for(&frame.message))
+            .fold(self.hello_version, u16::min);
         let hello = ChannelHello {
             box_capacity,
             channel_protocol_oldest: NonZeroU32::new(u32::from(ChannelProtocol::OLDEST)),
@@ -720,6 +767,11 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         for frame in &mut self.state.unacked {
             if let Some(batch) = legacy_line(&frame.message)? {
                 frame.message = batch;
+            }
+            if let Some(built) =
+                built_for(&frame.message).filter(|built| reuses_packs(*built) != reuses_packs(self.version))
+            {
+                frame.message = mismatched(&frame.message, built, self.version)?;
             }
         }
         Ok(())

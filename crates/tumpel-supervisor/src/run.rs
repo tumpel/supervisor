@@ -7,7 +7,6 @@ use std::hash::{BuildHasher, RandomState};
 use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{signal, SignalKind};
@@ -19,12 +18,12 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
-    HostReportedHealth, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    ChannelControlMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
+    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
 };
 use tumpel_channel::{
-    Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer, Store,
+    Backoff, ChannelError, Event, HeldIds, HostChannel, Outgoing, Phase, Port, RateBackoff, RateLimit, Signer, Store,
     HEARTBEAT_DEADLINE,
 };
 
@@ -100,7 +99,7 @@ type BoxRunner = JoinHandle<Result<(), String>>;
 struct Updates {
     updater: Arc<HostUpdater>,
     layout: Layout,
-    out: UnboundedSender<ChannelHostMessage>,
+    out: UnboundedSender<Outgoing>,
     restart: UnboundedSender<()>,
     trial: Option<SupervisorUpdatePending>,
     confirmed: watch::Sender<bool>,
@@ -183,7 +182,6 @@ struct Usage {
     holdings: watch::Receiver<Held>,
     data_dir: PathBuf,
     telemetry: Telemetry,
-    protocol: Arc<AtomicU16>,
 }
 
 impl Usage {
@@ -200,7 +198,7 @@ fn hello(
     channel: &mut Channel,
     nonce: &str,
     usage: &Usage,
-    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    from_box: &mut UnboundedReceiver<Outgoing>,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
     let turns = usage.turns.borrow().clone();
@@ -215,7 +213,7 @@ fn hello(
 
 fn drain(
     channel: &mut Channel,
-    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    from_box: &mut UnboundedReceiver<Outgoing>,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
     while let Ok(message) = from_box.try_recv() {
@@ -227,7 +225,7 @@ fn drain(
 fn beat(
     channel: &mut Channel,
     usage: &Usage,
-    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    from_box: &mut UnboundedReceiver<Outgoing>,
     health: HostReportedHealth,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
@@ -260,6 +258,7 @@ enum BoxCommand {
     HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>, Abandoned),
     SnapshotAccepted(EntityId),
+    Welcomed(u16),
 }
 
 fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Result<SetupCommand, String> {
@@ -367,6 +366,13 @@ async fn boxes(
                 }
                 continue;
             }
+            BoxCommand::Welcomed(protocol) => {
+                if lifecycle.send(Input::Welcomed(protocol)).is_err() {
+                    eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
+                    return;
+                }
+                continue;
+            }
         };
         if lifecycle.send(Input::Command(next)).is_err() {
             eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
@@ -384,7 +390,7 @@ fn start_boxes(
     box_size: Size,
     store: HttpStore,
     received: UnboundedReceiver<BoxCommand>,
-    out: UnboundedSender<ChannelHostMessage>,
+    out: UnboundedSender<Outgoing>,
     telemetry: Telemetry,
     taken: Option<(SupervisorHandover, Taken)>,
     standing: PathBuf,
@@ -412,7 +418,6 @@ fn start_boxes(
         holdings: lifecycle.holdings(),
         data_dir: PathBuf::from(&*runtime.data_dir),
         telemetry,
-        protocol: lifecycle.protocol(),
     };
     let answers = lifecycle.answers();
     let cancels = lifecycle.cancels();
@@ -448,7 +453,7 @@ fn boxes_stopped(ended: Result<Result<(), String>, JoinError>) -> Failure {
 async fn terminate(
     commands: &UnboundedSender<BoxCommand>,
     layout: &Layout,
-    out: &UnboundedSender<ChannelHostMessage>,
+    out: &UnboundedSender<Outgoing>,
 ) -> Result<(), Failure> {
     let (reply, answer) = oneshot::channel();
     let _ = commands.send(BoxCommand::HandOver(reply));
@@ -524,7 +529,7 @@ fn named_turns(text: &str) -> Vec<EntityId> {
         .collect()
 }
 
-fn handover_lost(layout: &Layout, out: &UnboundedSender<ChannelHostMessage>, cause: &str, turns: &[EntityId]) {
+fn handover_lost(layout: &Layout, out: &UnboundedSender<Outgoing>, cause: &str, turns: &[EntityId]) {
     eprintln!(
         "tumpel-supervisor: HandoverLost: {cause}; this supervisor fails the {} turns it names and starts without the handed boxes",
         turns.len()
@@ -545,11 +550,7 @@ fn handover_lost(layout: &Layout, out: &UnboundedSender<ChannelHostMessage>, cau
     }
 }
 
-fn read_handover(
-    layout: &Layout,
-    out: &UnboundedSender<ChannelHostMessage>,
-    handed: bool,
-) -> Option<SupervisorHandover> {
+fn read_handover(layout: &Layout, out: &UnboundedSender<Outgoing>, handed: bool) -> Option<SupervisorHandover> {
     let path = layout.handover();
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -746,7 +747,7 @@ fn read_standing(layout: &Layout) -> Option<SupervisorHandover> {
 
 fn taken(
     layout: &Layout,
-    out: &UnboundedSender<ChannelHostMessage>,
+    out: &UnboundedSender<Outgoing>,
     handed: bool,
     mut received: BTreeMap<String, OwnedFd>,
 ) -> Result<Option<(SupervisorHandover, Taken)>, Failure> {
@@ -861,7 +862,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     stopped
 }
 
-fn store_unsent(channel: &mut Channel, from_box: &mut UnboundedReceiver<ChannelHostMessage>) -> Result<(), Failure> {
+fn store_unsent(channel: &mut Channel, from_box: &mut UnboundedReceiver<Outgoing>) -> Result<(), Failure> {
     while let Ok(message) = from_box.try_recv() {
         channel
             .send(message, &mut Outbox::default())
@@ -877,7 +878,7 @@ async fn serve(
     heartbeat: Duration,
     usage: &Usage,
     commands: &UnboundedSender<BoxCommand>,
-    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    from_box: &mut UnboundedReceiver<Outgoing>,
     config: &SupervisorConfig,
     dir: &Path,
     updates: &mut Updates,
@@ -1047,7 +1048,7 @@ async fn session(
     heartbeat: Duration,
     usage: &Usage,
     commands: &UnboundedSender<BoxCommand>,
-    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    from_box: &mut UnboundedReceiver<Outgoing>,
     updates: &mut Updates,
     limit: &mut RateLimit,
 ) -> Result<Ended, Failure> {
@@ -1082,9 +1083,11 @@ async fn session(
                             Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
                             Ok(Event::Welcomed) => {
                                 eprintln!("connected to {url}");
-                                usage.protocol.store(channel.version(), Ordering::Relaxed);
                                 last_beat = Instant::now();
-                                updates.welcomed().await.err().map(Err)
+                                match commands.send(BoxCommand::Welcomed(channel.version())) {
+                                    Err(_) => Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
+                                    Ok(()) => updates.welcomed().await.err().map(Err),
+                                }
                             }
                             Ok(Event::Message(message)) => match box_command(*message) {
                                 Ok(command) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),

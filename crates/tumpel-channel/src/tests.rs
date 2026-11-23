@@ -10,8 +10,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    empty_state, hello_bytes, Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit,
-    Signer, Store, Usage, TURN_LINES_WAIT,
+    empty_state, hello_bytes, Backoff, ChannelError, Event, HeldIds, HostChannel, Outgoing, Phase, Port, RateBackoff,
+    RateLimit, Signer, Store, Usage, TURN_LINES_WAIT,
 };
 
 #[derive(Default)]
@@ -90,14 +90,18 @@ fn channel(disk: &Disk, signer: &Recorder) -> HostChannel<Disk, Recorder> {
     )
 }
 
-fn done(snapshot: &str) -> ChannelHostMessage {
-    ChannelSnapshotDone {
+fn done(snapshot: &str) -> Outgoing {
+    done_at(snapshot, ChannelProtocol::VERSION)
+}
+
+fn done_at(snapshot: &str, version: u16) -> Outgoing {
+    let message = ChannelSnapshotDone {
         snapshot_id: snapshot.try_into().expect("snapshot id"),
         uploaded_bytes: 10,
         chunk_count: 3,
         type_: ChannelSnapshotDoneType::SnapshotDone,
-    }
-    .into()
+    };
+    Outgoing::Snapshot(message.into(), version)
 }
 
 fn frame(seq: i64, ack: i64, snapshot: &str) -> String {
@@ -1293,43 +1297,77 @@ fn on_37_a_rate_limited_frame_and_every_frame_after_it_go_out_again_in_order_onc
     assert!(!channel.withholding());
 }
 
-fn packs(snapshot: &str) -> ChannelHostMessage {
-    serde_json::from_value(json!({
+fn packs_at(snapshot: &str, reused: &[String], version: u16) -> Outgoing {
+    let message = serde_json::from_value(json!({
         "type": "SnapshotPacks",
         "snapshotId": snapshot,
         "part": 1,
         "packs": [],
         "chunks": [],
-        "reusedPackDigests": ["e".repeat(64)]
+        "reusedPackDigests": reused
     }))
-    .expect("packs")
+    .expect("packs");
+    Outgoing::Snapshot(message, version)
 }
 
-fn snapshot_fields(wire: &mut Wire) -> Vec<(i64, Value, Option<Value>, Option<Value>)> {
+fn failures(wire: &mut Wire) -> Vec<(i64, Value, String)> {
     sent_frames(wire)
         .into_iter()
         .map(|(seq, message)| {
             (
                 seq,
                 message["type"].clone(),
-                message.get("reusedPackDigests").cloned(),
-                message.get("chunkCount").cloned(),
+                message["detail"].as_str().unwrap_or_default().to_string(),
             )
         })
         .collect()
 }
 
+fn snapshot_failed_naming(kind: &str, built: u16, session: u16) -> String {
+    format!("this host built the snapshot's {kind} for channel protocol {built}, but the session speaks {session}; ask for the snapshot again")
+}
+
 #[test]
-fn a_host_refused_at_39_steps_down_to_38_and_37_and_sends_no_reused_packs_or_chunk_count_there() {
+fn a_snapshot_built_at_38_handed_to_a_session_at_39_goes_out_as_snapshot_failed_and_is_never_accepted() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
-    channel.send(packs("snap-1"), &mut wire).expect("send");
+    open(&mut channel, &mut wire);
+    channel.send(packs_at("snap-1", &[], 38), &mut wire).expect("send");
+    channel.send(done_at("snap-1", 38), &mut wire).expect("send");
+    assert_eq!(
+        failures(&mut wire),
+        [
+            (
+                1,
+                json!("SnapshotFailed"),
+                snapshot_failed_naming("SnapshotPacks", 38, 39)
+            ),
+            (
+                2,
+                json!("SnapshotFailed"),
+                snapshot_failed_naming("SnapshotDone", 38, 39)
+            )
+        ]
+    );
+    channel
+        .receive(&json!({"type": "Ack", "seq": 2}).to_string())
+        .expect("the ack retires both frames");
+    assert_eq!(channel.take_accepted(), Vec::<EntityId>::new());
+}
+
+#[test]
+fn a_snapshot_built_at_39_offers_39_and_goes_out_as_snapshot_failed_when_the_session_steps_down_to_38() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    channel
+        .send(packs_at("snap-1", &["e".repeat(64)], 39), &mut wire)
+        .expect("send");
     channel.send(done("snap-1"), &mut wire).expect("send");
     let newest = say_hello(&mut channel, &mut wire);
     assert_eq!(newest["protocolVersion"], json!(39));
     assert_eq!(newest["channelProtocolOldest"], json!(37));
-
     assert_eq!(channel.step_down(), Some(38));
     assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(38));
     let at_38 = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 38}).to_string();
@@ -1338,28 +1376,49 @@ fn a_host_refused_at_39_steps_down_to_38_and_37_and_sends_no_reused_packs_or_chu
     };
     channel.release(usize::MAX, &mut wire).expect("release");
     assert_eq!(
-        snapshot_fields(&mut wire),
+        failures(&mut wire),
         [
-            (1, json!("SnapshotPacks"), None, None),
-            (2, json!("SnapshotDone"), None, None)
+            (
+                1,
+                json!("SnapshotFailed"),
+                snapshot_failed_naming("SnapshotPacks", 39, 38)
+            ),
+            (
+                2,
+                json!("SnapshotFailed"),
+                snapshot_failed_naming("SnapshotDone", 39, 38)
+            )
         ]
     );
+    channel
+        .receive(&json!({"type": "Ack", "seq": 2}).to_string())
+        .expect("the ack retires both frames");
+    assert_eq!(channel.take_accepted(), Vec::<EntityId>::new());
+}
 
-    assert_eq!(channel.step_down(), Some(37));
-    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(37));
-    assert_eq!(channel.step_down(), None);
-    channel.step_up();
-    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(39));
-    let at_39 = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 39}).to_string();
-    let Ok(Event::Welcomed) = channel.receive(&at_39) else {
-        panic!("the welcome opens the channel");
-    };
-    channel.release(usize::MAX, &mut wire).expect("release");
+#[test]
+fn a_snapshot_built_at_38_goes_out_without_reused_packs_or_chunk_count_in_a_session_at_38() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open_at(&mut channel, &mut wire, 38);
+    channel.send(packs_at("snap-1", &[], 38), &mut wire).expect("send");
+    channel.send(done_at("snap-1", 38), &mut wire).expect("send");
+    let sent: Vec<(Value, Option<Value>, Option<Value>)> = sent_frames(&mut wire)
+        .into_iter()
+        .map(|(_, message)| {
+            (
+                message["type"].clone(),
+                message.get("reusedPackDigests").cloned(),
+                message.get("chunkCount").cloned(),
+            )
+        })
+        .collect();
     assert_eq!(
-        snapshot_fields(&mut wire),
+        sent,
         [
-            (1, json!("SnapshotPacks"), Some(json!(["e".repeat(64)])), None),
-            (2, json!("SnapshotDone"), None, Some(json!(3)))
+            (json!("SnapshotPacks"), None, None),
+            (json!("SnapshotDone"), None, None)
         ]
     );
 }
@@ -1395,10 +1454,16 @@ fn snapshot_frames_saved_before_39_offer_38_until_the_control_plane_acks_them() 
     };
     channel.release(usize::MAX, &mut wire).expect("release");
     assert_eq!(
-        snapshot_fields(&mut wire),
+        sent_frames(&mut wire),
         [
-            (1, json!("SnapshotPacks"), None, None),
-            (2, json!("SnapshotDone"), None, None)
+            (
+                1,
+                json!({"type": "SnapshotPacks", "snapshotId": "snap-1", "part": 1, "packs": [], "chunks": []})
+            ),
+            (
+                2,
+                json!({"type": "SnapshotDone", "snapshotId": "snap-1", "uploadedBytes": 10})
+            )
         ]
     );
     channel

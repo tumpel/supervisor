@@ -10,6 +10,7 @@ use tumpel_api::types::{
     ChannelHostMessage, ChannelProtocol, HostArchitecture, Sha256Digest, SupervisorUpdateFailureReason,
     SupervisorUpdatePhase,
 };
+use tumpel_channel::Outgoing;
 
 use super::{
     announced_release, confirm, named, refresh_unit, sha256_hex, startup, version_refusal, Idle, Layout, Limits,
@@ -129,7 +130,7 @@ fn limits() -> Limits {
 
 struct Run<'a> {
     updater: Updater<FakeSource, &'a FakeIdle>,
-    events: UnboundedReceiver<ChannelHostMessage>,
+    events: UnboundedReceiver<Outgoing>,
 }
 
 fn updater<'a>(layout: &Layout, source: FakeSource, idle: &'a FakeIdle, limits: Limits) -> Run<'a> {
@@ -147,20 +148,20 @@ enum Seen {
     Failed(SupervisorUpdateFailureReason),
 }
 
-fn seen(events: &mut UnboundedReceiver<ChannelHostMessage>) -> Vec<Seen> {
+fn seen(events: &mut UnboundedReceiver<Outgoing>) -> Vec<Seen> {
     std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event {
-            ChannelHostMessage::SupervisorUpdateStep(step) => Some(Seen::Step(step.phase)),
-            ChannelHostMessage::SupervisorUpdateFailed(failed) => Some(Seen::Failed(failed.reason)),
+            Outgoing::Message(ChannelHostMessage::SupervisorUpdateStep(step)) => Some(Seen::Step(step.phase)),
+            Outgoing::Message(ChannelHostMessage::SupervisorUpdateFailed(failed)) => Some(Seen::Failed(failed.reason)),
             _ => None,
         })
         .collect()
 }
 
-fn failure(events: &mut UnboundedReceiver<ChannelHostMessage>) -> (String, Vec<String>) {
+fn failure(events: &mut UnboundedReceiver<Outgoing>) -> (String, Vec<String>) {
     std::iter::from_fn(|| events.try_recv().ok())
         .find_map(|event| match event {
-            ChannelHostMessage::SupervisorUpdateFailed(failed) => Some((
+            Outgoing::Message(ChannelHostMessage::SupervisorUpdateFailed(failed)) => Some((
                 failed.detail.into(),
                 failed.output_tail.into_iter().map(String::from).collect(),
             )),
