@@ -209,7 +209,10 @@ fn hello(
     drain(channel, from_box, outbox)?;
     channel
         .hello(nonce, usage.box_capacity, usage.sample()?, turns, outbox)
-        .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
+        .map_err(|error| match error {
+            ChannelError::Store(_) => store_lost(&error),
+            error => fail(SupervisorFailure::ProtocolError, error.to_string()),
+        })
 }
 
 fn drain(
