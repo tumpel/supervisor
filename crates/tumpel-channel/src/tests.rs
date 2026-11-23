@@ -1453,4 +1453,10 @@ fn an_ack_for_a_seq_this_host_never_sent_closes_the_channel_and_keeps_every_fram
         panic!("a control frame acking past the last sent seq is a protocol error");
     };
     assert_eq!(unacked_seqs(&disk), [1, 2]);
+    assert_eq!(channel.state().received.0, 0);
+
+    open(&mut channel, &mut wire);
+    let Ok(Event::Message(_)) = channel.receive(&frame(1, 1, "snap-9")) else {
+        panic!("the resent frame 1 is taken, not dropped as a duplicate");
+    };
 }

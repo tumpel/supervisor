@@ -809,9 +809,9 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                 frame.seq.0
             )));
         }
+        self.drop_acked(frame.ack.0)?;
         self.state.received = Sequence(frame.seq.0);
         self.progressed = true;
-        self.drop_acked(frame.ack.0)?;
         self.store.save(&self.state)?;
         match &frame.message {
             ChannelControlMessage::TurnOffer(offer) if !self.offered.contains(&offer.turn_id) => {
