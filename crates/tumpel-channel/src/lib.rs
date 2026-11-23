@@ -8,11 +8,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tumpel_api::frozen::{v37, v38};
 use tumpel_api::types::{
-    ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
-    ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType, ChannelHostMessage,
-    ChannelProtocol, ChannelSnapshotDone, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLines,
-    ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch, Sequence,
-    SupervisorChannelState,
+    ChannelBootImage, ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited,
+    ChannelFrameRefused, ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType,
+    ChannelHostMessage, ChannelProtocol, ChannelSnapshotDone, ChannelStoredHostFrame, ChannelStoredHostFrameType,
+    ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch,
+    Sequence, SupervisorChannelState,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
@@ -20,7 +20,7 @@ pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 const ASSUMED_FRAMES_PER_MINUTE: u32 = 600;
-const PACK_REUSE: u16 = 39;
+pub const PACK_REUSE: u16 = 39;
 pub const TURN_LINES_MAX_LINES: usize = 200;
 pub const TURN_LINES_MAX_BYTES: usize = 256_000;
 pub const TURN_LINES_WAIT: Duration = Duration::from_secs(2);
@@ -109,6 +109,29 @@ fn append_lines(batch: &mut Value, added: &ChannelTurnLines) -> bool {
     }
     lines.extend(added.lines.iter().map(|line| Value::String(line.to_string())));
     true
+}
+
+fn predates_pack_reuse(message: &Value) -> bool {
+    match message.get("type").and_then(Value::as_str) {
+        Some("SnapshotPacks") => message.get("reusedPackDigests").is_none(),
+        Some("SnapshotDone") => message.get("chunkCount").is_none(),
+        _ => false,
+    }
+}
+
+fn unrecognised(message: &ChannelControlMessage) -> Option<String> {
+    match message {
+        ChannelControlMessage::Unrecognised(message) => Some(format!("message {message}")),
+        ChannelControlMessage::TurnOffer(offer) => match &offer.image {
+            ChannelBootImage::Unrecognised(image) => Some(format!("image {image}")),
+            _ => None,
+        },
+        ChannelControlMessage::ClaudeSetupBoxOffer(offer) => match &offer.image {
+            ChannelBootImage::Unrecognised(image) => Some(format!("image {image}")),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn is_turn_lines(message: &Value) -> bool {
@@ -285,6 +308,7 @@ pub enum Event {
         retry_after: DateTime<Utc>,
     },
     Message(Box<ChannelControlMessage>),
+    Unrecognised(String),
 }
 
 pub struct HostChannel<S: Store, K: Signer> {
@@ -298,6 +322,7 @@ pub struct HostChannel<S: Store, K: Signer> {
     withheld: Option<i64>,
     offered: Vec<EntityId>,
     hello_version: u16,
+    offering: u16,
     version: u16,
     sealed: i64,
     batch_started: Option<Instant>,
@@ -356,6 +381,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             accepted: Vec::new(),
             offered: Vec::new(),
             hello_version: ChannelProtocol::VERSION,
+            offering: ChannelProtocol::VERSION,
             version: ChannelProtocol::VERSION,
             sealed,
             batch_started: None,
@@ -384,6 +410,11 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     pub fn disconnect(&mut self) {
         self.phase = Phase::Closed;
+    }
+
+    #[must_use]
+    pub fn version(&self) -> u16 {
+        self.version
     }
 
     pub fn step_down(&mut self) -> Option<u16> {
@@ -589,13 +620,23 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                 self.phase
             )));
         }
+        self.offering = if self
+            .state
+            .unacked
+            .iter()
+            .any(|frame| predates_pack_reuse(&frame.message))
+        {
+            self.hello_version.min(PACK_REUSE - 1)
+        } else {
+            self.hello_version
+        };
         let hello = ChannelHello {
             box_capacity,
             channel_protocol_oldest: NonZeroU32::new(u32::from(ChannelProtocol::OLDEST)),
             guest_protocol: None,
             held_turn_ids: self.held_turns(held_turn_ids),
             host_id: self.host_id.clone(),
-            protocol_version: NonZeroU32::new(u32::from(self.hello_version))
+            protocol_version: NonZeroU32::new(u32::from(self.offering))
                 .ok_or_else(|| protocol("protocol version 0"))?,
             resend_from: resend_from(&self.state)?,
             signature: self
@@ -641,7 +682,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             (Phase::AwaitingChallenge, other) => {
                 Err(protocol(format!("expected Challenge first, got {}", kind(&other))))
             }
-            (Phase::AwaitingWelcome, ChannelControlEnvelope::Welcome(welcome)) => self.welcomed(welcome),
+            (Phase::AwaitingWelcome, ChannelControlEnvelope::Welcome(welcome)) => self.welcomed(&welcome),
             (Phase::Open, ChannelControlEnvelope::ControlFrame(frame)) => self.accept(frame),
             (Phase::AwaitingWelcome | Phase::Open, ChannelControlEnvelope::Heartbeat(_)) => Ok(Event::Heartbeat),
             (Phase::Open, ChannelControlEnvelope::ReleasePublished(_)) => Ok(Event::ReleasePublished),
@@ -656,16 +697,16 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         }
     }
 
-    fn welcomed(&mut self, welcome: ChannelWelcome) -> Result<Event, ChannelError> {
+    fn welcomed(&mut self, welcome: &ChannelWelcome) -> Result<Event, ChannelError> {
         let named = welcome.protocol_version.get();
         self.version = u16::try_from(named)
             .ok()
-            .filter(|version| (ChannelProtocol::OLDEST..=self.hello_version).contains(version))
+            .filter(|version| (ChannelProtocol::OLDEST..=self.offering).contains(version))
             .ok_or_else(|| {
                 protocol(format!(
                     "the Welcome names protocol {named}, outside the {} to {} this Hello offered",
                     ChannelProtocol::OLDEST,
-                    self.hello_version
+                    self.offering
                 ))
             })?;
         self.reshape()?;
@@ -731,6 +772,12 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             return Err(protocol(format!(
                 "frame gap: expected seq {}, got {}",
                 received + 1,
+                frame.seq.0
+            )));
+        }
+        if let Some(unknown) = unrecognised(&frame.message) {
+            return Ok(Event::Unrecognised(format!(
+                "frame {} carries {unknown}, which this supervisor does not know; update the supervisor",
                 frame.seq.0
             )));
         }

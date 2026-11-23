@@ -205,7 +205,7 @@ impl ControlPlane {
         }
     }
 
-    fn welcome(&self) -> Value {
+    fn welcome() -> Value {
         json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION})
     }
 
@@ -238,7 +238,7 @@ impl ControlPlane {
 
     fn reconnect(&mut self, channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) -> Result<Event, ChannelError> {
         channel.disconnect();
-        let event = welcome(channel, wire, &self.welcome())?;
+        let event = welcome(channel, wire, &Self::welcome())?;
         self.ack(channel)?;
         channel.release(usize::MAX, wire)?;
         Ok(event)
@@ -891,7 +891,7 @@ fn a_socket_closed_mid_turn_keeps_the_turn_held_and_resends_its_unacked_output_a
         .expect("hello");
     let [hello] = wire.sent().try_into().expect("one hello");
     assert_eq!(hello["heldTurnIds"], json!(["turn-1"]));
-    let Ok(Event::Welcomed) = channel.receive(&control.welcome().to_string()) else {
+    let Ok(Event::Welcomed) = channel.receive(&ControlPlane::welcome().to_string()) else {
         panic!("the welcome opens the channel");
     };
     assert_eq!(wire.sent(), Vec::<Value>::new(), "the welcome sends nothing by itself");
@@ -1305,15 +1305,15 @@ fn packs(snapshot: &str) -> ChannelHostMessage {
     .expect("packs")
 }
 
-fn snapshot_fields(wire: &mut Wire) -> Vec<(i64, Value, Value, Value)> {
+fn snapshot_fields(wire: &mut Wire) -> Vec<(i64, Value, Option<Value>, Option<Value>)> {
     sent_frames(wire)
         .into_iter()
         .map(|(seq, message)| {
             (
                 seq,
                 message["type"].clone(),
-                message.get("reusedPackDigests").cloned().unwrap_or(Value::Null),
-                message.get("chunkCount").cloned().unwrap_or(Value::Null),
+                message.get("reusedPackDigests").cloned(),
+                message.get("chunkCount").cloned(),
             )
         })
         .collect()
@@ -1340,8 +1340,8 @@ fn a_host_refused_at_39_steps_down_to_38_and_37_and_sends_no_reused_packs_or_chu
     assert_eq!(
         snapshot_fields(&mut wire),
         [
-            (1, json!("SnapshotPacks"), Value::Null, Value::Null),
-            (2, json!("SnapshotDone"), Value::Null, Value::Null)
+            (1, json!("SnapshotPacks"), None, None),
+            (2, json!("SnapshotDone"), None, None)
         ]
     );
 
@@ -1358,10 +1358,64 @@ fn a_host_refused_at_39_steps_down_to_38_and_37_and_sends_no_reused_packs_or_chu
     assert_eq!(
         snapshot_fields(&mut wire),
         [
-            (1, json!("SnapshotPacks"), json!(["e".repeat(64)]), Value::Null),
-            (2, json!("SnapshotDone"), Value::Null, json!(3))
+            (1, json!("SnapshotPacks"), Some(json!(["e".repeat(64)])), None),
+            (2, json!("SnapshotDone"), None, Some(json!(3)))
         ]
     );
+}
+
+#[test]
+fn snapshot_frames_saved_before_39_offer_38_until_the_control_plane_acks_them() {
+    let saved: SupervisorChannelState = serde_json::from_value(json!({
+        "received": 0,
+        "sent": 2,
+        "unacked": [
+            {"type": "Frame", "seq": 1, "ack": 0, "message": {"type": "SnapshotPacks", "snapshotId": "snap-1", "part": 1, "packs": [], "chunks": []}},
+            {"type": "Frame", "seq": 2, "ack": 0, "message": {"type": "SnapshotDone", "snapshotId": "snap-1", "uploadedBytes": 10}}
+        ]
+    }))
+    .expect("channel.json");
+    let disk = Disk::default();
+    let mut channel = HostChannel::new(
+        saved,
+        disk.clone(),
+        Recorder::default(),
+        "host-1".try_into().expect("host id"),
+        "0.1.0".to_string(),
+    );
+    let mut wire = Wire::default();
+    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(38));
+    let at_38 = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 38}).to_string();
+    let Ok(Event::Welcomed) = channel.receive(&at_38) else {
+        panic!("the welcome opens the channel");
+    };
+    channel.release(usize::MAX, &mut wire).expect("release");
+    assert_eq!(
+        snapshot_fields(&mut wire),
+        [
+            (1, json!("SnapshotPacks"), None, None),
+            (2, json!("SnapshotDone"), None, None)
+        ]
+    );
+    channel
+        .receive(&json!({"type": "Ack", "seq": 2}).to_string())
+        .expect("the ack retires both frames");
+    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(39));
+}
+
+#[test]
+fn a_turn_offer_with_an_image_this_supervisor_does_not_know_is_reported_and_left_unacked() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    let mut frame: Value = serde_json::from_str(&offer(1, "grant-1")).expect("offer json");
+    frame["message"]["image"] = json!({"kind": "Teleported"});
+    let Ok(Event::Unrecognised(detail)) = channel.receive(&frame.to_string()) else {
+        panic!("an unknown image is reported");
+    };
+    assert!(detail.contains("frame 1"), "{detail}");
+    assert_eq!(channel.state().received.0, 0);
 }
 
 #[test]

@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io::BufWriter;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,15 +17,15 @@ use tracing::Instrument;
 use tumpel_api::types::{
     BoxBudgets, BoxRetention, ChannelBoxGone, ChannelBoxGoneType, ChannelBoxTeardownFailed,
     ChannelBoxTeardownFailedType, ChannelBoxTeardownFailureReason, ChannelDispatchGrant, ChannelHostMessage,
-    ChannelPack, ChannelPersonaFileDownload, ChannelRestoreChunks, ChannelRestoreChunksType, ChannelSnapshotChunks,
-    ChannelSnapshotChunksType, ChannelSnapshotDone, ChannelSnapshotDoneType, ChannelSnapshotDownload,
-    ChannelSnapshotFailed, ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPacks,
-    ChannelSnapshotPacksType, ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete,
-    ChannelTurnCompleteType, ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType,
+    ChannelPack, ChannelPersonaFileDownload, ChannelProtocol, ChannelRestoreChunks, ChannelRestoreChunksType,
+    ChannelSnapshotChunks, ChannelSnapshotChunksType, ChannelSnapshotDone, ChannelSnapshotDoneType,
+    ChannelSnapshotDownload, ChannelSnapshotFailed, ChannelSnapshotFailedType, ChannelSnapshotFailureReason,
+    ChannelSnapshotPacks, ChannelSnapshotPacksType, ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType,
+    ChannelTurnComplete, ChannelTurnCompleteType, ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType,
     ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLines, ChannelTurnLinesType,
     ChannelTurnRepositoryCloneFailed, ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady,
     ChannelTurnRepositoryReadyType, CredentialText, DisplayName, EmailAddress, EntityId, GuestHello, GuestInput,
-    GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnStart,
+    GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnLine, GuestTurnStart,
     GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl,
     Sequence, Sha256Digest, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
     SupervisorHandoverCommand, SupervisorHandoverDiscard, SupervisorHandoverDiscardKind, SupervisorHandoverMachine,
@@ -33,6 +33,7 @@ use tumpel_api::types::{
     SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
     SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
 };
+use tumpel_channel::PACK_REUSE;
 
 use crate::boot::{self, Boot, BootOrder, Caches, Hold, Holds};
 use crate::bounded::{bounded, reported};
@@ -892,6 +893,7 @@ struct Runner<V: Vmm, S: Store> {
     cancels: Cancels,
     staging: Tally,
     reserves: Tally,
+    protocol: Arc<AtomicU16>,
 }
 
 impl<V: Vmm, S: Store> Clone for Runner<V, S> {
@@ -910,6 +912,7 @@ impl<V: Vmm, S: Store> Clone for Runner<V, S> {
             cancels: self.cancels.clone(),
             staging: self.staging.clone(),
             reserves: self.reserves.clone(),
+            protocol: Arc::clone(&self.protocol),
         }
     }
 }
@@ -1195,8 +1198,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     ) -> Result<BTreeMap<String, String>, String> {
         let sizes: BTreeMap<&str, u64> = packs.iter().map(|pack| (pack.digest.as_str(), pack.size)).collect();
         let placed: Vec<&Place> = packs.iter().flat_map(|pack| pack.chunks.iter()).collect();
+        let parts = if self.protocol.load(Ordering::Relaxed) < PACK_REUSE {
+            placed.chunks(DIGESTS_PER_PART).map(|part| (part, &[][..])).collect()
+        } else {
+            pack_parts(&placed, reused, DIGESTS_PER_PART)
+        };
         let mut urls = BTreeMap::new();
-        for (index, (part, reused)) in pack_parts(&placed, reused, DIGESTS_PER_PART).into_iter().enumerate() {
+        for (index, (part, reused)) in parts.into_iter().enumerate() {
             let key = Key {
                 ask: Ask::SnapshotPacks,
                 id: snapshot_id.clone(),
@@ -1788,24 +1796,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                         telemetry::reached(&phase);
                     }
                     state.error = state.error.or_else(|| error_result(&protocol, &output.text));
-                    let Some(first_line_seq) = u64::try_from(output.line_seq.0).ok().and_then(NonZeroU64::new) else {
-                        return Followed::Ended(Err(Failure::turn(
-                            TurnFailureReason::HarnessExited,
-                            format!(
-                                "the guest sent line {} of turn {}, and line numbers start at 1.",
-                                output.line_seq.0, **turn_id
-                            ),
-                        )));
-                    };
-                    emit(
-                        &self.out,
-                        ChannelTurnLines {
-                            first_line_seq,
-                            lines: vec![output.text],
-                            turn_id: output.turn_id,
-                            type_: ChannelTurnLinesType::TurnLines,
-                        },
-                    );
+                    match turn_lines(output) {
+                        Ok(lines) => emit(&self.out, lines),
+                        Err(failure) => return Followed::Ended(Err(failure)),
+                    }
                 }
                 Ok(GuestMessage::TurnEnd(end)) if end.turn_id == *turn_id => {
                     live.credential_file = end.credential_file.as_deref().cloned();
@@ -2005,14 +1999,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 *order.snapshot_id
             ))
         })?;
-        let placements = staged.base.placements();
-        let chunk_count = i32::try_from(placements).map_err(|_| {
-            unreadable(format!(
-                "snapshot {} places {placements} chunks, more than an int32 counts",
-                *order.snapshot_id
-            ))
-        })?;
-        Ok((uploaded, chunk_count, staged.base))
+        Ok((uploaded, staged.chunk_count, staged.base))
     }
 }
 
@@ -2040,6 +2027,24 @@ async fn download_pack<S: Store>(
     })
     .await
     .map_err(|error| format!("unpacking a pack stopped: {error}"))?
+}
+
+fn turn_lines(output: GuestTurnLine) -> Result<ChannelTurnLines, Failure> {
+    let Some(first_line_seq) = u64::try_from(output.line_seq.0).ok().and_then(NonZeroU64::new) else {
+        return Err(Failure::turn(
+            TurnFailureReason::HarnessExited,
+            format!(
+                "the guest sent line {} of turn {}, and line numbers start at 1.",
+                output.line_seq.0, *output.turn_id
+            ),
+        ));
+    };
+    Ok(ChannelTurnLines {
+        first_line_seq,
+        lines: vec![output.text],
+        turn_id: output.turn_id,
+        type_: ChannelTurnLinesType::TurnLines,
+    })
 }
 
 fn sha256_digest(digest: &str) -> Result<Sha256Digest, String> {
@@ -2208,6 +2213,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 cancels: Cancels::default(),
                 staging: Tally::default(),
                 reserves: pool.reserves(),
+                protocol: Arc::new(AtomicU16::new(ChannelProtocol::VERSION)),
             },
             pool,
             slots: HashMap::new(),
@@ -2266,6 +2272,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     #[must_use]
     pub fn answers(&self) -> Answers {
         self.runner.answers.clone()
+    }
+
+    #[must_use]
+    pub fn protocol(&self) -> Arc<AtomicU16> {
+        Arc::clone(&self.runner.protocol)
     }
 
     #[must_use]
@@ -2734,8 +2745,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             idle: duration(handed.idle_milliseconds),
         });
         match (handed.state, taken) {
-            (SupervisorHandoverBoxState::Unrecognised(_), _) => {}
-            (SupervisorHandoverBoxState::Warm(_), _) => {
+            (SupervisorHandoverBoxState::Warm(_) | SupervisorHandoverBoxState::Unrecognised(_), _) => {
                 slot.paused = true;
                 slot.idle_end = Some(Instant::now() + duration(handed.idle_milliseconds));
                 self.runner.standing.idle_until(&session, slot.idle_end);

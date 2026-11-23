@@ -575,8 +575,12 @@ fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
         "rolloutWindow": { "startsAt": "2026-11-17T09:00:00+01:00" }
     }"#;
 
-    let release = announced_release(body, "https://api.example/v1/releases/current", HostArchitecture::Amd64)
-        .expect("the manifest a newer control plane serves");
+    let release = announced_release(
+        body,
+        "https://api.example/v1/releases/current",
+        &HostArchitecture::Amd64,
+    )
+    .expect("the manifest a newer control plane serves");
 
     assert_eq!(release.version.as_str(), "v1.4.0");
     assert_eq!(
@@ -595,7 +599,7 @@ fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
     let release = announced_release(
         rollback.as_bytes(),
         "https://api.example/v1/releases/current",
-        HostArchitecture::Amd64,
+        &HostArchitecture::Amd64,
     )
     .expect("the manifest of a rollback");
     assert!(release.rollback);

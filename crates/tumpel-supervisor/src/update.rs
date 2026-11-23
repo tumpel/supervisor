@@ -185,7 +185,7 @@ impl Source for HttpSource {
             .bytes()
             .await
             .map_err(|error| format!("reading {url} failed: {}", error.without_url()))?;
-        announced_release(&body, &url, self.architecture.clone())
+        announced_release(&body, &url, &self.architecture)
     }
 
     async fn binary(&self) -> Result<Vec<u8>, String> {
@@ -218,14 +218,14 @@ struct AnnouncedSupervisor {
     supervisor_version: ReleaseSupervisorSupervisorVersion,
 }
 
-fn announced_release(body: &[u8], url: &str, architecture: HostArchitecture) -> Result<Release, String> {
+fn announced_release(body: &[u8], url: &str, architecture: &HostArchitecture) -> Result<Release, String> {
     let manifest: AnnouncedRelease = serde_json::from_slice(body).map_err(|error| {
         format!("{url} is no ReleaseManifest: {error}; check that the stage has published a release")
     })?;
     let supervisor = manifest
         .supervisors
         .into_iter()
-        .find(|supervisor| supervisor.architecture == architecture)
+        .find(|supervisor| supervisor.architecture == *architecture)
         .ok_or_else(|| {
             format!(
                 "release {} carries no {architecture} supervisor; publish one for this architecture",

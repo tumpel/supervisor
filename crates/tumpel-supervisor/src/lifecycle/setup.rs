@@ -114,20 +114,21 @@ pub(crate) fn then(detail: String, stopped: Result<(), String>) -> String {
 }
 
 fn failed_in_guest(reason: GuestClaudeSetupFailureReason, detail: String) -> Ended {
-    let reason =
-        match reason {
-            GuestClaudeSetupFailureReason::Unrecognised(reason) => return Ended::Failed(stop(
+    let reason = match reason {
+        GuestClaudeSetupFailureReason::Unrecognised(reason) => {
+            return Ended::Failed(stop(
                 ClaudeSetupFailureReason::ClaudeCodeExited,
                 format!(
                     "the guest failed the setup with reason {reason}, which this supervisor does not know: {detail}"
                 ),
-            )),
-            GuestClaudeSetupFailureReason::UrlNotPrinted => ClaudeSetupFailureReason::SetupUrlMissing,
-            GuestClaudeSetupFailureReason::CodeRejected => ClaudeSetupFailureReason::CodeRejected,
-            GuestClaudeSetupFailureReason::ClaudeCodeExited => ClaudeSetupFailureReason::ClaudeCodeExited,
-            GuestClaudeSetupFailureReason::TokenNotStored => ClaudeSetupFailureReason::TokenNotStored,
-            GuestClaudeSetupFailureReason::MintTimedOut => ClaudeSetupFailureReason::SetupTimedOut,
-        };
+            ))
+        }
+        GuestClaudeSetupFailureReason::UrlNotPrinted => ClaudeSetupFailureReason::SetupUrlMissing,
+        GuestClaudeSetupFailureReason::CodeRejected => ClaudeSetupFailureReason::CodeRejected,
+        GuestClaudeSetupFailureReason::ClaudeCodeExited => ClaudeSetupFailureReason::ClaudeCodeExited,
+        GuestClaudeSetupFailureReason::TokenNotStored => ClaudeSetupFailureReason::TokenNotStored,
+        GuestClaudeSetupFailureReason::MintTimedOut => ClaudeSetupFailureReason::SetupTimedOut,
+    };
     Ended::Failed(stop(reason, detail))
 }
 

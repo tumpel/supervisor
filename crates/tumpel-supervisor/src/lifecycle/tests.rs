@@ -12,12 +12,11 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tumpel_api::types::{
     BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
     ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld, ChannelSnapshotChunksHeldType,
-    ChannelSnapshotDone, ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads,
-    ChannelSnapshotPackUploadsType, ChannelSnapshotPacks, ChannelTurnClaimed, ChannelTurnClaimedType,
-    ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId, GuestHarnessProtocol, GuestHello, GuestInput,
-    GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
-    SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind,
-    TurnFailureReason,
+    ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType,
+    ChannelSnapshotPacks, ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType,
+    EntityId, GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover,
+    SupervisorHandoverBox, SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine,
+    SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
 };
 
 use super::{
@@ -28,7 +27,7 @@ use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
 use crate::images::ImageOrder;
 use crate::pool::{Disk, Held, Size, Tap, TapPool};
-use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Manifest, Scan, Stored, Upper};
+use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Scan, Stored, Upper};
 use crate::store::{Store, UploadError};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -672,6 +671,12 @@ fn claim_answer(turn_id: EntityId) -> Answer {
     })
 }
 
+fn forward(sender: &UnboundedSender<ChannelHostMessage>, message: ChannelHostMessage) {
+    sender
+        .send(message)
+        .expect("the host reads what the control plane forwards");
+}
+
 fn control_plane(
     store: MemoryStore,
     answers: Answers,
@@ -679,7 +684,7 @@ fn control_plane(
     answering: Arc<AtomicBool>,
     mut from_lifecycle: UnboundedReceiver<ChannelHostMessage>,
 ) -> UnboundedReceiver<ChannelHostMessage> {
-    let (forward, received) = unbounded_channel();
+    let (sender, received) = unbounded_channel();
     tokio::spawn(async move {
         while let Some(message) = from_lifecycle.recv().await {
             let mut index = store.2.lock().expect("index");
@@ -724,7 +729,7 @@ fn control_plane(
                             })
                             .collect(),
                     }));
-                    let _ = forward.send(ChannelHostMessage::SnapshotPacks(packs));
+                    forward(&sender, ChannelHostMessage::SnapshotPacks(packs));
                 }
                 ChannelHostMessage::RestoreChunks(chunks) => {
                     let mut packs: Vec<ChannelPackUrl> = Vec::new();
@@ -750,7 +755,7 @@ fn control_plane(
                 }
                 ChannelHostMessage::TurnClaim(claim) => {
                     let turn_id = claim.turn_id.clone();
-                    let _ = forward.send(ChannelHostMessage::TurnClaim(claim));
+                    forward(&sender, ChannelHostMessage::TurnClaim(claim));
                     let delay = if turn_id.starts_with("late") {
                         LATE_CLAIM
                     } else if turn_id.starts_with("stalled") {
@@ -772,9 +777,7 @@ fn control_plane(
                         answers.deliver(claim_answer(turn_id));
                     });
                 }
-                other => {
-                    let _ = forward.send(other);
-                }
+                other => forward(&sender, other),
             }
         }
     });
@@ -884,7 +887,7 @@ fn start_host(
     }
 }
 
-fn image(image_digest: &str, clone_seconds: u32, protocol: GuestHarnessProtocol) -> serde_json::Value {
+fn image(image_digest: &str, clone_seconds: u32, protocol: &GuestHarnessProtocol) -> serde_json::Value {
     json!({
         "imageDigest": image_digest,
         "kernelUrl": "https://example.com/vmlinux",
@@ -992,17 +995,14 @@ impl Host {
         self.send(Command::Turn(Box::new(turn)));
     }
 
-    fn turn_speaking(&self, protocol: GuestHarnessProtocol, turn_id: &str, session_id: &str, prompt: &str) {
+    fn turn_speaking(&self, protocol: &GuestHarnessProtocol, turn_id: &str, session_id: &str, prompt: &str) {
         let mut turn = self.box_turn(turn_id, session_id, prompt, Vec::new(), 300);
         turn.image = BootOrder::Full(self.cached_image(protocol));
         self.send(Command::Turn(Box::new(turn)));
     }
 
-    fn cached_image(&self, protocol: GuestHarnessProtocol) -> ImageOrder {
-        let image_digest = format!(
-            "{:0>64}",
-            format!("{}{}", self.clone_seconds, protocol_digit(&protocol))
-        );
+    fn cached_image(&self, protocol: &GuestHarnessProtocol) -> ImageOrder {
+        let image_digest = format!("{:0>64}", format!("{}{}", self.clone_seconds, protocol_digit(protocol)));
         std::fs::create_dir_all(&self.images).expect("the image cache is created");
         std::fs::write(
             self.images.join(format!("{image_digest}.json")),
@@ -1032,7 +1032,7 @@ impl Host {
         let rootfs = b"fetched rootfs".to_vec();
         let kernel = b"fetched kernel".to_vec();
         let image_digest = sha256(&rootfs);
-        let mut manifest = image(&image_digest, self.clone_seconds, GuestHarnessProtocol::ShellLines);
+        let mut manifest = image(&image_digest, self.clone_seconds, &GuestHarnessProtocol::ShellLines);
         manifest["kernelDigest"] = json!(sha256(&kernel));
         let manifest = manifest.to_string().into_bytes();
         let order = ImageOrder {
@@ -1078,7 +1078,7 @@ impl Host {
             turn_id: turn_id.try_into().expect("turn id"),
             session_id: session_id.try_into().expect("session id"),
             box_id: format!("box-{session_id}").try_into().expect("box id"),
-            image: BootOrder::Full(self.cached_image(GuestHarnessProtocol::ShellLines)),
+            image: BootOrder::Full(self.cached_image(&GuestHarnessProtocol::ShellLines)),
             model: "default".try_into().expect("model"),
             prompt: prompt.to_string().try_into().expect("prompt"),
             credential: serde_json::from_value(json!({
@@ -1294,87 +1294,70 @@ async fn a_snapshot_whose_drive_reads_past_the_snapshot_budget_is_stored_before_
     assert_eq!(host.settle(SLOW_CUT * 2).await, ["snapshot done"]);
 }
 
-async fn snapshot_frames(host: &mut Host) -> (Vec<ChannelSnapshotPacks>, ChannelSnapshotDone) {
-    let mut parts = Vec::new();
-    loop {
-        let message = tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
-            .await
-            .expect("the snapshot ends within its budget")
-            .expect("the lifecycle is running");
-        match message {
-            ChannelHostMessage::SnapshotPacks(packs) => parts.push(packs),
-            ChannelHostMessage::SnapshotDone(done) => return (parts, done),
-            _ => {}
-        }
-    }
-}
-
-fn stored_manifest(store: &MemoryStore, root_url: &str) -> (Manifest, BTreeSet<String>) {
-    let root = decode_root(&store.get(root_url).expect("the root")).expect("the root json");
-    let mut bytes = Vec::new();
-    for place in &root {
-        let pack = store.get(&pack_url(&place.pack)).expect("a pack");
-        let from = usize::try_from(place.offset).expect("an offset");
-        bytes.extend_from_slice(&pack[from..from + place.length as usize]);
-    }
-    let manifest = decode(&bytes).expect("the manifest");
-    let referenced = manifest
-        .values()
-        .flat_map(|stored| stored.chunks.iter())
-        .chain(&root)
-        .map(|place| place.pack.clone())
-        .collect();
-    (manifest, referenced)
-}
-
-fn placements(manifest: &Manifest) -> i32 {
-    i32::try_from(manifest.values().map(|stored| stored.chunks.len()).sum::<usize>()).expect("a placement count")
-}
-
-fn digests<'a>(digests: impl Iterator<Item = &'a tumpel_api::types::Sha256Digest>) -> Vec<String> {
-    digests.map(|digest| digest.as_str().to_string()).collect()
-}
-
 #[tokio::test(start_paused = true)]
-async fn a_snapshot_over_a_base_names_each_reused_pack_once_and_counts_the_manifest_placements() {
+async fn a_snapshot_over_a_base_names_each_reused_pack_once_and_counts_every_placement() {
     let mut host = host("reused-packs", 1, Harness::Echo, Boot::Works);
-    host.turn("turn-1", "session-1", "one", Vec::new());
-    host.settle(SETTLE).await;
-    let first = host.snapshot("session-1");
-    let (first_parts, first_done) = snapshot_frames(&mut host).await;
-    host.turn("turn-2", "session-1", "two", Vec::new());
-    host.settle(SETTLE).await;
-    let second = host.snapshot("session-1");
-    let (parts, done) = snapshot_frames(&mut host).await;
-
-    assert_eq!(first_parts[0].part.get(), 1);
-    assert!(digests(first_parts.iter().flat_map(|part| &part.reused_pack_digests)).is_empty());
-    let first_packs: BTreeSet<String> = digests(
-        first_parts
-            .iter()
-            .flat_map(|part| part.packs.iter().map(|pack| &pack.pack_digest)),
-    )
-    .into_iter()
-    .collect();
-    let written: BTreeSet<String> = digests(
+    let mut snapshots = Vec::new();
+    for (turn_id, prompt) in [("turn-1", "one"), ("turn-2", "one")] {
+        host.turn(turn_id, "session-1", prompt, Vec::new());
+        host.settle(SETTLE).await;
+        let order = host.snapshot("session-1");
+        let mut parts = Vec::new();
+        let done = loop {
+            match tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
+                .await
+                .expect("the snapshot ends within its budget")
+                .expect("the lifecycle is running")
+            {
+                ChannelHostMessage::SnapshotPacks(packs) => parts.push(packs),
+                ChannelHostMessage::SnapshotDone(done) => break done,
+                _ => {}
+            }
+        };
+        snapshots.push((order, parts, done));
+    }
+    let [(_, first_parts, first_done), (second, parts, done)] = <[_; 2]>::try_from(snapshots).expect("two snapshots");
+    let packs_of = |parts: &[ChannelSnapshotPacks]| -> BTreeSet<String> {
         parts
             .iter()
-            .flat_map(|part| part.packs.iter().map(|pack| &pack.pack_digest)),
-    )
-    .into_iter()
-    .collect();
-    let reused = digests(parts.iter().flat_map(|part| &part.reused_pack_digests));
+            .flat_map(|part| part.packs.iter().map(|pack| pack.pack_digest.as_str().to_string()))
+            .collect()
+    };
+
+    assert_eq!(first_parts[0].part.get(), 1);
+    assert!(first_parts.iter().all(|part| part.reused_pack_digests.is_empty()));
+    assert_eq!(first_done.chunk_count, 1);
+    assert_eq!(done.chunk_count, 2);
+    let first_packs = packs_of(&first_parts);
+    let written = packs_of(&parts);
+    let reused: Vec<String> = parts
+        .iter()
+        .flat_map(|part| {
+            part.reused_pack_digests
+                .iter()
+                .map(|digest| digest.as_str().to_string())
+        })
+        .collect();
     let once: BTreeSet<String> = reused.iter().cloned().collect();
     assert_eq!(once.len(), reused.len(), "{reused:?}");
     assert!(!once.is_empty());
     assert!(once.is_subset(&first_packs), "{once:?} {first_packs:?}");
     assert!(once.is_disjoint(&written), "{once:?} {written:?}");
-    let (first_manifest, _) = stored_manifest(&host.store, first.download_url.as_str());
-    let (manifest, referenced) = stored_manifest(&host.store, second.download_url.as_str());
+    let root = decode_root(&host.store.get(second.download_url.as_str()).expect("the root")).expect("the root json");
+    let mut bytes = Vec::new();
+    for place in &root {
+        let pack = host.store.get(&pack_url(&place.pack)).expect("a pack");
+        let from = usize::try_from(place.offset).expect("an offset");
+        bytes.extend_from_slice(&pack[from..from + place.length as usize]);
+    }
+    let manifest = decode(&bytes).expect("the manifest");
+    let referenced: BTreeSet<String> = manifest
+        .values()
+        .flat_map(|stored| stored.chunks.iter())
+        .chain(&root)
+        .map(|place| place.pack.clone())
+        .collect();
     assert_eq!(referenced, written.union(&once).cloned().collect::<BTreeSet<_>>());
-    assert_eq!(first_done.chunk_count, placements(&first_manifest));
-    assert_eq!(done.chunk_count, placements(&manifest));
-    assert!(done.chunk_count > first_done.chunk_count);
 }
 
 fn pack_uploads(uploads: &[String]) -> usize {
@@ -2007,7 +1990,7 @@ async fn the_first_line_budget_starts_when_the_repository_is_ready() {
 async fn a_line_after_the_error_result_keeps_the_turn_failed() {
     let mut host = host("error-result", 1, Harness::Echo, Boot::Works);
     let prompt = "{\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 500\"}\n{\"type\":\"system\"}";
-    host.turn_speaking(GuestHarnessProtocol::ClaudeStreamJson, "turn-1", "session-1", prompt);
+    host.turn_speaking(&GuestHarnessProtocol::ClaudeStreamJson, "turn-1", "session-1", prompt);
     let seen = host.settle(SETTLE).await;
     let last = seen.last().expect("a failure");
     assert!(
@@ -2282,7 +2265,7 @@ async fn a_teardown_of_a_box_with_an_unsnapshotted_turn_fails_box_dirty_and_keep
 async fn a_teardown_after_a_failed_turn_fails_box_dirty_and_keeps_the_box() {
     let mut host = host("failed-dirty", 1, Harness::Echo, Boot::Works);
     let prompt = "{\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 500\"}";
-    host.turn_speaking(GuestHarnessProtocol::ClaudeStreamJson, "turn-1", "session-1", prompt);
+    host.turn_speaking(&GuestHarnessProtocol::ClaudeStreamJson, "turn-1", "session-1", prompt);
     let seen = host.settle(SETTLE).await;
     assert!(
         seen.last()

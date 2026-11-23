@@ -55,7 +55,7 @@ enum Command {
 
 const RESTART_INTO_UPDATE: u8 = 75;
 
-fn exit_code(failure: SupervisorFailure) -> ExitCode {
+fn exit_code(failure: &SupervisorFailure) -> ExitCode {
     match failure {
         SupervisorFailure::NotEnrolled => ExitCode::from(3),
         SupervisorFailure::ChannelStateLost => ExitCode::from(4),
@@ -137,11 +137,11 @@ fn main() -> ExitCode {
                     failure.kind,
                     failure.detail
                 );
-                    exit_code(SupervisorFailure::UpdateNotOnline)
+                    exit_code(&SupervisorFailure::UpdateNotOnline)
                 }
                 Err(failure) => {
                     eprintln!("tumpel-supervisor: {}: {}", failure.kind, failure.detail);
-                    exit_code(failure.kind)
+                    exit_code(&failure.kind)
                 }
             }
         }

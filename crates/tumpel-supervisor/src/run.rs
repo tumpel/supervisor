@@ -7,6 +7,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{signal, SignalKind};
@@ -182,6 +183,7 @@ struct Usage {
     holdings: watch::Receiver<Held>,
     data_dir: PathBuf,
     telemetry: Telemetry,
+    protocol: Arc<AtomicU16>,
 }
 
 impl Usage {
@@ -248,7 +250,7 @@ fn beat(
 }
 
 enum BoxCommand {
-    Turn(Box<ChannelTurnOffer>),
+    Turn(Box<(ChannelTurnOffer, BootOrder)>),
     Snapshot(ChannelSnapshotRequest),
     Teardown(ChannelBoxTeardown),
     Discard(ChannelBoxDiscard),
@@ -277,14 +279,18 @@ fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Result<SetupCommand, String
     })))
 }
 
-fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Result<Command, String> {
+fn turn(offer: ChannelTurnOffer) -> Result<BoxCommand, String> {
     let image = BootOrder::from_offer(
-        offer.image,
+        offer.image.clone(),
         offer.harness.to_string(),
         offer.harness_version.to_string(),
     )
     .map_err(|error| format!("turn {}: {error}", *offer.turn_id))?;
-    Ok(Command::Turn(Box::new(BoxTurn {
+    Ok(BoxCommand::Turn(Box::new((offer, image))))
+}
+
+fn command(files_dir: &Path, offer: ChannelTurnOffer, image: BootOrder) -> Command {
+    Command::Turn(Box::new(BoxTurn {
         turn_id: offer.turn_id,
         session_id: offer.session_id,
         box_id: offer.box_id,
@@ -305,7 +311,7 @@ fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Result<Command, String>
         turn_seconds: offer.turn_seconds,
         idle_seconds: offer.idle_seconds,
         box_retention: offer.box_retention,
-    })))
+    }))
 }
 
 async fn boxes(
@@ -318,13 +324,10 @@ async fn boxes(
 ) {
     while let Some(command) = commands.recv().await {
         let next = match command {
-            BoxCommand::Turn(offer) => match self::command(&files_dir, *offer) {
-                Ok(command) => command,
-                Err(error) => {
-                    eprintln!("tumpel-supervisor: ignored a turn offer: {error}");
-                    continue;
-                }
-            },
+            BoxCommand::Turn(turn) => {
+                let (offer, image) = *turn;
+                self::command(&files_dir, offer, image)
+            }
             BoxCommand::Snapshot(request) => Command::Snapshot(request.into()),
             BoxCommand::Teardown(teardown) => Command::Teardown(TeardownOrder {
                 session_id: teardown.session_id,
@@ -409,6 +412,7 @@ fn start_boxes(
         holdings: lifecycle.holdings(),
         data_dir: PathBuf::from(&*runtime.data_dir),
         telemetry,
+        protocol: lifecycle.protocol(),
     };
     let answers = lifecycle.answers();
     let cancels = lifecycle.cancels();
@@ -987,7 +991,7 @@ fn box_command(message: ChannelControlMessage) -> Result<BoxCommand, String> {
                 "the control plane sent {message}, which this supervisor does not know"
             ))
         }
-        ChannelControlMessage::TurnOffer(offer) => BoxCommand::Turn(Box::new(offer)),
+        ChannelControlMessage::TurnOffer(offer) => turn(offer)?,
         ChannelControlMessage::SnapshotRequest(request) => BoxCommand::Snapshot(request),
         ChannelControlMessage::BoxTeardown(teardown) => BoxCommand::Teardown(teardown),
         ChannelControlMessage::BoxDiscard(discard) => BoxCommand::Discard(discard),
@@ -1078,16 +1082,15 @@ async fn session(
                             Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
                             Ok(Event::Welcomed) => {
                                 eprintln!("connected to {url}");
+                                usage.protocol.store(channel.version(), Ordering::Relaxed);
                                 last_beat = Instant::now();
                                 updates.welcomed().await.err().map(Err)
                             }
                             Ok(Event::Message(message)) => match box_command(*message) {
                                 Ok(command) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
-                                Err(error) => {
-                                    eprintln!("tumpel-supervisor: ignored a control frame: {error}");
-                                    None
-                                }
+                                Err(error) => Some(Err(fail(SupervisorFailure::ProtocolError, error))),
                             },
+                            Ok(Event::Unrecognised(detail)) => Some(Err(fail(SupervisorFailure::ProtocolError, detail))),
                             Ok(Event::FrameRefused { seq, reason }) => {
                                 eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
                                 None

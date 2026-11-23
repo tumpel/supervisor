@@ -90,11 +90,6 @@ pub struct Base {
 
 impl Base {
     #[must_use]
-    pub fn placements(&self) -> usize {
-        self.manifest.values().map(|stored| stored.chunks.len()).sum()
-    }
-
-    #[must_use]
     pub fn places(&self) -> Places {
         self.manifest
             .values()
@@ -309,6 +304,7 @@ pub struct Staged {
     pub base: Base,
     pub packs: Vec<PackFile>,
     pub reused: Vec<String>,
+    pub chunk_count: i32,
     pub root: PathBuf,
 }
 
@@ -364,6 +360,9 @@ pub fn stage(
     pack(&missing, cache, dir, &mut packs)?;
     placed(&mut places, &packs);
     let manifest = seal(cut.draft, &places)?;
+    let placements: usize = manifest.values().map(|stored| stored.chunks.len()).sum();
+    let chunk_count = i32::try_from(placements)
+        .map_err(|_| format!("the snapshot places {placements} chunks, more than an int32 counts"))?;
     let manifest_digests = cut_bytes(&encode(&manifest)?, cache)?;
     let file_packs = packs.len();
     pack(&fresh(manifest_digests.iter(), &places), cache, dir, &mut packs)?;
@@ -382,6 +381,7 @@ pub fn stage(
         .map_err(|error| format!("writing {}: {error}", root_file.display()))?;
     Ok(Staged {
         reused: reused(&manifest, &root, &packs),
+        chunk_count,
         base: Base {
             manifest,
             root,
