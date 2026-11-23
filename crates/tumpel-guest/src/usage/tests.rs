@@ -3,7 +3,7 @@ use tumpel_api::types::GuestHarnessProtocol;
 use super::{metrics, Cost, Spend, Tokens, Usage};
 
 fn read(protocol: GuestHarnessProtocol, transcript: &str) -> Option<Usage> {
-    let mut spend = Spend::new(protocol);
+    let mut spend = Spend::new(&protocol);
     for line in transcript.lines() {
         spend.read(line);
     }

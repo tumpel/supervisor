@@ -185,7 +185,7 @@ impl Source for HttpSource {
             .bytes()
             .await
             .map_err(|error| format!("reading {url} failed: {}", error.without_url()))?;
-        announced_release(&body, &url, self.architecture)
+        announced_release(&body, &url, self.architecture.clone())
     }
 
     async fn binary(&self) -> Result<Vec<u8>, String> {
@@ -473,7 +473,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
 
     async fn apply(&self, release: &Release) -> Outcome {
         if let Err(stopped) = self.prepare(release).await {
-            let reason = stopped.reason;
+            let reason = stopped.reason.clone();
             self.fail(&release.sha256, stopped);
             return Outcome::Failed(reason);
         }
@@ -487,7 +487,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         match self.swap(&release.sha256).await {
             Ok(()) => Outcome::Restart,
             Err(stopped) => {
-                let reason = stopped.reason;
+                let reason = stopped.reason.clone();
                 self.fail(&release.sha256, stopped);
                 Outcome::Failed(reason)
             }
@@ -532,7 +532,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         let candidate = remove(&self.layout.candidate);
         let refusal = SupervisorUpdateRefusal {
             to_sha256: to.clone(),
-            reason: stopped.reason,
+            reason: stopped.reason.clone(),
             refused_at: Utc::now().fixed_offset(),
         };
         let written = dir::write_json(&self.layout.refusal(), &refusal).map_err(|error| format!("{error:#}"));

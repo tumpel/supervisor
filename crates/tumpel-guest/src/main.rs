@@ -142,6 +142,11 @@ fn connection(mut stream: File, guest: &Mutex<GuestState>) -> Result<(), String>
                     setup::run(&start, &config, &confinement, &mut stream, &mut decoder)?;
                 }
                 GuestInput::ClaudeSetupCode(_) | GuestInput::TurnCancel(_) => {}
+                GuestInput::Unrecognised(input) => {
+                    return Err(format!(
+                        "the host sent {input}, which this guest does not speak; update the guest image"
+                    ))
+                }
             }
         }
         let read = stream

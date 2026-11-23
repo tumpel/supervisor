@@ -90,6 +90,11 @@ pub struct Base {
 
 impl Base {
     #[must_use]
+    pub fn placements(&self) -> usize {
+        self.manifest.values().map(|stored| stored.chunks.len()).sum()
+    }
+
+    #[must_use]
     pub fn places(&self) -> Places {
         self.manifest
             .values()
@@ -303,7 +308,35 @@ pub fn assemble(places: &[Place], cache: &ChunkCache) -> Result<Vec<u8>, String>
 pub struct Staged {
     pub base: Base,
     pub packs: Vec<PackFile>,
+    pub reused: Vec<String>,
     pub root: PathBuf,
+}
+
+fn reused(manifest: &Manifest, root: &[Place], packs: &[PackFile]) -> Vec<String> {
+    let written: BTreeSet<&str> = packs.iter().map(|pack| pack.digest.as_str()).collect();
+    manifest
+        .values()
+        .flat_map(|stored| stored.chunks.iter())
+        .chain(root)
+        .map(|place| place.pack.as_str())
+        .filter(|pack| !written.contains(pack))
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn pack_parts<'a, P, R>(placed: &'a [P], reused: &'a [R], per_part: usize) -> Vec<(&'a [P], &'a [R])> {
+    let count = placed
+        .len()
+        .div_ceil(per_part)
+        .max(reused.len().div_ceil(per_part))
+        .max(1);
+    let mut placed = placed.chunks(per_part);
+    let mut reused = reused.chunks(per_part);
+    (0..count)
+        .map(|_| (placed.next().unwrap_or_default(), reused.next().unwrap_or_default()))
+        .collect()
 }
 
 fn placed(places: &mut Places, packs: &[PackFile]) {
@@ -348,6 +381,7 @@ pub fn stage(
     std::fs::write(&root_file, encode_root(&root)?)
         .map_err(|error| format!("writing {}: {error}", root_file.display()))?;
     Ok(Staged {
+        reused: reused(&manifest, &root, &packs),
         base: Base {
             manifest,
             root,
@@ -634,6 +668,11 @@ struct Common<'a> {
 
 fn decode_entry(entry: &SnapshotEntry) -> Result<(Vec<u8>, Stored), String> {
     let (common, kind, chunks) = match entry {
+        SnapshotEntry::Unrecognised(entry) => {
+            return Err(format!(
+                "the snapshot manifest holds an entry this supervisor does not know: {entry}"
+            ))
+        }
         SnapshotEntry::FileEntry(file) => (
             Common {
                 path: &file.path,

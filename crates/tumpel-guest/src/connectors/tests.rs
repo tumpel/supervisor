@@ -19,7 +19,7 @@ fn connector(id: &str, name: &str) -> ChannelDispatchConnector {
 #[test]
 fn each_harness_sees_the_connectors_as_loopback_mcp_servers_and_no_secret() {
     let connectors = [connector("B2", "Linear"), connector("A1", "GitMCP Docs")];
-    let claude = arguments(GuestHarnessProtocol::ClaudeStreamJson, &connectors);
+    let claude = arguments(&GuestHarnessProtocol::ClaudeStreamJson, &connectors);
     assert_eq!(claude[0], "--mcp-config");
     let config: Value = serde_json::from_str(&claude[1]).expect("the MCP config is JSON");
     assert_eq!(
@@ -30,7 +30,7 @@ fn each_harness_sees_the_connectors_as_loopback_mcp_servers_and_no_secret() {
         }})
     );
     assert_eq!(
-        arguments(GuestHarnessProtocol::CodexExecJson, &connectors),
+        arguments(&GuestHarnessProtocol::CodexExecJson, &connectors),
         [
             "-c",
             r#"mcp_servers.gitmcp-docs.url="http://127.0.0.1:47160/connectors/A1""#,
@@ -38,7 +38,7 @@ fn each_harness_sees_the_connectors_as_loopback_mcp_servers_and_no_secret() {
             r#"mcp_servers.linear.url="http://127.0.0.1:47160/connectors/B2""#,
         ]
     );
-    let opencode = variables(GuestHarnessProtocol::PromptOnStdin, &connectors);
+    let opencode = variables(&GuestHarnessProtocol::PromptOnStdin, &connectors);
     assert_eq!(opencode.len(), 1);
     assert_eq!(opencode[0].0, OPENCODE_CONFIG);
     let config: Value = serde_json::from_str(&opencode[0].1).expect("the OpenCode config is JSON");
@@ -52,7 +52,7 @@ fn each_harness_sees_the_connectors_as_loopback_mcp_servers_and_no_secret() {
         "{every}"
     );
     assert_eq!(
-        variables(GuestHarnessProtocol::ClaudeStreamJson, &connectors),
+        variables(&GuestHarnessProtocol::ClaudeStreamJson, &connectors),
         Vec::<(String, String)>::new()
     );
 }
@@ -85,7 +85,7 @@ fn pi_sees_the_connectors_beside_the_persona_mcp_servers_in_its_runtime_mcp_json
     let broken = pi_config(Some("{ mcpServers: "), &connectors).expect_err("a persona config that is not JSON");
     assert!(broken.contains(".pi/agent/mcp.json"), "{broken}");
     assert_eq!(
-        arguments(GuestHarnessProtocol::PiRpc, &connectors),
+        arguments(&GuestHarnessProtocol::PiRpc, &connectors),
         Vec::<String>::new()
     );
 }
@@ -146,7 +146,7 @@ fn a_persona_mcp_server_that_takes_a_connector_name_refuses_the_turn() {
     .expect("the persona config is written");
     let persona = [".codex/config.toml"];
     let refused = refuse_reserved(
-        GuestHarnessProtocol::CodexExecJson,
+        &GuestHarnessProtocol::CodexExecJson,
         &home,
         &persona,
         &[connector("A1", "Linear")],
@@ -158,7 +158,7 @@ fn a_persona_mcp_server_that_takes_a_connector_name_refuses_the_turn() {
     );
     assert_eq!(
         refuse_reserved(
-            GuestHarnessProtocol::CodexExecJson,
+            &GuestHarnessProtocol::CodexExecJson,
             &home,
             &persona,
             &[connector("B2", "Linear Docs")]
@@ -167,7 +167,7 @@ fn a_persona_mcp_server_that_takes_a_connector_name_refuses_the_turn() {
     );
     assert_eq!(
         refuse_reserved(
-            GuestHarnessProtocol::CodexExecJson,
+            &GuestHarnessProtocol::CodexExecJson,
             &home,
             &[],
             &[connector("A1", "Linear")]
@@ -182,7 +182,7 @@ fn a_persona_mcp_server_that_takes_a_connector_name_refuses_the_turn() {
     )
     .expect("the persona Pi config is written");
     let pi = refuse_reserved(
-        GuestHarnessProtocol::PiRpc,
+        &GuestHarnessProtocol::PiRpc,
         &home,
         &[".pi/agent/mcp.json"],
         &[connector("A1", "Linear")],
@@ -191,7 +191,7 @@ fn a_persona_mcp_server_that_takes_a_connector_name_refuses_the_turn() {
     assert!(pi.contains(".pi/agent/mcp.json"), "{pi}");
     assert_eq!(
         refuse_reserved(
-            GuestHarnessProtocol::ClaudeStreamJson,
+            &GuestHarnessProtocol::ClaudeStreamJson,
             &home,
             &persona,
             &[connector("A1", "Linear")]

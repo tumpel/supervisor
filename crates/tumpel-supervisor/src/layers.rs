@@ -165,13 +165,13 @@ fn read_manifest(order: &LayerOrder, staged: &Staged) -> Result<HarnessLayerMani
     let harness = layer.harness.to_string();
     let names = (
         manifest.layer_digest.as_str(),
-        manifest.architecture,
+        manifest.architecture.clone(),
         manifest.harness.harness.as_str(),
         manifest.harness.harness_version.as_str(),
     );
     let wanted = (
         layer.layer_digest.as_str(),
-        layer.architecture,
+        layer.architecture.clone(),
         harness.as_str(),
         layer.harness_version.as_str(),
     );

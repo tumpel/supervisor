@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::io::{Cursor, Read};
 use std::num::NonZeroU32;
@@ -12,11 +12,12 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tumpel_api::types::{
     BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
     ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld, ChannelSnapshotChunksHeldType,
-    ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType,
-    ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId,
-    GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox,
-    SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverTeardown,
-    SupervisorHandoverTeardownKind, TurnFailureReason,
+    ChannelSnapshotDone, ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads,
+    ChannelSnapshotPackUploadsType, ChannelSnapshotPacks, ChannelTurnClaimed, ChannelTurnClaimedType,
+    ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId, GuestHarnessProtocol, GuestHello, GuestInput,
+    GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
+    SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind,
+    TurnFailureReason,
 };
 
 use super::{
@@ -27,7 +28,7 @@ use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
 use crate::images::ImageOrder;
 use crate::pool::{Disk, Held, Size, Tap, TapPool};
-use crate::snapshot::{Born, Entry, Found, Kind, Scan, Stored, Upper};
+use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Manifest, Scan, Stored, Upper};
 use crate::store::{Store, UploadError};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -569,10 +570,18 @@ fn describe(message: ChannelHostMessage) -> Option<String> {
         | ChannelHostMessage::RestoreChunks(_)
         | ChannelHostMessage::SupervisorUpdateStep(_)
         | ChannelHostMessage::SupervisorUpdateFailed(_)
-        | ChannelHostMessage::TelemetryBatch(_)
-        | ChannelHostMessage::TurnLines(_) => return None,
+        | ChannelHostMessage::Unrecognised(_) => return None,
         ChannelHostMessage::TurnImageFetching(fetching) => format!("fetching {}", *fetching.image_digest),
-        ChannelHostMessage::TurnLine(line) => format!("line {} {}", line.line_seq.0, line.text),
+        ChannelHostMessage::TurnLines(lines) => format!(
+            "line {} {}",
+            lines.first_line_seq,
+            lines
+                .lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         ChannelHostMessage::TurnComplete(done) => format!("complete {}", done.last_line_seq.0),
         ChannelHostMessage::TurnRepositoryCloneFailed(failed) => {
             format!("clone failed {}: {}", failed.cause, failed.detail)
@@ -701,7 +710,7 @@ fn control_plane(
                     }
                     answers.deliver(Answer::PackUploads(ChannelSnapshotPackUploads {
                         part: packs.part,
-                        snapshot_id: packs.snapshot_id,
+                        snapshot_id: packs.snapshot_id.clone(),
                         type_: ChannelSnapshotPackUploadsType::SnapshotPackUploads,
                         upload_expires_at: in_seconds(60),
                         uploads: packs
@@ -715,6 +724,7 @@ fn control_plane(
                             })
                             .collect(),
                     }));
+                    let _ = forward.send(ChannelHostMessage::SnapshotPacks(packs));
                 }
                 ChannelHostMessage::RestoreChunks(chunks) => {
                     let mut packs: Vec<ChannelPackUrl> = Vec::new();
@@ -989,7 +999,10 @@ impl Host {
     }
 
     fn cached_image(&self, protocol: GuestHarnessProtocol) -> ImageOrder {
-        let image_digest = format!("{:0>64}", format!("{}{}", self.clone_seconds, protocol as u8));
+        let image_digest = format!(
+            "{:0>64}",
+            format!("{}{}", self.clone_seconds, protocol_digit(&protocol))
+        );
         std::fs::create_dir_all(&self.images).expect("the image cache is created");
         std::fs::write(
             self.images.join(format!("{image_digest}.json")),
@@ -1279,6 +1292,89 @@ async fn a_snapshot_whose_drive_reads_past_the_snapshot_budget_is_stored_before_
     host.settle(SETTLE).await;
     host.snapshot("session-1");
     assert_eq!(host.settle(SLOW_CUT * 2).await, ["snapshot done"]);
+}
+
+async fn snapshot_frames(host: &mut Host) -> (Vec<ChannelSnapshotPacks>, ChannelSnapshotDone) {
+    let mut parts = Vec::new();
+    loop {
+        let message = tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
+            .await
+            .expect("the snapshot ends within its budget")
+            .expect("the lifecycle is running");
+        match message {
+            ChannelHostMessage::SnapshotPacks(packs) => parts.push(packs),
+            ChannelHostMessage::SnapshotDone(done) => return (parts, done),
+            _ => {}
+        }
+    }
+}
+
+fn stored_manifest(store: &MemoryStore, root_url: &str) -> (Manifest, BTreeSet<String>) {
+    let root = decode_root(&store.get(root_url).expect("the root")).expect("the root json");
+    let mut bytes = Vec::new();
+    for place in &root {
+        let pack = store.get(&pack_url(&place.pack)).expect("a pack");
+        let from = usize::try_from(place.offset).expect("an offset");
+        bytes.extend_from_slice(&pack[from..from + place.length as usize]);
+    }
+    let manifest = decode(&bytes).expect("the manifest");
+    let referenced = manifest
+        .values()
+        .flat_map(|stored| stored.chunks.iter())
+        .chain(&root)
+        .map(|place| place.pack.clone())
+        .collect();
+    (manifest, referenced)
+}
+
+fn placements(manifest: &Manifest) -> i32 {
+    i32::try_from(manifest.values().map(|stored| stored.chunks.len()).sum::<usize>()).expect("a placement count")
+}
+
+fn digests<'a>(digests: impl Iterator<Item = &'a tumpel_api::types::Sha256Digest>) -> Vec<String> {
+    digests.map(|digest| digest.as_str().to_string()).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_over_a_base_names_each_reused_pack_once_and_counts_the_manifest_placements() {
+    let mut host = host("reused-packs", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    let first = host.snapshot("session-1");
+    let (first_parts, first_done) = snapshot_frames(&mut host).await;
+    host.turn("turn-2", "session-1", "two", Vec::new());
+    host.settle(SETTLE).await;
+    let second = host.snapshot("session-1");
+    let (parts, done) = snapshot_frames(&mut host).await;
+
+    assert_eq!(first_parts[0].part.get(), 1);
+    assert!(digests(first_parts.iter().flat_map(|part| &part.reused_pack_digests)).is_empty());
+    let first_packs: BTreeSet<String> = digests(
+        first_parts
+            .iter()
+            .flat_map(|part| part.packs.iter().map(|pack| &pack.pack_digest)),
+    )
+    .into_iter()
+    .collect();
+    let written: BTreeSet<String> = digests(
+        parts
+            .iter()
+            .flat_map(|part| part.packs.iter().map(|pack| &pack.pack_digest)),
+    )
+    .into_iter()
+    .collect();
+    let reused = digests(parts.iter().flat_map(|part| &part.reused_pack_digests));
+    let once: BTreeSet<String> = reused.iter().cloned().collect();
+    assert_eq!(once.len(), reused.len(), "{reused:?}");
+    assert!(!once.is_empty());
+    assert!(once.is_subset(&first_packs), "{once:?} {first_packs:?}");
+    assert!(once.is_disjoint(&written), "{once:?} {written:?}");
+    let (first_manifest, _) = stored_manifest(&host.store, first.download_url.as_str());
+    let (manifest, referenced) = stored_manifest(&host.store, second.download_url.as_str());
+    assert_eq!(referenced, written.union(&once).cloned().collect::<BTreeSet<_>>());
+    assert_eq!(first_done.chunk_count, placements(&first_manifest));
+    assert_eq!(done.chunk_count, placements(&manifest));
+    assert!(done.chunk_count > first_done.chunk_count);
 }
 
 fn pack_uploads(uploads: &[String]) -> usize {
@@ -2508,4 +2604,17 @@ async fn a_box_disk_that_cannot_be_deleted_stops_the_box_runner_with_disk_not_fr
             .is_err_and(|error| error.starts_with("DiskNotFreed: the box of session session-1 ended, then removing")),
         "{stopped:?}"
     );
+}
+
+fn protocol_digit(protocol: &GuestHarnessProtocol) -> usize {
+    [
+        GuestHarnessProtocol::ClaudeStreamJson,
+        GuestHarnessProtocol::PiRpc,
+        GuestHarnessProtocol::PromptOnStdin,
+        GuestHarnessProtocol::CodexExecJson,
+        GuestHarnessProtocol::ShellLines,
+    ]
+    .iter()
+    .position(|known| known == protocol)
+    .expect("a known harness protocol")
 }

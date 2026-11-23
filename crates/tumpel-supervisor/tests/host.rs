@@ -80,7 +80,16 @@ async fn until_complete(received: &mut UnboundedReceiver<ChannelHostMessage>) ->
         seen.push(match message {
             ChannelHostMessage::TurnClaim(claim) => format!("claim {}", *claim.turn_id),
             ChannelHostMessage::TurnRepositoryReady(ready) => format!("ready {}", *ready.turn_id),
-            ChannelHostMessage::TurnLine(line) => format!("line {} {}", line.line_seq.0, line.text),
+            ChannelHostMessage::TurnLines(lines) => format!(
+                "line {} {}",
+                lines.first_line_seq,
+                lines
+                    .lines
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
             ChannelHostMessage::TurnComplete(done) => format!("complete {}", done.last_line_seq.0),
             other => panic!("unexpected {other:?}"),
         });

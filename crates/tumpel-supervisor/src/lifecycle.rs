@@ -22,7 +22,7 @@ use tumpel_api::types::{
     ChannelSnapshotFailed, ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPacks,
     ChannelSnapshotPacksType, ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete,
     ChannelTurnCompleteType, ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType,
-    ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLine, ChannelTurnLineType,
+    ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLines, ChannelTurnLinesType,
     ChannelTurnRepositoryCloneFailed, ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady,
     ChannelTurnRepositoryReadyType, CredentialText, DisplayName, EmailAddress, EntityId, GuestHello, GuestInput,
     GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnStart,
@@ -42,8 +42,8 @@ use crate::images;
 use crate::layers::LayerCache;
 use crate::pool::{mib, restore_charge_mib, Charge, Disk, Held, Size, Tally, Tap, TapPool};
 use crate::snapshot::{
-    assemble, cut, decode, decode_root, draft_digests, fetches, fresh, lacking, restore_parts, stage, unpack,
-    write_restore, Base, Births, ChunkCache, Cut, Fetch, Kind, Manifest, PackFile, Place, Places, Span,
+    assemble, cut, decode, decode_root, draft_digests, fetches, fresh, lacking, pack_parts, restore_parts, stage,
+    unpack, write_restore, Base, Births, ChunkCache, Cut, Fetch, Kind, Manifest, PackFile, Place, Places, Span,
 };
 use crate::store::{Store, UploadError};
 use crate::telemetry::{self, Phase};
@@ -286,12 +286,21 @@ impl Command {
             .collect()
     }
 
-    fn from_record(record: SupervisorHandoverCommand, session_id: &EntityId, box_id: &EntityId) -> Self {
+    fn from_record(
+        record: SupervisorHandoverCommand,
+        session_id: &EntityId,
+        box_id: &EntityId,
+    ) -> Result<Self, String> {
         let order = || TeardownOrder {
             session_id: session_id.clone(),
             box_id: box_id.clone(),
         };
-        match record {
+        Ok(match record {
+            SupervisorHandoverCommand::Unrecognised(record) => {
+                return Err(format!(
+                    "the handover queues a command this supervisor does not know: {record}"
+                ))
+            }
             SupervisorHandoverCommand::Snapshot(snapshot) => Self::Snapshot(SnapshotOrder {
                 snapshot_id: snapshot.snapshot_id,
                 session_id: session_id.clone(),
@@ -302,7 +311,7 @@ impl Command {
             }),
             SupervisorHandoverCommand::Teardown(_) => Self::Teardown(order()),
             SupervisorHandoverCommand::Discard(_) => Self::Discard(order()),
-        }
+        })
     }
 
     fn session(&self) -> String {
@@ -342,7 +351,7 @@ impl<M: Machine> LiveBox<M> {
             _hold: hold,
             dirty: false,
             credential_file: None,
-            box_retention: turn.box_retention,
+            box_retention: turn.box_retention.clone(),
             idle: Duration::from_secs(u64::from(turn.idle_seconds.get())),
         }
     }
@@ -352,7 +361,7 @@ impl<M: Machine> LiveBox<M> {
     fn record(&self, turn_id: Option<&EntityId>) -> Result<SupervisorHandoverBox, String> {
         Ok(SupervisorHandoverBox {
             box_id: self.box_id.clone(),
-            box_retention: self.box_retention,
+            box_retention: self.box_retention.clone(),
             credential_file: credential_record(self.credential_file.clone())?,
             dirty: self.dirty || turn_id.is_some(),
             idle_milliseconds: milliseconds(self.idle),
@@ -392,6 +401,11 @@ fn standing_record(handed: &SupervisorHandoverBox) -> Result<SupervisorHandoverB
     let turn_id = match &handed.state {
         SupervisorHandoverBoxState::Turn(turn) => Some(turn.turn_id.clone()),
         SupervisorHandoverBoxState::Warm(_) => None,
+        SupervisorHandoverBoxState::Unrecognised(state) => {
+            return Err(format!(
+                "the handover names a box state this supervisor does not know: {state}"
+            ))
+        }
     };
     Ok(SupervisorHandoverBox {
         dirty: handed.dirty || turn_id.is_some(),
@@ -636,7 +650,7 @@ impl<M: Machine> Default for Slot<M> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Report {
     Turn(TurnFailureReason),
     Clone(RepositoryCloneFailureCause),
@@ -968,7 +982,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     async fn warm_turn(&self, mut live: LiveBox<V::Machine>, turn: &BoxTurn) -> Outcome<V::Machine> {
-        live.box_retention = turn.box_retention;
+        live.box_retention = turn.box_retention.clone();
         live.idle = Duration::from_secs(u64::from(turn.idle_seconds.get()));
         let claiming = self.claim(turn);
         let Some(files) = self.files(turn).await else {
@@ -1176,12 +1190,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         &self,
         snapshot_id: &EntityId,
         packs: &[PackFile],
+        reused: &[String],
         deadline: Instant,
     ) -> Result<BTreeMap<String, String>, String> {
         let sizes: BTreeMap<&str, u64> = packs.iter().map(|pack| (pack.digest.as_str(), pack.size)).collect();
         let placed: Vec<&Place> = packs.iter().flat_map(|pack| pack.chunks.iter()).collect();
         let mut urls = BTreeMap::new();
-        for (index, part) in placed.chunks(DIGESTS_PER_PART).enumerate() {
+        for (index, (part, reused)) in pack_parts(&placed, reused, DIGESTS_PER_PART).into_iter().enumerate() {
             let key = Key {
                 ask: Ask::SnapshotPacks,
                 id: snapshot_id.clone(),
@@ -1205,6 +1220,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     })
                     .collect::<Result<_, String>>()?,
                 part: key.part,
+                reused_pack_digests: reused
+                    .iter()
+                    .map(|digest| sha256_digest(digest))
+                    .collect::<Result<_, _>>()?,
                 snapshot_id: snapshot_id.clone(),
                 type_: ChannelSnapshotPacksType::SnapshotPacks,
             };
@@ -1708,7 +1727,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         phases: (Option<tracing::Span>, Option<tracing::Span>),
     ) -> Followed {
         let clone = Duration::from_secs(u64::from(live.image.harness().clone_seconds.get()));
-        let protocol = live.image.harness().protocol;
+        let protocol = live.image.harness().protocol.clone();
         let ((mut cloning, mut first_output), mut parking) = (phases, self.parking.clone());
         let (mut cancelling, mut disk_check) = (false, disk_checks());
         loop {
@@ -1768,21 +1787,30 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     if let Some(phase) = first_output.take() {
                         telemetry::reached(&phase);
                     }
-                    state.error = state.error.or_else(|| error_result(protocol, &output.text));
+                    state.error = state.error.or_else(|| error_result(&protocol, &output.text));
+                    let Some(first_line_seq) = u64::try_from(output.line_seq.0).ok().and_then(NonZeroU64::new) else {
+                        return Followed::Ended(Err(Failure::turn(
+                            TurnFailureReason::HarnessExited,
+                            format!(
+                                "the guest sent line {} of turn {}, and line numbers start at 1.",
+                                output.line_seq.0, **turn_id
+                            ),
+                        )));
+                    };
                     emit(
                         &self.out,
-                        ChannelTurnLine {
-                            line_seq: output.line_seq,
-                            text: output.text,
+                        ChannelTurnLines {
+                            first_line_seq,
+                            lines: vec![output.text],
                             turn_id: output.turn_id,
-                            type_: ChannelTurnLineType::TurnLine,
+                            type_: ChannelTurnLinesType::TurnLines,
                         },
                     );
                 }
                 Ok(GuestMessage::TurnEnd(end)) if end.turn_id == *turn_id => {
                     live.credential_file = end.credential_file.as_deref().cloned();
                     telemetry::guest_metrics(&end.metrics);
-                    let error = state.error.or_else(|| exit_result(protocol, &end));
+                    let error = state.error.or_else(|| exit_result(&protocol, &end));
                     return Followed::Ended(
                         turn_end(end, error).map_err(|(reason, detail)| Failure::turn(reason, detail)),
                     );
@@ -1806,9 +1834,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     async fn snapshot(&self, mut live: LiveBox<V::Machine>, order: &SnapshotOrder) -> Outcome<V::Machine> {
         let drive = live.machine.drive();
         let message: ChannelHostMessage = match self.store_snapshot(drive, &live.base, order).await {
-            Ok((uploaded_bytes, base)) => {
+            Ok((uploaded_bytes, chunk_count, base)) => {
                 live.base = Arc::new(base);
                 let done = ChannelSnapshotDone {
+                    chunk_count,
                     snapshot_id: order.snapshot_id.clone(),
                     type_: ChannelSnapshotDoneType::SnapshotDone,
                     uploaded_bytes,
@@ -1835,7 +1864,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         drive: PathBuf,
         base: &Arc<Base>,
         order: &SnapshotOrder,
-    ) -> Result<(i64, Base), (ChannelSnapshotFailureReason, String)> {
+    ) -> Result<(i64, i32, Base), (ChannelSnapshotFailureReason, String)> {
         let unreadable = |detail: String| (ChannelSnapshotFailureReason::UpperDirectoryUnreadable, detail);
         let dir = self
             .vmm
@@ -1897,7 +1926,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         base: &Arc<Base>,
         order: &SnapshotOrder,
         dir: &Path,
-    ) -> Result<(i64, Base), (ChannelSnapshotFailureReason, String)> {
+    ) -> Result<(i64, i32, Base), (ChannelSnapshotFailureReason, String)> {
         let unreadable = |detail: String| (ChannelSnapshotFailureReason::UpperDirectoryUnreadable, detail);
         let expired = |detail: String| {
             (
@@ -1938,7 +1967,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Err(_) => return Err(expired("its chunks were still being packed".to_string())),
         };
         let urls = self
-            .pack_uploads(&order.snapshot_id, &staged.packs, deadline)
+            .pack_uploads(&order.snapshot_id, &staged.packs, &staged.reused, deadline)
             .await
             .map_err(expired)?;
         let uploads: Vec<(&String, &PackFile)> = staged
@@ -1976,7 +2005,14 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 *order.snapshot_id
             ))
         })?;
-        Ok((uploaded, staged.base))
+        let placements = staged.base.placements();
+        let chunk_count = i32::try_from(placements).map_err(|_| {
+            unreadable(format!(
+                "snapshot {} places {placements} chunks, more than an int32 counts",
+                *order.snapshot_id
+            ))
+        })?;
+        Ok((uploaded, chunk_count, staged.base))
     }
 }
 
@@ -2444,7 +2480,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 turn_failed(
                     &self.runner.out,
                     &turn_id,
-                    abandoned.reason,
+                    abandoned.reason.clone(),
                     format!(
                         "{}, so the box of turn {} ended with it; send the turn again",
                         abandoned.cause, *turn_id
@@ -2650,10 +2686,18 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
 
     fn adopt(&mut self, handed: SupervisorHandoverBox, taken: Taken) -> Option<SupervisorHandoverBox> {
         let session = handed.session_id.to_string();
-        let attached = self
-            .attach(&handed)
-            .and_then(|attached| standing_record(&handed).map(|record| (attached, record)));
-        let ((machine, guest, tap), record) = match attached {
+        let read = standing_record(&handed).and_then(|record| {
+            let image = Boot::from_record(handed.image.clone())?;
+            let queue = handed
+                .queued
+                .iter()
+                .cloned()
+                .map(|record| Command::from_record(record, &handed.session_id, &handed.box_id))
+                .collect::<Result<VecDeque<_>, _>>()?;
+            Ok((record, image, queue))
+        });
+        let attached = read.and_then(|read| self.attach(&handed).map(|attached| (attached, read)));
+        let ((machine, guest, tap), (record, image, queue)) = match attached {
             Ok(attached) => attached,
             Err(error) => {
                 let detail = format!(
@@ -2672,13 +2716,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 return None;
             }
         };
-        let image = Boot::from_record(handed.image);
         let hold = self.runner.holds.hold_boot(&image);
-        let queue = handed
-            .queued
-            .into_iter()
-            .map(|record| Command::from_record(record, &handed.session_id, &handed.box_id))
-            .collect();
         let slot = self.slots.entry(session.clone()).or_default();
         slot.queue = queue;
         slot.live = Some(LiveBox {
@@ -2696,6 +2734,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             idle: duration(handed.idle_milliseconds),
         });
         match (handed.state, taken) {
+            (SupervisorHandoverBoxState::Unrecognised(_), _) => {}
             (SupervisorHandoverBoxState::Warm(_), _) => {
                 slot.paused = true;
                 slot.idle_end = Some(Instant::now() + duration(handed.idle_milliseconds));

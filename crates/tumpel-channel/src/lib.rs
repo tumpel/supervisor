@@ -6,13 +6,13 @@ use chrono::{DateTime, FixedOffset, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tumpel_api::frozen::v36;
+use tumpel_api::frozen::{v37, v38};
 use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType, ChannelHostMessage,
-    ChannelProtocol, ChannelSnapshotDone, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLine,
-    ChannelTurnLineType, ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth,
-    HostUsage, MetricBatch, Sequence, SupervisorChannelState,
+    ChannelProtocol, ChannelSnapshotDone, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLines,
+    ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch, Sequence,
+    SupervisorChannelState,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
@@ -20,7 +20,7 @@ pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 const ASSUMED_FRAMES_PER_MINUTE: u32 = 600;
-const STORED_ACKS: u16 = 37;
+const PACK_REUSE: u16 = 39;
 pub const TURN_LINES_MAX_LINES: usize = 200;
 pub const TURN_LINES_MAX_BYTES: usize = 256_000;
 pub const TURN_LINES_WAIT: Duration = Duration::from_secs(2);
@@ -37,7 +37,6 @@ pub struct HeldIds {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Usage {
     pub host: HostUsage,
-    pub boxes_warm: u32,
 }
 
 /// # Errors
@@ -50,53 +49,33 @@ pub fn resend_from(state: &SupervisorChannelState) -> Result<NonZeroU64, Channel
         .ok_or_else(|| ChannelError::Store(format!("channel.json resends from seq {next}, below 1")))
 }
 
-fn turn_lines_of(message: &Value) -> Result<Option<Vec<ChannelTurnLine>>, ChannelError> {
-    match message.get("type").and_then(Value::as_str) {
-        Some("TurnLine") => {
-            let line: ChannelTurnLine = serde_json::from_value(message.clone()).map_err(|error| {
-                ChannelError::Store(format!("channel.json holds a TurnLine that does not parse: {error}"))
-            })?;
-            Ok(Some(vec![line]))
-        }
-        Some("TurnLines") => {
-            let lines: ChannelTurnLines = serde_json::from_value(message.clone()).map_err(|error| {
-                ChannelError::Store(format!("channel.json holds a TurnLines that does not parse: {error}"))
-            })?;
-            let first = i64::try_from(lines.first_line_seq.get()).map_err(|error| {
-                ChannelError::Store(format!("channel.json holds a TurnLines past the last lineSeq: {error}"))
-            })?;
-            Ok(Some(
-                (first..)
-                    .zip(lines.lines)
-                    .map(|(line_seq, text)| ChannelTurnLine {
-                        line_seq: Sequence(line_seq),
-                        text,
-                        turn_id: lines.turn_id.clone(),
-                        type_: ChannelTurnLineType::TurnLine,
-                    })
-                    .collect(),
-            ))
-        }
-        _ => Ok(None),
+fn legacy_line(message: &Value) -> Result<Option<Value>, ChannelError> {
+    if message.get("type").and_then(Value::as_str) != Some("TurnLine") {
+        return Ok(None);
     }
-}
-
-fn batch_of(line: ChannelTurnLine) -> Result<Value, ChannelError> {
+    let line: v37::types::ChannelTurnLine = serde_json::from_value(message.clone())
+        .map_err(|error| ChannelError::Store(format!("channel.json holds a TurnLine that does not parse: {error}")))?;
     let first_line_seq = u64::try_from(line.line_seq.0)
         .ok()
         .and_then(NonZeroU64::new)
         .ok_or_else(|| {
-            protocol(format!(
-                "line {} of turn {} has no positive lineSeq",
+            ChannelError::Store(format!(
+                "channel.json holds line {} of turn {} with no positive lineSeq",
                 line.line_seq.0, *line.turn_id
             ))
         })?;
+    let text = serde_json::to_value(&line.text)
+        .and_then(serde_json::from_value)
+        .map_err(|error| ChannelError::Store(format!("channel.json holds a TurnLine that does not parse: {error}")))?;
+    let turn_id = EntityId::try_from(line.turn_id.as_str())
+        .map_err(|error| ChannelError::Store(format!("channel.json holds a TurnLine that does not parse: {error}")))?;
     to_value(&ChannelHostMessage::TurnLines(ChannelTurnLines {
         first_line_seq,
-        lines: vec![line.text],
-        turn_id: line.turn_id,
+        lines: vec![text],
+        turn_id,
         type_: ChannelTurnLinesType::TurnLines,
     }))
+    .map(Some)
 }
 
 fn batch_bytes(lines: &[Value]) -> usize {
@@ -110,43 +89,30 @@ fn batch_full(batch: &Value) -> bool {
         .is_some_and(|lines| lines.len() >= TURN_LINES_MAX_LINES || batch_bytes(lines) >= TURN_LINES_MAX_BYTES)
 }
 
-fn append_line(batch: &mut Value, line: &ChannelTurnLine) -> bool {
-    if !is_turn_lines(batch) || batch.get("turnId").and_then(Value::as_str) != Some(line.turn_id.as_str()) {
+fn append_lines(batch: &mut Value, added: &ChannelTurnLines) -> bool {
+    if !is_turn_lines(batch) || batch.get("turnId").and_then(Value::as_str) != Some(added.turn_id.as_str()) {
         return false;
     }
-    let Some(first) = batch.get("firstLineSeq").and_then(Value::as_i64) else {
+    let Some(first) = batch.get("firstLineSeq").and_then(Value::as_u64) else {
         return false;
     };
     let Some(lines) = batch.get_mut("lines").and_then(Value::as_array_mut) else {
         return false;
     };
-    let next = i64::try_from(lines.len()).map_or(i64::MAX, |count| first.saturating_add(count));
-    if next != line.line_seq.0
-        || lines.len() >= TURN_LINES_MAX_LINES
-        || batch_bytes(lines) + line.text.len() > TURN_LINES_MAX_BYTES
+    let next = u64::try_from(lines.len()).map_or(u64::MAX, |count| first.saturating_add(count));
+    let bytes: usize = added.lines.iter().map(|line| line.len()).sum();
+    if next != added.first_line_seq.get()
+        || lines.len() + added.lines.len() > TURN_LINES_MAX_LINES
+        || batch_bytes(lines) + bytes > TURN_LINES_MAX_BYTES
     {
         return false;
     }
-    lines.push(Value::String(line.text.to_string()));
+    lines.extend(added.lines.iter().map(|line| Value::String(line.to_string())));
     true
 }
 
 fn is_turn_lines(message: &Value) -> bool {
     message.get("type").and_then(Value::as_str) == Some("TurnLines")
-}
-
-fn expanded(messages: &[Value]) -> Result<Vec<Value>, ChannelError> {
-    let mut shaped = Vec::with_capacity(messages.len());
-    for message in messages {
-        let Some(lines) = turn_lines_of(message)? else {
-            shaped.push(message.clone());
-            continue;
-        };
-        for line in lines {
-            shaped.push(to_value(&ChannelHostMessage::TurnLine(line))?);
-        }
-    }
-    Ok(shaped)
 }
 
 fn to_value(message: &ChannelHostMessage) -> Result<Value, ChannelError> {
@@ -344,27 +310,25 @@ fn snapshot_done(message: &Value) -> Option<EntityId> {
         .map(|done| done.snapshot_id)
 }
 
-fn frozen<F: DeserializeOwned + Serialize>(value: Value, what: &str) -> Result<String, ChannelError> {
+fn frozen<F: DeserializeOwned + Serialize>(value: Value, what: &str) -> Result<Value, ChannelError> {
     let frozen: F = serde_json::from_value(value).map_err(|error| protocol(format!("encoding a {what}: {error}")))?;
-    serde_json::to_string(&frozen).map_err(|error| protocol(format!("encoding a {what}: {error}")))
+    serde_json::to_value(&frozen).map_err(|error| protocol(format!("encoding a {what}: {error}")))
 }
 
-fn encode_report<V36: DeserializeOwned + Serialize>(
-    report: &impl Serialize,
-    boxes_warm: u32,
-    version: u16,
-    kind: &str,
-) -> Result<String, ChannelError> {
-    let mut value = serde_json::to_value(report).map_err(|error| protocol(format!("encoding a {kind}: {error}")))?;
-    if version >= STORED_ACKS {
-        return serde_json::to_string(&value).map_err(|error| protocol(format!("encoding a {kind}: {error}")));
+fn encode(report: &impl Serialize, kind: &str) -> Result<String, ChannelError> {
+    serde_json::to_string(report).map_err(|error| protocol(format!("encoding a {kind}: {error}")))
+}
+
+fn encode_message(message: &Value, version: u16) -> Result<Value, ChannelError> {
+    if version >= PACK_REUSE {
+        return Ok(message.clone());
     }
-    value
-        .get_mut("usage")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| protocol(format!("a {kind} carries no usage")))?
-        .insert("boxesWarm".to_string(), Value::from(boxes_warm));
-    frozen::<V36>(value, &format!("protocol {version} {kind}"))
+    let what = format!("protocol {version} frame");
+    match message.get("type").and_then(Value::as_str) {
+        Some("SnapshotPacks") => frozen::<v38::types::ChannelSnapshotPacks>(message.clone(), &what),
+        Some("SnapshotDone") => frozen::<v38::types::ChannelSnapshotDone>(message.clone(), &what),
+        _ => Ok(message.clone()),
+    }
 }
 
 fn protocol(reason: impl Into<String>) -> ChannelError {
@@ -396,11 +360,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             sealed,
             batch_started: None,
         }
-    }
-
-    #[must_use]
-    pub fn sends_telemetry_frames(&self) -> bool {
-        self.version < STORED_ACKS
     }
 
     #[must_use]
@@ -447,7 +406,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     /// Fails when the state cannot be saved or the port refuses the frame.
     pub fn send(&mut self, message: ChannelHostMessage, port: &mut impl Port) -> Result<(), ChannelError> {
         match message {
-            ChannelHostMessage::TurnLine(line) if self.version >= STORED_ACKS => self.store_line(line)?,
+            ChannelHostMessage::TurnLines(lines) => self.store_lines(lines)?,
             message => self.push(to_value(&message)?),
         }
         self.store.save(&self.state)?;
@@ -473,7 +432,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         self.state.unacked.iter().filter(move |frame| frame.seq.0 > sealed)
     }
 
-    fn store_line(&mut self, line: ChannelTurnLine) -> Result<(), ChannelError> {
+    fn store_lines(&mut self, lines: ChannelTurnLines) -> Result<(), ChannelError> {
         let sealed = self.sealed;
         let tail_empty = self.unsent().next().is_none();
         let appended = self
@@ -482,12 +441,12 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             .iter_mut()
             .rev()
             .take_while(|frame| frame.seq.0 > sealed && is_turn_lines(&frame.message))
-            .find(|frame| frame.message.get("turnId").and_then(Value::as_str) == Some(line.turn_id.as_str()))
-            .is_some_and(|frame| append_line(&mut frame.message, &line));
+            .find(|frame| frame.message.get("turnId").and_then(Value::as_str) == Some(lines.turn_id.as_str()))
+            .is_some_and(|frame| append_lines(&mut frame.message, &lines));
         if appended {
             return Ok(());
         }
-        self.push(batch_of(line)?);
+        self.push(to_value(&ChannelHostMessage::TurnLines(lines))?);
         if tail_empty {
             self.batch_started = Some(Instant::now());
         }
@@ -513,6 +472,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     fn wire(&self, frame: &ChannelStoredHostFrame) -> Result<String, ChannelError> {
         let sent = ChannelStoredHostFrame {
             ack: Sequence(self.state.received.0),
+            message: encode_message(&frame.message, self.version)?,
             ..frame.clone()
         };
         serde_json::to_string(&sent).map_err(|error| protocol(format!("encoding a stored frame: {error}")))
@@ -598,15 +558,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         telemetry: impl FnOnce() -> MetricBatch,
         port: &mut impl Port,
     ) -> Result<(), ChannelError> {
-        let telemetry = if self.version >= STORED_ACKS {
-            telemetry()
-        } else {
-            MetricBatch {
-                instruments: Vec::new(),
-                samples: Vec::new(),
-                turns: Vec::new(),
-            }
-        };
+        let telemetry: MetricBatch = telemetry();
         let heartbeat = ChannelHostHeartbeat {
             ack: Sequence(self.state.received.0),
             health: Some(health),
@@ -618,12 +570,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             type_: ChannelHostHeartbeatType::Heartbeat,
             usage: usage.host,
         };
-        port.send(encode_report::<v36::types::ChannelHostHeartbeat>(
-            &heartbeat,
-            usage.boxes_warm,
-            self.version,
-            "Heartbeat",
-        )?)
+        port.send(encode(&heartbeat, "Heartbeat")?)
     }
 
     /// # Errors
@@ -664,12 +611,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             type_: ChannelHelloType::Hello,
             usage: usage.host,
         };
-        port.send(encode_report::<v36::types::ChannelHello>(
-            &hello,
-            usage.boxes_warm,
-            self.hello_version,
-            "Hello",
-        )?)?;
+        port.send(encode(&hello, "Hello")?)?;
         self.phase = Phase::AwaitingWelcome;
         Ok(())
     }
@@ -726,51 +668,19 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                     self.hello_version
                 ))
             })?;
-        let ack = welcome.ack.filter(|_| self.version < STORED_ACKS).map(|ack| ack.0);
-        if let Some(ack) = ack {
-            self.drop_acked(ack)?;
-        }
-        self.reshape(ack)?;
+        self.reshape()?;
         self.store.save(&self.state)?;
         self.withheld = self.state.unacked.first().map(|first| first.seq.0);
         self.phase = Phase::Open;
         Ok(Event::Welcomed)
     }
 
-    fn reshape(&mut self, welcome_ack: Option<i64>) -> Result<(), ChannelError> {
-        if self.version >= STORED_ACKS {
-            for frame in &mut self.state.unacked {
-                if let Some([line]) = turn_lines_of(&frame.message)?.as_deref() {
-                    if !is_turn_lines(&frame.message) {
-                        frame.message = batch_of(line.clone())?;
-                    }
-                }
+    fn reshape(&mut self) -> Result<(), ChannelError> {
+        for frame in &mut self.state.unacked {
+            if let Some(batch) = legacy_line(&frame.message)? {
+                frame.message = batch;
             }
-            return Ok(());
         }
-        let messages: Vec<Value> = self.state.unacked.iter().map(|frame| frame.message.clone()).collect();
-        let shaped = expanded(&messages)?;
-        let first = welcome_ack.map_or_else(
-            || {
-                self.state
-                    .unacked
-                    .first()
-                    .map_or(self.state.sent.0 + 1, |first| first.seq.0)
-            },
-            |ack| ack + 1,
-        );
-        let received = Sequence(self.state.received.0);
-        self.state.unacked = (first..)
-            .zip(shaped)
-            .map(|(seq, message)| ChannelStoredHostFrame {
-                ack: received.clone(),
-                message,
-                seq: Sequence(seq),
-                type_: ChannelStoredHostFrameType::Frame,
-            })
-            .collect();
-        self.state.sent = Sequence(self.state.unacked.last().map_or(first - 1, |last| last.seq.0));
-        self.sealed = self.state.sent.0;
         Ok(())
     }
 
@@ -851,6 +761,7 @@ fn kind(envelope: &ChannelControlEnvelope) -> &'static str {
         ChannelControlEnvelope::FrameRateLimited(_) => "FrameRateLimited",
         ChannelControlEnvelope::Ack(_) => "Ack",
         ChannelControlEnvelope::ControlFrame(_) => "Frame",
+        ChannelControlEnvelope::Unrecognised(_) => "an unrecognised message",
     }
 }
 
