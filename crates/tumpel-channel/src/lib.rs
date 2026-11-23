@@ -138,12 +138,14 @@ impl RateLimit {
     ) -> RateBackoff {
         self.last_limited = Some(now);
         self.frames_per_minute = frames_per_minute;
-        if self.paused(now) {
+        let current = self.paused_until.filter(|_| self.paused(now));
+        if current.is_some_and(|until| until >= retry_after) {
             return RateBackoff::Paused;
         }
         let wait = (retry_after - now).to_std().unwrap_or_default().max(FIRST_BACKOFF);
         let jittered = wait + (wait / 2).mul_f64(f64::from(jitter) / f64::from(u16::MAX));
         let until = now + chrono::Duration::from_std(jittered).unwrap_or(chrono::Duration::MAX);
+        let until = current.map_or(until, |current| current.max(until));
         self.paused_until = Some(until);
         RateBackoff::Until(until)
     }

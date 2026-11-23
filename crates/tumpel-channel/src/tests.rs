@@ -639,6 +639,16 @@ fn every_rate_limit_pauses_until_its_retry_after_and_never_gives_up() {
 }
 
 #[test]
+fn a_refusal_during_a_pause_with_a_later_retry_after_extends_the_pause_to_it() {
+    let mut limit = RateLimit::default();
+    assert_eq!(limit.limited(at(0), at(20), 600, 0), RateBackoff::Until(at(20)));
+    assert_eq!(limit.limited(at(5), at(50), 600, 0), RateBackoff::Until(at(50)));
+    assert_eq!(limit.limited(at(10), at(30), 600, 0), RateBackoff::Paused);
+    assert!(limit.paused(at(49)));
+    assert!(!limit.paused(at(50)));
+}
+
+#[test]
 fn jitter_only_lengthens_a_rate_limit_backoff_by_up_to_half() {
     let mut limit = RateLimit::default();
     let RateBackoff::Until(until) = limit.limited(at(0), at(20), 600, u16::MAX) else {

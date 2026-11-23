@@ -65,7 +65,7 @@ const assets = async (version, out) => {
   const manifest = {
     supervisorVersion: version,
     tumpelApiVersion: api,
-    channelProtocolOldest: ChannelProtocol.Version,
+    channelProtocolOldest: ChannelProtocol.Oldest,
     channelProtocolVersion: ChannelProtocol.Version,
     guestProtocolOldest: GuestProtocol.Oldest,
     guestProtocolVersion: GuestProtocol.Version,
