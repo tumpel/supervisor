@@ -159,6 +159,7 @@ pub(crate) enum BoxEnd {
     NotRecorded,
     RecoverFailed,
     PauseFailed,
+    SnapshotNotRecorded,
     SetupBootFailed,
     SetupNotHanded,
     SetupEnded,
@@ -596,8 +597,12 @@ struct Slot<M: Machine> {
     queue: VecDeque<Command>,
     idle: Option<AbortHandle>,
     idle_end: Option<Instant>,
-    snapshot_id: Option<EntityId>,
-    snapshot_accepted: bool,
+    snapshot: Option<Awaited>,
+}
+
+enum Awaited {
+    Pending(EntityId),
+    Accepted,
 }
 
 impl<M: Machine> Slot<M> {
@@ -626,8 +631,7 @@ impl<M: Machine> Default for Slot<M> {
             queue: VecDeque::new(),
             idle: None,
             idle_end: None,
-            snapshot_id: None,
-            snapshot_accepted: false,
+            snapshot: None,
         }
     }
 }
@@ -2282,7 +2286,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     Some(Input::Command(command)) => self.command(command).await?,
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
                     Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
-                    Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id),
+                    Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id).await?,
                     None => break,
                 },
                 Some(setup) = setups.recv() => self.setup_command(setup),
@@ -2883,8 +2887,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 armed.abort();
             }
             slot.idle_end = None;
-            slot.snapshot_id = None;
-            slot.snapshot_accepted = false;
+            slot.snapshot = None;
             let live = slot.live.take()?;
             slot.paused = false;
             slot.busy = true;
@@ -2971,8 +2974,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let live = self.slots.get_mut(&session).and_then(|slot| {
             let live = slot.live.take()?;
             slot.busy = true;
-            slot.snapshot_id = Some(order.snapshot_id.clone());
-            slot.snapshot_accepted = false;
+            slot.snapshot = Some(Awaited::Pending(order.snapshot_id.clone()));
             Some(live)
         });
         let Some(live) = live else {
@@ -3027,6 +3029,13 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     async fn start_teardown(&mut self, session: String, order: TeardownOrder) -> Result<(), String> {
+        if let Some(slot) = self.slots.get_mut(&session).filter(|slot| {
+            matches!(slot.snapshot, Some(Awaited::Pending(_)))
+                && slot.live.as_ref().is_some_and(|live| live.box_id == order.box_id)
+        }) {
+            slot.snapshot = Some(Awaited::Accepted);
+            self.clean(&session).await?;
+        }
         let Some(dirty) = self
             .live_box(&session)
             .filter(|live| live.box_id == order.box_id)
@@ -3220,16 +3229,16 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             stopped?;
             self.free_disk(&session)?;
         }
-        self.clean(&session);
+        self.clean(&session).await?;
         self.drain(session).await
     }
 
-    fn snapshot_accepted(&mut self, snapshot_id: &EntityId) {
+    async fn snapshot_accepted(&mut self, snapshot_id: &EntityId) -> Result<(), String> {
         let waiting = self.slots.iter_mut().find_map(|(session, slot)| {
-            if slot.snapshot_id.as_ref() != Some(snapshot_id) {
+            if !matches!(&slot.snapshot, Some(Awaited::Pending(pending)) if pending == snapshot_id) {
                 return None;
             }
-            slot.snapshot_accepted = true;
+            slot.snapshot = Some(Awaited::Accepted);
             Some(session.clone())
         });
         let Some(session) = waiting else {
@@ -3237,34 +3246,36 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 "tumpel-supervisor: the control plane accepted SnapshotDone {}, but no box here waits on that snapshot; a later turn ran or the box is gone, so nothing is marked clean",
                 **snapshot_id
             );
-            return;
+            return Ok(());
         };
-        self.clean(&session);
+        self.clean(&session).await?;
+        self.arm_idle(&session);
+        Ok(())
     }
 
-    fn clean(&mut self, session: &str) {
+    async fn clean(&mut self, session: &str) -> Result<(), String> {
         let Some(slot) = self
             .slots
             .get_mut(session)
-            .filter(|slot| slot.snapshot_accepted && !slot.busy)
+            .filter(|slot| matches!(slot.snapshot, Some(Awaited::Accepted)) && !slot.busy)
         else {
-            return;
+            return Ok(());
         };
         let Some(live) = slot.live.as_mut() else {
-            return;
+            return Ok(());
         };
-        slot.snapshot_id = None;
-        slot.snapshot_accepted = false;
+        slot.snapshot = None;
         live.dirty = false;
-        if let Err(error) = self.runner.standing.put(live, None) {
-            live.dirty = true;
-            eprintln!(
-                "tumpel-supervisor: session {session} box {} stays dirty: recording its accepted snapshot for a supervisor restart failed: {error}",
-                *live.box_id
-            );
-            return;
-        }
-        self.arm_idle(session);
+        let Err(error) = self.runner.standing.put(live, None) else {
+            return Ok(());
+        };
+        let box_id = live.box_id.clone();
+        self.teardown(session, BoxEnd::SnapshotNotRecorded).await?;
+        eprintln!(
+            "tumpel-supervisor: recording session {session} box {} as clean for a supervisor restart failed and the box was stopped: {error}",
+            *box_id
+        );
+        Ok(())
     }
 
     async fn drain(&mut self, session: String) -> Result<(), String> {

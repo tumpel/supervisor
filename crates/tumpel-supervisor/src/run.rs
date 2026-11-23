@@ -1021,8 +1021,8 @@ fn accepted(channel: &mut Channel, commands: &UnboundedSender<BoxCommand>) -> Re
     for snapshot_id in channel.take_accepted() {
         commands.send(BoxCommand::SnapshotAccepted(snapshot_id)).map_err(|_| {
             fail(
-                SupervisorFailure::ProtocolError,
-                "the box task stopped; restart the supervisor",
+                SupervisorFailure::ChannelStateLost,
+                "the box runner stopped before it took an accepted snapshot; systemd restarts the supervisor, which takes the running boxes over",
             )
         })?;
     }
@@ -1077,39 +1077,39 @@ async fn session(
                 None => Some(Ok(dropped(channel.progressed(), "the connection ended"))),
                 Some(Err(error)) => Some(Ok(dropped(channel.progressed(), error.to_string()))),
                 Some(Ok(Message::Close(frame))) => Some(closed_by_peer(frame.as_ref(), channel.progressed())),
-                Some(Ok(Message::Text(text))) => 'text: {
+                Some(Ok(Message::Text(text))) => {
                     last_received = Instant::now();
                     let received = channel.receive(text.as_str());
-                    if let Err(failure) = accepted(channel, commands) {
-                        break 'text Some(Err(failure));
-                    }
-                    match received {
-                        Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
-                        Ok(Event::Welcomed) => {
-                            eprintln!("connected to {url}");
-                            last_beat = Instant::now();
-                            updates.welcomed().await.err().map(Err)
-                        }
-                        Ok(Event::Message(message)) => commands.send(box_command(*message)).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
-                        Ok(Event::FrameRefused { seq, reason }) => {
-                            eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
-                            None
-                        }
-                        Ok(Event::FrameRateLimited { seq: _, reason, frames_per_minute, retry_after }) => {
-                            rate_limited(limit, url, &reason, frames_per_minute, retry_after);
-                            None
-                        }
-                        Ok(Event::ReleasePublished) => {
-                            updates.announced();
-                            None
-                        }
-                        Ok(Event::None | Event::Heartbeat) => None,
-                        Err(ChannelError::Protocol(reason)) => {
-                            let close = CloseFrame { code: CloseCode::from(ChannelCloseCode::PROTOCOL_ERROR), reason: reason.chars().take(120).collect::<String>().into() };
-                            let _ = sink.send(Message::Close(Some(close))).await;
-                            Some(Ok(dropped(channel.progressed(), reason)))
-                        }
-                        Err(error) => Some(Err(fail(SupervisorFailure::ChannelStateLost, error.to_string()))),
+                    match accepted(channel, commands) {
+                        Err(failure) => Some(Err(failure)),
+                        Ok(()) => match received {
+                            Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
+                            Ok(Event::Welcomed) => {
+                                eprintln!("connected to {url}");
+                                last_beat = Instant::now();
+                                updates.welcomed().await.err().map(Err)
+                            }
+                            Ok(Event::Message(message)) => commands.send(box_command(*message)).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
+                            Ok(Event::FrameRefused { seq, reason }) => {
+                                eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
+                                None
+                            }
+                            Ok(Event::FrameRateLimited { seq: _, reason, frames_per_minute, retry_after }) => {
+                                rate_limited(limit, url, &reason, frames_per_minute, retry_after);
+                                None
+                            }
+                            Ok(Event::ReleasePublished) => {
+                                updates.announced();
+                                None
+                            }
+                            Ok(Event::None | Event::Heartbeat) => None,
+                            Err(ChannelError::Protocol(reason)) => {
+                                let close = CloseFrame { code: CloseCode::from(ChannelCloseCode::PROTOCOL_ERROR), reason: reason.chars().take(120).collect::<String>().into() };
+                                let _ = sink.send(Message::Close(Some(close))).await;
+                                Some(Ok(dropped(channel.progressed(), reason)))
+                            }
+                            Err(error) => Some(Err(fail(SupervisorFailure::ChannelStateLost, error.to_string()))),
+                        },
                     }
                 }
                 Some(Ok(_)) => None,

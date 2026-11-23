@@ -4,15 +4,15 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset, Utc};
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tumpel_api::frozen::v36;
 use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType, ChannelHostMessage,
-    ChannelProtocol, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLine, ChannelTurnLineType,
-    ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch,
-    Sequence, SupervisorChannelState,
+    ChannelProtocol, ChannelSnapshotDone, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLine,
+    ChannelTurnLineType, ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth,
+    HostUsage, MetricBatch, Sequence, SupervisorChannelState,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
@@ -339,10 +339,9 @@ pub struct HostChannel<S: Store, K: Signer> {
 }
 
 fn snapshot_done(message: &Value) -> Option<EntityId> {
-    match serde_json::from_value::<ChannelHostMessage>(message.clone()) {
-        Ok(ChannelHostMessage::SnapshotDone(done)) => Some(done.snapshot_id),
-        _ => None,
-    }
+    ChannelSnapshotDone::deserialize(message)
+        .ok()
+        .map(|done| done.snapshot_id)
 }
 
 fn frozen<F: DeserializeOwned + Serialize>(value: Value, what: &str) -> Result<String, ChannelError> {
@@ -794,26 +793,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     fn refused(&mut self, refused: ChannelFrameRefused) -> Result<Event, ChannelError> {
         self.progressed = true;
-        let seq = refused.seq.0;
-        let message = self
-            .state
-            .unacked
-            .iter()
-            .find(|own| own.seq.0 == seq)
-            .map(|own| own.message.clone());
-        if message.is_none() {
-            eprintln!("tumpel-supervisor: FrameRefused: frame {seq} was no longer held when the control plane refused it, so its message is unknown");
-        }
-        if let Some(snapshot_id) = message.as_ref().and_then(snapshot_done) {
-            eprintln!(
-                "tumpel-supervisor: FrameRefused: SnapshotDone {} retires unaccepted, so its box stays dirty",
-                *snapshot_id
-            );
-        }
-        self.state.unacked.retain(|own| own.seq.0 != seq);
+        self.state.unacked.retain(|own| own.seq.0 != refused.seq.0);
         self.store.save(&self.state)?;
         Ok(Event::FrameRefused {
-            seq,
+            seq: refused.seq.0,
             reason: String::from(refused.reason),
         })
     }
