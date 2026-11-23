@@ -174,10 +174,8 @@ pub(crate) async fn end_box<M: Machine>(
 ) -> Result<(), String> {
     let Stopped { exit, cleared } = machine.stop().await;
     eprintln!(
-        "tumpel-supervisor: box {index} ({}) of session {}, box id {}, ended on {end:?}: Firecracker {exit}",
-        crate::firecracker::scope_of(index),
-        **session_id,
-        **box_id
+        "tumpel-supervisor: box {index} of session {}, box id {}, ended on {end:?}: Firecracker {exit}",
+        **session_id, **box_id
     );
     cleared
 }

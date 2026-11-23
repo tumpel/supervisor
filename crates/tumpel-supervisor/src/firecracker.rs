@@ -303,7 +303,7 @@ fn session_dir(data: &Path, session_id: &EntityId) -> Result<PathBuf, String> {
     Ok(data.join("sessions").join(&**session_id))
 }
 
-pub(crate) fn scope_of(index: u8) -> String {
+fn scope_of(index: u8) -> String {
     format!("tumpel-box{index}.scope")
 }
 
@@ -354,16 +354,12 @@ impl Adopted {
 
 impl Drop for Adopted {
     fn drop(&mut self) {
-        match self.owner.take() {
-            None => {}
-            Some(Owner::Child) => {
-                end_child(self.pid);
-            }
-            Some(Owner::Scope(scope)) => {
-                if let Err(error) = stop_scopes(std::slice::from_ref(&scope)) {
-                    eprintln!("tumpel-supervisor: ending a box: {error}");
-                }
-            }
+        if self.owner.is_some() {
+            let ended = self.end();
+            eprintln!(
+                "tumpel-supervisor: ending a box: Firecracker process {} {ended}",
+                self.pid
+            );
         }
     }
 }
@@ -422,12 +418,12 @@ fn end_child(pid: libc::pid_t) -> String {
     let mut status = 0;
     match unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) } {
         0 => {}
-        waited if waited == pid => return format!("had already ended with {}", ended(status)),
+        waited if waited == pid => return format!("had already ended with {}", exited(ExitStatus::from_raw(status))),
         _ => return format!("could not be waited for: {}", std::io::Error::last_os_error()),
     }
     unsafe { libc::kill(pid, libc::SIGKILL) };
     if unsafe { libc::waitpid(pid, &raw mut status, 0) } == pid {
-        return format!("was stopped and ended with {}", ended(status));
+        return format!("was stopped and ended with {}", exited(ExitStatus::from_raw(status)));
     }
     format!(
         "was killed and could not be waited for: {}",
@@ -459,6 +455,7 @@ fn watch(
     pid: libc::pid_t,
     session: String,
     console: &Arc<Mutex<VecDeque<u8>>>,
+    scoped: bool,
 ) -> Result<AbortHandle, String> {
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     if raw < 0 {
@@ -473,6 +470,7 @@ fn watch(
     let console = Arc::clone(console);
     let watcher = tokio::spawn(async move {
         let status = match pidfd.readable().await {
+            Ok(_) if scoped => "ended; systemd holds its exit status, as this supervisor did not start it".to_string(),
             Ok(_) => peek_exit(pidfd.get_ref()),
             Err(error) => format!("could no longer be watched: {error}"),
         };
@@ -483,16 +481,6 @@ fn watch(
         );
     });
     Ok(watcher.abort_handle())
-}
-
-fn ended(status: i32) -> String {
-    if libc::WIFEXITED(status) {
-        return format!("exit status {}", libc::WEXITSTATUS(status));
-    }
-    if libc::WIFSIGNALED(status) {
-        return format!("signal {}", libc::WTERMSIG(status));
-    }
-    format!("wait status {status}")
 }
 
 fn in_scope(pid: libc::pid_t, scope: &str) -> bool {
@@ -532,7 +520,7 @@ fn alive(pid: libc::pid_t, scope: &str) -> Result<Owner, String> {
     if waited == pid {
         return Err(format!(
             "its Firecracker process {pid} ended during the handover with {}",
-            ended(status)
+            exited(ExitStatus::from_raw(status))
         ));
     }
     if in_scope(pid, scope) {
@@ -656,11 +644,18 @@ impl Firecracker {
         }
         machine.stdout = Some(stdout);
         machine.stderr = Some(stderr);
+        let scoped = matches!(owner, Owner::Scope(_));
         machine.process = Some(Process::Adopted(Adopted {
             pid,
             owner: Some(owner),
         }));
-        machine.watcher = Some(watch(tap.index(), pid, machine.session_name(), &machine.console)?);
+        machine.watcher = Some(watch(
+            tap.index(),
+            pid,
+            machine.session_name(),
+            &machine.console,
+            scoped,
+        )?);
         Ok((machine, VsockGuest { stream, decoder }))
     }
 }
@@ -863,10 +858,6 @@ impl FirecrackerBox {
         Ok(())
     }
 
-    fn console_bytes(&self) -> Vec<u8> {
-        tail_bytes(&self.console)
-    }
-
     fn api_socket(&self) -> PathBuf {
         self.dir.join("api.sock")
     }
@@ -941,7 +932,7 @@ impl FirecrackerBox {
             .and_then(|pid| libc::pid_t::try_from(pid).ok())
             .ok_or_else(|| "Firecracker ended right after opening its API socket".to_string())?;
         self.unwatch();
-        self.watcher = Some(watch(self.index, pid, self.session_name(), &self.console)?);
+        self.watcher = Some(watch(self.index, pid, self.session_name(), &self.console, false)?);
         self.process = Some(Process::Spawned(child));
         Ok(())
     }
@@ -1133,6 +1124,7 @@ impl Machine for FirecrackerBox {
             Some(process) => process.kill().await,
             None => "was not running".to_string(),
         };
+        let exit = format!("process in {} {exit}", scope_of(self.index));
         let cleared = fd_store::forget_box(self.index)
             .and_then(|()| remove_dir(&self.dir))
             .map_err(|error| format!("BoxNotCleared: tearing down box {}: {error}", self.index));
@@ -1140,7 +1132,7 @@ impl Machine for FirecrackerBox {
     }
 
     fn console_tail(&self) -> String {
-        console_text(&self.console_bytes())
+        console_text(&tail_bytes(&self.console))
     }
 
     fn clear_console(&mut self) {
@@ -1187,7 +1179,7 @@ impl Machine for FirecrackerBox {
 
     fn hand_over(mut self, guest: VsockGuest) -> Result<SupervisorHandoverMachine, String> {
         let machine = SupervisorHandoverMachine {
-            console_tail: bounded("the console tail", STANDARD.encode(self.console_bytes()))?,
+            console_tail: bounded("the console tail", STANDARD.encode(tail_bytes(&self.console)))?,
             guest_buffer: bounded(
                 "the guest bytes buffered past the last frame",
                 STANDARD.encode(guest.decoder.buffered()),
