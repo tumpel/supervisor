@@ -39,9 +39,15 @@ impl BootOrder {
         }
     }
 
-    #[must_use]
-    pub fn from_offer(image: ChannelBootImage, harness: String, harness_version: String) -> Self {
-        match image {
+    /// # Errors
+    /// Fails on an image kind this supervisor does not know.
+    pub fn from_offer(image: ChannelBootImage, harness: String, harness_version: String) -> Result<Self, String> {
+        Ok(match image {
+            ChannelBootImage::Unrecognised(image) => {
+                return Err(format!(
+                    "the offer names an image this supervisor does not know: {image}"
+                ))
+            }
             ChannelBootImage::GuestImageDownload(download) => Self::Full(ImageOrder {
                 download,
                 harness,
@@ -61,7 +67,7 @@ impl BootOrder {
                 harness,
                 harness_version,
             }),
-        }
+        })
     }
 }
 
@@ -101,9 +107,15 @@ impl Boot {
         })
     }
 
-    #[must_use]
-    pub fn from_record(record: SupervisorHandoverImage) -> Self {
-        match record {
+    /// # Errors
+    /// Fails on an image record this supervisor does not know.
+    pub fn from_record(record: SupervisorHandoverImage) -> Result<Self, String> {
+        Ok(match record {
+            SupervisorHandoverImage::Unrecognised(record) => {
+                return Err(format!(
+                    "the handover names an image this supervisor does not know: {record}"
+                ))
+            }
             SupervisorHandoverImage::FullImage(full) => Self::Full(full.manifest),
             SupervisorHandoverImage::LayeredImage(layered) => Self::Layered(Layered {
                 base: layered.base,
@@ -112,7 +124,7 @@ impl Boot {
                     manifest: layered.layer,
                 },
             }),
-        }
+        })
     }
 
     #[must_use]

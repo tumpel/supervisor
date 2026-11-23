@@ -10,6 +10,7 @@ use tumpel_api::types::{
     ChannelHostMessage, ChannelProtocol, HostArchitecture, Sha256Digest, SupervisorUpdateFailureReason,
     SupervisorUpdatePhase,
 };
+use tumpel_channel::Outgoing;
 
 use super::{
     announced_release, confirm, named, refresh_unit, sha256_hex, startup, version_refusal, Idle, Layout, Limits,
@@ -129,7 +130,7 @@ fn limits() -> Limits {
 
 struct Run<'a> {
     updater: Updater<FakeSource, &'a FakeIdle>,
-    events: UnboundedReceiver<ChannelHostMessage>,
+    events: UnboundedReceiver<Outgoing>,
 }
 
 fn updater<'a>(layout: &Layout, source: FakeSource, idle: &'a FakeIdle, limits: Limits) -> Run<'a> {
@@ -147,20 +148,20 @@ enum Seen {
     Failed(SupervisorUpdateFailureReason),
 }
 
-fn seen(events: &mut UnboundedReceiver<ChannelHostMessage>) -> Vec<Seen> {
+fn seen(events: &mut UnboundedReceiver<Outgoing>) -> Vec<Seen> {
     std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event {
-            ChannelHostMessage::SupervisorUpdateStep(step) => Some(Seen::Step(step.phase)),
-            ChannelHostMessage::SupervisorUpdateFailed(failed) => Some(Seen::Failed(failed.reason)),
+            Outgoing::Message(ChannelHostMessage::SupervisorUpdateStep(step)) => Some(Seen::Step(step.phase)),
+            Outgoing::Message(ChannelHostMessage::SupervisorUpdateFailed(failed)) => Some(Seen::Failed(failed.reason)),
             _ => None,
         })
         .collect()
 }
 
-fn failure(events: &mut UnboundedReceiver<ChannelHostMessage>) -> (String, Vec<String>) {
+fn failure(events: &mut UnboundedReceiver<Outgoing>) -> (String, Vec<String>) {
     std::iter::from_fn(|| events.try_recv().ok())
         .find_map(|event| match event {
-            ChannelHostMessage::SupervisorUpdateFailed(failed) => Some((
+            Outgoing::Message(ChannelHostMessage::SupervisorUpdateFailed(failed)) => Some((
                 failed.detail.into(),
                 failed.output_tail.into_iter().map(String::from).collect(),
             )),
@@ -575,8 +576,12 @@ fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
         "rolloutWindow": { "startsAt": "2026-11-17T09:00:00+01:00" }
     }"#;
 
-    let release = announced_release(body, "https://api.example/v1/releases/current", HostArchitecture::Amd64)
-        .expect("the manifest a newer control plane serves");
+    let release = announced_release(
+        body,
+        "https://api.example/v1/releases/current",
+        &HostArchitecture::Amd64,
+    )
+    .expect("the manifest a newer control plane serves");
 
     assert_eq!(release.version.as_str(), "v1.4.0");
     assert_eq!(
@@ -595,7 +600,7 @@ fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
     let release = announced_release(
         rollback.as_bytes(),
         "https://api.example/v1/releases/current",
-        HostArchitecture::Amd64,
+        &HostArchitecture::Amd64,
     )
     .expect("the manifest of a rollback");
     assert!(release.rollback);

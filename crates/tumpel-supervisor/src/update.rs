@@ -22,6 +22,7 @@ use tumpel_api::types::{
     ReleaseManifestReleaseVersion, ReleaseSupervisorSupervisorVersion, Sha256Digest, SupervisorCheckReport,
     SupervisorUpdateFailureReason, SupervisorUpdatePending, SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
+use tumpel_channel::Outgoing;
 use tumpel_guest::setup_output::{redacted, strip_ansi};
 
 use crate::bounded::reported;
@@ -185,7 +186,7 @@ impl Source for HttpSource {
             .bytes()
             .await
             .map_err(|error| format!("reading {url} failed: {}", error.without_url()))?;
-        announced_release(&body, &url, self.architecture)
+        announced_release(&body, &url, &self.architecture)
     }
 
     async fn binary(&self) -> Result<Vec<u8>, String> {
@@ -218,14 +219,14 @@ struct AnnouncedSupervisor {
     supervisor_version: ReleaseSupervisorSupervisorVersion,
 }
 
-fn announced_release(body: &[u8], url: &str, architecture: HostArchitecture) -> Result<Release, String> {
+fn announced_release(body: &[u8], url: &str, architecture: &HostArchitecture) -> Result<Release, String> {
     let manifest: AnnouncedRelease = serde_json::from_slice(body).map_err(|error| {
         format!("{url} is no ReleaseManifest: {error}; check that the stage has published a release")
     })?;
     let supervisor = manifest
         .supervisors
         .into_iter()
-        .find(|supervisor| supervisor.architecture == architecture)
+        .find(|supervisor| supervisor.architecture == *architecture)
         .ok_or_else(|| {
             format!(
                 "release {} carries no {architecture} supervisor; publish one for this architecture",
@@ -375,7 +376,7 @@ pub struct Updater<S: Source, I: Idle> {
     running: Sha256Digest,
     version: &'static str,
     idle: I,
-    out: UnboundedSender<ChannelHostMessage>,
+    out: UnboundedSender<Outgoing>,
     running_update: Mutex<()>,
 }
 
@@ -387,7 +388,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         running: Sha256Digest,
         version: &'static str,
         idle: I,
-        out: UnboundedSender<ChannelHostMessage>,
+        out: UnboundedSender<Outgoing>,
     ) -> Self {
         Self {
             source,
@@ -473,7 +474,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
 
     async fn apply(&self, release: &Release) -> Outcome {
         if let Err(stopped) = self.prepare(release).await {
-            let reason = stopped.reason;
+            let reason = stopped.reason.clone();
             self.fail(&release.sha256, stopped);
             return Outcome::Failed(reason);
         }
@@ -487,7 +488,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         match self.swap(&release.sha256).await {
             Ok(()) => Outcome::Restart,
             Err(stopped) => {
-                let reason = stopped.reason;
+                let reason = stopped.reason.clone();
                 self.fail(&release.sha256, stopped);
                 Outcome::Failed(reason)
             }
@@ -495,9 +496,8 @@ impl<S: Source, I: Idle> Updater<S, I> {
     }
 
     fn step(&self, release: &Release, phase: SupervisorUpdatePhase, boxes: u32) {
-        let _ = self
-            .out
-            .send(ChannelHostMessage::SupervisorUpdateStep(ChannelSupervisorUpdateStep {
+        let _ = self.out.send(
+            ChannelHostMessage::SupervisorUpdateStep(ChannelSupervisorUpdateStep {
                 type_: ChannelSupervisorUpdateStepType::SupervisorUpdateStep,
                 from_sha256: self.running.clone(),
                 to_sha256: release.sha256.clone(),
@@ -505,14 +505,16 @@ impl<S: Source, I: Idle> Updater<S, I> {
                 boxes_running: i32::try_from(boxes).unwrap_or(i32::MAX),
                 phase,
                 at: Utc::now().fixed_offset(),
-            }));
+            })
+            .into(),
+        );
     }
 
     fn fail(&self, to: &Sha256Digest, stopped: Stop) {
         let detail = redacted(&stopped.detail);
         eprintln!("tumpel-supervisor: {}: {detail}", stopped.reason);
-        let _ = self.out.send(ChannelHostMessage::SupervisorUpdateFailed(
-            ChannelSupervisorUpdateFailed {
+        let _ = self.out.send(
+            ChannelHostMessage::SupervisorUpdateFailed(ChannelSupervisorUpdateFailed {
                 type_: ChannelSupervisorUpdateFailedType::SupervisorUpdateFailed,
                 from_sha256: self.running.clone(),
                 to_sha256: to.clone(),
@@ -524,15 +526,16 @@ impl<S: Source, I: Idle> Updater<S, I> {
                     .map(|line| reported("an update output line", &line))
                     .collect(),
                 failed_at: Utc::now().fixed_offset(),
-            },
-        ));
+            })
+            .into(),
+        );
     }
 
     fn refuse(&self, to: &Sha256Digest, stopped: Stop) -> Stop {
         let candidate = remove(&self.layout.candidate);
         let refusal = SupervisorUpdateRefusal {
             to_sha256: to.clone(),
-            reason: stopped.reason,
+            reason: stopped.reason.clone(),
             refused_at: Utc::now().fixed_offset(),
         };
         let written = dir::write_json(&self.layout.refusal(), &refusal).map_err(|error| format!("{error:#}"));
@@ -777,11 +780,7 @@ fn steady(layout: &Layout) -> Result<Startup, String> {
     Ok(Startup::Steady)
 }
 
-pub fn startup(
-    layout: &Layout,
-    running: &Sha256Digest,
-    out: &UnboundedSender<ChannelHostMessage>,
-) -> Result<Startup, String> {
+pub fn startup(layout: &Layout, running: &Sha256Digest, out: &UnboundedSender<Outgoing>) -> Result<Startup, String> {
     let now = Utc::now().fixed_offset();
     if let Some(record) = read::<SupervisorUpdatePending>(&layout.rolled_back(), "SupervisorUpdatePending")? {
         let detail = format!(
@@ -797,8 +796,8 @@ pub fn startup(
             refused_at: now,
         };
         dir::write_json(&layout.refusal(), &refusal).map_err(|error| format!("{error:#}"))?;
-        let _ = out.send(ChannelHostMessage::SupervisorUpdateFailed(
-            ChannelSupervisorUpdateFailed {
+        let _ = out.send(
+            ChannelHostMessage::SupervisorUpdateFailed(ChannelSupervisorUpdateFailed {
                 type_: ChannelSupervisorUpdateFailedType::SupervisorUpdateFailed,
                 from_sha256: record.from_sha256,
                 to_sha256: record.to_sha256,
@@ -806,8 +805,9 @@ pub fn startup(
                 detail: reported("the update failure detail", &detail),
                 output_tail: Vec::new(),
                 failed_at: now,
-            },
-        ));
+            })
+            .into(),
+        );
         remove(&layout.rolled_back())?;
     }
     let Some(trial) = read::<SupervisorUpdatePending>(&layout.trial(), "SupervisorUpdatePending")? else {
@@ -826,7 +826,7 @@ pub fn startup(
 pub fn confirm(
     layout: &Layout,
     trial: &SupervisorUpdatePending,
-    out: &UnboundedSender<ChannelHostMessage>,
+    out: &UnboundedSender<Outgoing>,
 ) -> Result<(), String> {
     let release_version = env!("TUMPEL_RELEASE_VERSION")
         .parse()
@@ -834,15 +834,18 @@ pub fn confirm(
     remove(&layout.trial())?;
     remove(&layout.pending())?;
     remove(&layout.previous)?;
-    let _ = out.send(ChannelHostMessage::SupervisorUpdateStep(ChannelSupervisorUpdateStep {
-        type_: ChannelSupervisorUpdateStepType::SupervisorUpdateStep,
-        from_sha256: trial.from_sha256.clone(),
-        to_sha256: trial.to_sha256.clone(),
-        release_version,
-        boxes_running: 0,
-        phase: SupervisorUpdatePhase::Online,
-        at: Utc::now().fixed_offset(),
-    }));
+    let _ = out.send(
+        ChannelHostMessage::SupervisorUpdateStep(ChannelSupervisorUpdateStep {
+            type_: ChannelSupervisorUpdateStepType::SupervisorUpdateStep,
+            from_sha256: trial.from_sha256.clone(),
+            to_sha256: trial.to_sha256.clone(),
+            release_version,
+            boxes_running: 0,
+            phase: SupervisorUpdatePhase::Online,
+            at: Utc::now().fixed_offset(),
+        })
+        .into(),
+    );
     Ok(())
 }
 

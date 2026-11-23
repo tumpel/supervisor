@@ -115,6 +115,14 @@ pub(crate) fn then(detail: String, stopped: Result<(), String>) -> String {
 
 fn failed_in_guest(reason: GuestClaudeSetupFailureReason, detail: String) -> Ended {
     let reason = match reason {
+        GuestClaudeSetupFailureReason::Unrecognised(reason) => {
+            return Ended::Failed(stop(
+                ClaudeSetupFailureReason::ClaudeCodeExited,
+                format!(
+                    "the guest failed the setup with reason {reason}, which this supervisor does not know: {detail}"
+                ),
+            ))
+        }
         GuestClaudeSetupFailureReason::UrlNotPrinted => ClaudeSetupFailureReason::SetupUrlMissing,
         GuestClaudeSetupFailureReason::CodeRejected => ClaudeSetupFailureReason::CodeRejected,
         GuestClaudeSetupFailureReason::ClaudeCodeExited => ClaudeSetupFailureReason::ClaudeCodeExited,

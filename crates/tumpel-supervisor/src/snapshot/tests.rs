@@ -9,8 +9,9 @@ use tar::Archive;
 
 use super::cache::sha256;
 use super::{
-    assemble, cut, decode, decode_root, draft_digests, encode, fetches, fresh, lacking, stage, unpack, write_restore,
-    Base, Born, ChunkCache, Entry, Ext4Upper, Found, Kind, Manifest, Places, Scan, Span, Staged, Stored, Upper,
+    assemble, cut, decode, decode_root, draft_digests, encode, fetches, fresh, lacking, pack_parts, stage, unpack,
+    write_restore, Base, Born, ChunkCache, Entry, Ext4Upper, Found, Kind, Manifest, Places, Scan, Span, Staged, Stored,
+    Upper,
 };
 
 pub(super) fn sbin(tool: &str) -> PathBuf {
@@ -418,4 +419,32 @@ fn a_cancelled_restore_stops_before_it_archives_an_entry() {
 
     assert_eq!(restored, Err(super::CANCELLED.to_string()));
     assert_eq!(listing(archive), BTreeMap::new());
+}
+
+#[test]
+fn pack_parts_send_each_reused_pack_in_exactly_one_part_and_always_send_part_one() {
+    let placed: Vec<u32> = (0..5).collect();
+    let reused: Vec<String> = (0..7).map(|pack| format!("pack-{pack}")).collect();
+    let parts = pack_parts(&placed, &reused, 3);
+    assert_eq!(
+        parts
+            .iter()
+            .map(|(placed, reused)| (placed.len(), reused.len()))
+            .collect::<Vec<_>>(),
+        [(3, 3), (2, 3), (0, 1)]
+    );
+    let sent: Vec<&String> = parts.iter().flat_map(|(_, reused)| reused.iter()).collect();
+    assert_eq!(sent, reused.iter().collect::<Vec<_>>());
+    assert_eq!(
+        parts
+            .iter()
+            .flat_map(|(placed, _)| placed.iter())
+            .copied()
+            .collect::<Vec<_>>(),
+        placed
+    );
+
+    let none: [u32; 0] = [];
+    let unused: [String; 0] = [];
+    assert_eq!(pack_parts(&none, &unused, 500).len(), 1);
 }
