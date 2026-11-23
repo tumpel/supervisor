@@ -13,10 +13,10 @@ use tumpel_api::types::{
     BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
     ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld, ChannelSnapshotChunksHeldType,
     ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType,
-    ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId,
-    GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox,
-    SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverTeardown,
-    SupervisorHandoverTeardownKind, TurnFailureReason,
+    ChannelSnapshotPacks, ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType,
+    EntityId, GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover,
+    SupervisorHandoverBox, SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine,
+    SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
 };
 
 use super::{
@@ -617,6 +617,7 @@ struct Host {
     holdings: tokio::sync::watch::Receiver<Held>,
     runner: tokio::task::JoinHandle<Result<(), String>>,
     answering: Arc<AtomicBool>,
+    accepting: Arc<AtomicBool>,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -662,11 +663,32 @@ fn claim_answer(turn_id: EntityId) -> Answer {
     })
 }
 
+fn pack_uploads_answer(store: &MemoryStore, packs: ChannelSnapshotPacks) -> Answer {
+    Answer::PackUploads(ChannelSnapshotPackUploads {
+        part: packs.part,
+        snapshot_id: packs.snapshot_id,
+        type_: ChannelSnapshotPackUploadsType::SnapshotPackUploads,
+        upload_expires_at: in_seconds(60),
+        uploads: packs
+            .packs
+            .iter()
+            .filter(|pack| !store.holds(&pack_url(&pack.pack_digest)))
+            .map(|pack| ChannelPackUrl {
+                pack_digest: pack.pack_digest.clone(),
+                size_bytes: pack.size_bytes,
+                url: pack_url(&pack.pack_digest).parse().expect("a pack URL"),
+            })
+            .collect(),
+    })
+}
+
 fn control_plane(
     store: MemoryStore,
     answers: Answers,
     log: Log,
     answering: Arc<AtomicBool>,
+    accepting: Arc<AtomicBool>,
+    commands: UnboundedSender<Input>,
     mut from_lifecycle: UnboundedReceiver<ChannelHostMessage>,
 ) -> UnboundedReceiver<ChannelHostMessage> {
     let (forward, received) = unbounded_channel();
@@ -698,22 +720,7 @@ fn control_plane(
                             .packs
                             .insert(pack.pack_digest.as_str().to_string(), pack.size_bytes);
                     }
-                    answers.deliver(Answer::PackUploads(ChannelSnapshotPackUploads {
-                        part: packs.part,
-                        snapshot_id: packs.snapshot_id,
-                        type_: ChannelSnapshotPackUploadsType::SnapshotPackUploads,
-                        upload_expires_at: in_seconds(60),
-                        uploads: packs
-                            .packs
-                            .iter()
-                            .filter(|pack| !store.holds(&pack_url(&pack.pack_digest)))
-                            .map(|pack| ChannelPackUrl {
-                                pack_digest: pack.pack_digest.clone(),
-                                size_bytes: pack.size_bytes,
-                                url: pack_url(&pack.pack_digest).parse().expect("a pack URL"),
-                            })
-                            .collect(),
-                    }));
+                    answers.deliver(pack_uploads_answer(&store, packs));
                 }
                 ChannelHostMessage::RestoreChunks(chunks) => {
                     let mut packs: Vec<ChannelPackUrl> = Vec::new();
@@ -760,6 +767,12 @@ fn control_plane(
                         note(&log, format!("claimed {}", *turn_id));
                         answers.deliver(claim_answer(turn_id));
                     });
+                }
+                ChannelHostMessage::SnapshotDone(done) => {
+                    if accepting.load(Ordering::SeqCst) {
+                        let _ = commands.send(Input::SnapshotAccepted(done.snapshot_id.clone()));
+                    }
+                    let _ = forward.send(ChannelHostMessage::SnapshotDone(done));
                 }
                 other => {
                     let _ = forward.send(other);
@@ -813,17 +826,20 @@ fn start_host(
         vmm.staging.join("boxes.json"),
     );
     let answering = Arc::new(AtomicBool::new(true));
+    let accepting = Arc::new(AtomicBool::new(true));
+    let (commands, from_host) = unbounded_channel();
     let received = control_plane(
         store.clone(),
         lifecycle.answers(),
         Arc::clone(&log),
         Arc::clone(&answering),
+        Arc::clone(&accepting),
+        commands.clone(),
         from_lifecycle,
     );
     lifecycle.start(taken).expect("the lifecycle starts");
     let sessions = lifecycle.sessions();
     let holdings = lifecycle.holdings();
-    let (commands, from_host) = unbounded_channel();
     let cancels = lifecycle.cancels();
     let runner = tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
     Host {
@@ -844,6 +860,7 @@ fn start_host(
         holdings,
         runner,
         answering,
+        accepting,
     }
 }
 
@@ -1270,11 +1287,9 @@ async fn a_torn_down_box_restores_its_next_turn_from_the_latest_snapshot() {
     host.settle(SETTLE).await;
     host.log();
     let second = host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
     host.teardown("session-1");
-    assert_eq!(
-        host.settle_until("box gone session-1").await,
-        ["snapshot done", "box gone session-1"]
-    );
+    assert_eq!(host.settle_until("box gone session-1").await, ["box gone session-1"]);
     assert_eq!(host.log(), ["stop session-1"]);
     let uploads = host.store.uploads();
     assert_eq!(pack_uploads(&uploads), 2, "{uploads:?}");
@@ -1683,6 +1698,7 @@ async fn a_warm_box_handed_over_with_a_queued_teardown_is_stopped_and_answers_bo
     old.settle_until("complete 1").await;
     old.snapshot("session-1");
     old.settle_until("snapshot done").await;
+    old.settle(SETTLE).await;
     assert!(
         !old.standing().boxes[0].dirty,
         "a snapshot that holds the turn records the box clean"
@@ -1925,20 +1941,37 @@ async fn a_snapshotted_box_idle_for_the_offered_idle_time_is_stopped_and_answers
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_box_whose_snapshot_done_the_control_plane_refused_stays_dirty_and_outlives_its_idle_time() {
+async fn a_box_whose_snapshot_done_is_never_accepted_stays_dirty_past_its_idle_time() {
     let mut host = host("idle-refused", 1, Harness::Echo, Boot::Works);
     host.idle_seconds = NonZeroU32::new(300).expect("five minutes");
+    host.accepting.store(false, Ordering::SeqCst);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    host.log();
+    assert_eq!(host.settle(Duration::from_mins(20)).await, Vec::<String>::new());
+    assert_eq!(host.log(), Vec::<String>::new());
+    assert!(host.standing().boxes[0].dirty);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_box_is_clean_once_its_snapshot_done_is_accepted_and_then_ends_on_idle() {
+    let mut host = host("idle-accepted", 1, Harness::Echo, Boot::Works);
+    host.idle_seconds = NonZeroU32::new(300).expect("five minutes");
+    host.accepting.store(false, Ordering::SeqCst);
     host.turn("turn-1", "session-1", "one", Vec::new());
     host.settle(SETTLE).await;
     let first = host.snapshot("session-1");
     assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
-    host.log();
-    host.commands
-        .send(Input::SnapshotRefused(first.snapshot_id))
-        .expect("send");
-    assert_eq!(host.settle(Duration::from_mins(20)).await, Vec::<String>::new());
-    assert_eq!(host.log(), Vec::<String>::new());
+    assert_eq!(host.settle(Duration::from_mins(2)).await, Vec::<String>::new());
     assert!(host.standing().boxes[0].dirty);
+    host.commands
+        .send(Input::SnapshotAccepted(first.snapshot_id))
+        .expect("send");
+    host.settle(SETTLE).await;
+    assert!(!host.standing().boxes[0].dirty);
+    assert_eq!(host.settle(Duration::from_mins(4)).await, ["box gone session-1"]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1963,6 +1996,7 @@ async fn a_box_snapshotted_late_keeps_its_idle_deadline_across_a_crash() {
     assert_eq!(old.settle(Duration::from_mins(10)).await, Vec::<String>::new());
     old.snapshot("session-1");
     assert_eq!(old.settle_until("snapshot done").await, ["snapshot done"]);
+    old.settle(SETTLE).await;
     let mut standing = old.standing();
     old.keep_guest(&mut standing.boxes[0], 40);
     let mut new = old.after_crash(standing);
@@ -1991,11 +2025,9 @@ async fn a_teardown_after_the_snapshot_stops_a_clean_box_and_the_next_turn_boots
     host.turn("turn-1", "session-1", "one", Vec::new());
     host.settle(SETTLE).await;
     let first = host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
     host.teardown("session-1");
-    assert_eq!(
-        host.settle_until("box gone session-1").await,
-        ["snapshot done", "box gone session-1"]
-    );
+    assert_eq!(host.settle_until("box gone session-1").await, ["box gone session-1"]);
     assert_eq!(
         host.log(),
         [
@@ -2038,11 +2070,9 @@ async fn a_cancelled_turn_ends_in_the_guest_with_its_credential_file_and_the_pla
     );
     assert_eq!(host.settle_until(&failed).await, [failed]);
     host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
     host.teardown("session-1");
-    assert_eq!(
-        host.settle_until("box gone session-1").await,
-        ["snapshot done", "box gone session-1"]
-    );
+    assert_eq!(host.settle_until("box gone session-1").await, ["box gone session-1"]);
     assert_eq!(
         host.log(),
         [

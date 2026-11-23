@@ -398,18 +398,10 @@ fn a_saved_frame_no_reader_knows_is_resent_unchanged_and_dropped_once_the_contro
     assert_eq!(sent[0], json!({"type": "Frame", "seq": 7, "ack": 4, "message": step}));
 
     let refused = json!({"type": "FrameRefused", "seq": 7, "reason": "message.phase: Invalid option"}).to_string();
-    let Ok(Event::FrameRefused {
-        seq,
-        reason,
-        snapshot_id,
-    }) = channel.receive(&refused)
-    else {
+    let Ok(Event::FrameRefused { seq, reason }) = channel.receive(&refused) else {
         panic!("the refusal is reported");
     };
-    assert_eq!(
-        (seq, reason.as_str(), snapshot_id),
-        (7, "message.phase: Invalid option", None)
-    );
+    assert_eq!((seq, reason.as_str()), (7, "message.phase: Invalid option"));
     let state = disk.0.borrow().clone().expect("saved state");
     assert!(state.unacked.is_empty(), "the refused frame leaves channel.json");
     assert_eq!(channel.phase(), Phase::Open, "a refusal keeps the connection");
@@ -417,16 +409,32 @@ fn a_saved_frame_no_reader_knows_is_resent_unchanged_and_dropped_once_the_contro
     channel.send(done("snap-8"), &mut wire).expect("send");
     let next = wire.sent();
     assert_eq!((next[0]["seq"].as_i64(), next[0]["ack"].as_i64()), (Some(8), Some(4)));
+}
 
-    let refused = json!({"type": "FrameRefused", "seq": 8, "reason": "the manifest did not parse"}).to_string();
-    let Ok(Event::FrameRefused { snapshot_id, .. }) = channel.receive(&refused) else {
+#[test]
+fn an_acked_snapshot_done_is_accepted_and_a_refused_one_retires_without_acceptance() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    channel.send(done("snap-1"), &mut wire).expect("send");
+    channel.send(done("snap-2"), &mut wire).expect("send");
+    let refused = json!({"type": "FrameRefused", "seq": 2, "reason": "the manifest did not parse"}).to_string();
+    let Ok(Event::FrameRefused { seq: 2, .. }) = channel.receive(&refused) else {
         panic!("the refusal is reported");
     };
     assert_eq!(
-        snapshot_id.as_deref().map(String::as_str),
-        Some("snap-8"),
-        "a refused SnapshotDone names its snapshot"
+        channel.take_accepted(),
+        Vec::<EntityId>::new(),
+        "a refusal accepts nothing"
     );
+
+    channel
+        .receive(&json!({"type": "Ack", "seq": 2}).to_string())
+        .expect("the ack retires both frames");
+    let accepted: Vec<String> = channel.take_accepted().into_iter().map(|id| id.to_string()).collect();
+    assert_eq!(accepted, ["snap-1"]);
+    assert_eq!(channel.take_accepted(), Vec::<EntityId>::new());
 }
 
 #[test]

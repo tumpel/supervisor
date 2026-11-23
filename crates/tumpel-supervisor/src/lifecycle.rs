@@ -159,7 +159,6 @@ pub(crate) enum BoxEnd {
     NotRecorded,
     RecoverFailed,
     PauseFailed,
-    SnapshotNotRecorded,
     SetupBootFailed,
     SetupNotHanded,
     SetupEnded,
@@ -324,7 +323,6 @@ struct LiveBox<M: Machine> {
     image: Box<Boot>,
     _hold: Hold,
     dirty: bool,
-    snapshot_id: Option<EntityId>,
     credential_file: Option<String>,
     box_retention: BoxRetention,
     idle: Duration,
@@ -342,7 +340,6 @@ impl<M: Machine> LiveBox<M> {
             image: Box::new(image),
             _hold: hold,
             dirty: false,
-            snapshot_id: None,
             credential_file: None,
             box_retention: turn.box_retention,
             idle: Duration::from_secs(u64::from(turn.idle_seconds.get())),
@@ -599,6 +596,8 @@ struct Slot<M: Machine> {
     queue: VecDeque<Command>,
     idle: Option<AbortHandle>,
     idle_end: Option<Instant>,
+    snapshot_id: Option<EntityId>,
+    snapshot_accepted: bool,
 }
 
 impl<M: Machine> Slot<M> {
@@ -627,6 +626,8 @@ impl<M: Machine> Default for Slot<M> {
             queue: VecDeque::new(),
             idle: None,
             idle_end: None,
+            snapshot_id: None,
+            snapshot_accepted: false,
         }
     }
 }
@@ -1800,17 +1801,15 @@ impl<V: Vmm, S: Store> Runner<V, S> {
 
     async fn snapshot(&self, mut live: LiveBox<V::Machine>, order: &SnapshotOrder) -> Outcome<V::Machine> {
         let drive = live.machine.drive();
-        let (message, stored): (ChannelHostMessage, bool) = match self.store_snapshot(drive, &live.base, order).await {
+        let message: ChannelHostMessage = match self.store_snapshot(drive, &live.base, order).await {
             Ok((uploaded_bytes, base)) => {
                 live.base = Arc::new(base);
-                live.dirty = false;
-                live.snapshot_id = Some(order.snapshot_id.clone());
                 let done = ChannelSnapshotDone {
                     snapshot_id: order.snapshot_id.clone(),
                     type_: ChannelSnapshotDoneType::SnapshotDone,
                     uploaded_bytes,
                 };
-                (done.into(), true)
+                done.into()
             }
             Err((reason, detail)) => {
                 let failed = ChannelSnapshotFailed {
@@ -1820,21 +1819,11 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     snapshot_id: order.snapshot_id.clone(),
                     type_: ChannelSnapshotFailedType::SnapshotFailed,
                 };
-                (failed.into(), false)
+                failed.into()
             }
         };
         emit(&self.out, message);
-        if !stored {
-            return Outcome::Kept(live);
-        }
-        let Err(error) = self.standing.put(&live, None) else {
-            return Outcome::Kept(live);
-        };
-        let (tap, tail, stopped) = stop_box(&self.standing, live, BoxEnd::SnapshotNotRecorded).await;
-        eprintln!(
-            "tumpel-supervisor: recording a snapshotted box as clean for a supervisor restart failed and the box was stopped: {error}. Console: {tail}"
-        );
-        Outcome::Gone(tap, stopped)
+        Outcome::Kept(live)
     }
 
     async fn store_snapshot(
@@ -2073,7 +2062,7 @@ pub enum Input {
     Command(Command),
     HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>, Abandoned),
-    SnapshotRefused(EntityId),
+    SnapshotAccepted(EntityId),
 }
 
 #[derive(Clone)]
@@ -2293,7 +2282,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     Some(Input::Command(command)) => self.command(command).await?,
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
                     Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
-                    Some(Input::SnapshotRefused(snapshot_id)) => self.snapshot_refused(&snapshot_id)?,
+                    Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id),
                     None => break,
                 },
                 Some(setup) = setups.recv() => self.setup_command(setup),
@@ -2698,7 +2687,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             image: Box::new(image),
             _hold: hold,
             dirty: handed.dirty,
-            snapshot_id: None,
             credential_file: handed.credential_file.map(String::from),
             box_retention: handed.box_retention,
             idle: duration(handed.idle_milliseconds),
@@ -2895,6 +2883,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 armed.abort();
             }
             slot.idle_end = None;
+            slot.snapshot_id = None;
+            slot.snapshot_accepted = false;
             let live = slot.live.take()?;
             slot.paused = false;
             slot.busy = true;
@@ -2981,6 +2971,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let live = self.slots.get_mut(&session).and_then(|slot| {
             let live = slot.live.take()?;
             slot.busy = true;
+            slot.snapshot_id = Some(order.snapshot_id.clone());
+            slot.snapshot_accepted = false;
             Some(live)
         });
         let Some(live) = live else {
@@ -3006,30 +2998,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.spawn(session, Work::Snapshot, running, async move {
             runner.snapshot(live, &order).await
         });
-    }
-
-    fn snapshot_refused(&mut self, snapshot_id: &EntityId) -> Result<(), String> {
-        let Some((session, live)) = self.slots.iter_mut().find_map(|(session, slot)| {
-            let live = slot
-                .live
-                .as_mut()
-                .filter(|live| live.snapshot_id.as_ref() == Some(snapshot_id))?;
-            Some((session.clone(), live))
-        }) else {
-            eprintln!(
-                "tumpel-supervisor: the control plane refused SnapshotDone {}, but no box here holds that snapshot",
-                **snapshot_id
-            );
-            return Ok(());
-        };
-        live.dirty = true;
-        eprintln!(
-            "tumpel-supervisor: session {session} box {} stays dirty and no longer ends on Idle: the control plane refused SnapshotDone {}",
-            *live.box_id, **snapshot_id
-        );
-        self.runner.standing.put(live, None)?;
-        self.arm_idle(&session);
-        Ok(())
     }
 
     fn live_box(&self, session: &str) -> Option<&LiveBox<V::Machine>> {
@@ -3252,7 +3220,51 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             stopped?;
             self.free_disk(&session)?;
         }
+        self.clean(&session);
         self.drain(session).await
+    }
+
+    fn snapshot_accepted(&mut self, snapshot_id: &EntityId) {
+        let waiting = self.slots.iter_mut().find_map(|(session, slot)| {
+            if slot.snapshot_id.as_ref() != Some(snapshot_id) {
+                return None;
+            }
+            slot.snapshot_accepted = true;
+            Some(session.clone())
+        });
+        let Some(session) = waiting else {
+            eprintln!(
+                "tumpel-supervisor: the control plane accepted SnapshotDone {}, but no box here waits on that snapshot; a later turn ran or the box is gone, so nothing is marked clean",
+                **snapshot_id
+            );
+            return;
+        };
+        self.clean(&session);
+    }
+
+    fn clean(&mut self, session: &str) {
+        let Some(slot) = self
+            .slots
+            .get_mut(session)
+            .filter(|slot| slot.snapshot_accepted && !slot.busy)
+        else {
+            return;
+        };
+        let Some(live) = slot.live.as_mut() else {
+            return;
+        };
+        slot.snapshot_id = None;
+        slot.snapshot_accepted = false;
+        live.dirty = false;
+        if let Err(error) = self.runner.standing.put(live, None) {
+            live.dirty = true;
+            eprintln!(
+                "tumpel-supervisor: session {session} box {} stays dirty: recording its accepted snapshot for a supervisor restart failed: {error}",
+                *live.box_id
+            );
+            return;
+        }
+        self.arm_idle(session);
     }
 
     async fn drain(&mut self, session: String) -> Result<(), String> {

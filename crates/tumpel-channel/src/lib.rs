@@ -311,7 +311,6 @@ pub enum Event {
     FrameRefused {
         seq: i64,
         reason: String,
-        snapshot_id: Option<EntityId>,
     },
     FrameRateLimited {
         seq: i64,
@@ -336,6 +335,14 @@ pub struct HostChannel<S: Store, K: Signer> {
     version: u16,
     sealed: i64,
     batch_started: Option<Instant>,
+    accepted: Vec<EntityId>,
+}
+
+fn snapshot_done(message: &Value) -> Option<EntityId> {
+    match serde_json::from_value::<ChannelHostMessage>(message.clone()) {
+        Ok(ChannelHostMessage::SnapshotDone(done)) => Some(done.snapshot_id),
+        _ => None,
+    }
 }
 
 fn frozen<F: DeserializeOwned + Serialize>(value: Value, what: &str) -> Result<String, ChannelError> {
@@ -383,6 +390,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             phase: Phase::Closed,
             progressed: false,
             withheld: None,
+            accepted: Vec::new(),
             offered: Vec::new(),
             hello_version: ChannelProtocol::VERSION,
             version: ChannelProtocol::VERSION,
@@ -430,6 +438,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     pub fn step_up(&mut self) {
         self.hello_version = ChannelProtocol::VERSION;
+    }
+
+    pub fn take_accepted(&mut self) -> Vec<EntityId> {
+        std::mem::take(&mut self.accepted)
     }
 
     /// # Errors
@@ -773,6 +785,9 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         if self.state.unacked.first().is_some_and(|first| first.seq.0 <= ack) {
             self.progressed = true;
         }
+        let retired = self.state.unacked.iter().filter(|own| own.seq.0 <= ack);
+        let accepted: Vec<EntityId> = retired.filter_map(|own| snapshot_done(&own.message)).collect();
+        self.accepted.extend(accepted);
         self.state.unacked.retain(|own| own.seq.0 > ack);
         Ok(())
     }
@@ -789,16 +804,17 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         if message.is_none() {
             eprintln!("tumpel-supervisor: FrameRefused: frame {seq} was no longer held when the control plane refused it, so its message is unknown");
         }
-        let snapshot_id = match message.map(serde_json::from_value::<ChannelHostMessage>) {
-            Some(Ok(ChannelHostMessage::SnapshotDone(done))) => Some(done.snapshot_id),
-            _ => None,
-        };
+        if let Some(snapshot_id) = message.as_ref().and_then(snapshot_done) {
+            eprintln!(
+                "tumpel-supervisor: FrameRefused: SnapshotDone {} retires unaccepted, so its box stays dirty",
+                *snapshot_id
+            );
+        }
         self.state.unacked.retain(|own| own.seq.0 != seq);
         self.store.save(&self.state)?;
         Ok(Event::FrameRefused {
             seq,
             reason: String::from(refused.reason),
-            snapshot_id,
         })
     }
 

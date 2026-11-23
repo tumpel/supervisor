@@ -273,7 +273,7 @@ enum BoxCommand {
     Setup(SetupCommand),
     HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>, Abandoned),
-    SnapshotRefused(EntityId),
+    SnapshotAccepted(EntityId),
 }
 
 fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> SetupCommand {
@@ -365,8 +365,8 @@ async fn boxes(
                 let _ = lifecycle.send(Input::Abandon(reply, abandoned));
                 continue;
             }
-            BoxCommand::SnapshotRefused(snapshot_id) => {
-                if lifecycle.send(Input::SnapshotRefused(snapshot_id)).is_err() {
+            BoxCommand::SnapshotAccepted(snapshot_id) => {
+                if lifecycle.send(Input::SnapshotAccepted(snapshot_id)).is_err() {
                     eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
                     return;
                 }
@@ -1017,6 +1017,18 @@ fn box_command(message: ChannelControlMessage) -> BoxCommand {
     }
 }
 
+fn accepted(channel: &mut Channel, commands: &UnboundedSender<BoxCommand>) -> Result<(), Failure> {
+    for snapshot_id in channel.take_accepted() {
+        commands.send(BoxCommand::SnapshotAccepted(snapshot_id)).map_err(|_| {
+            fail(
+                SupervisorFailure::ProtocolError,
+                "the box task stopped; restart the supervisor",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn rate_limited(
     limit: &mut RateLimit,
     url: &str,
@@ -1065,9 +1077,13 @@ async fn session(
                 None => Some(Ok(dropped(channel.progressed(), "the connection ended"))),
                 Some(Err(error)) => Some(Ok(dropped(channel.progressed(), error.to_string()))),
                 Some(Ok(Message::Close(frame))) => Some(closed_by_peer(frame.as_ref(), channel.progressed())),
-                Some(Ok(Message::Text(text))) => {
+                Some(Ok(Message::Text(text))) => 'text: {
                     last_received = Instant::now();
-                    match channel.receive(text.as_str()) {
+                    let received = channel.receive(text.as_str());
+                    if let Err(failure) = accepted(channel, commands) {
+                        break 'text Some(Err(failure));
+                    }
+                    match received {
                         Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
                         Ok(Event::Welcomed) => {
                             eprintln!("connected to {url}");
@@ -1075,15 +1091,9 @@ async fn session(
                             updates.welcomed().await.err().map(Err)
                         }
                         Ok(Event::Message(message)) => commands.send(box_command(*message)).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
-                        Ok(Event::FrameRefused { seq, reason, snapshot_id }) => {
+                        Ok(Event::FrameRefused { seq, reason }) => {
                             eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
-                            match snapshot_id {
-                                None => None,
-                                Some(snapshot_id) => match commands.send(BoxCommand::SnapshotRefused(snapshot_id)) {
-                                    Ok(()) => None,
-                                    Err(_) => Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
-                                },
-                            }
+                            None
                         }
                         Ok(Event::FrameRateLimited { seq: _, reason, frames_per_minute, retry_after }) => {
                             rate_limited(limit, url, &reason, frames_per_minute, retry_after);
