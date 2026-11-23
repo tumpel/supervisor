@@ -311,6 +311,7 @@ pub enum Event {
     FrameRefused {
         seq: i64,
         reason: String,
+        message: Option<Value>,
     },
     FrameRateLimited {
         seq: i64,
@@ -778,11 +779,18 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     fn refused(&mut self, refused: ChannelFrameRefused) -> Result<Event, ChannelError> {
         self.progressed = true;
+        let message = self
+            .state
+            .unacked
+            .iter()
+            .find(|own| own.seq.0 == refused.seq.0)
+            .map(|own| own.message.clone());
         self.state.unacked.retain(|own| own.seq.0 != refused.seq.0);
         self.store.save(&self.state)?;
         Ok(Event::FrameRefused {
             seq: refused.seq.0,
             reason: String::from(refused.reason),
+            message,
         })
     }
 

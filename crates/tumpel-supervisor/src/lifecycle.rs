@@ -597,6 +597,7 @@ struct Slot<M: Machine> {
     queue: VecDeque<Command>,
     idle: Option<AbortHandle>,
     idle_end: Option<Instant>,
+    snapshot_id: Option<EntityId>,
 }
 
 impl<M: Machine> Slot<M> {
@@ -625,6 +626,7 @@ impl<M: Machine> Default for Slot<M> {
             queue: VecDeque::new(),
             idle: None,
             idle_end: None,
+            snapshot_id: None,
         }
     }
 }
@@ -2070,6 +2072,7 @@ pub enum Input {
     Command(Command),
     HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>, Abandoned),
+    SnapshotRefused(EntityId),
 }
 
 #[derive(Clone)]
@@ -2289,6 +2292,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     Some(Input::Command(command)) => self.command(command).await?,
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
                     Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
+                    Some(Input::SnapshotRefused(snapshot_id)) => self.snapshot_refused(&snapshot_id)?,
                     None => break,
                 },
                 Some(setup) = setups.recv() => self.setup_command(setup),
@@ -2975,6 +2979,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let live = self.slots.get_mut(&session).and_then(|slot| {
             let live = slot.live.take()?;
             slot.busy = true;
+            slot.snapshot_id = Some(order.snapshot_id.clone());
             Some(live)
         });
         let Some(live) = live else {
@@ -3000,6 +3005,26 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.spawn(session, Work::Snapshot, running, async move {
             runner.snapshot(live, &order).await
         });
+    }
+
+    fn snapshot_refused(&mut self, snapshot_id: &EntityId) -> Result<(), String> {
+        let Some((session, live)) = self.slots.iter_mut().find_map(|(session, slot)| {
+            let live = slot
+                .live
+                .as_mut()
+                .filter(|_| slot.snapshot_id.as_ref() == Some(snapshot_id))?;
+            Some((session.clone(), live))
+        }) else {
+            return Ok(());
+        };
+        live.dirty = true;
+        eprintln!(
+            "tumpel-supervisor: session {session} box {} stays dirty and no longer ends on Idle: the control plane refused SnapshotDone {}",
+            *live.box_id, **snapshot_id
+        );
+        self.runner.standing.put(live, None)?;
+        self.arm_idle(&session);
+        Ok(())
     }
 
     fn live_box(&self, session: &str) -> Option<&LiveBox<V::Machine>> {

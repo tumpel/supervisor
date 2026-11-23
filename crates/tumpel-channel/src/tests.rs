@@ -398,10 +398,11 @@ fn a_saved_frame_no_reader_knows_is_resent_unchanged_and_dropped_once_the_contro
     assert_eq!(sent[0], json!({"type": "Frame", "seq": 7, "ack": 4, "message": step}));
 
     let refused = json!({"type": "FrameRefused", "seq": 7, "reason": "message.phase: Invalid option"}).to_string();
-    let Ok(Event::FrameRefused { seq, reason }) = channel.receive(&refused) else {
+    let Ok(Event::FrameRefused { seq, reason, message }) = channel.receive(&refused) else {
         panic!("the refusal is reported");
     };
     assert_eq!((seq, reason.as_str()), (7, "message.phase: Invalid option"));
+    assert_eq!(message, Some(step), "the refusal names the frame it refused");
     let state = disk.0.borrow().clone().expect("saved state");
     assert!(state.unacked.is_empty(), "the refused frame leaves channel.json");
     assert_eq!(channel.phase(), Phase::Open, "a refusal keeps the connection");
