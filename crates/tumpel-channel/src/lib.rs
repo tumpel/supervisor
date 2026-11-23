@@ -4,25 +4,29 @@ use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use serde_json::Value;
+use tumpel_api::frozen::v34;
 use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostEnvelope, ChannelHostFrame, ChannelHostFrameType, ChannelHostHeartbeat,
-    ChannelHostHeartbeatType, ChannelHostMessage, ChannelProtocol, ChannelSnapshotDone, ChannelSnapshotFailed,
-    ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelStoredHostFrame, ChannelStoredHostFrameType,
-    EntityId, HostReportedHealth, HostUsage, Sequence, SupervisorChannelReplay, SupervisorChannelState,
+    ChannelHostHeartbeatType, ChannelHostMessage, ChannelProtocol, ChannelStoredHostFrame, ChannelStoredHostFrameType,
+    ChannelWelcome, EntityId, HostReportedHealth, HostUsage, Sequence, SupervisorChannelState,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
 pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
-pub const MAX_REPLAYS: u32 = 10;
-pub const MAX_RECONNECTS: u32 = 10;
+const FROZEN_V34: u16 = 34;
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
-pub const MAX_RATE_BACKOFFS: u32 = 10;
 const ASSUMED_FRAMES_PER_MINUTE: u32 = 600;
-pub const LAST_RATE_BACKOFF: Duration = Duration::from_mins(15);
 
 const HELLO_CONTEXT: &[u8] = b"tumpel-channel-hello-v1";
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeldIds {
+    pub session_ids: Vec<EntityId>,
+    pub claude_setup_ids: Vec<EntityId>,
+    pub turn_ids: Vec<EntityId>,
+}
 
 #[must_use]
 pub fn hello_bytes(nonce: &str, host_id: &str) -> Vec<u8> {
@@ -41,7 +45,6 @@ pub fn empty_state() -> SupervisorChannelState {
         received: Sequence(0),
         sent: Sequence(0),
         unacked: Vec::new(),
-        replays: Vec::new(),
     }
 }
 
@@ -50,7 +53,6 @@ pub enum ChannelError {
     Protocol(String),
     Port(String),
     Store(String),
-    Undelivered(String),
 }
 
 impl fmt::Display for ChannelError {
@@ -59,7 +61,6 @@ impl fmt::Display for ChannelError {
             Self::Protocol(reason) => write!(f, "channel protocol error: {reason}"),
             Self::Port(reason) => write!(f, "sending on the channel failed: {reason}"),
             Self::Store(reason) => write!(f, "saving the channel state failed: {reason}"),
-            Self::Undelivered(reason) => f.write_str(reason),
         }
     }
 }
@@ -93,38 +94,28 @@ pub enum Phase {
 
 pub struct Backoff {
     wait: Duration,
-    fruitless: u32,
 }
 
 impl Default for Backoff {
     fn default() -> Self {
-        Self {
-            wait: FIRST_BACKOFF,
-            fruitless: 0,
-        }
+        Self { wait: FIRST_BACKOFF }
     }
 }
 
 impl Backoff {
-    pub fn next(&mut self, progressed: bool, jitter: u16) -> Option<Duration> {
+    pub fn next(&mut self, progressed: bool, jitter: u16) -> Duration {
         if progressed {
-            self.fruitless = 0;
             self.wait = FIRST_BACKOFF;
-        }
-        self.fruitless += 1;
-        if self.fruitless > MAX_RECONNECTS {
-            return None;
         }
         let half = self.wait / 2;
         let wait = half + half.mul_f64(f64::from(jitter) / f64::from(u16::MAX));
         self.wait = (self.wait * 2).min(LAST_BACKOFF);
-        Some(wait)
+        wait
     }
 }
 
 #[derive(Default)]
 pub struct RateLimit {
-    backoffs: u32,
     paused_until: Option<DateTime<Utc>>,
     last_limited: Option<DateTime<Utc>>,
     frames_per_minute: u32,
@@ -134,7 +125,6 @@ pub struct RateLimit {
 pub enum RateBackoff {
     Until(DateTime<Utc>),
     Paused,
-    Exhausted,
 }
 
 impl RateLimit {
@@ -147,19 +137,14 @@ impl RateLimit {
     ) -> RateBackoff {
         self.last_limited = Some(now);
         self.frames_per_minute = frames_per_minute;
-        if self.paused(now) {
+        let current = self.paused_until.filter(|_| self.paused(now));
+        if current.is_some_and(|until| until >= retry_after) {
             return RateBackoff::Paused;
         }
-        self.backoffs += 1;
-        if self.backoffs > MAX_RATE_BACKOFFS {
-            return RateBackoff::Exhausted;
-        }
-        let first = (retry_after - now).to_std().unwrap_or_default().max(FIRST_BACKOFF);
-        let wait = first
-            .saturating_mul(1 << (self.backoffs - 1).min(16))
-            .min(LAST_RATE_BACKOFF);
+        let wait = (retry_after - now).to_std().unwrap_or_default().max(FIRST_BACKOFF);
         let jittered = wait + (wait / 2).mul_f64(f64::from(jitter) / f64::from(u16::MAX));
         let until = now + chrono::Duration::from_std(jittered).unwrap_or(chrono::Duration::MAX);
+        let until = current.map_or(until, |current| current.max(until));
         self.paused_until = Some(until);
         RateBackoff::Until(until)
     }
@@ -181,11 +166,6 @@ impl RateLimit {
     }
 
     #[must_use]
-    pub fn backoffs(&self) -> u32 {
-        self.backoffs
-    }
-
-    #[must_use]
     pub fn health(&self, now: DateTime<Utc>) -> HostReportedHealth {
         let window = chrono::Duration::from_std(RATE_WINDOW).unwrap_or(chrono::Duration::MAX);
         let recent = self.last_limited.is_some_and(|at| now < at + window);
@@ -193,14 +173,6 @@ impl RateLimit {
             return HostReportedHealth::RateLimited;
         }
         HostReportedHealth::Healthy
-    }
-
-    pub fn recovered(&mut self, now: DateTime<Utc>) -> bool {
-        if self.last_limited.is_none() || self.health(now) == HostReportedHealth::RateLimited {
-            return false;
-        }
-        *self = Self::default();
-        true
     }
 }
 
@@ -233,49 +205,38 @@ pub struct HostChannel<S: Store, K: Signer> {
     phase: Phase,
     progressed: bool,
     withheld: Option<i64>,
+    offered: Vec<EntityId>,
+    hello_version: u16,
 }
 
 fn encode(envelope: &ChannelHostEnvelope) -> Result<String, ChannelError> {
     serde_json::to_string(envelope).map_err(|error| ChannelError::Protocol(format!("encoding a message: {error}")))
 }
 
+fn encode_hello(hello: ChannelHello, version: u16) -> Result<String, ChannelError> {
+    if version > FROZEN_V34 {
+        return encode(&hello.into());
+    }
+    let hello: v34::types::ChannelHello = serde_json::to_value(&hello)
+        .and_then(serde_json::from_value)
+        .map_err(|error| protocol(format!("encoding a protocol 34 Hello: {error}")))?;
+    serde_json::to_string(&v34::types::ChannelHostEnvelope::from(hello))
+        .map_err(|error| protocol(format!("encoding a protocol 34 Hello: {error}")))
+}
+
+fn encode_heartbeat(heartbeat: ChannelHostHeartbeat, version: u16) -> Result<String, ChannelError> {
+    if version > FROZEN_V34 {
+        return encode(&heartbeat.into());
+    }
+    let heartbeat: v34::types::ChannelHostHeartbeat = serde_json::to_value(&heartbeat)
+        .and_then(serde_json::from_value)
+        .map_err(|error| protocol(format!("encoding a protocol 34 Heartbeat: {error}")))?;
+    serde_json::to_string(&v34::types::ChannelHostEnvelope::from(heartbeat))
+        .map_err(|error| protocol(format!("encoding a protocol 34 Heartbeat: {error}")))
+}
+
 fn protocol(reason: impl Into<String>) -> ChannelError {
     ChannelError::Protocol(reason.into())
-}
-
-fn message_type(frame: &ChannelStoredHostFrame) -> &str {
-    frame.message.get("type").and_then(Value::as_str).unwrap_or("unknown")
-}
-
-fn snapshot_failed(frame: &ChannelStoredHostFrame) -> Result<Option<Value>, ChannelError> {
-    if message_type(frame) != "SnapshotDone" {
-        return Ok(None);
-    }
-    let done: ChannelSnapshotDone = serde_json::from_value(frame.message.clone())
-        .map_err(|error| protocol(format!("reading saved SnapshotDone frame {}: {error}", frame.seq.0)))?;
-    let failed: ChannelHostMessage = ChannelSnapshotFailed {
-        detail: format!(
-            "the control plane did not ack SnapshotDone for snapshot {} after the host resent it after {MAX_REPLAYS} Welcomes, so the host reports the snapshot failed in its place; check the control plane logs for this snapshot",
-            *done.snapshot_id
-        )
-        .try_into()
-        .map_err(|error| protocol(format!("the SnapshotFailed detail for snapshot {}: {error}", *done.snapshot_id)))?,
-        failed_at: Utc::now().fixed_offset(),
-        reason: ChannelSnapshotFailureReason::NotAnswered,
-        snapshot_id: done.snapshot_id,
-        type_: ChannelSnapshotFailedType::SnapshotFailed,
-    }
-    .into();
-    serde_json::to_value(&failed)
-        .map(Some)
-        .map_err(|error| protocol(format!("encoding SnapshotFailed for channel.json: {error}")))
-}
-
-fn replays_of(replays: &[SupervisorChannelReplay], seq: i64) -> u32 {
-    replays
-        .iter()
-        .find(|replay| replay.seq.0 == seq)
-        .map_or(0, |replay| replay.replays.get())
 }
 
 impl<S: Store, K: Signer> HostChannel<S, K> {
@@ -286,7 +247,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         host_id: EntityId,
         supervisor_version: String,
     ) -> Self {
-        let withheld = state.unacked.first().map(|first| first.seq.0);
         Self {
             state,
             store,
@@ -295,7 +255,9 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             supervisor_version,
             phase: Phase::Closed,
             progressed: false,
-            withheld,
+            withheld: None,
+            offered: Vec::new(),
+            hello_version: ChannelProtocol::VERSION,
         }
     }
 
@@ -323,6 +285,18 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         self.phase = Phase::Closed;
     }
 
+    pub fn step_down(&mut self) -> Option<u16> {
+        if self.hello_version <= ChannelProtocol::OLDEST {
+            return None;
+        }
+        self.hello_version = ChannelProtocol::OLDEST;
+        Some(self.hello_version)
+    }
+
+    pub fn step_up(&mut self) {
+        self.hello_version = ChannelProtocol::VERSION;
+    }
+
     /// # Errors
     /// Fails when the state cannot be saved or the port refuses the frame.
     pub fn send(&mut self, message: ChannelHostMessage, port: &mut impl Port) -> Result<(), ChannelError> {
@@ -334,6 +308,9 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         };
         let message = serde_json::to_value(&frame.message)
             .map_err(|error| protocol(format!("encoding a message for channel.json: {error}")))?;
+        if let Some(turn_id) = message.get("turnId").and_then(Value::as_str) {
+            self.offered.retain(|offered| **offered != *turn_id);
+        }
         self.state.sent = Sequence(frame.seq.0);
         self.state.unacked.push(ChannelStoredHostFrame {
             ack: Sequence(frame.ack.0),
@@ -346,12 +323,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             port.send(encode(&frame.into())?)?;
         }
         Ok(())
-    }
-
-    pub fn withhold(&mut self) {
-        if self.withheld.is_none() {
-            self.withheld = Some(self.state.sent.0 + 1);
-        }
     }
 
     #[must_use]
@@ -383,28 +354,45 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         Ok(())
     }
 
+    fn unacked_turns(&self) -> Vec<EntityId> {
+        self.state
+            .unacked
+            .iter()
+            .filter_map(|frame| frame.message.get("turnId").and_then(Value::as_str))
+            .filter_map(|turn_id| EntityId::try_from(turn_id).ok())
+            .collect()
+    }
+
+    fn held_turns(&mut self, mut held: Vec<EntityId>) -> Vec<EntityId> {
+        self.offered.retain(|offered| !held.contains(offered));
+        for turn_id in self.unacked_turns().into_iter().chain(self.offered.iter().cloned()) {
+            if !held.contains(&turn_id) {
+                held.push(turn_id);
+            }
+        }
+        held
+    }
+
     /// # Errors
     /// Fails when the port refuses the heartbeat.
     pub fn heartbeat(
         &mut self,
         now: DateTime<FixedOffset>,
         usage: HostUsage,
-        held_session_ids: Vec<EntityId>,
-        held_claude_setup_ids: Vec<EntityId>,
+        held: HeldIds,
         health: HostReportedHealth,
         port: &mut impl Port,
     ) -> Result<(), ChannelError> {
-        port.send(encode(
-            &ChannelHostHeartbeat {
-                health: Some(health),
-                held_claude_setup_ids,
-                held_session_ids,
-                sent_at: now,
-                type_: ChannelHostHeartbeatType::Heartbeat,
-                usage,
-            }
-            .into(),
-        )?)
+        let heartbeat = ChannelHostHeartbeat {
+            health: Some(health),
+            held_claude_setup_ids: held.claude_setup_ids,
+            held_session_ids: held.session_ids,
+            held_turn_ids: self.held_turns(held.turn_ids),
+            sent_at: now,
+            type_: ChannelHostHeartbeatType::Heartbeat,
+            usage,
+        };
+        port.send(encode_heartbeat(heartbeat, self.hello_version)?)
     }
 
     /// # Errors
@@ -414,6 +402,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         nonce: &str,
         box_capacity: NonZeroU32,
         usage: HostUsage,
+        held_turn_ids: Vec<EntityId>,
         port: &mut impl Port,
     ) -> Result<(), ChannelError> {
         if self.phase != Phase::AwaitingHello {
@@ -424,10 +413,11 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         }
         let hello = ChannelHello {
             box_capacity,
-            channel_protocol_oldest: None,
+            channel_protocol_oldest: NonZeroU32::new(u32::from(ChannelProtocol::OLDEST)),
             guest_protocol: None,
+            held_turn_ids: self.held_turns(held_turn_ids),
             host_id: self.host_id.clone(),
-            protocol_version: NonZeroU32::new(u32::from(ChannelProtocol::VERSION))
+            protocol_version: NonZeroU32::new(u32::from(self.hello_version))
                 .ok_or_else(|| protocol("protocol version 0"))?,
             signature: self
                 .signer
@@ -442,28 +432,28 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             type_: ChannelHelloType::Hello,
             usage,
         };
-        port.send(encode(&hello.into())?)?;
+        port.send(encode_hello(hello, self.hello_version)?)?;
         self.phase = Phase::AwaitingWelcome;
         Ok(())
     }
 
     /// # Errors
     /// Fails on a message the protocol does not allow in the current phase, a frame gap, or when
-    /// the state cannot be saved or the port refuses a message. The connection must be closed then.
-    pub fn receive(&mut self, text: &str, port: &mut impl Port) -> Result<Event, ChannelError> {
+    /// the state cannot be saved. The connection must be closed then.
+    pub fn receive(&mut self, text: &str) -> Result<Event, ChannelError> {
         if self.phase == Phase::Closed {
             return Ok(Event::None);
         }
         let envelope: ChannelControlEnvelope = serde_json::from_str(text)
             .map_err(|error| protocol(format!("the message matches no channel envelope: {error}")))?;
-        let outcome = self.handle(envelope, port);
+        let outcome = self.handle(envelope);
         if outcome.is_err() {
             self.phase = Phase::Closed;
         }
         outcome
     }
 
-    fn handle(&mut self, envelope: ChannelControlEnvelope, port: &mut impl Port) -> Result<Event, ChannelError> {
+    fn handle(&mut self, envelope: ChannelControlEnvelope) -> Result<Event, ChannelError> {
         match (self.phase, envelope) {
             (Phase::AwaitingChallenge, ChannelControlEnvelope::Challenge(challenge)) => {
                 self.phase = Phase::AwaitingHello;
@@ -472,67 +462,24 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             (Phase::AwaitingChallenge, other) => {
                 Err(protocol(format!("expected Challenge first, got {}", kind(&other))))
             }
-            (Phase::AwaitingWelcome, ChannelControlEnvelope::Welcome(welcome)) => self.welcomed(welcome.ack, port),
+            (Phase::AwaitingWelcome, ChannelControlEnvelope::Welcome(welcome)) => self.welcomed(welcome),
             (Phase::Open, ChannelControlEnvelope::ControlFrame(frame)) => self.accept(frame),
             (Phase::AwaitingWelcome | Phase::Open, ChannelControlEnvelope::Heartbeat(_)) => Ok(Event::Heartbeat),
             (Phase::Open, ChannelControlEnvelope::ReleasePublished(_)) => Ok(Event::ReleasePublished),
             (Phase::Open, ChannelControlEnvelope::FrameRefused(refused)) => self.refused(refused),
-            (Phase::Open, ChannelControlEnvelope::FrameRateLimited(limited)) => self.rate_limited(limited),
+            (Phase::Open, ChannelControlEnvelope::FrameRateLimited(limited)) => Ok(self.rate_limited(limited)),
             (phase, other) => Err(protocol(format!("{} arrived in phase {phase:?}", kind(&other)))),
         }
     }
 
-    fn welcomed(&mut self, ack: Option<Sequence>, port: &mut impl Port) -> Result<Event, ChannelError> {
-        if let Some(ack) = ack {
+    fn welcomed(&mut self, welcome: ChannelWelcome) -> Result<Event, ChannelError> {
+        if let Some(ack) = welcome.ack {
             self.drop_acked(ack.0);
         }
-        self.count_replay()?;
         self.store.save(&self.state)?;
-        self.phase = Phase::Open;
-        if let Some(first) = self.state.unacked.first().filter(|_| self.withheld.is_some()) {
-            self.withheld = Some(first.seq.0);
-            return Ok(Event::Welcomed);
-        }
-        for frame in &self.state.unacked {
-            let resent = ChannelStoredHostFrame {
-                ack: Sequence(self.state.received.0),
-                ..frame.clone()
-            };
-            port.send(
-                serde_json::to_string(&resent)
-                    .map_err(|error| protocol(format!("encoding a stored frame: {error}")))?,
-            )?;
-        }
+        self.withheld = self.state.unacked.first().map(|first| first.seq.0);
         self.phase = Phase::Open;
         Ok(Event::Welcomed)
-    }
-
-    fn count_replay(&mut self) -> Result<(), ChannelError> {
-        let Some(first) = self.state.unacked.first_mut() else {
-            return Ok(());
-        };
-        let seq = first.seq.0;
-        let replays = replays_of(&self.state.replays, seq);
-        self.state.replays.retain(|replay| replay.seq.0 != seq);
-        if replays < MAX_REPLAYS {
-            self.state.replays.push(SupervisorChannelReplay {
-                replays: NonZeroU32::MIN.saturating_add(replays),
-                seq: Sequence(seq),
-            });
-            return Ok(());
-        }
-        let Some(failed) = snapshot_failed(first)? else {
-            return Err(ChannelError::Undelivered(format!(
-                "the control plane did not ack frame {seq} ({}) after the host resent it after {MAX_REPLAYS} Welcomes, and the host cannot skip a frame; check the control plane logs for this host",
-                message_type(first)
-            )));
-        };
-        first.message = failed;
-        self.state.replays.push(SupervisorChannelReplay {
-            replays: NonZeroU32::MIN,
-            seq: Sequence(seq),
-        });
-        Ok(())
     }
 
     fn drop_acked(&mut self, ack: i64) {
@@ -540,13 +487,11 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             self.progressed = true;
         }
         self.state.unacked.retain(|own| own.seq.0 > ack);
-        self.state.replays.retain(|replay| replay.seq.0 > ack);
     }
 
     fn refused(&mut self, refused: ChannelFrameRefused) -> Result<Event, ChannelError> {
         self.progressed = true;
         self.state.unacked.retain(|own| own.seq.0 != refused.seq.0);
-        self.state.replays.retain(|replay| replay.seq.0 != refused.seq.0);
         self.store.save(&self.state)?;
         Ok(Event::FrameRefused {
             seq: refused.seq.0,
@@ -554,17 +499,15 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         })
     }
 
-    fn rate_limited(&mut self, limited: ChannelFrameRateLimited) -> Result<Event, ChannelError> {
+    fn rate_limited(&mut self, limited: ChannelFrameRateLimited) -> Event {
         self.progressed = true;
-        self.state.unacked.retain(|own| own.seq.0 != limited.seq.0);
-        self.state.replays.retain(|replay| replay.seq.0 != limited.seq.0);
-        self.store.save(&self.state)?;
-        Ok(Event::FrameRateLimited {
+        self.withheld = Some(self.withheld.map_or(limited.seq.0, |from| from.min(limited.seq.0)));
+        Event::FrameRateLimited {
             seq: limited.seq.0,
             reason: String::from(limited.reason),
             frames_per_minute: limited.frames_per_minute.get(),
             retry_after: limited.retry_after.with_timezone(&Utc),
-        })
+        }
     }
 
     fn accept(&mut self, frame: ChannelControlFrame) -> Result<Event, ChannelError> {
@@ -583,6 +526,15 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         self.progressed = true;
         self.drop_acked(frame.ack.0);
         self.store.save(&self.state)?;
+        match &frame.message {
+            ChannelControlMessage::TurnOffer(offer) if !self.offered.contains(&offer.turn_id) => {
+                self.offered.push(offer.turn_id.clone());
+            }
+            ChannelControlMessage::TurnWithdrawn(withdrawn) => {
+                self.offered.retain(|offered| *offered != withdrawn.turn_id);
+            }
+            _ => {}
+        }
         Ok(Event::Message(Box::new(frame.message)))
     }
 }

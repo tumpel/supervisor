@@ -4,7 +4,7 @@ use base64::Engine;
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::path::Path;
-use tumpel_api::types::{Host, HostEnrol, SupervisorConfig, SupervisorHostKey};
+use tumpel_api::types::{HostEnrol, SupervisorConfig, SupervisorHostKey, TenantApiHostRecord};
 use tumpel_api::{Client, Error};
 
 use crate::bounded::bounded;
@@ -48,7 +48,7 @@ pub fn ensure_unenrolled() -> Result<()> {
     Ok(())
 }
 
-pub async fn enrol_with_token(endpoint: &str, token: String, name: Option<String>) -> Result<Host> {
+pub async fn enrol_with_token(endpoint: &str, token: String, name: Option<String>) -> Result<TenantApiHostRecord> {
     let endpoint = endpoint.trim_end_matches('/');
     let dir = dir::supervisor_dir();
     ensure_unenrolled()?;

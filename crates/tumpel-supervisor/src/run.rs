@@ -17,16 +17,15 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
-    BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxFailed,
-    ChannelClaudeSetupBoxFailedType, ChannelClaudeSetupBoxOffer, ChannelCloseCode, ChannelControlMessage,
-    ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupFailureReason, ClaudeSetupHarness,
-    EntityId, HostReportedHealth, HostUsage, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure,
+    BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
+    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
+    HostReportedHealth, HostUsage, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure,
     SupervisorHandover, SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending,
     TurnFailureReason,
 };
 use tumpel_channel::{
-    Backoff, ChannelError, Event, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer, HEARTBEAT_DEADLINE,
-    MAX_RATE_BACKOFFS, MAX_RECONNECTS,
+    Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer, Store,
+    HEARTBEAT_DEADLINE,
 };
 
 use crate::boot::BootOrder;
@@ -180,6 +179,7 @@ struct Usage {
     running: watch::Receiver<u32>,
     sessions: watch::Receiver<Vec<EntityId>>,
     claude_setups: watch::Receiver<Vec<EntityId>>,
+    turns: watch::Receiver<Vec<EntityId>>,
     holdings: watch::Receiver<Held>,
     data_dir: PathBuf,
     telemetry: Telemetry,
@@ -196,10 +196,29 @@ impl Usage {
     }
 }
 
-fn hello(channel: &mut Channel, nonce: &str, usage: &Usage, outbox: &mut Outbox) -> Result<(), Failure> {
+fn hello(
+    channel: &mut Channel,
+    nonce: &str,
+    usage: &Usage,
+    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    outbox: &mut Outbox,
+) -> Result<(), Failure> {
+    let turns = usage.turns.borrow().clone();
+    drain(channel, from_box, outbox)?;
     channel
-        .hello(nonce, usage.box_capacity, usage.sample()?, outbox)
+        .hello(nonce, usage.box_capacity, usage.sample()?, turns, outbox)
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
+}
+
+fn drain(
+    channel: &mut Channel,
+    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    outbox: &mut Outbox,
+) -> Result<(), Failure> {
+    while let Ok(message) = from_box.try_recv() {
+        channel.send(message, outbox).map_err(|error| store_lost(&error))?;
+    }
+    Ok(())
 }
 
 fn beat(
@@ -209,20 +228,14 @@ fn beat(
     health: HostReportedHealth,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
-    let held = usage.sessions.borrow().clone();
-    let setups = usage.claude_setups.borrow().clone();
-    while let Ok(message) = from_box.try_recv() {
-        channel.send(message, outbox).map_err(|error| store_lost(&error))?;
-    }
+    let held = HeldIds {
+        session_ids: usage.sessions.borrow().clone(),
+        claude_setup_ids: usage.claude_setups.borrow().clone(),
+        turn_ids: usage.turns.borrow().clone(),
+    };
+    drain(channel, from_box, outbox)?;
     channel
-        .heartbeat(
-            chrono::Utc::now().fixed_offset(),
-            usage.sample()?,
-            held,
-            setups,
-            health,
-            outbox,
-        )
+        .heartbeat(chrono::Utc::now().fixed_offset(), usage.sample()?, held, health, outbox)
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
 }
 
@@ -377,6 +390,7 @@ fn start_boxes(
         running: lifecycle.boxes(),
         sessions: lifecycle.sessions(),
         claude_setups: lifecycle.claude_setups(),
+        turns: lifecycle.turns(),
         holdings: lifecycle.holdings(),
         data_dir: PathBuf::from(&*runtime.data_dir),
         telemetry,
@@ -451,19 +465,10 @@ async fn terminate(
 }
 
 fn restarts(kind: SupervisorFailure) -> bool {
-    !matches!(
-        kind,
-        SupervisorFailure::NotEnrolled | SupervisorFailure::HostRevoked | SupervisorFailure::RateLimited
-    )
+    !matches!(kind, SupervisorFailure::NotEnrolled | SupervisorFailure::HostRevoked)
 }
 
-fn abandoned(failure: &Failure) -> Abandoned {
-    if failure.kind == SupervisorFailure::RateLimited {
-        return Abandoned {
-            reason: TurnFailureReason::RateLimited,
-            cause: format!("this supervisor stopped because {}", failure.detail),
-        };
-    }
+fn abandoned() -> Abandoned {
     Abandoned {
         reason: TurnFailureReason::HarnessExited,
         cause: "this supervisor binary stopped before it reached the control plane".to_string(),
@@ -823,13 +828,16 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
             .await
             .map(|()| Stopped::Terminated),
         Err(failure) if restarts(failure.kind) => {
-            terminate(&commands, &updates.layout, &updates.out).await?;
+            if let Err(lost) = terminate(&commands, &updates.layout, &updates.out).await {
+                store_unsent(&mut channel, &mut from_box, &usage.telemetry)?;
+                return Err(lost);
+            }
             Err(failure)
         }
         Ok(Served::BoxesStopped(failure)) | Err(failure) => Err(failure),
     };
-    if let Err(failure) = &stopped {
-        abandon(&commands, abandoned(failure)).await;
+    if stopped.is_err() {
+        abandon(&commands, abandoned()).await;
     }
     store_unsent(&mut channel, &mut from_box, &usage.telemetry)?;
     stopped
@@ -863,8 +871,9 @@ async fn serve(
     let mut backoff = Backoff::default();
     let mut limit = RateLimit::default();
     loop {
-        match session(channel, url, heartbeat, usage, commands, from_box, updates, &mut limit).await? {
-            Ended::Revoked(reason) => {
+        let ended = session(channel, url, heartbeat, usage, commands, from_box, updates, &mut limit).await?;
+        match next(channel, &mut backoff, url, ended, jitter()) {
+            Next::Revoked(reason) => {
                 let key = dir.join(KEY_FILE);
                 std::fs::remove_file(&key).map_err(|error| {
                     fail(
@@ -882,24 +891,14 @@ async fn serve(
                 );
                 return Ok(Served::Revoked);
             }
-            Ended::Refused(reason) => {
+            Next::Update(reason) => {
                 eprintln!("the control plane refused this supervisor's protocol ({reason}); updating now");
                 if updates.updater.now().await == Outcome::Restart {
                     return Ok(Served::Updated);
                 }
                 return Err(fail(SupervisorFailure::ProtocolError, reason));
             }
-            Ended::Dropped { progressed, reason } => {
-                let Some(wait) = backoff.next(progressed, jitter()) else {
-                    return Err(fail(
-                        SupervisorFailure::ChannelUnreachable,
-                        format!("{MAX_RECONNECTS} connections in a row to {url} ended with no frame from the control plane and no ack of the host frames, the last with: {reason}; check the network and the control plane"),
-                    ));
-                };
-                eprintln!(
-                    "channel to {url} dropped: {reason}; reconnecting in {:.1}s",
-                    wait.as_secs_f64()
-                );
+            Next::Reconnect(wait) => {
                 let wake = tokio::time::Instant::now() + wait;
                 loop {
                     tokio::select! {
@@ -908,6 +907,40 @@ async fn serve(
                     }
                 }
             }
+        }
+    }
+}
+
+enum Next {
+    Revoked(String),
+    Update(String),
+    Reconnect(Duration),
+}
+
+fn next<S: Store, K: Signer>(
+    channel: &mut HostChannel<S, K>,
+    backoff: &mut Backoff,
+    url: &str,
+    ended: Ended,
+    jitter: u16,
+) -> Next {
+    match ended {
+        Ended::Revoked(reason) => Next::Revoked(reason),
+        Ended::Refused(reason) => match channel.step_down() {
+            Some(version) => {
+                eprintln!("the control plane refused this supervisor's newest protocol ({reason}); reconnecting with protocol {version}");
+                Next::Reconnect(Duration::ZERO)
+            }
+            None => Next::Update(reason),
+        },
+        Ended::Dropped { progressed, reason } => {
+            channel.step_up();
+            let wait = backoff.next(progressed, jitter);
+            eprintln!(
+                "channel to {url} dropped: {reason}; reconnecting in {:.1}s",
+                wait.as_secs_f64()
+            );
+            Next::Reconnect(wait)
         }
     }
 }
@@ -962,58 +995,17 @@ fn box_command(message: ChannelControlMessage) -> BoxCommand {
 }
 
 fn rate_limited(
-    channel: &mut Channel,
     limit: &mut RateLimit,
     url: &str,
     reason: &str,
     frames_per_minute: u32,
     retry_after: chrono::DateTime<chrono::Utc>,
-) -> Option<Result<Ended, Failure>> {
-    match limit.limited(chrono::Utc::now(), retry_after, frames_per_minute, jitter()) {
-        RateBackoff::Paused => None,
-        RateBackoff::Until(until) => {
-            channel.withhold();
-            eprintln!(
-                "tumpel-supervisor: RateLimited: {url} refused a frame: {reason}; backoff {} of {MAX_RATE_BACKOFFS}: this host reports RateLimited, takes no new turns or setup boxes and holds its frames until {}",
-                limit.backoffs(),
-                until.to_rfc3339()
-            );
-            None
-        }
-        RateBackoff::Exhausted => Some(Err(fail(
-            SupervisorFailure::RateLimited,
-            format!("{url} still refused this host's frames ({reason}) after {MAX_RATE_BACKOFFS} backoffs in a row; find what floods the channel, then start the unit by hand"),
-        ))),
-    }
-}
-
-fn refused_offer(
-    message: ChannelControlMessage,
-    out: &UnboundedSender<ChannelHostMessage>,
-) -> Option<ChannelControlMessage> {
-    let detail = "this host is rate limited by the control plane and takes no new work until it is Healthy again";
-    match message {
-        ChannelControlMessage::TurnOffer(offer) => {
-            turn_failed(
-                out,
-                &offer.turn_id,
-                TurnFailureReason::RateLimited,
-                format!("{detail}; send the turn again"),
-            );
-            None
-        }
-        ChannelControlMessage::ClaudeSetupBoxOffer(offer) => {
-            let failed = ChannelClaudeSetupBoxFailed {
-                claude_setup_id: offer.claude_setup_id,
-                detail: format!("{detail}; start the Claude setup again").try_into().ok()?,
-                failed_at: chrono::Utc::now().fixed_offset(),
-                reason: ClaudeSetupFailureReason::RateLimited,
-                type_: ChannelClaudeSetupBoxFailedType::ClaudeSetupBoxFailed,
-            };
-            let _ = out.send(failed.into());
-            None
-        }
-        other => Some(other),
+) {
+    if let RateBackoff::Until(until) = limit.limited(chrono::Utc::now(), retry_after, frames_per_minute, jitter()) {
+        eprintln!(
+            "tumpel-supervisor: RateLimited: {url} refused a frame: {reason}; this host reports RateLimited and holds its frames until {}, then sends them again",
+            until.to_rfc3339()
+        );
     }
 }
 
@@ -1052,28 +1044,21 @@ async fn session(
                 Some(Ok(Message::Close(frame))) => Some(closed_by_peer(frame.as_ref(), channel.progressed())),
                 Some(Ok(Message::Text(text))) => {
                     last_received = Instant::now();
-                    match channel.receive(text.as_str(), &mut outbox) {
-                        Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, &mut outbox).err().map(Err),
+                    match channel.receive(text.as_str()) {
+                        Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
                         Ok(Event::Welcomed) => {
                             eprintln!("connected to {url}");
                             last_beat = Instant::now();
                             updates.welcomed().await.err().map(Err)
                         }
-                        Ok(Event::Message(message)) => {
-                            let message = if limit.health(chrono::Utc::now()) == HostReportedHealth::RateLimited {
-                                refused_offer(*message, &updates.out)
-                            } else {
-                                Some(*message)
-                            };
-                            let command = message.map(box_command);
-                            command.and_then(|command| commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))))
-                        }
+                        Ok(Event::Message(message)) => commands.send(box_command(*message)).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
                         Ok(Event::FrameRefused { seq, reason }) => {
                             eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
                             None
                         }
                         Ok(Event::FrameRateLimited { seq: _, reason, frames_per_minute, retry_after }) => {
-                            rate_limited(channel, limit, url, &reason, frames_per_minute, retry_after)
+                            rate_limited(limit, url, &reason, frames_per_minute, retry_after);
+                            None
                         }
                         Ok(Event::ReleasePublished) => {
                             updates.announced();
@@ -1085,7 +1070,6 @@ async fn session(
                             let _ = sink.send(Message::Close(Some(close))).await;
                             Some(Ok(dropped(channel.progressed(), reason)))
                         }
-                        Err(ChannelError::Undelivered(reason)) => Some(Err(fail(SupervisorFailure::FrameUndelivered, reason))),
                         Err(error) => Some(Err(fail(SupervisorFailure::ChannelStateLost, error.to_string()))),
                     }
                 }
@@ -1094,9 +1078,6 @@ async fn session(
             Some(message) = from_box.recv() => channel.send(message, &mut outbox).err().map(|error| Err(store_lost(&error))),
             _ = tick.tick() => {
                 let now = chrono::Utc::now();
-                if limit.recovered(now) {
-                    eprintln!("tumpel-supervisor: Healthy: {url} refused no frame for a full minute; this host takes new work again");
-                }
                 if last_received.elapsed() >= HEARTBEAT_DEADLINE {
                     Some(Ok(dropped(channel.progressed(), format!("nothing arrived for {} seconds", HEARTBEAT_DEADLINE.as_secs()))))
                 } else if channel.phase() == Phase::Open && last_beat.elapsed() >= heartbeat {
@@ -1164,5 +1145,87 @@ mod tests {
         assert_eq!(booted(&frame), "ClaudeCode 0.169.0");
         frame["harness"] = serde_json::json!("Codex");
         assert_eq!(booted(&frame), "Codex 0.169.0");
+    }
+
+    struct Unsaved;
+
+    impl Store for Unsaved {
+        fn save(&mut self, _: &tumpel_api::types::SupervisorChannelState) -> Result<(), ChannelError> {
+            Ok(())
+        }
+    }
+
+    struct Unsigned;
+
+    impl Signer for Unsigned {
+        fn sign(&self, _: &[u8]) -> String {
+            "c2lnbmF0dXJl".to_string()
+        }
+    }
+
+    fn hello_version(channel: &mut HostChannel<Unsaved, Unsigned>) -> serde_json::Value {
+        channel.connect();
+        let challenge = serde_json::json!({"type": "Challenge", "nonce": "n".repeat(43)}).to_string();
+        let Ok(Event::Challenged(nonce)) = channel.receive(&challenge) else {
+            panic!("the challenge asks for a Hello");
+        };
+        let usage =
+            serde_json::from_value(serde_json::json!({"boxesWarm": 0, "loadAverage": 0.0, "memoryAvailableMib": 1024}))
+                .expect("usage");
+        let mut outbox = Outbox::default();
+        channel
+            .hello(&nonce, std::num::NonZeroU32::MIN, usage, Vec::new(), &mut outbox)
+            .expect("hello");
+        channel.disconnect();
+        let [hello] = outbox.0.try_into().expect("one hello");
+        let hello: serde_json::Value = serde_json::from_str(&hello).expect("json");
+        hello["protocolVersion"].clone()
+    }
+
+    #[test]
+    fn a_refused_protocol_reconnects_at_once_at_34_and_a_dropped_connection_goes_back_to_36() {
+        let mut channel = HostChannel::new(
+            tumpel_channel::empty_state(),
+            Unsaved,
+            Unsigned,
+            "host-1".try_into().expect("host id"),
+            "0.1.0".to_string(),
+        );
+        let mut backoff = Backoff::default();
+        let url = "wss://control.example.test/v1/channel";
+        assert_eq!(hello_version(&mut channel), serde_json::json!(36));
+
+        let refusal = CloseFrame {
+            code: CloseCode::from(4426),
+            reason: "this control plane speaks 34 to 34, update the supervisor".into(),
+        };
+        let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
+            panic!("a refusal ends the session");
+        };
+        let Next::Reconnect(wait) = next(&mut channel, &mut backoff, url, ended, 0) else {
+            panic!("a refusal of the newest protocol reconnects");
+        };
+        assert_eq!(wait, Duration::ZERO);
+        assert_eq!(hello_version(&mut channel), serde_json::json!(34));
+
+        let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
+            panic!("a refusal ends the session");
+        };
+        assert!(matches!(
+            next(&mut channel, &mut backoff, url, ended, 0),
+            Next::Update(_)
+        ));
+
+        let Next::Reconnect(wait) = next(
+            &mut channel,
+            &mut backoff,
+            url,
+            dropped(false, "the connection ended"),
+            u16::MAX,
+        ) else {
+            panic!("a dropped connection reconnects");
+        };
+        assert_eq!(wait, Duration::from_secs(1));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(36));
     }
 }

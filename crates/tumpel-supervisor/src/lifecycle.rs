@@ -561,6 +561,21 @@ struct Slot<M: Machine> {
     idle_end: Option<Instant>,
 }
 
+impl<M: Machine> Slot<M> {
+    fn turns(&self) -> Vec<EntityId> {
+        let running = self.task.iter().filter_map(|(running, _)| match running {
+            Running::Turn(turn_id) => Some(turn_id.clone()),
+            Running::Snapshot => None,
+        });
+        let queued = self.queue.iter().filter_map(|command| match command {
+            Command::Turn(turn) => Some(turn.turn_id.clone()),
+            _ => None,
+        });
+        let parked = self.parked.iter().map(|parked| parked.turn_id.clone());
+        running.chain(queued).chain(parked).collect()
+    }
+}
+
 impl<M: Machine> Default for Slot<M> {
     fn default() -> Self {
         Self {
@@ -2072,6 +2087,7 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     busy: watch::Sender<u32>,
     sessions: watch::Sender<Vec<EntityId>>,
     claude_setups: watch::Sender<Vec<EntityId>>,
+    turns: watch::Sender<Vec<EntityId>>,
     holdings: watch::Sender<Held>,
     setups: HashMap<String, UnboundedSender<SetupInput>>,
     setup_tasks: HashMap<String, JoinHandle<()>>,
@@ -2125,6 +2141,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             busy: watch::Sender::new(0),
             sessions: watch::Sender::new(Vec::new()),
             claude_setups: watch::Sender::new(Vec::new()),
+            turns: watch::Sender::new(Vec::new()),
             holdings,
             setups: HashMap::new(),
             setup_tasks: HashMap::new(),
@@ -2160,6 +2177,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     #[must_use]
+    pub fn turns(&self) -> watch::Receiver<Vec<EntityId>> {
+        self.turns.subscribe()
+    }
+
+    #[must_use]
     pub fn holdings(&self) -> watch::Receiver<Held> {
         self.holdings.subscribe()
     }
@@ -2188,6 +2210,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 .map(|claude_setup_id| held_setup(claude_setup_id))
                 .collect(),
         );
+        self.turns
+            .send_replace(self.slots.values().flat_map(Slot::turns).collect());
         self.holdings.send_replace(self.current_holdings());
     }
 
