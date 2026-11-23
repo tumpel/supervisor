@@ -28,7 +28,11 @@ pub const UPDATE_REQUIRED: &str =
     "the control plane sent something this supervisor doesn't recognise; update the supervisor";
 
 pub fn update_required() {
-    tracing::warn!(target: "tumpel::compatibility", "{UPDATE_REQUIRED}");
+    if tracing::dispatcher::has_been_set() {
+        tracing::warn!(target: "tumpel::compatibility", "{UPDATE_REQUIRED}");
+        return;
+    }
+    eprintln!("{UPDATE_REQUIRED}");
 }
 
 const HELLO_CONTEXT: &[u8] = b"tumpel-channel-hello-v1";

@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use tumpel_api::types::{ChannelChallenge, ChannelProtocol, GuestProtocol, SupervisorCheckReport};
+use tumpel_api::types::{ChannelControlEnvelope, ChannelProtocol, GuestProtocol, SupervisorCheckReport};
 
 use crate::run::start;
 
@@ -19,20 +19,31 @@ async fn challenge(url: &str) -> Result<(), String> {
         .await
         .map_err(|_| format!("dialing {url} ran past {} s", CHANNEL_DIAL.as_secs()))?
         .map_err(|error| format!("dialing {url} failed: {error}"))?;
-    let first = timeout(CHALLENGE, stream.next())
-        .await
-        .map_err(|_| format!("{url} sent no Challenge within {} s", CHALLENGE.as_secs()))?;
-    let text = match first {
-        Some(Ok(Message::Text(text))) => text,
-        Some(Ok(other)) => return Err(format!("{url} sent {other:?} in place of a Challenge")),
-        Some(Err(error)) => return Err(format!("reading the Challenge from {url} failed: {error}")),
-        None => return Err(format!("{url} closed before its Challenge")),
-    };
-    let _: ChannelChallenge =
-        serde_json::from_str(text.as_str()).map_err(|error| format!("{url} sent no Challenge: {error}"))?;
+    timeout(CHALLENGE, async {
+        loop {
+            let text = match stream.next().await {
+                Some(Ok(Message::Text(text))) => text,
+                Some(Ok(other)) => return Err(format!("{url} sent {other:?} in place of a Challenge")),
+                Some(Err(error)) => return Err(format!("reading the Challenge from {url} failed: {error}")),
+                None => return Err(format!("{url} closed before its Challenge")),
+            };
+            let envelope: ChannelControlEnvelope =
+                serde_json::from_str(text.as_str()).map_err(|error| format!("{url} sent no Challenge: {error}"))?;
+            match envelope {
+                ChannelControlEnvelope::Challenge(_) => return Ok(()),
+                ChannelControlEnvelope::Unrecognised(_) => tumpel_channel::update_required(),
+                _ => return Err(format!("{url} sent no Challenge; update the supervisor")),
+            }
+        }
+    })
+    .await
+    .map_err(|_| format!("{url} sent no Challenge within {} s", CHALLENGE.as_secs()))??;
     let _ = stream.send(Message::Close(None)).await;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
 
 pub async fn check() -> Result<SupervisorCheckReport, String> {
     let started = start().map_err(|failure| format!("{}: {}", failure.kind, failure.detail))?;
