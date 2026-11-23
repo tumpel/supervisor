@@ -24,7 +24,8 @@ use tumpel_api::types::{
     TurnFailureReason,
 };
 use tumpel_channel::{
-    Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer, HEARTBEAT_DEADLINE,
+    Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer, Store,
+    HEARTBEAT_DEADLINE,
 };
 
 use crate::boot::BootOrder;
@@ -870,8 +871,9 @@ async fn serve(
     let mut backoff = Backoff::default();
     let mut limit = RateLimit::default();
     loop {
-        match session(channel, url, heartbeat, usage, commands, from_box, updates, &mut limit).await? {
-            Ended::Revoked(reason) => {
+        let ended = session(channel, url, heartbeat, usage, commands, from_box, updates, &mut limit).await?;
+        match next(channel, &mut backoff, url, ended, jitter()) {
+            Next::Revoked(reason) => {
                 let key = dir.join(KEY_FILE);
                 std::fs::remove_file(&key).map_err(|error| {
                     fail(
@@ -889,24 +891,14 @@ async fn serve(
                 );
                 return Ok(Served::Revoked);
             }
-            Ended::Refused(reason) => {
-                if let Some(version) = channel.step_down() {
-                    eprintln!("the control plane refused this supervisor's newest protocol ({reason}); reconnecting with protocol {version}");
-                    continue;
-                }
+            Next::Update(reason) => {
                 eprintln!("the control plane refused this supervisor's protocol ({reason}); updating now");
                 if updates.updater.now().await == Outcome::Restart {
                     return Ok(Served::Updated);
                 }
                 return Err(fail(SupervisorFailure::ProtocolError, reason));
             }
-            Ended::Dropped { progressed, reason } => {
-                channel.step_up();
-                let wait = backoff.next(progressed, jitter());
-                eprintln!(
-                    "channel to {url} dropped: {reason}; reconnecting in {:.1}s",
-                    wait.as_secs_f64()
-                );
+            Next::Reconnect(wait) => {
                 let wake = tokio::time::Instant::now() + wait;
                 loop {
                     tokio::select! {
@@ -915,6 +907,40 @@ async fn serve(
                     }
                 }
             }
+        }
+    }
+}
+
+enum Next {
+    Revoked(String),
+    Update(String),
+    Reconnect(Duration),
+}
+
+fn next<S: Store, K: Signer>(
+    channel: &mut HostChannel<S, K>,
+    backoff: &mut Backoff,
+    url: &str,
+    ended: Ended,
+    jitter: u16,
+) -> Next {
+    match ended {
+        Ended::Revoked(reason) => Next::Revoked(reason),
+        Ended::Refused(reason) => match channel.step_down() {
+            Some(version) => {
+                eprintln!("the control plane refused this supervisor's newest protocol ({reason}); reconnecting with protocol {version}");
+                Next::Reconnect(Duration::ZERO)
+            }
+            None => Next::Update(reason),
+        },
+        Ended::Dropped { progressed, reason } => {
+            channel.step_up();
+            let wait = backoff.next(progressed, jitter);
+            eprintln!(
+                "channel to {url} dropped: {reason}; reconnecting in {:.1}s",
+                wait.as_secs_f64()
+            );
+            Next::Reconnect(wait)
         }
     }
 }
@@ -1052,9 +1078,6 @@ async fn session(
             Some(message) = from_box.recv() => channel.send(message, &mut outbox).err().map(|error| Err(store_lost(&error))),
             _ = tick.tick() => {
                 let now = chrono::Utc::now();
-                if limit.recovered(now) {
-                    eprintln!("tumpel-supervisor: Healthy: {url} refused no frame for a full minute; this host takes new work again");
-                }
                 if last_received.elapsed() >= HEARTBEAT_DEADLINE {
                     Some(Ok(dropped(channel.progressed(), format!("nothing arrived for {} seconds", HEARTBEAT_DEADLINE.as_secs()))))
                 } else if channel.phase() == Phase::Open && last_beat.elapsed() >= heartbeat {
@@ -1122,5 +1145,87 @@ mod tests {
         assert_eq!(booted(&frame), "ClaudeCode 0.169.0");
         frame["harness"] = serde_json::json!("Codex");
         assert_eq!(booted(&frame), "Codex 0.169.0");
+    }
+
+    struct Unsaved;
+
+    impl Store for Unsaved {
+        fn save(&mut self, _: &tumpel_api::types::SupervisorChannelState) -> Result<(), ChannelError> {
+            Ok(())
+        }
+    }
+
+    struct Unsigned;
+
+    impl Signer for Unsigned {
+        fn sign(&self, _: &[u8]) -> String {
+            "c2lnbmF0dXJl".to_string()
+        }
+    }
+
+    fn hello_version(channel: &mut HostChannel<Unsaved, Unsigned>) -> serde_json::Value {
+        channel.connect();
+        let challenge = serde_json::json!({"type": "Challenge", "nonce": "n".repeat(43)}).to_string();
+        let Ok(Event::Challenged(nonce)) = channel.receive(&challenge) else {
+            panic!("the challenge asks for a Hello");
+        };
+        let usage =
+            serde_json::from_value(serde_json::json!({"boxesWarm": 0, "loadAverage": 0.0, "memoryAvailableMib": 1024}))
+                .expect("usage");
+        let mut outbox = Outbox::default();
+        channel
+            .hello(&nonce, std::num::NonZeroU32::MIN, usage, Vec::new(), &mut outbox)
+            .expect("hello");
+        channel.disconnect();
+        let [hello] = outbox.0.try_into().expect("one hello");
+        let hello: serde_json::Value = serde_json::from_str(&hello).expect("json");
+        hello["protocolVersion"].clone()
+    }
+
+    #[test]
+    fn a_refused_protocol_reconnects_at_once_at_34_and_a_dropped_connection_goes_back_to_36() {
+        let mut channel = HostChannel::new(
+            tumpel_channel::empty_state(),
+            Unsaved,
+            Unsigned,
+            "host-1".try_into().expect("host id"),
+            "0.1.0".to_string(),
+        );
+        let mut backoff = Backoff::default();
+        let url = "wss://control.example.test/v1/channel";
+        assert_eq!(hello_version(&mut channel), serde_json::json!(36));
+
+        let refusal = CloseFrame {
+            code: CloseCode::from(4426),
+            reason: "this control plane speaks 34 to 34, update the supervisor".into(),
+        };
+        let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
+            panic!("a refusal ends the session");
+        };
+        let Next::Reconnect(wait) = next(&mut channel, &mut backoff, url, ended, 0) else {
+            panic!("a refusal of the newest protocol reconnects");
+        };
+        assert_eq!(wait, Duration::ZERO);
+        assert_eq!(hello_version(&mut channel), serde_json::json!(34));
+
+        let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
+            panic!("a refusal ends the session");
+        };
+        assert!(matches!(
+            next(&mut channel, &mut backoff, url, ended, 0),
+            Next::Update(_)
+        ));
+
+        let Next::Reconnect(wait) = next(
+            &mut channel,
+            &mut backoff,
+            url,
+            dropped(false, "the connection ended"),
+            u16::MAX,
+        ) else {
+            panic!("a dropped connection reconnects");
+        };
+        assert_eq!(wait, Duration::from_secs(1));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(36));
     }
 }

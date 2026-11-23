@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use serde_json::Value;
+use tumpel_api::frozen::v34;
 use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostEnvelope, ChannelHostFrame, ChannelHostFrameType, ChannelHostHeartbeat,
@@ -14,7 +15,7 @@ use tumpel_api::types::{
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
 pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
-const HELD_TURNS_SINCE: u16 = 35;
+const FROZEN_V34: u16 = 34;
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 const ASSUMED_FRAMES_PER_MINUTE: u32 = 600;
 
@@ -172,14 +173,6 @@ impl RateLimit {
         }
         HostReportedHealth::Healthy
     }
-
-    pub fn recovered(&mut self, now: DateTime<Utc>) -> bool {
-        if self.last_limited.is_none() || self.health(now) == HostReportedHealth::RateLimited {
-            return false;
-        }
-        *self = Self::default();
-        true
-    }
 }
 
 #[derive(Debug)]
@@ -213,22 +206,32 @@ pub struct HostChannel<S: Store, K: Signer> {
     withheld: Option<i64>,
     offered: Vec<EntityId>,
     hello_version: u16,
-    spoken: u16,
 }
 
 fn encode(envelope: &ChannelHostEnvelope) -> Result<String, ChannelError> {
     serde_json::to_string(envelope).map_err(|error| ChannelError::Protocol(format!("encoding a message: {error}")))
 }
 
-fn encode_for(envelope: &ChannelHostEnvelope, version: u16) -> Result<String, ChannelError> {
-    if version >= HELD_TURNS_SINCE {
-        return encode(envelope);
+fn encode_hello(hello: ChannelHello, version: u16) -> Result<String, ChannelError> {
+    if version > FROZEN_V34 {
+        return encode(&hello.into());
     }
-    let mut value = serde_json::to_value(envelope).map_err(|error| protocol(format!("encoding a message: {error}")))?;
-    if let Value::Object(fields) = &mut value {
-        fields.remove("heldTurnIds");
+    let hello: v34::types::ChannelHello = serde_json::to_value(&hello)
+        .and_then(serde_json::from_value)
+        .map_err(|error| protocol(format!("encoding a protocol 34 Hello: {error}")))?;
+    serde_json::to_string(&v34::types::ChannelHostEnvelope::from(hello))
+        .map_err(|error| protocol(format!("encoding a protocol 34 Hello: {error}")))
+}
+
+fn encode_heartbeat(heartbeat: ChannelHostHeartbeat, version: u16) -> Result<String, ChannelError> {
+    if version > FROZEN_V34 {
+        return encode(&heartbeat.into());
     }
-    serde_json::to_string(&value).map_err(|error| protocol(format!("encoding a message: {error}")))
+    let heartbeat: v34::types::ChannelHostHeartbeat = serde_json::to_value(&heartbeat)
+        .and_then(serde_json::from_value)
+        .map_err(|error| protocol(format!("encoding a protocol 34 Heartbeat: {error}")))?;
+    serde_json::to_string(&v34::types::ChannelHostEnvelope::from(heartbeat))
+        .map_err(|error| protocol(format!("encoding a protocol 34 Heartbeat: {error}")))
 }
 
 fn protocol(reason: impl Into<String>) -> ChannelError {
@@ -243,7 +246,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         host_id: EntityId,
         supervisor_version: String,
     ) -> Self {
-        let withheld = state.unacked.first().map(|first| first.seq.0);
         let state = SupervisorChannelState {
             replays: Vec::new(),
             ..state
@@ -256,10 +258,9 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             supervisor_version,
             phase: Phase::Closed,
             progressed: false,
-            withheld,
+            withheld: None,
             offered: Vec::new(),
             hello_version: ChannelProtocol::VERSION,
-            spoken: ChannelProtocol::VERSION,
         }
     }
 
@@ -385,20 +386,16 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         health: HostReportedHealth,
         port: &mut impl Port,
     ) -> Result<(), ChannelError> {
-        let spoken = self.spoken;
-        port.send(encode_for(
-            &ChannelHostHeartbeat {
-                health: Some(health),
-                held_claude_setup_ids: held.claude_setup_ids,
-                held_session_ids: held.session_ids,
-                held_turn_ids: self.held_turns(held.turn_ids),
-                sent_at: now,
-                type_: ChannelHostHeartbeatType::Heartbeat,
-                usage,
-            }
-            .into(),
-            spoken,
-        )?)
+        let heartbeat = ChannelHostHeartbeat {
+            health: Some(health),
+            held_claude_setup_ids: held.claude_setup_ids,
+            held_session_ids: held.session_ids,
+            held_turn_ids: self.held_turns(held.turn_ids),
+            sent_at: now,
+            type_: ChannelHostHeartbeatType::Heartbeat,
+            usage,
+        };
+        port.send(encode_heartbeat(heartbeat, self.hello_version)?)
     }
 
     /// # Errors
@@ -438,7 +435,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             type_: ChannelHelloType::Hello,
             usage,
         };
-        port.send(encode_for(&hello.into(), self.hello_version)?)?;
+        port.send(encode_hello(hello, self.hello_version)?)?;
         self.phase = Phase::AwaitingWelcome;
         Ok(())
     }
@@ -483,7 +480,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             self.drop_acked(ack.0);
         }
         self.store.save(&self.state)?;
-        self.spoken = u16::try_from(welcome.protocol_version.get()).unwrap_or(u16::MAX);
         self.withheld = self.state.unacked.first().map(|first| first.seq.0);
         self.phase = Phase::Open;
         Ok(Event::Welcomed)

@@ -654,10 +654,8 @@ fn a_rate_limited_host_reports_rate_limited_until_a_full_minute_passes_with_no_r
     assert_eq!(limit.limited(at(0), at(20), 600, 0), RateBackoff::Until(at(20)));
     assert_eq!(limit.limited(at(30), at(60), 600, 0), RateBackoff::Until(at(60)));
     assert_eq!(limit.health(at(80)), HostReportedHealth::RateLimited);
-    assert!(!limit.recovered(at(89)));
+    assert_eq!(limit.health(at(89)), HostReportedHealth::RateLimited);
     assert_eq!(limit.health(at(90)), HostReportedHealth::Healthy);
-    assert!(limit.recovered(at(90)));
-    assert!(!limit.recovered(at(91)), "it turns Healthy once");
     assert_eq!(limit.limited(at(100), at(120), 600, 0), RateBackoff::Until(at(120)));
 }
 
@@ -721,7 +719,6 @@ fn a_backlog_saved_before_a_restart_is_held_at_the_welcome_and_goes_out_paced() 
         "host-1".try_into().expect("host id"),
         "0.1.0".to_string(),
     );
-    assert!(channel.withholding());
     let mut wire = Wire::default();
     let quiet = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": ChannelProtocol::VERSION});
     let Ok(Event::Welcomed) = welcome(&mut channel, &mut wire, &quiet) else {
@@ -1026,21 +1023,20 @@ fn a_host_stepped_down_to_the_oldest_protocol_says_hello_in_its_shape() {
         hello
     };
     let newest = hello(&mut channel, &mut wire);
-    assert_eq!(newest["protocolVersion"], json!(ChannelProtocol::VERSION));
-    assert_eq!(newest["channelProtocolOldest"], json!(ChannelProtocol::OLDEST));
+    assert_eq!(newest["protocolVersion"], json!(36));
+    assert_eq!(newest["channelProtocolOldest"], json!(34));
     assert_eq!(newest["heldTurnIds"], json!(["turn-1"]));
 
-    let stepped = channel.step_down();
+    assert_eq!(channel.step_down(), Some(34));
     let oldest = hello(&mut channel, &mut wire);
-    assert_eq!(stepped.is_some(), ChannelProtocol::OLDEST < ChannelProtocol::VERSION);
-    assert_eq!(oldest["protocolVersion"], json!(ChannelProtocol::OLDEST));
-    assert_eq!(oldest["channelProtocolOldest"], json!(ChannelProtocol::OLDEST));
-    assert_eq!(oldest.get("heldTurnIds").is_some(), ChannelProtocol::OLDEST >= 35);
+    assert_eq!(oldest["protocolVersion"], json!(34));
+    assert_eq!(oldest["channelProtocolOldest"], json!(34));
+    assert_eq!(oldest.get("heldTurnIds"), None);
     assert_eq!(channel.step_down(), None);
 
     channel.step_up();
     let climbed = hello(&mut channel, &mut wire);
-    assert_eq!(climbed["protocolVersion"], json!(ChannelProtocol::VERSION));
+    assert_eq!(climbed["protocolVersion"], json!(36));
 }
 
 #[test]
@@ -1048,6 +1044,7 @@ fn a_heartbeat_on_a_channel_welcomed_at_protocol_34_names_no_held_turns() {
     let mut channel = channel(&Disk::default(), &Recorder::default());
     let mut wire = Wire::default();
     let at_34 = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 34});
+    assert_eq!(channel.step_down(), Some(34));
     let Ok(Event::Welcomed) = welcome(&mut channel, &mut wire, &at_34) else {
         panic!("the welcome opens the channel");
     };
@@ -1055,6 +1052,7 @@ fn a_heartbeat_on_a_channel_welcomed_at_protocol_34_names_no_held_turns() {
     assert_eq!(held_in_heartbeat(&mut channel, &mut wire), Value::Null);
 
     channel.disconnect();
+    channel.step_up();
     open(&mut channel, &mut wire);
     assert_eq!(held_in_heartbeat(&mut channel, &mut wire), json!(["turn-1"]));
 }
