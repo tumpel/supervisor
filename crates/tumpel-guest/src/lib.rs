@@ -92,3 +92,10 @@ impl Decoder {
 
 #[cfg(test)]
 mod tests;
+
+pub const UPDATE_REQUIRED: &str =
+    "the control plane sent something this supervisor doesn't recognise; update the supervisor";
+
+pub fn update_required() {
+    eprintln!("{UPDATE_REQUIRED}");
+}

@@ -182,7 +182,6 @@ struct Usage {
     holdings: watch::Receiver<Held>,
     data_dir: PathBuf,
     telemetry: Telemetry,
-    telemetry_interval: Duration,
 }
 
 impl Usage {
@@ -191,10 +190,7 @@ impl Usage {
         let stats = usage::sample(*self.warm.borrow(), &self.data_dir, &held)
             .map_err(|error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}")))?;
         self.telemetry.host(&stats, *self.running.borrow());
-        Ok(tumpel_channel::Usage {
-            host: stats.usage,
-            boxes_warm: stats.boxes_warm,
-        })
+        Ok(tumpel_channel::Usage { host: stats.usage })
     }
 }
 
@@ -251,18 +247,6 @@ fn beat(
         .map_err(|error| fail(SupervisorFailure::ProtocolError, error.to_string()))
 }
 
-fn flush(channel: &mut Channel, telemetry: &Telemetry, interval: Duration, outbox: &mut Outbox) -> Result<(), Failure> {
-    if !channel.sends_telemetry_frames() {
-        return Ok(());
-    }
-    for batch in telemetry.flush_due(interval) {
-        channel
-            .send(ChannelHostMessage::TelemetryBatch(batch), outbox)
-            .map_err(|error| store_lost(&error))?;
-    }
-    Ok(())
-}
-
 enum BoxCommand {
     Turn(Box<ChannelTurnOffer>),
     Snapshot(ChannelSnapshotRequest),
@@ -275,8 +259,8 @@ enum BoxCommand {
     Abandon(oneshot::Sender<()>, Abandoned),
 }
 
-fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> SetupCommand {
-    SetupCommand::Start(Box::new(SetupOrder {
+fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Option<SetupCommand> {
+    Some(SetupCommand::Start(Box::new(SetupOrder {
         claude_setup_id: offer.claude_setup_id,
         tenant_id: offer.tenant_id,
         box_id: offer.box_id,
@@ -284,16 +268,16 @@ fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> SetupCommand {
             offer.image,
             offer.harness.unwrap_or(ClaudeSetupHarness::ClaudeCode).to_string(),
             offer.harness_version.to_string(),
-        ),
+        )?,
         token_url: offer.token_url,
         token_credential: offer.token_credential,
         url: Duration::from_secs(u64::from(offer.url_seconds.get())),
         code: Duration::from_secs(u64::from(offer.code_seconds.get())),
-    }))
+    })))
 }
 
-fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Command {
-    Command::Turn(Box::new(BoxTurn {
+fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Option<Command> {
+    Some(Command::Turn(Box::new(BoxTurn {
         turn_id: offer.turn_id,
         session_id: offer.session_id,
         box_id: offer.box_id,
@@ -301,7 +285,7 @@ fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Command {
             offer.image,
             offer.harness.to_string(),
             offer.harness_version.to_string(),
-        ),
+        )?,
         model: offer.model,
         prompt: offer.prompt,
         credential: offer.credential,
@@ -318,7 +302,7 @@ fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Command {
         turn_seconds: offer.turn_seconds,
         idle_seconds: offer.idle_seconds,
         box_retention: offer.box_retention,
-    }))
+    })))
 }
 
 async fn boxes(
@@ -331,7 +315,12 @@ async fn boxes(
 ) {
     while let Some(command) = commands.recv().await {
         let next = match command {
-            BoxCommand::Turn(offer) => self::command(&files_dir, *offer),
+            BoxCommand::Turn(offer) => {
+                let Some(command) = self::command(&files_dir, *offer) else {
+                    continue;
+                };
+                command
+            }
             BoxCommand::Snapshot(request) => Command::Snapshot(request.into()),
             BoxCommand::Teardown(teardown) => Command::Teardown(TeardownOrder {
                 session_id: teardown.session_id,
@@ -409,7 +398,6 @@ fn start_boxes(
         holdings: lifecycle.holdings(),
         data_dir: PathBuf::from(&*runtime.data_dir),
         telemetry,
-        telemetry_interval: Duration::from_secs(u64::from(runtime.telemetry_interval_seconds.get())),
     };
     let answers = lifecycle.answers();
     let cancels = lifecycle.cancels();
@@ -479,7 +467,7 @@ async fn terminate(
     Ok(())
 }
 
-fn restarts(kind: SupervisorFailure) -> bool {
+fn restarts(kind: &SupervisorFailure) -> bool {
     !matches!(kind, SupervisorFailure::NotEnrolled | SupervisorFailure::HostRevoked)
 }
 
@@ -504,6 +492,10 @@ fn handed_turns(handover: &SupervisorHandover) -> Vec<EntityId> {
         .filter_map(|handed| match &handed.state {
             SupervisorHandoverBoxState::Turn(turn) => Some(turn.turn_id.clone()),
             SupervisorHandoverBoxState::Warm(_) => None,
+            SupervisorHandoverBoxState::Unrecognised(_) => {
+                tumpel_channel::update_required();
+                None
+            }
         })
         .collect()
 }
@@ -842,9 +834,9 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         Ok(Served::Terminated) => terminate(&commands, &updates.layout, &updates.out)
             .await
             .map(|()| Stopped::Terminated),
-        Err(failure) if restarts(failure.kind) => {
+        Err(failure) if restarts(&failure.kind) => {
             if let Err(lost) = terminate(&commands, &updates.layout, &updates.out).await {
-                store_unsent(&mut channel, &mut from_box, &usage.telemetry)?;
+                store_unsent(&mut channel, &mut from_box)?;
                 return Err(lost);
             }
             Err(failure)
@@ -854,21 +846,17 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     if stopped.is_err() {
         abandon(&commands, abandoned()).await;
     }
-    store_unsent(&mut channel, &mut from_box, &usage.telemetry)?;
+    store_unsent(&mut channel, &mut from_box)?;
     stopped
 }
 
-fn store_unsent(
-    channel: &mut Channel,
-    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
-    telemetry: &Telemetry,
-) -> Result<(), Failure> {
+fn store_unsent(channel: &mut Channel, from_box: &mut UnboundedReceiver<ChannelHostMessage>) -> Result<(), Failure> {
     while let Ok(message) = from_box.try_recv() {
         channel
             .send(message, &mut Outbox::default())
             .map_err(|error| store_lost(&error))?;
     }
-    flush(channel, telemetry, Duration::ZERO, &mut Outbox::default())
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -985,8 +973,12 @@ fn closed_by_peer(frame: Option<&CloseFrame>, progressed: bool) -> Result<Ended,
     }
 }
 
-fn box_command(message: ChannelControlMessage) -> BoxCommand {
-    match message {
+fn box_command(message: ChannelControlMessage) -> Option<BoxCommand> {
+    Some(match message {
+        ChannelControlMessage::Unrecognised(_) => {
+            tumpel_channel::update_required();
+            return None;
+        }
         ChannelControlMessage::TurnOffer(offer) => BoxCommand::Turn(Box::new(offer)),
         ChannelControlMessage::SnapshotRequest(request) => BoxCommand::Snapshot(request),
         ChannelControlMessage::BoxTeardown(teardown) => BoxCommand::Teardown(teardown),
@@ -997,7 +989,7 @@ fn box_command(message: ChannelControlMessage) -> BoxCommand {
         ChannelControlMessage::TurnWithdrawn(withdrawn) => BoxCommand::Answer(Answer::Withdrawn(withdrawn)),
         ChannelControlMessage::TurnClaimed(claimed) => BoxCommand::Answer(Answer::Claimed(claimed)),
         ChannelControlMessage::TurnCancel(cancel) => BoxCommand::Cancel(cancel.turn_id),
-        ChannelControlMessage::ClaudeSetupBoxOffer(offer) => BoxCommand::Setup(setup_order(offer)),
+        ChannelControlMessage::ClaudeSetupBoxOffer(offer) => BoxCommand::Setup(setup_order(offer)?),
         ChannelControlMessage::ClaudeSetupBoxCode(code) => BoxCommand::Setup(SetupCommand::Code {
             claude_setup_id: code.claude_setup_id,
             code: code.code,
@@ -1006,7 +998,7 @@ fn box_command(message: ChannelControlMessage) -> BoxCommand {
         ChannelControlMessage::ClaudeSetupBoxDiscard(discard) => BoxCommand::Setup(SetupCommand::Discard {
             claude_setup_id: discard.claude_setup_id,
         }),
-    }
+    })
 }
 
 fn rate_limited(
@@ -1066,7 +1058,7 @@ async fn session(
                             last_beat = Instant::now();
                             updates.welcomed().await.err().map(Err)
                         }
-                        Ok(Event::Message(message)) => commands.send(box_command(*message)).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
+                        Ok(Event::Message(message)) => box_command(*message).and_then(|command| commands.send(command).err()).map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
                         Ok(Event::FrameRefused { seq, reason }) => {
                             eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
                             None
@@ -1101,8 +1093,7 @@ async fn session(
                 } else if channel.phase() == Phase::Open && channel.withholding() && !limit.paused(now) {
                     channel.release(limit.release_budget(TICK), &mut outbox).err().map(|error| Err(store_lost(&error)))
                 } else if channel.phase() == Phase::Open {
-                    flush(channel, &usage.telemetry, usage.telemetry_interval, &mut outbox)
-                        .and_then(|()| channel.transmit_due(Instant::now(), &mut outbox).map_err(|error| store_lost(&error)))
+                    channel.transmit_due(Instant::now(), &mut outbox).map_err(|error| store_lost(&error))
                         .err()
                         .map(Err)
                 } else {
@@ -1154,7 +1145,7 @@ mod tests {
         });
         let booted = |frame: &serde_json::Value| {
             let offer: ChannelClaudeSetupBoxOffer = serde_json::from_value(frame.clone()).expect("the offer parses");
-            let SetupCommand::Start(order) = setup_order(offer) else {
+            let SetupCommand::Start(order) = setup_order(offer).expect("known setup") else {
                 panic!("a setup offer starts a setup box");
             };
             let (harness, version) = order.image.harness();
@@ -1190,7 +1181,7 @@ mod tests {
         let usage = tumpel_channel::Usage {
             host: serde_json::from_value(serde_json::json!({"loadAverage": 0.0, "memoryAvailableMib": 1024, "diskBudgetMib": 0, "diskHeldMib": 0, "memoryBudgetMib": 0, "memoryHeldMib": 0}))
                 .expect("usage"),
-            boxes_warm: 0,
+
         };
         let mut outbox = Outbox::default();
         channel
@@ -1203,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_protocol_steps_down_one_version_at_a_time_and_a_dropped_connection_goes_back_to_37() {
+    fn a_refused_protocol_steps_down_one_version_at_a_time_and_a_dropped_connection_goes_back_to_38() {
         let mut channel = HostChannel::new(
             tumpel_channel::empty_state(),
             Unsaved,
@@ -1213,7 +1204,7 @@ mod tests {
         );
         let mut backoff = Backoff::default();
         let url = "wss://control.example.test/v1/channel";
-        assert_eq!(hello_version(&mut channel), serde_json::json!(37));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(38));
 
         let refusal = CloseFrame {
             code: CloseCode::from(4426),
@@ -1226,16 +1217,7 @@ mod tests {
             panic!("a refusal of the newest protocol reconnects");
         };
         assert_eq!(wait, Duration::ZERO);
-        assert_eq!(hello_version(&mut channel), serde_json::json!(36));
-
-        let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
-            panic!("a refusal ends the session");
-        };
-        let Next::Reconnect(wait) = next(&mut channel, &mut backoff, url, ended, 0) else {
-            panic!("a refusal of 36 reconnects at the oldest");
-        };
-        assert_eq!(wait, Duration::ZERO);
-        assert_eq!(hello_version(&mut channel), serde_json::json!(35));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(37));
 
         let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
             panic!("a refusal ends the session");
@@ -1255,6 +1237,6 @@ mod tests {
             panic!("a dropped connection reconnects");
         };
         assert_eq!(wait, Duration::from_secs(1));
-        assert_eq!(hello_version(&mut channel), serde_json::json!(37));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(38));
     }
 }

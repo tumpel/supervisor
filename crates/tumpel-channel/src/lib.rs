@@ -6,13 +6,13 @@ use chrono::{DateTime, FixedOffset, Utc};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
-use tumpel_api::frozen::v36;
+use tumpel_api::frozen::v37;
 use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType, ChannelHostMessage,
-    ChannelProtocol, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLine, ChannelTurnLineType,
-    ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch,
-    Sequence, SupervisorChannelState,
+    ChannelProtocol, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLines, ChannelTurnLinesType,
+    ChannelWelcome, EntityId, GuestTurnLine as ChannelTurnLine, GuestTurnLineType as ChannelTurnLineType,
+    HostReportedHealth, HostUsage, MetricBatch, Sequence, SupervisorChannelState,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
@@ -20,10 +20,16 @@ pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const LAST_BACKOFF: Duration = Duration::from_secs(30);
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 const ASSUMED_FRAMES_PER_MINUTE: u32 = 600;
-const STORED_ACKS: u16 = 37;
 pub const TURN_LINES_MAX_LINES: usize = 200;
 pub const TURN_LINES_MAX_BYTES: usize = 256_000;
 pub const TURN_LINES_WAIT: Duration = Duration::from_secs(2);
+
+pub const UPDATE_REQUIRED: &str =
+    "the control plane sent something this supervisor doesn't recognise; update the supervisor";
+
+pub fn update_required() {
+    tracing::warn!(target: "tumpel::compatibility", "{UPDATE_REQUIRED}");
+}
 
 const HELLO_CONTEXT: &[u8] = b"tumpel-channel-hello-v1";
 
@@ -37,7 +43,6 @@ pub struct HeldIds {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Usage {
     pub host: HostUsage,
-    pub boxes_warm: u32,
 }
 
 /// # Errors
@@ -133,20 +138,6 @@ fn append_line(batch: &mut Value, line: &ChannelTurnLine) -> bool {
 
 fn is_turn_lines(message: &Value) -> bool {
     message.get("type").and_then(Value::as_str) == Some("TurnLines")
-}
-
-fn expanded(messages: &[Value]) -> Result<Vec<Value>, ChannelError> {
-    let mut shaped = Vec::with_capacity(messages.len());
-    for message in messages {
-        let Some(lines) = turn_lines_of(message)? else {
-            shaped.push(message.clone());
-            continue;
-        };
-        for line in lines {
-            shaped.push(to_value(&ChannelHostMessage::TurnLine(line))?);
-        }
-    }
-    Ok(shaped)
 }
 
 fn to_value(message: &ChannelHostMessage) -> Result<Value, ChannelError> {
@@ -342,22 +333,16 @@ fn frozen<F: DeserializeOwned + Serialize>(value: Value, what: &str) -> Result<S
     serde_json::to_string(&frozen).map_err(|error| protocol(format!("encoding a {what}: {error}")))
 }
 
-fn encode_report<V36: DeserializeOwned + Serialize>(
+fn encode_report<V37: DeserializeOwned + Serialize>(
     report: &impl Serialize,
-    boxes_warm: u32,
     version: u16,
     kind: &str,
 ) -> Result<String, ChannelError> {
-    let mut value = serde_json::to_value(report).map_err(|error| protocol(format!("encoding a {kind}: {error}")))?;
-    if version >= STORED_ACKS {
+    let value = serde_json::to_value(report).map_err(|error| protocol(format!("encoding a {kind}: {error}")))?;
+    if version == ChannelProtocol::VERSION {
         return serde_json::to_string(&value).map_err(|error| protocol(format!("encoding a {kind}: {error}")));
     }
-    value
-        .get_mut("usage")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| protocol(format!("a {kind} carries no usage")))?
-        .insert("boxesWarm".to_string(), Value::from(boxes_warm));
-    frozen::<V36>(value, &format!("protocol {version} {kind}"))
+    frozen::<V37>(value, &format!("protocol {version} {kind}"))
 }
 
 fn protocol(reason: impl Into<String>) -> ChannelError {
@@ -388,11 +373,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             sealed,
             batch_started: None,
         }
-    }
-
-    #[must_use]
-    pub fn sends_telemetry_frames(&self) -> bool {
-        self.version < STORED_ACKS
     }
 
     #[must_use]
@@ -435,7 +415,19 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     /// Fails when the state cannot be saved or the port refuses the frame.
     pub fn send(&mut self, message: ChannelHostMessage, port: &mut impl Port) -> Result<(), ChannelError> {
         match message {
-            ChannelHostMessage::TurnLine(line) if self.version >= STORED_ACKS => self.store_line(line)?,
+            ChannelHostMessage::TurnLines(lines) => {
+                for (seq, text) in (lines.first_line_seq.get()..).zip(lines.lines) {
+                    self.store_line(ChannelTurnLine {
+                        line_seq: Sequence(
+                            i64::try_from(seq)
+                                .map_err(|_| protocol("a transcript lineSeq exceeds the supported range"))?,
+                        ),
+                        text,
+                        turn_id: lines.turn_id.clone(),
+                        type_: ChannelTurnLineType::TurnLine,
+                    })?;
+                }
+            }
             message => self.push(to_value(&message)?),
         }
         self.store.save(&self.state)?;
@@ -586,15 +578,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         telemetry: impl FnOnce() -> MetricBatch,
         port: &mut impl Port,
     ) -> Result<(), ChannelError> {
-        let telemetry = if self.version >= STORED_ACKS {
-            telemetry()
-        } else {
-            MetricBatch {
-                instruments: Vec::new(),
-                samples: Vec::new(),
-                turns: Vec::new(),
-            }
-        };
         let heartbeat = ChannelHostHeartbeat {
             ack: Sequence(self.state.received.0),
             health: Some(health),
@@ -602,13 +585,12 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             held_session_ids: held.session_ids,
             held_turn_ids: self.held_turns(held.turn_ids),
             sent_at: now,
-            telemetry,
+            telemetry: telemetry(),
             type_: ChannelHostHeartbeatType::Heartbeat,
             usage: usage.host,
         };
-        port.send(encode_report::<v36::types::ChannelHostHeartbeat>(
+        port.send(encode_report::<v37::types::ChannelHostHeartbeat>(
             &heartbeat,
-            usage.boxes_warm,
             self.version,
             "Heartbeat",
         )?)
@@ -652,9 +634,8 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             type_: ChannelHelloType::Hello,
             usage: usage.host,
         };
-        port.send(encode_report::<v36::types::ChannelHello>(
+        port.send(encode_report::<v37::types::ChannelHello>(
             &hello,
-            usage.boxes_warm,
             self.hello_version,
             "Hello",
         )?)?;
@@ -680,6 +661,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     fn handle(&mut self, envelope: ChannelControlEnvelope) -> Result<Event, ChannelError> {
         match (self.phase, envelope) {
+            (_, ChannelControlEnvelope::Unrecognised(_)) => {
+                update_required();
+                Ok(Event::None)
+            }
             (Phase::AwaitingChallenge, ChannelControlEnvelope::Challenge(challenge)) => {
                 self.phase = Phase::AwaitingHello;
                 Ok(Event::Challenged(challenge.nonce.to_string()))
@@ -687,7 +672,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             (Phase::AwaitingChallenge, other) => {
                 Err(protocol(format!("expected Challenge first, got {}", kind(&other))))
             }
-            (Phase::AwaitingWelcome, ChannelControlEnvelope::Welcome(welcome)) => self.welcomed(welcome),
+            (Phase::AwaitingWelcome, ChannelControlEnvelope::Welcome(welcome)) => self.welcomed(&welcome),
             (Phase::Open, ChannelControlEnvelope::ControlFrame(frame)) => self.accept(frame),
             (Phase::AwaitingWelcome | Phase::Open, ChannelControlEnvelope::Heartbeat(_)) => Ok(Event::Heartbeat),
             (Phase::Open, ChannelControlEnvelope::ReleasePublished(_)) => Ok(Event::ReleasePublished),
@@ -702,7 +687,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         }
     }
 
-    fn welcomed(&mut self, welcome: ChannelWelcome) -> Result<Event, ChannelError> {
+    fn welcomed(&mut self, welcome: &ChannelWelcome) -> Result<Event, ChannelError> {
         let named = welcome.protocol_version.get();
         self.version = u16::try_from(named)
             .ok()
@@ -714,51 +699,21 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                     self.hello_version
                 ))
             })?;
-        let ack = welcome.ack.filter(|_| self.version < STORED_ACKS).map(|ack| ack.0);
-        if let Some(ack) = ack {
-            self.drop_acked(ack)?;
-        }
-        self.reshape(ack)?;
+        self.reshape()?;
         self.store.save(&self.state)?;
         self.withheld = self.state.unacked.first().map(|first| first.seq.0);
         self.phase = Phase::Open;
         Ok(Event::Welcomed)
     }
 
-    fn reshape(&mut self, welcome_ack: Option<i64>) -> Result<(), ChannelError> {
-        if self.version >= STORED_ACKS {
-            for frame in &mut self.state.unacked {
-                if let Some([line]) = turn_lines_of(&frame.message)?.as_deref() {
-                    if !is_turn_lines(&frame.message) {
-                        frame.message = batch_of(line.clone())?;
-                    }
+    fn reshape(&mut self) -> Result<(), ChannelError> {
+        for frame in &mut self.state.unacked {
+            if let Some([line]) = turn_lines_of(&frame.message)?.as_deref() {
+                if !is_turn_lines(&frame.message) {
+                    frame.message = batch_of(line.clone())?;
                 }
             }
-            return Ok(());
         }
-        let messages: Vec<Value> = self.state.unacked.iter().map(|frame| frame.message.clone()).collect();
-        let shaped = expanded(&messages)?;
-        let first = welcome_ack.map_or_else(
-            || {
-                self.state
-                    .unacked
-                    .first()
-                    .map_or(self.state.sent.0 + 1, |first| first.seq.0)
-            },
-            |ack| ack + 1,
-        );
-        let received = Sequence(self.state.received.0);
-        self.state.unacked = (first..)
-            .zip(shaped)
-            .map(|(seq, message)| ChannelStoredHostFrame {
-                ack: received.clone(),
-                message,
-                seq: Sequence(seq),
-                type_: ChannelStoredHostFrameType::Frame,
-            })
-            .collect();
-        self.state.sent = Sequence(self.state.unacked.last().map_or(first - 1, |last| last.seq.0));
-        self.sealed = self.state.sent.0;
         Ok(())
     }
 
@@ -813,6 +768,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         self.state.received = Sequence(frame.seq.0);
         self.progressed = true;
         self.store.save(&self.state)?;
+        if !understood(&frame.message) {
+            update_required();
+            return Ok(Event::None);
+        }
         match &frame.message {
             ChannelControlMessage::TurnOffer(offer) if !self.offered.contains(&offer.turn_id) => {
                 self.offered.push(offer.turn_id.clone());
@@ -826,6 +785,23 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     }
 }
 
+fn understood(message: &ChannelControlMessage) -> bool {
+    use tumpel_api::types::{BoxRetention, ChannelBootImage, ClaudeSetupHarness, Harness};
+    match message {
+        ChannelControlMessage::Unrecognised(_) => false,
+        ChannelControlMessage::TurnOffer(offer) => {
+            !matches!(offer.harness, Harness::Unrecognised(_))
+                && !matches!(offer.box_retention, BoxRetention::Unrecognised(_))
+                && !matches!(offer.image, ChannelBootImage::Unrecognised(_))
+        }
+        ChannelControlMessage::ClaudeSetupBoxOffer(offer) => {
+            !matches!(offer.harness, Some(ClaudeSetupHarness::Unrecognised(_)))
+                && !matches!(offer.image, ChannelBootImage::Unrecognised(_))
+        }
+        _ => true,
+    }
+}
+
 fn kind(envelope: &ChannelControlEnvelope) -> &'static str {
     match envelope {
         ChannelControlEnvelope::Challenge(_) => "Challenge",
@@ -836,6 +812,7 @@ fn kind(envelope: &ChannelControlEnvelope) -> &'static str {
         ChannelControlEnvelope::FrameRateLimited(_) => "FrameRateLimited",
         ChannelControlEnvelope::Ack(_) => "Ack",
         ChannelControlEnvelope::ControlFrame(_) => "Frame",
+        ChannelControlEnvelope::Unrecognised(_) => "unrecognised message",
     }
 }
 

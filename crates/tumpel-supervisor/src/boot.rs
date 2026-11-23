@@ -40,8 +40,12 @@ impl BootOrder {
     }
 
     #[must_use]
-    pub fn from_offer(image: ChannelBootImage, harness: String, harness_version: String) -> Self {
-        match image {
+    pub fn from_offer(image: ChannelBootImage, harness: String, harness_version: String) -> Option<Self> {
+        Some(match image {
+            ChannelBootImage::Unrecognised(_) => {
+                tumpel_channel::update_required();
+                return None;
+            }
             ChannelBootImage::GuestImageDownload(download) => Self::Full(ImageOrder {
                 download,
                 harness,
@@ -61,7 +65,7 @@ impl BootOrder {
                 harness,
                 harness_version,
             }),
-        }
+        })
     }
 }
 
@@ -102,8 +106,12 @@ impl Boot {
     }
 
     #[must_use]
-    pub fn from_record(record: SupervisorHandoverImage) -> Self {
-        match record {
+    pub fn from_record(record: SupervisorHandoverImage) -> Option<Self> {
+        Some(match record {
+            SupervisorHandoverImage::Unrecognised(_) => {
+                tumpel_channel::update_required();
+                return None;
+            }
             SupervisorHandoverImage::FullImage(full) => Self::Full(full.manifest),
             SupervisorHandoverImage::LayeredImage(layered) => Self::Layered(Layered {
                 base: layered.base,
@@ -112,7 +120,7 @@ impl Boot {
                     manifest: layered.layer,
                 },
             }),
-        }
+        })
     }
 
     #[must_use]

@@ -122,7 +122,7 @@ fn publish(bucket: &mut Bucket, base: &str, fill: u8) -> Release {
     Release {
         base: base_digest,
         layer: layer_digest,
-        order: BootOrder::from_offer(image, "Shell".to_string(), "1".to_string()),
+        order: BootOrder::from_offer(image, "Shell".to_string(), "1".to_string()).expect("known image"),
     }
 }
 

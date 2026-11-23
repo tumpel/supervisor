@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
 
 use tokio::time::Instant;
 use tracing::field::{Field, Visit};
@@ -11,8 +10,8 @@ use tracing::{Event, Instrument, Span, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::{LookupSpan, Registry};
 use tumpel_api::types::{
-    ChannelHostMessage, ChannelTelemetryBatch, ChannelTelemetryBatchType, EntityId, GuestMetric, MetricBatch,
-    MetricInstrument, MetricKind, MetricName, SamplePoint, ShortText, TurnPoint,
+    ChannelHostMessage, EntityId, GuestMetric, MetricBatch, MetricInstrument, MetricKind, MetricName, SamplePoint,
+    ShortText, TurnPoint,
 };
 
 use crate::bounded::bounded;
@@ -178,7 +177,6 @@ struct Buffer {
     points: VecDeque<Point>,
     capacity: usize,
     dropped: u64,
-    flushed: Instant,
     cpu: Option<CpuTimes>,
     declared: HashMap<MetricName, MetricInstrument>,
 }
@@ -195,7 +193,7 @@ fn instrument(metric: &MetricName) -> Option<MetricInstrument> {
     Some(MetricInstrument {
         metric: metric.clone(),
         unit: (*unit).try_into().ok()?,
-        kind: *kind,
+        kind: kind.clone(),
         description: (*description).try_into().ok()?,
     })
 }
@@ -211,7 +209,6 @@ impl Telemetry {
             points: VecDeque::with_capacity(capacity),
             capacity,
             dropped: 0,
-            flushed: Instant::now(),
             cpu: None,
             declared: HashMap::new(),
         })))
@@ -261,38 +258,6 @@ impl Telemetry {
         self.sample("host.boxes.running", f64::from(running));
         self.sample("host.boxes.warm", f64::from(stats.boxes_warm));
         self.sample("telemetry.dropped", dropped as f64);
-    }
-
-    #[must_use]
-    pub fn flush_due(&self, interval: Duration) -> Vec<ChannelTelemetryBatch> {
-        let (points, declared) = {
-            let mut buffer = self.buffer();
-            if buffer.points.is_empty() || buffer.flushed.elapsed() < interval {
-                return Vec::new();
-            }
-            buffer.flushed = Instant::now();
-            let points: Vec<Point> = buffer.points.drain(..).collect();
-            (points, buffer.declared.clone())
-        };
-        let (samples, turns) = split(points);
-        let frames = samples.len().max(turns.len()).div_ceil(BATCH_POINTS);
-        let mut samples = samples.chunks(BATCH_POINTS);
-        let mut turns = turns.chunks(BATCH_POINTS);
-        (0..frames)
-            .map(|_| {
-                let batch = metric_batch(
-                    samples.next().unwrap_or_default().to_vec(),
-                    turns.next().unwrap_or_default().to_vec(),
-                    &declared,
-                );
-                ChannelTelemetryBatch {
-                    instruments: batch.instruments,
-                    samples: batch.samples,
-                    turns: batch.turns,
-                    type_: ChannelTelemetryBatchType::TelemetryBatch,
-                }
-            })
-            .collect()
     }
 
     #[must_use]
@@ -419,7 +384,7 @@ fn declared(metric: &GuestMetric) -> Option<MetricInstrument> {
     Some(MetricInstrument {
         metric: metric.metric.clone(),
         unit: metric.unit.as_str().try_into().ok()?,
-        kind: metric.kind,
+        kind: metric.kind.clone(),
         description: metric.description.as_str().try_into().ok()?,
     })
 }
@@ -443,6 +408,10 @@ pub fn guest_metrics(metrics: &[GuestMetric]) {
             return;
         };
         for metric in metrics {
+            if matches!(metric.kind, MetricKind::Unrecognised(_)) {
+                tumpel_channel::update_required();
+                continue;
+            }
             let Some(instrument) = declared(metric) else {
                 continue;
             };
@@ -514,6 +483,10 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        if event.metadata().target() == "tumpel::compatibility" {
+            eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
+            return;
+        }
         if event.metadata().target() != TARGET {
             return;
         }
@@ -581,7 +554,7 @@ mod tests {
     use tracing::Instrument;
     use tracing_subscriber::layer::SubscriberExt;
     use tumpel_api::types::{
-        ChannelTurnComplete, ChannelTurnCompleteType, MetricKind, SamplePoint, Sequence, ShortText, TurnPoint,
+        ChannelTurnComplete, ChannelTurnCompleteType, SamplePoint, Sequence, ShortText, TurnPoint,
     };
 
     use super::{instrument, metric, Phase, Point, Telemetry, TelemetryLayer, INSTRUMENTS};
@@ -614,7 +587,7 @@ mod tests {
         );
         assert_eq!(tokens.dimensions.len(), 3, "{:?}", tokens.dimensions);
         assert_eq!(tokens.turn_id.as_str(), "turn-1");
-        let batch = telemetry.flush_due(Duration::ZERO).pop().expect("a batch");
+        let batch = telemetry.heartbeat_batch();
         let mut declared: Vec<(String, String)> = batch
             .instruments
             .iter()
@@ -680,75 +653,23 @@ mod tests {
         })
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_thousand_points_in_one_interval_make_one_frame_two_intervals_make_two_and_shutdown_sends_the_rest() {
-        let telemetry = Telemetry::new(5_000);
-        let mut frames = Vec::new();
-        for value in 0..500 {
-            telemetry.push(sample(f64::from(value)));
-            telemetry.push(turn(f64::from(value)));
-        }
-        for _ in 0..59 {
-            tokio::time::advance(Duration::from_millis(500)).await;
-            frames.extend(telemetry.flush_due(Duration::from_secs(30)));
-        }
-        assert_eq!(frames.len(), 0);
-        tokio::time::advance(Duration::from_millis(500)).await;
-        frames.extend(telemetry.flush_due(Duration::from_secs(30)));
-        assert_eq!(frames.len(), 1);
-        assert_eq!((frames[0].samples.len(), frames[0].turns.len()), (500, 500));
-
-        for value in 0..500 {
-            telemetry.push(sample(f64::from(value)));
-            telemetry.push(turn(f64::from(value)));
-            tokio::time::advance(Duration::from_millis(60)).await;
-            frames.extend(telemetry.flush_due(Duration::from_secs(30)));
-        }
-        assert_eq!(frames.len(), 2);
-        assert_eq!((frames[1].samples.len(), frames[1].turns.len()), (500, 500));
-
-        telemetry.push(sample(1.0));
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(telemetry.flush_due(Duration::from_secs(30)).len(), 0);
-        let shutdown = telemetry.flush_due(Duration::ZERO);
-        assert_eq!(shutdown.len(), 1);
-        assert_eq!(shutdown[0].samples.len(), 1);
-    }
-
     #[test]
-    fn a_flush_splits_into_frames_of_at_most_500_samples_and_500_turns_that_declare_only_their_own_metrics() {
-        let telemetry = Telemetry::new(5_000);
-        for value in 0..1_200 {
+    fn heartbeats_drain_known_points_in_batches_of_five_hundred() {
+        let telemetry = Telemetry::new(5000);
+        for value in 0..1200 {
             telemetry.push(sample(f64::from(value)));
-        }
-        for value in 0..300 {
             telemetry.push(turn(f64::from(value)));
         }
-        let frames = telemetry.flush_due(Duration::ZERO);
+        let batches: Vec<_> = (0..6)
+            .map(|_| {
+                let batch = telemetry.heartbeat_batch();
+                (batch.samples.len(), batch.turns.len())
+            })
+            .collect();
         assert_eq!(
-            frames
-                .iter()
-                .map(|frame| (frame.samples.len(), frame.turns.len()))
-                .collect::<Vec<_>>(),
-            [(500, 300), (500, 0), (200, 0)]
+            batches,
+            [(250, 250), (250, 250), (250, 250), (250, 250), (200, 200), (0, 0)]
         );
-        assert_eq!(
-            frames
-                .iter()
-                .map(|frame| frame
-                    .instruments
-                    .iter()
-                    .map(|instrument| instrument.metric.to_string())
-                    .collect::<Vec<_>>())
-                .collect::<Vec<_>>(),
-            [
-                vec!["host.load.1m".to_string(), "turn.end".to_string()],
-                vec!["host.load.1m".to_string()],
-                vec!["host.load.1m".to_string()]
-            ]
-        );
-        assert_eq!(frames[1].instruments[0].kind, MetricKind::Sample);
-        assert_eq!(telemetry.flush_due(Duration::ZERO).len(), 0);
     }
 
     fn turn_points(telemetry: &Telemetry) -> Vec<TurnPoint> {

@@ -569,10 +569,17 @@ fn describe(message: ChannelHostMessage) -> Option<String> {
         | ChannelHostMessage::RestoreChunks(_)
         | ChannelHostMessage::SupervisorUpdateStep(_)
         | ChannelHostMessage::SupervisorUpdateFailed(_)
-        | ChannelHostMessage::TelemetryBatch(_)
-        | ChannelHostMessage::TurnLines(_) => return None,
+        | ChannelHostMessage::Unrecognised(_) => return None,
         ChannelHostMessage::TurnImageFetching(fetching) => format!("fetching {}", *fetching.image_digest),
-        ChannelHostMessage::TurnLine(line) => format!("line {} {}", line.line_seq.0, line.text),
+        ChannelHostMessage::TurnLines(line) => format!(
+            "line {} {}",
+            line.first_line_seq.get(),
+            line.lines
+                .iter()
+                .map(tumpel_api::types::LongText::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
         ChannelHostMessage::TurnComplete(done) => format!("complete {}", done.last_line_seq.0),
         ChannelHostMessage::TurnRepositoryCloneFailed(failed) => {
             format!("clone failed {}: {}", failed.cause, failed.detail)
@@ -847,7 +854,7 @@ fn start_host(
     }
 }
 
-fn image(image_digest: &str, clone_seconds: u32, protocol: GuestHarnessProtocol) -> serde_json::Value {
+fn image(image_digest: &str, clone_seconds: u32, protocol: &GuestHarnessProtocol) -> serde_json::Value {
     json!({
         "imageDigest": image_digest,
         "kernelUrl": "https://example.com/vmlinux",
@@ -955,14 +962,24 @@ impl Host {
         self.send(Command::Turn(Box::new(turn)));
     }
 
-    fn turn_speaking(&self, protocol: GuestHarnessProtocol, turn_id: &str, session_id: &str, prompt: &str) {
+    fn turn_speaking(&self, protocol: &GuestHarnessProtocol, turn_id: &str, session_id: &str, prompt: &str) {
         let mut turn = self.box_turn(turn_id, session_id, prompt, Vec::new(), 300);
         turn.image = BootOrder::Full(self.cached_image(protocol));
         self.send(Command::Turn(Box::new(turn)));
     }
 
-    fn cached_image(&self, protocol: GuestHarnessProtocol) -> ImageOrder {
-        let image_digest = format!("{:0>64}", format!("{}{}", self.clone_seconds, protocol as u8));
+    fn cached_image(&self, protocol: &GuestHarnessProtocol) -> ImageOrder {
+        let image_digest = format!(
+            "{:0>64}",
+            format!(
+                "{}{}",
+                self.clone_seconds,
+                protocol
+                    .to_string()
+                    .bytes()
+                    .fold(0u64, |sum, byte| sum.wrapping_mul(31).wrapping_add(u64::from(byte)))
+            )
+        );
         std::fs::create_dir_all(&self.images).expect("the image cache is created");
         std::fs::write(
             self.images.join(format!("{image_digest}.json")),
@@ -992,7 +1009,7 @@ impl Host {
         let rootfs = b"fetched rootfs".to_vec();
         let kernel = b"fetched kernel".to_vec();
         let image_digest = sha256(&rootfs);
-        let mut manifest = image(&image_digest, self.clone_seconds, GuestHarnessProtocol::ShellLines);
+        let mut manifest = image(&image_digest, self.clone_seconds, &GuestHarnessProtocol::ShellLines);
         manifest["kernelDigest"] = json!(sha256(&kernel));
         let manifest = manifest.to_string().into_bytes();
         let order = ImageOrder {
@@ -1038,7 +1055,7 @@ impl Host {
             turn_id: turn_id.try_into().expect("turn id"),
             session_id: session_id.try_into().expect("session id"),
             box_id: format!("box-{session_id}").try_into().expect("box id"),
-            image: BootOrder::Full(self.cached_image(GuestHarnessProtocol::ShellLines)),
+            image: BootOrder::Full(self.cached_image(&GuestHarnessProtocol::ShellLines)),
             model: "default".try_into().expect("model"),
             prompt: prompt.to_string().try_into().expect("prompt"),
             credential: serde_json::from_value(json!({
@@ -1883,7 +1900,7 @@ async fn the_first_line_budget_starts_when_the_repository_is_ready() {
 async fn a_line_after_the_error_result_keeps_the_turn_failed() {
     let mut host = host("error-result", 1, Harness::Echo, Boot::Works);
     let prompt = "{\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 500\"}\n{\"type\":\"system\"}";
-    host.turn_speaking(GuestHarnessProtocol::ClaudeStreamJson, "turn-1", "session-1", prompt);
+    host.turn_speaking(&GuestHarnessProtocol::ClaudeStreamJson, "turn-1", "session-1", prompt);
     let seen = host.settle(SETTLE).await;
     let last = seen.last().expect("a failure");
     assert!(
@@ -2105,7 +2122,7 @@ async fn a_teardown_of_a_box_with_an_unsnapshotted_turn_fails_box_dirty_and_keep
 async fn a_teardown_after_a_failed_turn_fails_box_dirty_and_keeps_the_box() {
     let mut host = host("failed-dirty", 1, Harness::Echo, Boot::Works);
     let prompt = "{\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 500\"}";
-    host.turn_speaking(GuestHarnessProtocol::ClaudeStreamJson, "turn-1", "session-1", prompt);
+    host.turn_speaking(&GuestHarnessProtocol::ClaudeStreamJson, "turn-1", "session-1", prompt);
     let seen = host.settle(SETTLE).await;
     assert!(
         seen.last()

@@ -233,7 +233,7 @@ fn codex(value: Value) -> Option<Usage> {
     })
 }
 
-fn reading(protocol: GuestHarnessProtocol, line: &str) -> Option<Usage> {
+fn reading(protocol: &GuestHarnessProtocol, line: &str) -> Option<Usage> {
     let value: Value = serde_json::from_str(line).ok()?;
     let kind = value.get("type").and_then(Value::as_str)?;
     match (protocol, kind) {
@@ -257,7 +257,7 @@ impl Spend {
     }
 
     pub fn read(&mut self, line: &str) {
-        let Some(read) = reading(self.protocol, line) else {
+        let Some(read) = reading(&self.protocol, line) else {
             return;
         };
         self.usage = Some(match self.usage {

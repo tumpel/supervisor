@@ -10,7 +10,14 @@ pub fn turn_end(
     end: GuestTurnEnd,
     error: Option<(TurnFailureReason, String)>,
 ) -> Result<(Sequence, Option<ChannelTurnCompleteWarning>), (TurnFailureReason, String)> {
-    match (end.reason, error) {
+    match (end.reason.clone(), error) {
+        (GuestTurnEndReason::Unrecognised(_), _) => {
+            tumpel_channel::update_required();
+            Err((
+                TurnFailureReason::HarnessExited,
+                tumpel_channel::UPDATE_REQUIRED.to_string(),
+            ))
+        }
         (GuestTurnEndReason::HarnessOutOfMemory, _) => Err((TurnFailureReason::HarnessOutOfMemory, end.detail.into())),
         (GuestTurnEndReason::BoxDiskFull, _) => Err((TurnFailureReason::BoxDiskFull, end.detail.into())),
         (GuestTurnEndReason::Cancelled, _) => Err((TurnFailureReason::Cancelled, end.detail.into())),
@@ -64,8 +71,8 @@ const CODEX_STARTUP_REFUSALS: [&str; 3] = [
     "failed to decode agent identity JWT",
 ];
 
-pub fn exit_result(protocol: GuestHarnessProtocol, end: &GuestTurnEnd) -> Option<(TurnFailureReason, String)> {
-    if protocol != GuestHarnessProtocol::CodexExecJson || end.reason != GuestTurnEndReason::HarnessExited {
+pub fn exit_result(protocol: &GuestHarnessProtocol, end: &GuestTurnEnd) -> Option<(TurnFailureReason, String)> {
+    if protocol != &GuestHarnessProtocol::CodexExecJson || end.reason != GuestTurnEndReason::HarnessExited {
         return None;
     }
     let refusal = end
@@ -75,7 +82,7 @@ pub fn exit_result(protocol: GuestHarnessProtocol, end: &GuestTurnEnd) -> Option
     Some(classify(refusal.trim(), true))
 }
 
-pub fn error_result(protocol: GuestHarnessProtocol, line: &str) -> Option<(TurnFailureReason, String)> {
+pub fn error_result(protocol: &GuestHarnessProtocol, line: &str) -> Option<(TurnFailureReason, String)> {
     let value: Value = serde_json::from_str(line).ok()?;
     match protocol {
         GuestHarnessProtocol::ClaudeStreamJson => claude_error(&value),
@@ -83,6 +90,10 @@ pub fn error_result(protocol: GuestHarnessProtocol, line: &str) -> Option<(TurnF
         GuestHarnessProtocol::PromptOnStdin => opencode_error(&value),
         GuestHarnessProtocol::CodexExecJson => codex_error(&value),
         GuestHarnessProtocol::ShellLines => None,
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_channel::update_required();
+            None
+        }
     }
 }
 
@@ -211,7 +222,7 @@ mod tests {
         );
     }
 
-    fn reason_of(protocol: GuestHarnessProtocol, line: &str) -> Option<TurnFailureReason> {
+    fn reason_of(protocol: &GuestHarnessProtocol, line: &str) -> Option<TurnFailureReason> {
         error_result(protocol, line).map(|(reason, _)| reason)
     }
 
@@ -219,7 +230,7 @@ mod tests {
     fn an_error_result_naming_an_invalid_key_is_a_refusal() {
         let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"Invalid API key · Fix external API key"}"#;
         assert_eq!(
-            error_result(STREAM, line),
+            error_result(&STREAM, line),
             Some((
                 TurnFailureReason::CredentialRefused,
                 "the provider refused the credential: Invalid API key · Fix external API key; renew the persona's credential".to_string()
@@ -230,7 +241,7 @@ mod tests {
     #[test]
     fn an_expired_oauth_token_is_a_refusal() {
         let line = r#"{"type":"result","is_error":true,"result":"OAuth token has expired. Please run /login"}"#;
-        assert_eq!(reason_of(STREAM, line), Some(TurnFailureReason::CredentialRefused));
+        assert_eq!(reason_of(&STREAM, line), Some(TurnFailureReason::CredentialRefused));
     }
 
     #[test]
@@ -238,14 +249,14 @@ mod tests {
         let status = r#"{"type":"result","is_error":true,"result":"API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}}"}"#;
         let kind = r#"{"type":"result","is_error":true,"result":"{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}"}"#;
         for line in [status, kind] {
-            assert_eq!(reason_of(STREAM, line), Some(TurnFailureReason::CredentialRefused));
+            assert_eq!(reason_of(&STREAM, line), Some(TurnFailureReason::CredentialRefused));
         }
     }
 
     #[test]
     fn a_server_error_whose_request_id_holds_401_is_not_a_refusal() {
         let line = r#"{"type":"result","is_error":true,"result":"API Error: 500 {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Internal server error\"},\"request_id\":\"req_011CU401abc\"}"}"#;
-        assert_eq!(reason_of(STREAM, line), Some(TurnFailureReason::HarnessReportedError));
+        assert_eq!(reason_of(&STREAM, line), Some(TurnFailureReason::HarnessReportedError));
     }
 
     #[test]
@@ -253,14 +264,14 @@ mod tests {
         let ok = r#"{"type":"result","is_error":false,"result":"Invalid API key handling is fixed"}"#;
         let assistant = r#"{"type":"assistant","is_error":true,"result":"Invalid API key"}"#;
         for line in [ok, assistant, "not json"] {
-            assert_eq!(error_result(STREAM, line), None);
+            assert_eq!(error_result(&STREAM, line), None);
         }
     }
 
     #[test]
     fn an_error_result_that_is_not_a_refusal_names_what_the_harness_reported() {
         let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"API Error: 404 {\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model: claude-opus-4-1-20250805\"}}"}"#;
-        let (reason, detail) = error_result(STREAM, line).expect("an error result");
+        let (reason, detail) = error_result(&STREAM, line).expect("an error result");
         assert_eq!(reason, TurnFailureReason::HarnessReportedError);
         assert!(detail.contains("model: claude-opus-4-1-20250805"), "{detail}");
         assert!(
@@ -272,7 +283,7 @@ mod tests {
     #[test]
     fn an_error_result_without_text_names_its_subtype() {
         let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#;
-        let (reason, detail) = error_result(STREAM, line).expect("an error result");
+        let (reason, detail) = error_result(&STREAM, line).expect("an error result");
         assert_eq!(reason, TurnFailureReason::HarnessReportedError);
         assert!(detail.contains("error_max_turns"), "{detail}");
     }
@@ -280,7 +291,7 @@ mod tests {
     #[test]
     fn an_error_result_with_neither_result_nor_subtype_still_fails_the_turn() {
         let line = r#"{"type":"result","is_error":true}"#;
-        let (reason, detail) = error_result(STREAM, line).expect("an error result");
+        let (reason, detail) = error_result(&STREAM, line).expect("an error result");
         assert_eq!(reason, TurnFailureReason::HarnessReportedError);
         assert!(
             detail.contains("an error result with neither result nor subtype"),
@@ -292,7 +303,7 @@ mod tests {
     fn the_harness_text_in_a_detail_is_capped() {
         let text = format!("start{}end", "x".repeat(10_000));
         let line = format!(r#"{{"type":"result","is_error":true,"result":"{text}"}}"#);
-        let (_, detail) = error_result(STREAM, &line).expect("an error result");
+        let (_, detail) = error_result(&STREAM, &line).expect("an error result");
         assert!(detail.len() < HARNESS_TEXT_LIMIT + 100, "{}", detail.len());
         assert!(detail.contains("xend"), "{detail}");
         assert!(!detail.contains("start"), "{detail}");
@@ -301,7 +312,7 @@ mod tests {
     #[test]
     fn a_shell_harness_never_reports_an_error_result() {
         let line = r#"{"type":"result","is_error":true,"result":"Invalid API key"}"#;
-        assert_eq!(error_result(GuestHarnessProtocol::ShellLines, line), None);
+        assert_eq!(error_result(&GuestHarnessProtocol::ShellLines, line), None);
     }
 
     const PI: GuestHarnessProtocol = GuestHarnessProtocol::PiRpc;
@@ -312,7 +323,7 @@ mod tests {
         let missing = r#"{"type":"response","command":"prompt","success":false,"error":"No API key found for openrouter.\n\nUse /login to log into a provider"}"#;
         for line in [status, missing] {
             assert_eq!(
-                reason_of(PI, line),
+                reason_of(&PI, line),
                 Some(TurnFailureReason::CredentialRefused),
                 "{line}"
             );
@@ -322,7 +333,7 @@ mod tests {
     #[test]
     fn a_pi_error_that_is_not_a_refusal_names_what_pi_reported() {
         let line = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"404: No endpoints found for qwen/qwen3-coderx. Request id 401"}}"#;
-        let (reason, detail) = error_result(PI, line).expect("an error message");
+        let (reason, detail) = error_result(&PI, line).expect("an error message");
         assert_eq!(reason, TurnFailureReason::HarnessReportedError);
         assert!(detail.contains("No endpoints found for qwen/qwen3-coderx"), "{detail}");
     }
@@ -333,7 +344,7 @@ mod tests {
             r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","errorMessage":"401"}}"#;
         let accepted = r#"{"type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}"#;
         for line in [stopped, accepted] {
-            assert_eq!(error_result(PI, line), None, "{line}");
+            assert_eq!(error_result(&PI, line), None, "{line}");
         }
     }
 
@@ -345,7 +356,7 @@ mod tests {
         let missing = r#"{"type":"error","timestamp":1763215200000,"sessionID":"ses_5a1b2c3d4e5f","error":{"name":"ProviderAuthError","data":{"providerID":"openrouter","message":"OpenRouter API key is missing. Pass it using the apiKey parameter or the OPENROUTER_API_KEY environment variable."}}}"#;
         for line in [status, missing] {
             assert_eq!(
-                reason_of(OPENCODE, line),
+                reason_of(&OPENCODE, line),
                 Some(TurnFailureReason::CredentialRefused),
                 "{line}"
             );
@@ -355,7 +366,7 @@ mod tests {
     #[test]
     fn an_opencode_error_that_is_not_a_refusal_names_what_opencode_reported() {
         let line = r#"{"type":"error","timestamp":1763215200000,"sessionID":"ses_5a1b2c3d4e5f","error":{"name":"APIError","data":{"message":"qwen/qwen3-coderx is not a valid model ID","statusCode":400,"isRetryable":false,"metadata":{}}}}"#;
-        let (reason, detail) = error_result(OPENCODE, line).expect("an error record");
+        let (reason, detail) = error_result(&OPENCODE, line).expect("an error record");
         assert_eq!(reason, TurnFailureReason::HarnessReportedError);
         assert!(detail.contains("qwen/qwen3-coderx is not a valid model ID"), "{detail}");
     }
@@ -368,7 +379,7 @@ mod tests {
         let forbidden = r#"{"type":"turn.failed","error":{"message":"unexpected status 403 Forbidden: Key limit exceeded, url: https://openrouter.ai/api/v1/responses"}}"#;
         for line in [unauthorized, forbidden] {
             assert_eq!(
-                reason_of(CODEX, line),
+                reason_of(&CODEX, line),
                 Some(TurnFailureReason::CredentialRefused),
                 "{line}"
             );
@@ -391,7 +402,7 @@ mod tests {
         let revoked = "the harness exited (exit status: 1) mid-turn; Reading prompt from stdin...\npersonal access token metadata request failed with status 401 Unauthorized\n";
         let not_a_token = "the harness exited (exit status: 1) mid-turn; failed to decode agent identity JWT: invalid credential JSON (Data at line 1 column 53)\n";
         for detail in [revoked, not_a_token] {
-            let (reason, message) = exit_result(CODEX, &codex_exit(detail)).expect("a refusal");
+            let (reason, message) = exit_result(&CODEX, &codex_exit(detail)).expect("a refusal");
             assert_eq!(reason, TurnFailureReason::CredentialRefused, "{detail}");
             assert!(message.ends_with("renew the persona's credential"), "{message}");
         }
@@ -403,6 +414,6 @@ mod tests {
             r#"{"type":"error","message":"stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses)"}"#,
             r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":3}}"#,
         ];
-        assert_eq!(lines.iter().find_map(|line| error_result(CODEX, line)), None);
+        assert_eq!(lines.iter().find_map(|line| error_result(&CODEX, line)), None);
     }
 }

@@ -100,6 +100,7 @@ impl HostWatch {
                         Ok(Some(GuestInput::TurnCancel(cancel))) if cancel.turn_id == turn_id => {
                             let _ = sender.send(Output::Cancelled(turn));
                         }
+                        Ok(Some(GuestInput::Unrecognised(_))) => tumpel_guest::update_required(),
                         Ok(Some(_)) => {}
                         Err(error) => {
                             let _ = sender.send(Output::HostGone(turn, format!("the host sent {error}")));
@@ -190,7 +191,7 @@ fn environment(config: &GuestHarness, start: &GuestTurnStart) -> Vec<(String, St
                 .map(|variable| (variable.name.to_string(), variable.value.to_string())),
         )
         .chain(turn_environment(start))
-        .chain(connectors::variables(config.protocol, &start.credential.connectors))
+        .chain(connectors::variables(&config.protocol, &start.credential.connectors))
         .collect()
 }
 
@@ -291,7 +292,7 @@ impl Harness {
         }
     }
 
-    fn receive(&self, protocol: GuestHarnessProtocol, turn: u64) -> Result<Output, mpsc::RecvError> {
+    fn receive(&self, protocol: &GuestHarnessProtocol, turn: u64) -> Result<Output, mpsc::RecvError> {
         loop {
             let output = self.output.recv()?;
             if matches!(output, Output::HostGone(of, _) | Output::Cancelled(of) if of != turn) {
@@ -397,7 +398,7 @@ fn pi_prompt(prompt: &str) -> String {
 
 const PI_DELTAS: [&str; 2] = ["message_update", "tool_execution_update"];
 
-fn per_turn(protocol: GuestHarnessProtocol) -> bool {
+fn per_turn(protocol: &GuestHarnessProtocol) -> bool {
     matches!(
         protocol,
         GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::CodexExecJson
@@ -410,8 +411,8 @@ fn codex_thread(value: &Value) -> Option<&str> {
         .flatten()
 }
 
-fn record_codex_thread(protocol: GuestHarnessProtocol, line: &str) -> Result<(), String> {
-    if protocol != GuestHarnessProtocol::CodexExecJson {
+fn record_codex_thread(protocol: &GuestHarnessProtocol, line: &str) -> Result<(), String> {
+    if protocol != &GuestHarnessProtocol::CodexExecJson {
         return Ok(());
     }
     let Some(thread) = serde_json::from_str::<Value>(line)
@@ -471,7 +472,7 @@ fn codex_turn_usage(total: Usage) -> Result<Usage, String> {
 }
 
 fn turn_arguments(
-    protocol: GuestHarnessProtocol,
+    protocol: &GuestHarnessProtocol,
     start: &GuestTurnStart,
     started: bool,
     thread: Option<&str>,
@@ -479,6 +480,7 @@ fn turn_arguments(
     let model = start.model.to_string();
     let connectors = connectors::arguments(protocol, &start.credential.connectors);
     Ok(match protocol {
+        GuestHarnessProtocol::Unrecognised(_) => return Err(tumpel_guest::UPDATE_REQUIRED.to_string()),
         GuestHarnessProtocol::ShellLines => Vec::new(),
         GuestHarnessProtocol::CodexExecJson => {
             if start.credential.arguments.is_empty() {
@@ -516,11 +518,15 @@ fn claude_thinking_tokens(value: &Value) -> bool {
     record_type(value) == Some("system") && value.get("subtype").and_then(Value::as_str) == Some("thinking_tokens")
 }
 
-fn skips(protocol: GuestHarnessProtocol, line: &str) -> bool {
+fn skips(protocol: &GuestHarnessProtocol, line: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return false;
     };
     match protocol {
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_guest::update_required();
+            false
+        }
         GuestHarnessProtocol::PiRpc => {
             record_type(&value).is_some_and(|kind| PI_DELTAS.contains(&kind)) || pi_retry_off(&value)
         }
@@ -567,7 +573,7 @@ fn pi_prompt_settled(value: &Value) -> bool {
             || value.pointer("/data/disposition").and_then(Value::as_str) == Some("handled"))
 }
 
-fn ends_turn(protocol: GuestHarnessProtocol, line: &str) -> bool {
+fn ends_turn(protocol: &GuestHarnessProtocol, line: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return false;
     };
@@ -579,8 +585,8 @@ fn ends_turn(protocol: GuestHarnessProtocol, line: &str) -> bool {
     }
 }
 
-fn answers_no_prompt(protocol: GuestHarnessProtocol, line: &str) -> bool {
-    if protocol != GuestHarnessProtocol::ClaudeStreamJson {
+fn answers_no_prompt(protocol: &GuestHarnessProtocol, line: &str) -> bool {
+    if protocol != &GuestHarnessProtocol::ClaudeStreamJson {
         return false;
     }
     let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -665,11 +671,11 @@ fn disk_full(mut ending: Ending, disk: Space) -> Ending {
     ending
 }
 
-fn with_spend(ending: Ending, spend: &Spend, protocol: GuestHarnessProtocol, priced: bool) -> Result<Ending, String> {
+fn with_spend(ending: Ending, spend: &Spend, protocol: &GuestHarnessProtocol, priced: bool) -> Result<Ending, String> {
     let Some(read) = spend.usage() else {
         return Ok(ending);
     };
-    let used = if protocol == GuestHarnessProtocol::CodexExecJson {
+    let used = if protocol == &GuestHarnessProtocol::CodexExecJson {
         codex_turn_usage(read)?
     } else {
         read
@@ -692,6 +698,9 @@ fn with_spend(ending: Ending, spend: &Spend, protocol: GuestHarnessProtocol, pri
 
 impl GuestState {
     pub fn new(config: GuestHarness, memory: Memory) -> Result<Self, String> {
+        if matches!(config.protocol, GuestHarnessProtocol::Unrecognised(_)) {
+            return Err(tumpel_guest::UPDATE_REQUIRED.to_string());
+        }
         let home = PathBuf::from(&*config.environment.home);
         Ok(Self {
             config,
@@ -741,7 +750,7 @@ impl GuestState {
         let written = write_files(&self.home, &start.files, &read_written()?)?;
         let persona_files: Vec<&str> = start.files.iter().map(|file| file.path.as_str()).collect();
         let connectors = &start.credential.connectors;
-        connectors::refuse_reserved(self.config.protocol, &self.home, &persona_files, connectors)?;
+        connectors::refuse_reserved(&self.config.protocol, &self.home, &persona_files, connectors)?;
         if self.config.protocol == GuestHarnessProtocol::PiRpc && !connectors.is_empty() {
             connectors::write_pi_config(&self.home, connectors, self.pi_config_mounted)?;
             self.pi_config_mounted = true;
@@ -761,16 +770,24 @@ impl GuestState {
             .command
             .split_first()
             .ok_or("guest.json names an empty command")?;
-        let per_turn = per_turn(self.config.protocol);
+        let per_turn = per_turn(&self.config.protocol);
         let mut command = Command::new(program);
         command.args(arguments);
         command.args(turn_arguments(
-            self.config.protocol,
+            &self.config.protocol,
             start,
             Path::new(STARTED_FILE).exists(),
             read_codex_thread()?.as_deref(),
         )?);
-        let harness = self.start_process(command, environment(&self.config, start), per_turn, start)?;
+        let harness = Self::start_process(
+            &self.config,
+            &self.memory,
+            &self.keys,
+            command,
+            environment(&self.config, start),
+            per_turn,
+            start,
+        )?;
         std::fs::create_dir_all(STATE_DIR).map_err(|error| format!("creating {STATE_DIR}: {error}"))?;
         std::fs::write(STARTED_FILE, b"").map_err(|error| format!("writing {STARTED_FILE}: {error}"))?;
         Ok(harness)
@@ -779,11 +796,21 @@ impl GuestState {
     fn spawn_setup(&self, start: &GuestTurnStart) -> Result<Harness, String> {
         let mut command = Command::new(SETUP_PROGRAM);
         command.arg("run");
-        self.start_process(command, image_environment(&self.config), true, start)
+        Self::start_process(
+            &self.config,
+            &self.memory,
+            &self.keys,
+            command,
+            image_environment(&self.config),
+            true,
+            start,
+        )
     }
 
     fn start_process(
-        &self,
+        config: &GuestHarness,
+        memory: &Memory,
+        keys: &RandomState,
         mut command: Command,
         variables: Vec<(String, String)>,
         per_turn: bool,
@@ -791,11 +818,11 @@ impl GuestState {
     ) -> Result<Harness, String> {
         let program = command.get_program().to_string_lossy().into_owned();
         command.process_group(0);
-        self.memory.confinement.apply(&mut command);
+        memory.confinement.apply(&mut command);
         let mut child = command
             .env_clear()
             .envs(variables)
-            .current_dir(&*self.config.working_directory)
+            .current_dir(&*config.working_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -819,7 +846,7 @@ impl GuestState {
             output,
             sender,
             stderr: tail,
-            launch: launch(&self.keys, start),
+            launch: launch(keys, start),
         })
     }
 
@@ -829,7 +856,7 @@ impl GuestState {
             .harness
             .as_mut()
             .is_some_and(|harness| matches!(harness.child.try_wait(), Ok(None)));
-        if per_turn(self.config.protocol)
+        if per_turn(&self.config.protocol)
             || !alive
             || !reuses(self.harness.as_ref().map(|harness| &harness.launch), &wanted)
         {
@@ -974,7 +1001,7 @@ impl GuestState {
         let protocol = if setup {
             GuestHarnessProtocol::PromptOnStdin
         } else {
-            self.config.protocol
+            self.config.protocol.clone()
         };
         let priced = protocol != GuestHarnessProtocol::ClaudeStreamJson || priced_by_anthropic(start);
         let mut last_line_seq = self.last_line_seq;
@@ -988,12 +1015,12 @@ impl GuestState {
         };
         harness.discard_leftovers(&start.turn_id);
         let _host = HostWatch::watch(host.as_fd(), harness.sender.clone(), turn, start.turn_id.clone())?;
-        let input = prompt_input(protocol, setup, &start.prompt, &marker);
+        let input = prompt_input(&protocol, setup, &start.prompt, &marker);
         let written = harness
             .stdin
             .write_all(input.as_bytes())
             .and_then(|()| harness.stdin.flush());
-        if per_turn(protocol) {
+        if per_turn(&protocol) {
             harness.stdin = Box::new(std::io::sink());
         }
         if let Err(error) = written {
@@ -1003,9 +1030,9 @@ impl GuestState {
             ));
         }
         let mut killed = None;
-        let mut spend = Spend::new(protocol);
+        let mut spend = Spend::new(protocol.clone());
         let ending = loop {
-            let text = match harness.receive(protocol, turn) {
+            let text = match harness.receive(&protocol, turn) {
                 Ok(Output::Line(text)) => text,
                 Ok(Output::Exited(pid)) => {
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
@@ -1021,7 +1048,7 @@ impl GuestState {
                 }
                 Ok(Output::Closed) | Err(_) => {
                     let waited = harness.child.wait();
-                    if per_turn(protocol) && waited.as_ref().is_ok_and(std::process::ExitStatus::success) {
+                    if per_turn(&protocol) && waited.as_ref().is_ok_and(std::process::ExitStatus::success) {
                         break ended(GuestTurnEndReason::Completed, "");
                     }
                     killed = (waited.as_ref().ok().and_then(ExitStatusExt::signal) == Some(libc::SIGKILL))
@@ -1036,10 +1063,10 @@ impl GuestState {
             if protocol == GuestHarnessProtocol::ShellLines && text == marker {
                 break ended(GuestTurnEndReason::Completed, "");
             }
-            if skips(protocol, &text) {
+            if skips(&protocol, &text) {
                 continue;
             }
-            if let Err(error) = record_codex_thread(protocol, &text) {
+            if let Err(error) = record_codex_thread(&protocol, &text) {
                 self.last_line_seq = last_line_seq;
                 return Err(error);
             }
@@ -1047,7 +1074,7 @@ impl GuestState {
             if !setup {
                 spend.read(&text);
             }
-            let finished = ends_turn(protocol, &text);
+            let finished = ends_turn(&protocol, &text);
             let text = if priced { text } else { without_list_price(text) };
             if let Err(error) = send_line(host, &start.turn_id, last_line_seq, text) {
                 self.last_line_seq = last_line_seq;
@@ -1058,7 +1085,7 @@ impl GuestState {
             }
         };
         self.last_line_seq = last_line_seq;
-        with_spend(self.box_ending(ending, killed)?, &spend, protocol, priced)
+        with_spend(self.box_ending(ending, killed)?, &spend, &protocol, priced)
     }
 
     fn box_ending(&mut self, ending: Ending, killed: Option<(u32, String)>) -> Result<Ending, String> {
@@ -1080,8 +1107,12 @@ impl GuestState {
     }
 }
 
-fn prompt_input(protocol: GuestHarnessProtocol, setup: bool, prompt: &str, marker: &str) -> String {
+fn prompt_input(protocol: &GuestHarnessProtocol, setup: bool, prompt: &str, marker: &str) -> String {
     match protocol {
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_guest::update_required();
+            String::new()
+        }
         _ if setup => String::new(),
         GuestHarnessProtocol::ClaudeStreamJson => format!("{}\n", user_message(prompt)),
         GuestHarnessProtocol::PiRpc => pi_prompt(prompt),

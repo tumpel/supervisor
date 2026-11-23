@@ -22,7 +22,7 @@ use tumpel_api::types::{
     ChannelSnapshotFailed, ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPacks,
     ChannelSnapshotPacksType, ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete,
     ChannelTurnCompleteType, ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType,
-    ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLine, ChannelTurnLineType,
+    ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLines, ChannelTurnLinesType,
     ChannelTurnRepositoryCloneFailed, ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady,
     ChannelTurnRepositoryReadyType, CredentialText, DisplayName, EmailAddress, EntityId, GuestHello, GuestInput,
     GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnStart,
@@ -286,12 +286,16 @@ impl Command {
             .collect()
     }
 
-    fn from_record(record: SupervisorHandoverCommand, session_id: &EntityId, box_id: &EntityId) -> Self {
+    fn from_record(record: SupervisorHandoverCommand, session_id: &EntityId, box_id: &EntityId) -> Option<Self> {
         let order = || TeardownOrder {
             session_id: session_id.clone(),
             box_id: box_id.clone(),
         };
-        match record {
+        Some(match record {
+            SupervisorHandoverCommand::Unrecognised(_) => {
+                tumpel_channel::update_required();
+                return None;
+            }
             SupervisorHandoverCommand::Snapshot(snapshot) => Self::Snapshot(SnapshotOrder {
                 snapshot_id: snapshot.snapshot_id,
                 session_id: session_id.clone(),
@@ -302,7 +306,7 @@ impl Command {
             }),
             SupervisorHandoverCommand::Teardown(_) => Self::Teardown(order()),
             SupervisorHandoverCommand::Discard(_) => Self::Discard(order()),
-        }
+        })
     }
 
     fn session(&self) -> String {
@@ -342,7 +346,7 @@ impl<M: Machine> LiveBox<M> {
             _hold: hold,
             dirty: false,
             credential_file: None,
-            box_retention: turn.box_retention,
+            box_retention: turn.box_retention.clone(),
             idle: Duration::from_secs(u64::from(turn.idle_seconds.get())),
         }
     }
@@ -352,7 +356,7 @@ impl<M: Machine> LiveBox<M> {
     fn record(&self, turn_id: Option<&EntityId>) -> Result<SupervisorHandoverBox, String> {
         Ok(SupervisorHandoverBox {
             box_id: self.box_id.clone(),
-            box_retention: self.box_retention,
+            box_retention: self.box_retention.clone(),
             credential_file: credential_record(self.credential_file.clone())?,
             dirty: self.dirty || turn_id.is_some(),
             idle_milliseconds: milliseconds(self.idle),
@@ -392,6 +396,10 @@ fn standing_record(handed: &SupervisorHandoverBox) -> Result<SupervisorHandoverB
     let turn_id = match &handed.state {
         SupervisorHandoverBoxState::Turn(turn) => Some(turn.turn_id.clone()),
         SupervisorHandoverBoxState::Warm(_) => None,
+        SupervisorHandoverBoxState::Unrecognised(_) => {
+            tumpel_channel::update_required();
+            return Err(tumpel_channel::UPDATE_REQUIRED.to_string());
+        }
     };
     Ok(SupervisorHandoverBox {
         dirty: handed.dirty || turn_id.is_some(),
@@ -629,10 +637,22 @@ impl<M: Machine> Default for Slot<M> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Report {
     Turn(TurnFailureReason),
     Clone(RepositoryCloneFailureCause),
+}
+
+fn turn_lines(output: tumpel_api::types::GuestTurnLine) -> Result<ChannelTurnLines, Failure> {
+    let invalid = || Failure::turn(TurnFailureReason::HarnessExited, "the guest sent a nonpositive lineSeq");
+    let seq = u64::try_from(output.line_seq.0).map_err(|_| invalid())?;
+    let first_line_seq = std::num::NonZeroU64::new(seq).ok_or_else(invalid)?;
+    Ok(ChannelTurnLines {
+        first_line_seq,
+        lines: vec![output.text],
+        turn_id: output.turn_id,
+        type_: ChannelTurnLinesType::TurnLines,
+    })
 }
 
 struct Failure {
@@ -961,7 +981,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     async fn warm_turn(&self, mut live: LiveBox<V::Machine>, turn: &BoxTurn) -> Outcome<V::Machine> {
-        live.box_retention = turn.box_retention;
+        live.box_retention = turn.box_retention.clone();
         live.idle = Duration::from_secs(u64::from(turn.idle_seconds.get()));
         let claiming = self.claim(turn);
         let Some(files) = self.files(turn).await else {
@@ -1701,7 +1721,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         phases: (Option<tracing::Span>, Option<tracing::Span>),
     ) -> Followed {
         let clone = Duration::from_secs(u64::from(live.image.harness().clone_seconds.get()));
-        let protocol = live.image.harness().protocol;
+        let protocol = live.image.harness().protocol.clone();
         let ((mut cloning, mut first_output), mut parking) = (phases, self.parking.clone());
         let (mut cancelling, mut disk_check) = (false, disk_checks());
         loop {
@@ -1734,6 +1754,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 }));
             };
             match received {
+                Ok(GuestMessage::Unrecognised(_)) => tumpel_channel::update_required(),
                 Err(error) => {
                     return Followed::Ended(Err(Failure::turn(
                         TurnFailureReason::HarnessExited,
@@ -1761,21 +1782,17 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     if let Some(phase) = first_output.take() {
                         telemetry::reached(&phase);
                     }
-                    state.error = state.error.or_else(|| error_result(protocol, &output.text));
-                    emit(
-                        &self.out,
-                        ChannelTurnLine {
-                            line_seq: output.line_seq,
-                            text: output.text,
-                            turn_id: output.turn_id,
-                            type_: ChannelTurnLineType::TurnLine,
-                        },
-                    );
+                    state.error = state.error.or_else(|| error_result(&protocol, &output.text));
+                    let output = match turn_lines(output) {
+                        Ok(output) => output,
+                        Err(failure) => return Followed::Ended(Err(failure)),
+                    };
+                    emit(&self.out, output);
                 }
                 Ok(GuestMessage::TurnEnd(end)) if end.turn_id == *turn_id => {
                     live.credential_file = end.credential_file.as_deref().cloned();
                     telemetry::guest_metrics(&end.metrics);
-                    let error = state.error.or_else(|| exit_result(protocol, &end));
+                    let error = state.error.or_else(|| exit_result(&protocol, &end));
                     return Followed::Ended(
                         turn_end(end, error).map_err(|(reason, detail)| Failure::turn(reason, detail)),
                     );
@@ -2446,7 +2463,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 turn_failed(
                     &self.runner.out,
                     &turn_id,
-                    abandoned.reason,
+                    abandoned.reason.clone(),
                     format!(
                         "{}, so the box of turn {} ended with it; send the turn again",
                         abandoned.cause, *turn_id
@@ -2674,12 +2691,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 return None;
             }
         };
-        let image = Boot::from_record(handed.image);
+        let image = Boot::from_record(handed.image)?;
         let hold = self.runner.holds.hold_boot(&image);
         let queue = handed
             .queued
             .into_iter()
-            .map(|record| Command::from_record(record, &handed.session_id, &handed.box_id))
+            .filter_map(|record| Command::from_record(record, &handed.session_id, &handed.box_id))
             .collect();
         let slot = self.slots.entry(session.clone()).or_default();
         slot.queue = queue;
@@ -2698,6 +2715,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             idle: duration(handed.idle_milliseconds),
         });
         match (handed.state, taken) {
+            (SupervisorHandoverBoxState::Unrecognised(_), _) => {
+                tumpel_channel::update_required();
+                return None;
+            }
             (SupervisorHandoverBoxState::Warm(_), _) => {
                 slot.paused = true;
                 slot.idle_end = Some(Instant::now() + duration(handed.idle_milliseconds));

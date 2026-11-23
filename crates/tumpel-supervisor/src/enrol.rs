@@ -80,11 +80,22 @@ pub async fn enrol_with_token(endpoint: &str, token: String, name: Option<String
     let client = Client::new(endpoint).context("building the HTTP client")?;
     let host = match client.hosts_enrol(&body).await {
         Ok(host) => host.into_inner(),
+        Err(Error::ErrorResponse(problem))
+            if matches!(problem.code, tumpel_api::types::ProblemCode::Unrecognised(_)) =>
+        {
+            bail!("{}", tumpel_channel::UPDATE_REQUIRED)
+        }
+        Err(Error::InvalidResponsePayload(_, _) | Error::UnexpectedResponse(_)) => {
+            bail!("{}", tumpel_channel::UPDATE_REQUIRED)
+        }
         Err(Error::ErrorResponse(problem)) => {
             bail!("{}: {}. {}", problem.title, problem.detail, problem.fix)
         }
         Err(error) => return Err(error).with_context(|| format!("enrolling with {endpoint}/v1/hosts/enrol")),
     };
+    if matches!(host.state, tumpel_api::types::HostState::Unrecognised(_)) {
+        eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
+    }
     dir::ensure_dir(&dir)?;
     dir::write_json(
         &dir.join(KEY_FILE),

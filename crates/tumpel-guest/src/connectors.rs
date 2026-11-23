@@ -75,12 +75,16 @@ fn object(servers: &[(String, String)], entry: impl Fn(&str) -> Value) -> Value 
     )
 }
 
-pub fn arguments(protocol: GuestHarnessProtocol, connectors: &[ChannelDispatchConnector]) -> Vec<String> {
+pub fn arguments(protocol: &GuestHarnessProtocol, connectors: &[ChannelDispatchConnector]) -> Vec<String> {
     let servers = servers(connectors);
     if servers.is_empty() {
         return Vec::new();
     }
     match protocol {
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_guest::update_required();
+            Vec::new()
+        }
         GuestHarnessProtocol::ClaudeStreamJson => vec![
             "--mcp-config".to_string(),
             json!({ "mcpServers": object(&servers, |url| json!({ "type": "http", "url": url })) }).to_string(),
@@ -139,9 +143,9 @@ pub fn write_pi_config(home: &Path, connectors: &[ChannelDispatchConnector], mou
     bind(generated, &target)
 }
 
-pub fn variables(protocol: GuestHarnessProtocol, connectors: &[ChannelDispatchConnector]) -> Vec<(String, String)> {
+pub fn variables(protocol: &GuestHarnessProtocol, connectors: &[ChannelDispatchConnector]) -> Vec<(String, String)> {
     let servers = servers(connectors);
-    if servers.is_empty() || protocol != GuestHarnessProtocol::PromptOnStdin {
+    if servers.is_empty() || protocol != &GuestHarnessProtocol::PromptOnStdin {
         return Vec::new();
     }
     let mcp = object(&servers, |url| json!({ "type": "remote", "url": url, "oauth": false }));
@@ -212,18 +216,22 @@ pub fn mask_oauth_caches(home: &Path, credential_file: Option<&str>) -> Result<(
     Ok(())
 }
 
-fn harness_configs(protocol: GuestHarnessProtocol) -> &'static [&'static str] {
+fn harness_configs(protocol: &GuestHarnessProtocol) -> &'static [&'static str] {
     match protocol {
         GuestHarnessProtocol::ClaudeStreamJson => &[".claude.json"],
         GuestHarnessProtocol::CodexExecJson => &[".codex/config.toml"],
         GuestHarnessProtocol::PromptOnStdin => &[".config/opencode/opencode.json", ".config/opencode/opencode.jsonc"],
         GuestHarnessProtocol::PiRpc => &[PI_CONFIG],
         GuestHarnessProtocol::ShellLines => &[],
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_guest::update_required();
+            &[]
+        }
     }
 }
 
 pub fn refuse_reserved(
-    protocol: GuestHarnessProtocol,
+    protocol: &GuestHarnessProtocol,
     home: &Path,
     persona_files: &[&str],
     connectors: &[ChannelDispatchConnector],

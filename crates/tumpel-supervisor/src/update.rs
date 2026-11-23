@@ -185,7 +185,7 @@ impl Source for HttpSource {
             .bytes()
             .await
             .map_err(|error| format!("reading {url} failed: {}", error.without_url()))?;
-        announced_release(&body, &url, self.architecture)
+        announced_release(&body, &url, &self.architecture)
     }
 
     async fn binary(&self) -> Result<Vec<u8>, String> {
@@ -218,14 +218,21 @@ struct AnnouncedSupervisor {
     supervisor_version: ReleaseSupervisorSupervisorVersion,
 }
 
-fn announced_release(body: &[u8], url: &str, architecture: HostArchitecture) -> Result<Release, String> {
+fn announced_release(body: &[u8], url: &str, architecture: &HostArchitecture) -> Result<Release, String> {
     let manifest: AnnouncedRelease = serde_json::from_slice(body).map_err(|error| {
         format!("{url} is no ReleaseManifest: {error}; check that the stage has published a release")
     })?;
+    if manifest
+        .supervisors
+        .iter()
+        .any(|supervisor| matches!(supervisor.architecture, HostArchitecture::Unrecognised(_)))
+    {
+        tumpel_channel::update_required();
+    }
     let supervisor = manifest
         .supervisors
         .into_iter()
-        .find(|supervisor| supervisor.architecture == architecture)
+        .find(|supervisor| &supervisor.architecture == architecture)
         .ok_or_else(|| {
             format!(
                 "release {} carries no {architecture} supervisor; publish one for this architecture",
@@ -473,7 +480,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
 
     async fn apply(&self, release: &Release) -> Outcome {
         if let Err(stopped) = self.prepare(release).await {
-            let reason = stopped.reason;
+            let reason = stopped.reason.clone();
             self.fail(&release.sha256, stopped);
             return Outcome::Failed(reason);
         }
@@ -487,7 +494,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         match self.swap(&release.sha256).await {
             Ok(()) => Outcome::Restart,
             Err(stopped) => {
-                let reason = stopped.reason;
+                let reason = stopped.reason.clone();
                 self.fail(&release.sha256, stopped);
                 Outcome::Failed(reason)
             }
@@ -516,7 +523,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
                 type_: ChannelSupervisorUpdateFailedType::SupervisorUpdateFailed,
                 from_sha256: self.running.clone(),
                 to_sha256: to.clone(),
-                reason: stopped.reason,
+                reason: stopped.reason.clone(),
                 detail: reported("the update failure detail", &detail),
                 output_tail: stopped
                     .tail
@@ -532,7 +539,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         let candidate = remove(&self.layout.candidate);
         let refusal = SupervisorUpdateRefusal {
             to_sha256: to.clone(),
-            reason: stopped.reason,
+            reason: stopped.reason.clone(),
             refused_at: Utc::now().fixed_offset(),
         };
         let written = dir::write_json(&self.layout.refusal(), &refusal).map_err(|error| format!("{error:#}"));

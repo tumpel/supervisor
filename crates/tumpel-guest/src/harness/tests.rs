@@ -198,12 +198,12 @@ fn a_pi_turn_ends_when_pi_settles_or_answers_the_prompt_without_a_run() {
         r#"{"type":"response","command":"prompt","success":false,"error":"No API key found for openrouter."}"#;
     let handled = r#"{"type":"response","command":"prompt","success":true,"data":{"disposition":"handled"}}"#;
     for line in [settled, refused, handled] {
-        assert!(ends_turn(pi, line), "{line}");
+        assert!(ends_turn(&pi, line), "{line}");
     }
     let started = r#"{"type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}"#;
     let run_ended = r#"{"type":"agent_end","messages":[],"willRetry":true}"#;
     for line in [started, run_ended, r#"{"type":"result"}"#, "not json"] {
-        assert!(!ends_turn(pi, line), "{line}");
+        assert!(!ends_turn(&pi, line), "{line}");
     }
 }
 
@@ -212,15 +212,15 @@ fn a_pi_turn_leaves_out_the_streaming_deltas() {
     let pi = GuestHarnessProtocol::PiRpc;
     let delta = r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Hi"}}"#;
     let partial = r#"{"type":"tool_execution_update","toolCallId":"call_1","toolName":"bash"}"#;
-    assert!(skips(pi, delta));
-    assert!(skips(pi, partial));
-    assert!(!skips(pi, r#"{"type":"message_end","message":{"role":"assistant"}}"#));
+    assert!(skips(&pi, delta));
+    assert!(skips(&pi, partial));
+    assert!(!skips(&pi, r#"{"type":"message_end","message":{"role":"assistant"}}"#));
     assert!(skips(
-        pi,
+        &pi,
         r#"{"type":"response","command":"set_auto_retry","success":true}"#
     ));
     assert!(!skips(
-        pi,
+        &pi,
         r#"{"type":"response","command":"set_auto_retry","success":false,"error":"Unknown command"}"#
     ));
 }
@@ -232,11 +232,11 @@ fn claude_code_thinking_token_ticks_stay_out_of_the_transcript_and_its_messages_
     let init = r#"{"type":"system","subtype":"init","cwd":"/root/workspace","session_id":"ca9a48ec-b580-43de-a965-00ab062e5bb3","model":"qwen/qwen3.8-27b"}"#;
     let assistant = r#"{"type":"assistant","message":{"id":"msg_UuSLEyhno5vWjtmGCbMW","type":"message","role":"assistant","content":[{"type":"text","text":"on it"}],"model":"qwen/qwen3.8-27b","usage":{"input_tokens":0,"output_tokens":0},"provider":"PrimeIntellect"},"session_id":"ca9a48ec-b580-43de-a965-00ab062e5bb3"}"#;
     let result = r#"{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.0123,"usage":{"input_tokens":5120,"output_tokens":812}}"#;
-    assert!(skips(claude, tick));
-    assert!(!skips(claude, init));
-    assert!(!skips(claude, assistant));
-    assert!(!skips(claude, result));
-    assert!(!skips(GuestHarnessProtocol::PiRpc, tick));
+    assert!(skips(&claude, tick));
+    assert!(!skips(&claude, init));
+    assert!(!skips(&claude, assistant));
+    assert!(!skips(&claude, result));
+    assert!(!skips(&GuestHarnessProtocol::PiRpc, tick));
 }
 
 #[test]
@@ -286,8 +286,8 @@ fn a_result_for_a_background_task_notification_does_not_end_the_turn_and_the_rea
     let protocol = GuestHarnessProtocol::ClaudeStreamJson;
     let ending = [notification, reply]
         .into_iter()
-        .filter(|line| !answers_no_prompt(protocol, line))
-        .find(|line| ends_turn(protocol, line));
+        .filter(|line| !answers_no_prompt(&protocol, line))
+        .find(|line| ends_turn(&protocol, line));
     assert_eq!(ending.as_deref().map(|line| line.contains("\"done\"")), Some(true));
     let failure = json!({
         "type": "result",
@@ -306,11 +306,11 @@ fn a_result_for_a_background_task_notification_does_not_end_the_turn_and_the_rea
     })
     .to_string();
     for line in [failure, failed_notification] {
-        assert!(!answers_no_prompt(protocol, &line));
-        assert!(ends_turn(protocol, &line));
+        assert!(!answers_no_prompt(&protocol, &line));
+        assert!(ends_turn(&protocol, &line));
     }
     assert!(!answers_no_prompt(
-        GuestHarnessProtocol::PiRpc,
+        &GuestHarnessProtocol::PiRpc,
         r#"{"type":"result","num_turns":0}"#
     ));
 }
@@ -331,18 +331,18 @@ fn codex_turn(arguments: &Value) -> GuestTurnStart {
 fn a_later_codex_turn_resumes_the_recorded_thread() {
     let turn = codex_turn(&json!(["-c", "model_provider=openrouter"]));
     let thread = "0199a213-81c0-7800-8aa1-bbab2a035a53";
-    let resumed = turn_arguments(CODEX, &turn, true, Some(thread)).expect("a Codex credential");
+    let resumed = turn_arguments(&CODEX, &turn, true, Some(thread)).expect("a Codex credential");
     assert_eq!(
         resumed[2..],
         ["-c", "model_provider=openrouter", "resume", thread].map(String::from)
     );
-    let unrecorded = turn_arguments(CODEX, &turn, true, None).expect("a Codex credential");
+    let unrecorded = turn_arguments(&CODEX, &turn, true, None).expect("a Codex credential");
     assert!(!unrecorded.contains(&"resume".to_string()), "{unrecorded:?}");
 }
 
 #[test]
 fn a_codex_turn_whose_credential_names_no_provider_does_not_start() {
-    let error = turn_arguments(CODEX, &codex_turn(&json!([])), false, None).expect_err("no Codex provider");
+    let error = turn_arguments(&CODEX, &codex_turn(&json!([])), false, None).expect_err("no Codex provider");
     assert!(error.contains("names no Codex model provider"), "{error}");
 }
 
@@ -409,11 +409,18 @@ fn a_cancel_kills_a_persistent_harness_and_every_process_it_started() {
         kernel: crate::memory::KernelLog::open(Path::new("/dev/null")).expect("a kernel log"),
         box_mib: 1024,
     };
-    let state = super::GuestState::new(config, memory).expect("a guest state");
+    let keys = RandomState::new();
     let turn = start("m", &json!([]), &json!([]));
-    let mut harness = state
-        .start_process(std::process::Command::new("sh"), Vec::new(), false, &turn)
-        .expect("the harness starts");
+    let mut harness = super::GuestState::start_process(
+        &config,
+        &memory,
+        &keys,
+        std::process::Command::new("sh"),
+        Vec::new(),
+        false,
+        &turn,
+    )
+    .expect("the harness starts");
     harness
         .stdin
         .write_all(b"sleep 300 & echo $!\n")

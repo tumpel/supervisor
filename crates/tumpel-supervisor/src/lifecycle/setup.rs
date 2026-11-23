@@ -113,8 +113,12 @@ pub(crate) fn then(detail: String, stopped: Result<(), String>) -> String {
     }
 }
 
-fn failed_in_guest(reason: GuestClaudeSetupFailureReason, detail: String) -> Ended {
+fn failed_in_guest(reason: &GuestClaudeSetupFailureReason, detail: String) -> Ended {
     let reason = match reason {
+        GuestClaudeSetupFailureReason::Unrecognised(_) => {
+            tumpel_channel::update_required();
+            ClaudeSetupFailureReason::ClaudeCodeExited
+        }
         GuestClaudeSetupFailureReason::UrlNotPrinted => ClaudeSetupFailureReason::SetupUrlMissing,
         GuestClaudeSetupFailureReason::CodeRejected => ClaudeSetupFailureReason::CodeRejected,
         GuestClaudeSetupFailureReason::ClaudeCodeExited => ClaudeSetupFailureReason::ClaudeCodeExited,
@@ -321,7 +325,11 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     Some(Ended::Stored)
                 }
                 Next::Received(Ok(GuestMessage::ClaudeSetupFailed(failed))) if failed.claude_setup_id == *id => {
-                    Some(failed_in_guest(failed.reason, failed.detail.into()))
+                    Some(failed_in_guest(&failed.reason, failed.detail.into()))
+                }
+                Next::Received(Ok(GuestMessage::Unrecognised(_))) => {
+                    tumpel_channel::update_required();
+                    None
                 }
                 Next::Received(Ok(_)) => None,
                 Next::Received(Err(error)) => Some(Ended::Failed(stop(

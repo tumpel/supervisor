@@ -15,13 +15,15 @@
     "clippy": "cargo clippy --workspace --all-targets -- -D warnings",
     "fmt:check": "cargo fmt --all --check",
     "check": "npm run lint && npm run comments:check && npm run secrets:check && npm run pins:check && npm run clippy && npm run fmt:check",
-    "test": "node --test npm-scripts/release.test.mjs && cargo test --workspace",
+    "test": "npm run test:release && npm run test:rust -- --workspace",
     "guest:build": "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p tumpel-guest --target ${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}",
     "guest:drive": "node npm-scripts/guest-drive.mjs",
-    "supervisor:build": "npm run guest:build && npm run guest:drive && TUMPEL_GUEST_DRIVE=\"$PWD/.tmp/guest-drive/${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}.squashfs\" RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p tumpel-supervisor --target ${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}"
+    "supervisor:build": "npm run guest:build && npm run guest:drive && TUMPEL_GUEST_DRIVE=\"$PWD/.tmp/guest-drive/${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}.squashfs\" RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p tumpel-supervisor --target ${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}",
+    "test:rust": "cargo test",
+    "test:release": "node --test npm-scripts/release.test.mjs"
   },
   "dependencies": {
-    "@tumpel/schemas": "https://github.com/tumpel/protocol/releases/download/v1.0.0-rc.52/tumpel-schemas-1.0.0-rc.52.tgz"
+    "@tumpel/schemas": "https://github.com/tumpel/protocol/releases/download/v1.0.0-rc.55/tumpel-schemas-1.0.0-rc.55.tgz"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.8"

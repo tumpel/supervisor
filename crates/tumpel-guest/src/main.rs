@@ -130,6 +130,7 @@ fn connection(mut stream: File, guest: &Mutex<GuestState>) -> Result<(), String>
     loop {
         while let Some(input) = decoder.take::<GuestInput>().map_err(|error| error.to_string())? {
             match input {
+                GuestInput::Unrecognised(_) => tumpel_guest::update_required(),
                 GuestInput::TurnStart(start) => {
                     let mut guest = guest.lock().map_err(|_| "the box state was poisoned by a panic")?;
                     guest.run(&start, &mut stream)?;

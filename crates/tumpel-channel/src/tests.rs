@@ -65,7 +65,6 @@ fn usage() -> Usage {
             memory_budget_mib: 30_000,
             memory_held_mib: 6144,
         },
-        boxes_warm: 1,
     }
 }
 
@@ -206,7 +205,7 @@ impl ControlPlane {
     }
 
     fn welcome(&self) -> Value {
-        json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 36, "ack": self.received})
+        json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 37, "ack": self.received})
     }
 
     fn read(&mut self, wire: &mut Wire) {
@@ -232,6 +231,7 @@ impl ControlPlane {
     fn reconnect(&mut self, channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) -> Result<Event, ChannelError> {
         channel.disconnect();
         let event = welcome(channel, wire, &self.welcome())?;
+        channel.receive(&json!({"type":"Ack", "seq":self.received}).to_string())?;
         channel.release(usize::MAX, wire)?;
         Ok(event)
     }
@@ -783,7 +783,7 @@ fn a_backlog_saved_before_a_restart_is_held_at_the_welcome_and_goes_out_paced() 
 
 fn line(turn: &str, line_seq: i64) -> ChannelHostMessage {
     serde_json::from_value(
-        json!({"type": "TurnLine", "turnId": turn, "lineSeq": line_seq, "text": format!("line {line_seq}")}),
+        json!({"type": "TurnLines", "turnId": turn, "firstLineSeq": line_seq, "lines": [format!("line {line_seq}")]}),
     )
     .expect("line")
 }
@@ -834,7 +834,7 @@ fn a_socket_closed_mid_turn_keeps_the_turn_held_and_resends_its_unacked_output_a
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
     let mut control = ControlPlane::new(true);
-    open_at(&mut channel, &mut wire, 36);
+    open_at(&mut channel, &mut wire, 37);
     channel.receive(&offer(1, "grant-1")).expect("offer");
     channel.send(claim("turn-1"), &mut wire).expect("send");
     control.read(&mut wire);
@@ -844,7 +844,7 @@ fn a_socket_closed_mid_turn_keeps_the_turn_held_and_resends_its_unacked_output_a
     channel.send(line("turn-1", 2), &mut wire).expect("send");
     channel.send(line("turn-1", 3), &mut wire).expect("send");
     assert!(wire.sent().is_empty(), "nothing goes out on a closed socket");
-    assert_eq!(unacked_seqs(&disk), [1, 2, 3, 4]);
+    assert_eq!(unacked_seqs(&disk), [1, 2]);
 
     channel.connect();
     let challenge = json!({"type": "Challenge", "nonce": NONCE}).to_string();
@@ -860,19 +860,14 @@ fn a_socket_closed_mid_turn_keeps_the_turn_held_and_resends_its_unacked_output_a
         panic!("the welcome opens the channel");
     };
     assert_eq!(wire.sent(), Vec::<Value>::new(), "the welcome sends nothing by itself");
+    channel.receive(r#"{"type":"Ack","seq":1}"#).expect("ack");
     channel.release(usize::MAX, &mut wire).expect("release");
-    let resent: Vec<(i64, i64)> = wire
-        .sent()
-        .iter()
-        .map(|frame| {
-            (
-                frame["seq"].as_i64().expect("seq"),
-                frame["message"]["lineSeq"].as_i64().expect("line seq"),
-            )
-        })
-        .collect();
-    assert_eq!(resent, [(2, 1), (3, 2), (4, 3)]);
-    assert_eq!(unacked_seqs(&disk), [2, 3, 4]);
+    let resent: Vec<Value> = wire.sent().into_iter().map(|frame| frame["message"].clone()).collect();
+    assert_eq!(
+        resent,
+        [json!({"type":"TurnLines","turnId":"turn-1","firstLineSeq":1,"lines":["line 1","line 2","line 3"]})]
+    );
+    assert_eq!(unacked_seqs(&disk), [2]);
 }
 
 #[test]
@@ -881,7 +876,7 @@ fn twenty_failed_reconnects_wait_thirty_seconds_apart_and_keep_every_unacked_fra
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
     let mut control = ControlPlane::new(true);
-    open_at(&mut channel, &mut wire, 36);
+    open_at(&mut channel, &mut wire, 37);
     channel.send(claim("turn-1"), &mut wire).expect("send");
     control.read(&mut wire);
     channel.disconnect();
@@ -896,17 +891,20 @@ fn twenty_failed_reconnects_wait_thirty_seconds_apart_and_keep_every_unacked_fra
     }
     assert_eq!(waited, Duration::from_secs(1 + 2 + 4 + 8 + 16 + 30 * 15));
     assert_eq!(wire.sent(), Vec::<Value>::new());
-    assert_eq!(unacked_seqs(&disk), (1..=21).collect::<Vec<_>>());
+    assert_eq!(unacked_seqs(&disk), [1, 2]);
 
     let Ok(Event::Welcomed) = control.reconnect(&mut channel, &mut wire) else {
         panic!("the twenty-first reconnect is welcomed");
     };
-    let resent: Vec<i64> = wire
+    let resent: Vec<Value> = wire
         .sent()
-        .iter()
-        .map(|frame| frame["message"]["lineSeq"].as_i64().expect("line seq"))
+        .into_iter()
+        .flat_map(|frame| frame["message"]["lines"].as_array().expect("lines").clone())
         .collect();
-    assert_eq!(resent, (1..=20).collect::<Vec<_>>());
+    assert_eq!(
+        resent,
+        (1..=20).map(|seq| json!(format!("line {seq}"))).collect::<Vec<_>>()
+    );
     let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
     channel
         .heartbeat(
@@ -927,7 +925,7 @@ fn a_host_rate_limited_for_five_windows_holds_its_output_until_each_retry_after_
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
-    open_at(&mut channel, &mut wire, 36);
+    open_at(&mut channel, &mut wire, 37);
     let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
     let mut limit = RateLimit::default();
     let mut released = Vec::new();
@@ -936,6 +934,9 @@ fn a_host_rate_limited_for_five_windows_holds_its_output_until_each_retry_after_
     for _ in 0..5 {
         line_seq += 1;
         channel.send(line("turn-1", line_seq), &mut wire).expect("send");
+        channel
+            .transmit_due(Instant::now() + TURN_LINES_WAIT, &mut wire)
+            .expect("batch due");
         let [refused] = wire.sent().try_into().expect("one frame");
         let limited = json!({"type": "FrameRateLimited", "seq": refused["seq"], "reason": "host host-1 sent more than 600 frames a minute", "framesPerMinute": 600, "retryAfter": at(now + 60).to_rfc3339()});
         let Ok(Event::FrameRateLimited { retry_after, .. }) = channel.receive(&limited.to_string()) else {
@@ -965,11 +966,15 @@ fn a_host_rate_limited_for_five_windows_holds_its_output_until_each_retry_after_
         released.extend(
             wire.sent()
                 .iter()
-                .map(|frame| frame["message"]["lineSeq"].as_i64().expect("line seq")),
+                .flat_map(|frame| frame["message"]["lines"].as_array().expect("lines").clone()),
         );
     }
-    assert_eq!(released, (1..=20).collect::<Vec<_>>(), "no line is lost");
-    assert_eq!(unacked_seqs(&disk), (1..=20).collect::<Vec<_>>());
+    assert_eq!(
+        released,
+        (1..=20).map(|seq| json!(format!("line {seq}"))).collect::<Vec<_>>(),
+        "no line is lost"
+    );
+    assert_eq!(unacked_seqs(&disk), (1..=10).collect::<Vec<_>>());
 }
 
 fn withdrawn(seq: i64) -> String {
@@ -1074,7 +1079,7 @@ fn sent_frames(wire: &mut Wire) -> Vec<(i64, Value)> {
 }
 
 fn text_line(turn: &str, line_seq: i64, text: &str) -> ChannelHostMessage {
-    serde_json::from_value(json!({"type": "TurnLine", "turnId": turn, "lineSeq": line_seq, "text": text}))
+    serde_json::from_value(json!({"type": "TurnLines", "turnId": turn, "firstLineSeq": line_seq, "lines": [text]}))
         .expect("line")
 }
 
@@ -1256,69 +1261,6 @@ fn on_37_a_rate_limited_frame_and_every_frame_after_it_go_out_again_in_order_onc
 }
 
 #[test]
-fn a_host_refused_at_37_steps_down_to_36_and_35_and_speaks_the_old_shape_there() {
-    let disk = Disk::default();
-    let mut channel = channel(&disk, &Recorder::default());
-    let mut wire = Wire::default();
-    for line_seq in 1..=3 {
-        channel.send(line("turn-1", line_seq), &mut wire).expect("send");
-    }
-    channel.send(done("snap-1"), &mut wire).expect("send");
-    assert_eq!(unacked_seqs(&disk), [1, 2]);
-    let newest = say_hello(&mut channel, &mut wire);
-    assert_eq!(newest["protocolVersion"], json!(37));
-    assert_eq!(newest["channelProtocolOldest"], json!(35));
-
-    assert_eq!(channel.step_down(), Some(36));
-    let hello = say_hello(&mut channel, &mut wire);
-    assert_eq!(hello["protocolVersion"], json!(36));
-    assert_eq!(hello["usage"]["boxesWarm"], json!(1));
-    assert_eq!(hello["heldTurnIds"], json!(["turn-1"]));
-    assert_eq!(hello.get("resendFrom"), None);
-    let at_36 = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 36, "ack": 0}).to_string();
-    let Ok(Event::Welcomed) = channel.receive(&at_36) else {
-        panic!("the welcome opens the channel");
-    };
-    channel.release(usize::MAX, &mut wire).expect("release");
-    let resent: Vec<(i64, Value, Value)> = sent_frames(&mut wire)
-        .into_iter()
-        .map(|(seq, message)| (seq, message["type"].clone(), message["lineSeq"].clone()))
-        .collect();
-    assert_eq!(
-        resent,
-        [
-            (1, json!("TurnLine"), json!(1)),
-            (2, json!("TurnLine"), json!(2)),
-            (3, json!("TurnLine"), json!(3)),
-            (4, json!("SnapshotDone"), Value::Null)
-        ]
-    );
-    assert!(channel.sends_telemetry_frames());
-    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
-    channel
-        .heartbeat(
-            sent_at,
-            usage(),
-            HeldIds::default(),
-            HostReportedHealth::Healthy,
-            || panic!("a 36 Heartbeat takes no telemetry points"),
-            &mut wire,
-        )
-        .expect("heartbeat");
-    let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
-    assert_eq!((heartbeat.get("ack"), heartbeat.get("telemetry")), (None, None));
-    assert_eq!(heartbeat["usage"]["boxesWarm"], json!(1));
-    channel.send(line("turn-1", 4), &mut wire).expect("send");
-    assert_eq!(sent_frames(&mut wire)[0].1["type"], json!("TurnLine"));
-
-    assert_eq!(channel.step_down(), Some(35));
-    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(35));
-    assert_eq!(channel.step_down(), None);
-    channel.step_up();
-    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(37));
-}
-
-#[test]
 fn a_backlog_saved_by_an_older_supervisor_goes_out_on_37_with_each_line_its_own_frame_under_its_own_seq() {
     let saved: SupervisorChannelState = serde_json::from_value(json!({
         "received": 0,
@@ -1402,39 +1344,6 @@ fn lines_of_turns_streaming_side_by_side_share_one_frame_per_turn_until_another_
 }
 
 #[test]
-fn a_control_plane_rolled_back_to_36_gets_the_unacked_frames_numbered_on_from_its_own_count() {
-    let disk = Disk::default();
-    let mut channel = channel(&disk, &Recorder::default());
-    let mut wire = Wire::default();
-    open(&mut channel, &mut wire);
-    for snapshot in ["snap-1", "snap-2", "snap-3", "snap-4", "snap-5"] {
-        channel.send(done(snapshot), &mut wire).expect("send");
-    }
-    channel
-        .receive(&json!({"type": "Ack", "seq": 3}).to_string())
-        .expect("ack");
-    assert_eq!(unacked_seqs(&disk), [4, 5]);
-    wire.sent();
-
-    channel.disconnect();
-    assert_eq!(channel.step_down(), Some(36));
-    say_hello(&mut channel, &mut wire);
-    let stale = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 36, "ack": 1}).to_string();
-    let Ok(Event::Welcomed) = channel.receive(&stale) else {
-        panic!("the welcome opens the channel");
-    };
-    channel.release(usize::MAX, &mut wire).expect("release");
-    let resent: Vec<(i64, Value)> = sent_frames(&mut wire)
-        .into_iter()
-        .map(|(seq, message)| (seq, message["snapshotId"].clone()))
-        .collect();
-    assert_eq!(resent, [(2, json!("snap-4")), (3, json!("snap-5"))]);
-    channel.send(done("snap-6"), &mut wire).expect("send");
-    assert_eq!(sent_frames(&mut wire)[0].0, 4);
-    assert_eq!(unacked_seqs(&disk), [2, 3, 4]);
-}
-
-#[test]
 fn an_ack_for_a_seq_this_host_never_sent_closes_the_channel_and_keeps_every_frame() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
@@ -1459,4 +1368,236 @@ fn an_ack_for_a_seq_this_host_never_sent_closes_the_channel_and_keeps_every_fram
     let Ok(Event::Message(_)) = channel.receive(&frame(1, 1, "snap-9")) else {
         panic!("the resent frame 1 is taken, not dropped as a duplicate");
     };
+}
+
+#[derive(Clone, Default)]
+struct UpdateLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::field::Visit for UpdateLogs {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0.lock().expect("logs").push(format!("{value:?}"));
+        }
+    }
+}
+
+impl tracing_subscriber::Layer<tracing_subscriber::Registry> for UpdateLogs {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _: tracing_subscriber::layer::Context<'_, tracing_subscriber::Registry>,
+    ) {
+        if event.metadata().target() == "tumpel::compatibility" {
+            event.record(&mut self.clone());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unfamiliar_envelopes_leave_the_handshake_and_known_notifications_working() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let logs = UpdateLogs::default();
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+    let mut channel = HostChannel::new(
+        empty_state(),
+        Disk::default(),
+        Recorder::default(),
+        "host-1".try_into().expect("host"),
+        "1".to_string(),
+    );
+    channel.connect();
+    assert!(matches!(
+        channel.receive(r#"{"type":"FutureChallenge","extra":true}"#),
+        Ok(Event::None)
+    ));
+    assert!(matches!(
+        channel.receive(r#"{"type":"Challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":true}"#),
+        Ok(Event::Challenged(_))
+    ));
+    channel
+        .hello(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            NonZeroU32::new(1).expect("capacity"),
+            Usage {
+                host: HostUsage {
+                    load_average: 0.0,
+                    memory_available_mib: 1,
+                    disk_budget_mib: 1,
+                    disk_held_mib: 0,
+                    memory_budget_mib: 1,
+                    memory_held_mib: 0,
+                },
+            },
+            Vec::new(),
+            &mut Wire::default(),
+        )
+        .expect("hello");
+    assert!(matches!(
+        channel.receive(r#"{"type":"FutureWelcome","extra":true}"#),
+        Ok(Event::None)
+    ));
+    assert!(matches!(
+        channel.receive(
+            &json!({"type":"Welcome","hostId":"host-1","protocolVersion":ChannelProtocol::VERSION,"extra":true})
+                .to_string()
+        ),
+        Ok(Event::Welcomed)
+    ));
+    for known in [
+        json!({"type":"Heartbeat","sentAt":"2026-11-23T12:00:00Z","extra":true}),
+        json!({"type":"ReleasePublished","releaseVersion":"1.0.0","extra":true}),
+        json!({"type":"Ack","seq":0,"extra":true}),
+        json!({"type":"FrameRefused","seq":0,"reason":"FutureFailureReason","extra":true}),
+        json!({"type":"FrameRateLimited","seq":1,"reason":"FuturePauseReason","framesPerMinute":60,"retryAfter":"2026-11-23T12:00:00Z","extra":true}),
+    ] {
+        let future = json!({"type":format!("Future{}", known["type"].as_str().expect("type")),"extra":true});
+        assert!(matches!(channel.receive(&future.to_string()), Ok(Event::None)));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let event = channel.receive(&known.to_string()).expect("known notification");
+        match known["type"].as_str().expect("type") {
+            "Heartbeat" => assert!(matches!(event, Event::Heartbeat)),
+            "ReleasePublished" => assert!(matches!(event, Event::ReleasePublished)),
+            "Ack" => assert!(matches!(event, Event::None)),
+            "FrameRefused" => {
+                assert!(matches!(event, Event::FrameRefused { reason, .. } if reason == "FutureFailureReason"));
+            }
+            "FrameRateLimited" => assert!(
+                matches!(event, Event::FrameRateLimited { reason, frames_per_minute:60, .. } if reason == "FuturePauseReason")
+            ),
+            _ => panic!("unexpected test notification"),
+        }
+        assert_eq!(channel.phase(), Phase::Open);
+    }
+    assert_eq!(*logs.0.lock().expect("logs"), vec![super::UPDATE_REQUIRED; 7]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unfamiliar_commands_advance_the_cursor_and_every_known_command_keeps_its_work() {
+    use tracing_subscriber::layer::SubscriberExt;
+    for known in [
+        json!({"type":"TurnWithdrawn","turnId":"turn-1"}),
+        json!({"type":"TurnClaimed","turnId":"turn-1"}),
+        json!({"type":"TurnCancel","turnId":"turn-1"}),
+        json!({"type":"SnapshotRequest","snapshotId":"snap-1","sessionId":"session-1","boxId":"box-1","turnId":"turn-1","snapshotSeq":1,"storageKey":"snapshots/snap-1","uploadUrl":"https://example.test/upload","uploadExpiresAt":"2026-11-23T12:00:00Z"}),
+        json!({"type":"SnapshotChunksHeld","snapshotId":"snap-1","part":1,"held":[]}),
+        json!({"type":"SnapshotPackUploads","snapshotId":"snap-1","part":1,"uploads":[],"uploadExpiresAt":"2026-11-23T12:00:00Z"}),
+        json!({"type":"RestoreDownloads","turnId":"turn-1","part":1,"packs":[],"downloadExpiresAt":"2026-11-23T12:00:00Z"}),
+        json!({"type":"BoxTeardown","sessionId":"session-1","boxId":"box-1"}),
+        json!({"type":"BoxDiscard","sessionId":"session-1","boxId":"box-1"}),
+        json!({"type":"ClaudeSetupBoxCode","claudeSetupId":"setup-1","boxId":"box-1","code":"code","mintBudgetSeconds":60}),
+        json!({"type":"ClaudeSetupBoxDiscard","claudeSetupId":"setup-1","boxId":"box-1"}),
+    ] {
+        let logs = UpdateLogs::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let mut channel = HostChannel::new(
+            empty_state(),
+            Disk::default(),
+            Recorder::default(),
+            "host-1".try_into().expect("host"),
+            "1".to_string(),
+        );
+        channel.phase = Phase::Open;
+        let future = json!({"type":"Frame","seq":1,"ack":0,"extra":true,"message":{"type":format!("Future{}",known["type"].as_str().expect("type")),"extra":true}});
+        assert!(matches!(channel.receive(&future.to_string()), Ok(Event::None)));
+        assert_eq!(channel.state().received.0, 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut extended = known.clone();
+        extended["extra"] = json!(true);
+        let frame = json!({"type":"Frame","seq":2,"ack":0,"extra":true,"message":extended});
+        let Event::Message(message) = channel.receive(&frame.to_string()).expect("known command") else {
+            panic!("known work is delivered");
+        };
+        assert_eq!(serde_json::to_value(message).expect("message"), known);
+        assert_eq!(channel.state().received.0, 2);
+        assert_eq!(channel.phase(), Phase::Open);
+        assert_eq!(*logs.0.lock().expect("logs"), [super::UPDATE_REQUIRED]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unfamiliar_turn_values_are_acked_without_starting_them_and_known_offers_still_arrive() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let known = json!({
+        "type":"TurnOffer","turnId":"turn-1","sessionId":"session-1","boxId":"box-1",
+        "repository":"https://example.test/repo.git","harness":"ClaudeCode","harnessVersion":"1","model":"model","prompt":"hello",
+        "credential":{"credentialHandoverId":"grant-1","expiresAt":"2026-11-23T12:00:00Z","variables":[],"connectors":[]},
+        "lastLineSeq":0,"snapshots":[],"personaFiles":[],
+        "image":{"kind":"Full","imageDigest":"b".repeat(64),"kernelDigest":"c".repeat(64),"manifestDigest":"d".repeat(64),"imageUrl":"https://example.test/image","kernelUrl":"https://example.test/kernel","manifestUrl":"https://example.test/manifest","downloadExpiresAt":"2026-11-23T12:00:00Z","fetchSeconds":60},
+        "gitAuthorName":"Agent","gitAuthorEmail":"agent@example.test","boxRetention":"Auto","turnSeconds":60,"idleSeconds":60
+    });
+    for (field, future) in [
+        ("type", json!("FutureTurnOffer")),
+        ("harness", json!("FutureHarness")),
+        ("boxRetention", json!("FutureRetention")),
+        ("image", json!({"kind":"FutureImage"})),
+    ] {
+        let logs = UpdateLogs::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let mut channel = HostChannel::new(
+            empty_state(),
+            Disk::default(),
+            Recorder::default(),
+            "host-1".try_into().expect("host"),
+            "1".to_string(),
+        );
+        channel.phase = Phase::Open;
+        let mut unfamiliar = known.clone();
+        unfamiliar[field] = future;
+        unfamiliar["extra"] = json!(true);
+        assert!(matches!(
+            channel.receive(&json!({"type":"Frame","seq":1,"ack":0,"message":unfamiliar}).to_string()),
+            Ok(Event::None)
+        ));
+        assert_eq!(channel.state().received.0, 1);
+        assert_eq!(channel.offered, []);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut extended = known.clone();
+        extended["extra"] = json!(true);
+        assert!(
+            matches!(channel.receive(&json!({"type":"Frame","seq":2,"ack":0,"message":extended}).to_string()), Ok(Event::Message(message)) if matches!(*message, ChannelControlMessage::TurnOffer(_)))
+        );
+        assert_eq!(channel.offered.len(), 1);
+        assert_eq!(*logs.0.lock().expect("logs"), [super::UPDATE_REQUIRED]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unfamiliar_setup_values_leave_known_setup_work_available() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let known = json!({
+        "type":"ClaudeSetupBoxOffer","claudeSetupId":"setup-1","tenantId":"tenant-1","boxId":"box-1","harness":"ClaudeCode","harnessVersion":"1",
+        "urlSeconds":60,"codeSeconds":60,"expiresAt":"2026-11-23T12:00:00Z","tokenUrl":"https://example.test/token","tokenCredential":"c".repeat(43),
+        "image":{"kind":"Full","imageDigest":"b".repeat(64),"kernelDigest":"c".repeat(64),"manifestDigest":"d".repeat(64),"imageUrl":"https://example.test/image","kernelUrl":"https://example.test/kernel","manifestUrl":"https://example.test/manifest","downloadExpiresAt":"2026-11-23T12:00:00Z","fetchSeconds":60}
+    });
+    for (field, future) in [
+        ("type", json!("FutureSetupOffer")),
+        ("harness", json!("FutureHarness")),
+        ("image", json!({"kind":"FutureImage"})),
+    ] {
+        let logs = UpdateLogs::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let mut channel = HostChannel::new(
+            empty_state(),
+            Disk::default(),
+            Recorder::default(),
+            "host-1".try_into().expect("host"),
+            "1".to_string(),
+        );
+        channel.phase = Phase::Open;
+        let mut unfamiliar = known.clone();
+        unfamiliar[field] = future;
+        unfamiliar["extra"] = json!(true);
+        assert!(matches!(
+            channel.receive(&json!({"type":"Frame","seq":1,"ack":0,"message":unfamiliar}).to_string()),
+            Ok(Event::None)
+        ));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut extended = known.clone();
+        extended["extra"] = json!(true);
+        assert!(
+            matches!(channel.receive(&json!({"type":"Frame","seq":2,"ack":0,"message":extended}).to_string()), Ok(Event::Message(message)) if matches!(*message, ChannelControlMessage::ClaudeSetupBoxOffer(_)))
+        );
+        assert_eq!(channel.state().received.0, 2);
+        assert_eq!(*logs.0.lock().expect("logs"), [super::UPDATE_REQUIRED]);
+    }
 }

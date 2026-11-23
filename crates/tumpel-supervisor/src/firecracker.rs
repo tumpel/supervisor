@@ -73,6 +73,25 @@ impl VsockGuest {
         let mut buffer = vec![0u8; 64 * 1024];
         loop {
             if let Some(message) = self.decoder.take::<GuestMessage>().map_err(|error| error.to_string())? {
+                let unfamiliar = match &message {
+                    GuestMessage::Unrecognised(_) => true,
+                    GuestMessage::TurnEnd(end) => {
+                        matches!(end.reason, tumpel_api::types::GuestTurnEndReason::Unrecognised(_))
+                    }
+                    GuestMessage::TurnRepositoryCloneFailed(failed) => matches!(
+                        failed.cause,
+                        tumpel_api::types::RepositoryCloneFailureCause::Unrecognised(_)
+                    ),
+                    GuestMessage::ClaudeSetupFailed(failed) => matches!(
+                        failed.reason,
+                        tumpel_api::types::GuestClaudeSetupFailureReason::Unrecognised(_)
+                    ),
+                    _ => false,
+                };
+                if unfamiliar {
+                    tumpel_channel::update_required();
+                    continue;
+                }
                 return Ok(message);
             }
             let read = self

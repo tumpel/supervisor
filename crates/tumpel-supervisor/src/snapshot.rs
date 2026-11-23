@@ -634,6 +634,10 @@ struct Common<'a> {
 
 fn decode_entry(entry: &SnapshotEntry) -> Result<(Vec<u8>, Stored), String> {
     let (common, kind, chunks) = match entry {
+        SnapshotEntry::Unrecognised(_) => {
+            tumpel_channel::update_required();
+            return Err(tumpel_channel::UPDATE_REQUIRED.to_string());
+        }
         SnapshotEntry::FileEntry(file) => (
             Common {
                 path: &file.path,
