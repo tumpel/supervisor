@@ -134,12 +134,52 @@ pub trait Machine: Send + 'static {
     fn pause(&mut self) -> impl Future<Output = Result<(), String>> + Send;
     fn resume(&mut self) -> impl Future<Output = Result<(), String>> + Send;
     fn drive(&self) -> PathBuf;
-    fn stop(self) -> impl Future<Output = Result<(), String>> + Send;
+    fn stop(self) -> impl Future<Output = Stopped> + Send;
     fn console_tail(&self) -> String;
     fn clear_console(&mut self);
     fn hand_over(self, guest: Self::Guest) -> Result<SupervisorHandoverMachine, String>;
     fn record(&self) -> Result<SupervisorHandoverMachine, String>;
     fn reconnect(&mut self, guest: &mut Self::Guest) -> impl Future<Output = Result<(), String>> + Send;
+}
+
+pub struct Stopped {
+    pub exit: String,
+    pub cleared: Result<(), String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BoxEnd {
+    Discard,
+    Teardown,
+    NewBox,
+    Idle,
+    Shutdown,
+    BootFailed,
+    ResumeFailed,
+    NotRecorded,
+    RecoverFailed,
+    PauseFailed,
+    SnapshotNotRecorded,
+    SetupBootFailed,
+    SetupNotHanded,
+    SetupEnded,
+}
+
+pub(crate) async fn end_box<M: Machine>(
+    machine: M,
+    index: u8,
+    session_id: &EntityId,
+    box_id: &EntityId,
+    end: BoxEnd,
+) -> Result<(), String> {
+    let Stopped { exit, cleared } = machine.stop().await;
+    eprintln!(
+        "tumpel-supervisor: box {index} ({}) of session {}, box id {}, ended on {end:?}: Firecracker {exit}",
+        crate::firecracker::scope_of(index),
+        **session_id,
+        **box_id
+    );
+    cleared
 }
 
 pub trait Vmm: Send + Sync + 'static {
@@ -751,10 +791,16 @@ async fn cancel<M: Machine>(live: &mut LiveBox<M>, turn_id: &EntityId, state: &m
     })
 }
 
-async fn stop_box<M: Machine>(standing: &Standing, live: LiveBox<M>) -> (Tap, String, Result<(), String>) {
+async fn stop_box<M: Machine>(standing: &Standing, live: LiveBox<M>, end: BoxEnd) -> (Tap, String, Result<(), String>) {
     let tail = live.machine.console_tail();
-    let LiveBox { machine, tap, .. } = live;
-    let stopped = machine.stop().await;
+    let LiveBox {
+        machine,
+        tap,
+        session_id,
+        box_id,
+        ..
+    } = live;
+    let stopped = end_box(machine, tap.index(), &session_id, &box_id, end).await;
     let index = i32::from(tap.index());
     if let Err(error) = standing.write(|boxes| {
         boxes.remove(&index);
@@ -946,7 +992,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 ),
             },
         };
-        let (tap, tail, stopped) = stop_box(&self.standing, live).await;
+        let (tap, tail, stopped) = stop_box(&self.standing, live, BoxEnd::ResumeFailed).await;
         turn_failed(
             &self.out,
             &turn.turn_id,
@@ -1039,7 +1085,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             ),
         };
         let tail = machine.console_tail();
-        let stopped = machine.stop().await;
+        let stopped = end_box(machine, tap.index(), &turn.session_id, &turn.box_id, BoxEnd::BootFailed).await;
         turn_failed(
             &self.out,
             &turn.turn_id,
@@ -1059,7 +1105,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let Err(error) = self.standing.put(&live, Some(&turn.turn_id)) else {
             return self.run_turn(live, turn, files, claiming).await;
         };
-        let (tap, tail, stopped) = stop_box(&self.standing, live).await;
+        let (tap, tail, stopped) = stop_box(&self.standing, live, BoxEnd::NotRecorded).await;
         turn_failed(
             &self.out,
             &turn.turn_id,
@@ -1593,7 +1639,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             ),
         };
         let session = live.session_id.to_string();
-        let (tap, tail, stopped) = stop_box(&self.standing, live).await;
+        let (tap, tail, stopped) = stop_box(&self.standing, live, BoxEnd::RecoverFailed).await;
         eprintln!(
             "tumpel-supervisor: the box of session {session} did not take a new guest connection and was stopped: {failed}. Console: {tail}"
         );
@@ -1612,7 +1658,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 self.settings.budgets.boot.as_secs()
             ),
         };
-        let (tap, tail, stopped) = stop_box(&self.standing, live).await;
+        let (tap, tail, stopped) = stop_box(&self.standing, live, BoxEnd::PauseFailed).await;
         eprintln!(
             "tumpel-supervisor: a box could not be paused after its turn and was stopped: {failed}. Console: {tail}"
         );
@@ -1783,7 +1829,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let Err(error) = self.standing.put(&live, None) else {
             return Outcome::Kept(live);
         };
-        let (tap, tail, stopped) = stop_box(&self.standing, live).await;
+        let (tap, tail, stopped) = stop_box(&self.standing, live, BoxEnd::SnapshotNotRecorded).await;
         eprintln!(
             "tumpel-supervisor: recording a snapshotted box as clean for a supervisor restart failed and the box was stopped: {error}. Console: {tail}"
         );
@@ -2274,7 +2320,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         let sessions: Vec<String> = self.slots.keys().cloned().collect();
         for session in sessions {
-            self.teardown(&session).await?;
+            self.teardown(&session, BoxEnd::Shutdown).await?;
         }
         Ok(())
     }
@@ -2838,7 +2884,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             return Ok(());
         }
         if self.live_box(&session).is_some_and(|live| live.box_id != turn.box_id) {
-            self.teardown(&session).await?;
+            self.teardown(&session, BoxEnd::NewBox).await?;
         }
         let warm = self.slots.get_mut(&session).and_then(|slot| {
             if let Some(armed) = slot.idle.take() {
@@ -2975,7 +3021,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
 
     async fn start_discard(&mut self, session: String, order: TeardownOrder) -> Result<(), String> {
         match self.live_box(&session) {
-            Some(live) if live.box_id == order.box_id => self.teardown(&session).await?,
+            Some(live) if live.box_id == order.box_id => self.teardown(&session, BoxEnd::Discard).await?,
             Some(_) => {}
             None => self.free_disk(&session)?,
         }
@@ -3017,7 +3063,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             );
             return Ok(());
         }
-        self.teardown(&session).await?;
+        self.teardown(&session, BoxEnd::Teardown).await?;
         self.prune(&session);
         self.box_gone(order);
         Ok(())
@@ -3058,7 +3104,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .map_err(|error| format!("DiskNotFreed: the box of session {session} ended, then {error}"))
     }
 
-    async fn teardown(&mut self, session: &str) -> Result<(), String> {
+    async fn teardown(&mut self, session: &str, end: BoxEnd) -> Result<(), String> {
         let Some(slot) = self.slots.get_mut(session) else {
             return Ok(());
         };
@@ -3066,7 +3112,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let Some(live) = slot.live.take() else {
             return Ok(());
         };
-        let (tap, _, stopped) = stop_box(&self.runner.standing, live).await;
+        let (tap, _, stopped) = stop_box(&self.runner.standing, live, end).await;
         self.pool.release(tap);
         stopped?;
         self.free_disk(session)?;
@@ -3141,7 +3187,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         if self.idle_box(session).map(|(idle, _)| idle) != Some(&box_id) {
             return Ok(());
         }
-        self.teardown(session).await?;
+        self.teardown(session, BoxEnd::Idle).await?;
         self.box_gone(TeardownOrder {
             session_id: held_session(session),
             box_id,
