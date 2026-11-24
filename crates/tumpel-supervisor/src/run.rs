@@ -993,8 +993,10 @@ async fn serve(
                 match updates.updater.now().await {
                     Outcome::Restart => return Ok(Served::Updated),
                     Outcome::Busy => {
-                        tokio::time::sleep(tumpel_channel::FIRST_BACKOFF).await;
-                        channel.step_up();
+                        return Err(fail(
+                            SupervisorFailure::ProtocolError,
+                            format!("{reason}; the update could not prepare the live boxes for handover"),
+                        ))
                     }
                     _ => return Err(fail(SupervisorFailure::ProtocolError, reason)),
                 }
