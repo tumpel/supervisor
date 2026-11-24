@@ -10,13 +10,10 @@ pub fn turn_end(
     end: GuestTurnEnd,
     error: Option<(TurnFailureReason, String)>,
 ) -> Result<(Sequence, Option<ChannelTurnCompleteWarning>), (TurnFailureReason, String)> {
-    match (end.reason.clone(), error) {
+    match (&end.reason, error) {
         (GuestTurnEndReason::Unrecognised(_), _) => {
             tumpel_channel::update_required();
-            Err((
-                TurnFailureReason::HarnessExited,
-                tumpel_channel::UPDATE_REQUIRED.to_string(),
-            ))
+            Err((TurnFailureReason::HarnessExited, end.detail.into()))
         }
         (GuestTurnEndReason::HarnessOutOfMemory, _) => Err((TurnFailureReason::HarnessOutOfMemory, end.detail.into())),
         (GuestTurnEndReason::BoxDiskFull, _) => Err((TurnFailureReason::BoxDiskFull, end.detail.into())),
@@ -72,7 +69,7 @@ const CODEX_STARTUP_REFUSALS: [&str; 3] = [
 ];
 
 pub fn exit_result(protocol: &GuestHarnessProtocol, end: &GuestTurnEnd) -> Option<(TurnFailureReason, String)> {
-    if protocol != &GuestHarnessProtocol::CodexExecJson || end.reason != GuestTurnEndReason::HarnessExited {
+    if *protocol != GuestHarnessProtocol::CodexExecJson || end.reason != GuestTurnEndReason::HarnessExited {
         return None;
     }
     let refusal = end
@@ -415,5 +412,25 @@ mod tests {
             r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":3}}"#,
         ];
         assert_eq!(lines.iter().find_map(|line| error_result(&CODEX, line)), None);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_future_end_reason_logs_an_update_and_the_next_known_end_still_completes() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = crate::test_logs::UpdateLogs::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let future: GuestTurnEnd = serde_json::from_str(
+            r#"{"type":"TurnEnd","turnId":"turn-1","reason":"FutureEndReason","detail":"ended","lastLineSeq":1,"extra":true}"#,
+        ).expect("future reason");
+        assert_eq!(
+            turn_end(future, None),
+            Err((TurnFailureReason::HarnessExited, "ended".to_string()))
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let known: GuestTurnEnd = serde_json::from_str(
+            r#"{"type":"TurnEnd","turnId":"turn-2","reason":"Completed","detail":"done","lastLineSeq":1,"extra":true}"#,
+        )
+        .expect("known end");
+        assert_eq!(turn_end(known, None).expect("known work completes").0, Sequence(1));
+        assert_eq!(*logs.0.lock().expect("logs"), [tumpel_channel::UPDATE_REQUIRED]);
     }
 }

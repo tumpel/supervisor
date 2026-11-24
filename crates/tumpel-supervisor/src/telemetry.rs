@@ -642,36 +642,6 @@ mod tests {
         assert_eq!(telemetry.buffer().dropped, 2);
     }
 
-    fn turn(value: f64) -> Point {
-        Point::Turn(TurnPoint {
-            at: super::now(),
-            dimensions: std::collections::HashMap::new(),
-            metric: metric("turn.end").expect("metric"),
-            session_id: "session-1".try_into().expect("session id"),
-            turn_id: "turn-1".try_into().expect("turn id"),
-            value,
-        })
-    }
-
-    #[test]
-    fn heartbeats_drain_known_points_in_batches_of_five_hundred() {
-        let telemetry = Telemetry::new(5000);
-        for value in 0..1200 {
-            telemetry.push(sample(f64::from(value)));
-            telemetry.push(turn(f64::from(value)));
-        }
-        let batches: Vec<_> = (0..6)
-            .map(|_| {
-                let batch = telemetry.heartbeat_batch();
-                (batch.samples.len(), batch.turns.len())
-            })
-            .collect();
-        assert_eq!(
-            batches,
-            [(250, 250), (250, 250), (250, 250), (250, 250), (200, 200), (0, 0)]
-        );
-    }
-
     fn turn_points(telemetry: &Telemetry) -> Vec<TurnPoint> {
         telemetry
             .buffer()

@@ -32,7 +32,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["registry", "std"] }
 sd-notify = { version = "0.5.0", features = ["fdstore"] }
 sendfd = "0.4.5"
-tumpel-api = "=1.0.0-rc.55"
+tumpel-api = "=1.0.0-rc.59"
 tumpel-channel = { path = "crates/tumpel-channel", version = "=0.1.0" }
 tumpel-guest = { path = "crates/tumpel-guest", version = "=0.1.0" }
 

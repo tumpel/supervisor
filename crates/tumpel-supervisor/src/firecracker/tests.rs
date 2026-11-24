@@ -328,6 +328,11 @@ async fn every_guest_family_survives_unknown_variants_and_extra_fields() {
                 .await
                 .expect("send reason");
         }
+        if field.is_some() {
+            let message = guest.read_message().await.expect("known family with a future reason");
+            let value = serde_json::to_value(message).expect("message");
+            assert_eq!(value[field.expect("reason field")], json!("FutureFailureReason"));
+        }
         let mut extended = known.clone();
         extended["extra"] = json!(true);
         producer
@@ -337,9 +342,6 @@ async fn every_guest_family_survives_unknown_variants_and_extra_fields() {
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         let message = guest.read_message().await.expect("known work continues");
         assert_eq!(serde_json::to_value(message).expect("message"), known);
-        assert_eq!(
-            *logs.0.lock().expect("logs"),
-            vec![tumpel_channel::UPDATE_REQUIRED; if field.is_some() { 2 } else { 1 }]
-        );
+        assert_eq!(*logs.0.lock().expect("logs"), vec![tumpel_channel::UPDATE_REQUIRED]);
     }
 }

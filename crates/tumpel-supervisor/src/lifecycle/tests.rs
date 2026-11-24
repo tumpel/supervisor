@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::io::{Cursor, Read};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,13 +11,15 @@ use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tumpel_api::types::{
     BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
-    ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld, ChannelSnapshotChunksHeldType,
-    ChannelSnapshotDownload, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType,
+    ChannelProtocol, ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld,
+    ChannelSnapshotChunksHeldType, ChannelSnapshotDownload, ChannelSnapshotFailed, ChannelSnapshotFailedType,
+    ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType, ChannelSnapshotPacks,
     ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId,
     GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox,
-    SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverTeardown,
-    SupervisorHandoverTeardownKind, TurnFailureReason,
+    SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
+    SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
 };
+use tumpel_channel::Outgoing;
 
 use super::{
     restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SnapshotOrder, Stopped,
@@ -27,7 +29,7 @@ use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
 use crate::images::ImageOrder;
 use crate::pool::{Disk, Held, Size, Tap, TapPool};
-use crate::snapshot::{Born, Entry, Found, Kind, Scan, Stored, Upper};
+use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Scan, Stored, Upper};
 use crate::store::{Store, UploadError};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -571,14 +573,15 @@ fn describe(message: ChannelHostMessage) -> Option<String> {
         | ChannelHostMessage::SupervisorUpdateFailed(_)
         | ChannelHostMessage::Unrecognised(_) => return None,
         ChannelHostMessage::TurnImageFetching(fetching) => format!("fetching {}", *fetching.image_digest),
-        ChannelHostMessage::TurnLines(line) => format!(
+        ChannelHostMessage::TurnLines(lines) => format!(
             "line {} {}",
-            line.first_line_seq.get(),
-            line.lines
+            lines.first_line_seq,
+            lines
+                .lines
                 .iter()
-                .map(tumpel_api::types::LongText::as_str)
+                .map(ToString::to_string)
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join(" ")
         ),
         ChannelHostMessage::TurnComplete(done) => format!("complete {}", done.last_line_seq.0),
         ChannelHostMessage::TurnRepositoryCloneFailed(failed) => {
@@ -624,6 +627,8 @@ struct Host {
     holdings: tokio::sync::watch::Receiver<Held>,
     runner: tokio::task::JoinHandle<Result<(), String>>,
     answering: Arc<AtomicBool>,
+    accepting: Arc<AtomicBool>,
+    session: Arc<AtomicU16>,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -669,6 +674,49 @@ fn claim_answer(turn_id: EntityId) -> Answer {
     })
 }
 
+fn forward(sender: &UnboundedSender<ChannelHostMessage>, message: ChannelHostMessage) {
+    sender
+        .send(message)
+        .expect("the host reads what the control plane forwards");
+}
+
+fn swapped(snapshot_id: EntityId, built: u16) -> ChannelHostMessage {
+    ChannelSnapshotFailed {
+        detail: format!("built for {built}").try_into().expect("detail"),
+        failed_at: chrono::Utc::now().fixed_offset(),
+        reason: ChannelSnapshotFailureReason::NotAnswered,
+        snapshot_id,
+        type_: ChannelSnapshotFailedType::SnapshotFailed,
+    }
+    .into()
+}
+
+fn channel(
+    mut from_lifecycle: UnboundedReceiver<Outgoing>,
+    session: Arc<AtomicU16>,
+    commands: UnboundedSender<Input>,
+) -> UnboundedReceiver<ChannelHostMessage> {
+    let (sender, sent) = unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(outgoing) = from_lifecycle.recv().await {
+            let message = match outgoing {
+                Outgoing::Snapshot(message, built) if built != session.load(Ordering::SeqCst) => {
+                    let snapshot_id = match message {
+                        ChannelHostMessage::SnapshotPacks(packs) => packs.snapshot_id,
+                        ChannelHostMessage::SnapshotDone(done) => done.snapshot_id,
+                        other => panic!("{other:?} is no snapshot frame"),
+                    };
+                    let _ = commands.send(Input::SnapshotFailed(snapshot_id.clone()));
+                    swapped(snapshot_id, built)
+                }
+                Outgoing::Message(message) | Outgoing::Snapshot(message, _) => message,
+            };
+            let _ = sender.send(message);
+        }
+    });
+    sent
+}
+
 fn control_plane(
     store: MemoryStore,
     answers: Answers,
@@ -676,7 +724,7 @@ fn control_plane(
     answering: Arc<AtomicBool>,
     mut from_lifecycle: UnboundedReceiver<ChannelHostMessage>,
 ) -> UnboundedReceiver<ChannelHostMessage> {
-    let (forward, received) = unbounded_channel();
+    let (sender, received) = unbounded_channel();
     tokio::spawn(async move {
         while let Some(message) = from_lifecycle.recv().await {
             let mut index = store.2.lock().expect("index");
@@ -707,7 +755,7 @@ fn control_plane(
                     }
                     answers.deliver(Answer::PackUploads(ChannelSnapshotPackUploads {
                         part: packs.part,
-                        snapshot_id: packs.snapshot_id,
+                        snapshot_id: packs.snapshot_id.clone(),
                         type_: ChannelSnapshotPackUploadsType::SnapshotPackUploads,
                         upload_expires_at: in_seconds(60),
                         uploads: packs
@@ -721,6 +769,7 @@ fn control_plane(
                             })
                             .collect(),
                     }));
+                    forward(&sender, ChannelHostMessage::SnapshotPacks(packs));
                 }
                 ChannelHostMessage::RestoreChunks(chunks) => {
                     let mut packs: Vec<ChannelPackUrl> = Vec::new();
@@ -746,7 +795,7 @@ fn control_plane(
                 }
                 ChannelHostMessage::TurnClaim(claim) => {
                     let turn_id = claim.turn_id.clone();
-                    let _ = forward.send(ChannelHostMessage::TurnClaim(claim));
+                    forward(&sender, ChannelHostMessage::TurnClaim(claim));
                     let delay = if turn_id.starts_with("late") {
                         LATE_CLAIM
                     } else if turn_id.starts_with("stalled") {
@@ -768,13 +817,34 @@ fn control_plane(
                         answers.deliver(claim_answer(turn_id));
                     });
                 }
-                other => {
-                    let _ = forward.send(other);
-                }
+                other => forward(&sender, other),
             }
         }
     });
     received
+}
+
+fn acking(
+    mut received: UnboundedReceiver<ChannelHostMessage>,
+    accepting: Arc<AtomicBool>,
+    commands: UnboundedSender<Input>,
+) -> UnboundedReceiver<ChannelHostMessage> {
+    let (forward, acked) = unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(message) = received.recv().await {
+            let accepted = match &message {
+                ChannelHostMessage::SnapshotDone(done) if accepting.load(Ordering::SeqCst) => {
+                    Some(Input::SnapshotAccepted(done.snapshot_id.clone()))
+                }
+                _ => None,
+            };
+            let _ = forward.send(message);
+            if let Some(accepted) = accepted {
+                let _ = commands.send(accepted);
+            }
+        }
+    });
+    acked
 }
 
 fn host_on(
@@ -797,7 +867,15 @@ fn host_on(
         hands: Arc::default(),
         free_disk_mib: Arc::new(AtomicU64::new(1 << 30)),
     };
-    start_host(vmm, store, capacity, settings, clone_seconds, None)
+    start_host(
+        vmm,
+        store,
+        capacity,
+        settings,
+        clone_seconds,
+        None,
+        Some(ChannelProtocol::VERSION),
+    )
 }
 
 fn start_host(
@@ -807,6 +885,7 @@ fn start_host(
     settings: Settings,
     clone_seconds: u32,
     taken: Option<(SupervisorHandover, Taken)>,
+    welcome: Option<u16>,
 ) -> Host {
     let log = Arc::clone(&vmm.log);
     let images = vmm.staging.join("images");
@@ -820,18 +899,26 @@ fn start_host(
         vmm.staging.join("boxes.json"),
     );
     let answering = Arc::new(AtomicBool::new(true));
+    let accepting = Arc::new(AtomicBool::new(true));
+    let (commands, from_host) = unbounded_channel();
+    let session = Arc::new(AtomicU16::new(welcome.unwrap_or(ChannelProtocol::VERSION)));
     let received = control_plane(
         store.clone(),
         lifecycle.answers(),
         Arc::clone(&log),
         Arc::clone(&answering),
-        from_lifecycle,
+        channel(from_lifecycle, Arc::clone(&session), commands.clone()),
     );
+    let received = acking(received, Arc::clone(&accepting), commands.clone());
     lifecycle.start(taken).expect("the lifecycle starts");
     let sessions = lifecycle.sessions();
     let holdings = lifecycle.holdings();
-    let (commands, from_host) = unbounded_channel();
     let cancels = lifecycle.cancels();
+    if let Some(protocol) = welcome {
+        commands
+            .send(Input::Welcomed(protocol))
+            .expect("the lifecycle reads its inputs");
+    }
     let runner = tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
     Host {
         commands,
@@ -851,6 +938,8 @@ fn start_host(
         holdings,
         runner,
         answering,
+        accepting,
+        session,
     }
 }
 
@@ -883,6 +972,10 @@ impl Host {
     }
 
     fn successor(self, handover: &SupervisorHandover) -> Host {
+        self.successor_welcomed(handover, Some(ChannelProtocol::VERSION))
+    }
+
+    fn successor_welcomed(self, handover: &SupervisorHandover, welcome: Option<u16>) -> Host {
         let text = serde_json::to_string(handover).expect("the handover is JSON");
         let record = serde_json::from_str(&text).expect("the handover reads back as a SupervisorHandover");
         let Host {
@@ -900,6 +993,7 @@ impl Host {
             settings,
             clone_seconds,
             Some((record, Taken::Handed)),
+            welcome,
         )
     }
 
@@ -934,6 +1028,7 @@ impl Host {
             self.settings,
             self.clone_seconds,
             Some((standing, Taken::Crashed)),
+            Some(ChannelProtocol::VERSION),
         )
     }
 
@@ -944,6 +1039,11 @@ impl Host {
 
     fn send(&self, command: Command) {
         self.commands.send(Input::Command(command)).expect("send");
+    }
+
+    fn welcome(&self, protocol: u16) {
+        self.session.store(protocol, Ordering::SeqCst);
+        self.commands.send(Input::Welcomed(protocol)).expect("send");
     }
 
     fn turn(&self, turn_id: &str, session_id: &str, prompt: &str, snapshots: Vec<ChannelSnapshotDownload>) {
@@ -969,17 +1069,7 @@ impl Host {
     }
 
     fn cached_image(&self, protocol: &GuestHarnessProtocol) -> ImageOrder {
-        let image_digest = format!(
-            "{:0>64}",
-            format!(
-                "{}{}",
-                self.clone_seconds,
-                protocol
-                    .to_string()
-                    .bytes()
-                    .fold(0u64, |sum, byte| sum.wrapping_mul(31).wrapping_add(u64::from(byte)))
-            )
-        );
+        let image_digest = format!("{:0>64}", format!("{}{}", self.clone_seconds, protocol_digit(protocol)));
         std::fs::create_dir_all(&self.images).expect("the image cache is created");
         std::fs::write(
             self.images.join(format!("{image_digest}.json")),
@@ -1269,6 +1359,104 @@ async fn a_snapshot_whose_drive_reads_past_the_snapshot_budget_is_stored_before_
     host.settle(SETTLE).await;
     host.snapshot("session-1");
     assert_eq!(host.settle(SLOW_CUT * 2).await, ["snapshot done"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_over_a_base_names_each_reused_pack_once_and_counts_every_placement() {
+    let mut host = host("reused-packs", 1, Harness::Echo, Boot::Works);
+    let mut snapshots = Vec::new();
+    for (turn_id, prompt) in [("turn-1", "one"), ("turn-2", "one")] {
+        host.turn(turn_id, "session-1", prompt, Vec::new());
+        host.settle(SETTLE).await;
+        let order = host.snapshot("session-1");
+        let mut parts = Vec::new();
+        let done = loop {
+            match tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
+                .await
+                .expect("the snapshot ends within its budget")
+                .expect("the lifecycle is running")
+            {
+                ChannelHostMessage::SnapshotPacks(packs) => parts.push(packs),
+                ChannelHostMessage::SnapshotDone(done) => break done,
+                _ => {}
+            }
+        };
+        snapshots.push((order, parts, done));
+    }
+    let [(_, first_parts, first_done), (second, parts, done)] = <[_; 2]>::try_from(snapshots).expect("two snapshots");
+    let packs_of = |parts: &[ChannelSnapshotPacks]| -> BTreeSet<String> {
+        parts
+            .iter()
+            .flat_map(|part| part.packs.iter().map(|pack| pack.pack_digest.as_str().to_string()))
+            .collect()
+    };
+
+    assert_eq!(first_parts[0].part.get(), 1);
+    assert!(first_parts.iter().all(|part| part.reused_pack_digests.is_empty()));
+    assert_eq!(first_done.chunk_count, 1);
+    assert_eq!(done.chunk_count, 2);
+    let first_packs = packs_of(&first_parts);
+    let written = packs_of(&parts);
+    let reused: Vec<String> = parts
+        .iter()
+        .flat_map(|part| {
+            part.reused_pack_digests
+                .iter()
+                .map(|digest| digest.as_str().to_string())
+        })
+        .collect();
+    let once: BTreeSet<String> = reused.iter().cloned().collect();
+    assert_eq!(once.len(), reused.len(), "{reused:?}");
+    assert!(!once.is_empty());
+    assert!(once.is_subset(&first_packs), "{once:?} {first_packs:?}");
+    assert!(once.is_disjoint(&written), "{once:?} {written:?}");
+    let root = decode_root(&host.store.get(second.download_url.as_str()).expect("the root")).expect("the root json");
+    let mut bytes = Vec::new();
+    for place in &root {
+        let pack = host.store.get(&pack_url(&place.pack)).expect("a pack");
+        let from = usize::try_from(place.offset).expect("an offset");
+        bytes.extend_from_slice(&pack[from..from + place.length as usize]);
+    }
+    let manifest = decode(&bytes).expect("the manifest");
+    let referenced: BTreeSet<String> = manifest
+        .values()
+        .flat_map(|stored| stored.chunks.iter())
+        .chain(&root)
+        .map(|place| place.pack.clone())
+        .collect();
+    assert_eq!(referenced, written.union(&once).cloned().collect::<BTreeSet<_>>());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_over_a_base_at_38_names_no_reused_packs_and_sends_only_parts_with_chunks() {
+    let mut host = host("reused-packs-38", 1, Harness::Echo, Boot::Works);
+    host.welcome(38);
+    let mut snapshots = Vec::new();
+    for turn_id in ["turn-1", "turn-2"] {
+        host.turn(turn_id, "session-1", "one", Vec::new());
+        host.settle(SETTLE).await;
+        host.snapshot("session-1");
+        let mut parts = Vec::new();
+        loop {
+            match tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
+                .await
+                .expect("the snapshot ends within its budget")
+                .expect("the lifecycle is running")
+            {
+                ChannelHostMessage::SnapshotPacks(packs) => parts.push(packs),
+                ChannelHostMessage::SnapshotDone(_) => break,
+                _ => {}
+            }
+        }
+        snapshots.push(parts);
+    }
+
+    for parts in &snapshots {
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part.get(), 1);
+        assert_ne!(parts[0].chunks.len(), 0);
+        assert_eq!(parts[0].reused_pack_digests.len(), 0);
+    }
 }
 
 fn pack_uploads(uploads: &[String]) -> usize {
@@ -1700,6 +1888,7 @@ async fn a_warm_box_handed_over_with_a_queued_teardown_is_stopped_and_answers_bo
     old.settle_until("complete 1").await;
     old.snapshot("session-1");
     old.settle_until("snapshot done").await;
+    old.settle(SETTLE).await;
     assert!(
         !old.standing().boxes[0].dirty,
         "a snapshot that holds the turn records the box clean"
@@ -1723,6 +1912,51 @@ async fn a_warm_box_handed_over_with_a_queued_teardown_is_stopped_and_answers_bo
         ]
     );
     assert_eq!(new.standing().boxes.len(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_handed_over_in_the_queue_waits_for_the_control_plane_welcome() {
+    let mut old = host("handover-queued-snapshot", 1, Harness::Echo, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    let mut handover = old.ask_handover().await.expect("the boxes are handed over");
+    handover.boxes[0]
+        .queued
+        .push(SupervisorHandoverCommand::Snapshot(SupervisorHandoverSnapshot {
+            kind: SupervisorHandoverSnapshotKind::Snapshot,
+            snapshot_id: "snapshot-9".try_into().expect("snapshot id"),
+            snapshot_seq: Sequence(9),
+            upload_expires_at: in_seconds(600),
+            upload_url: "https://store.example/session-1/9".try_into().expect("url"),
+        }));
+    let mut new = old.successor_welcomed(&handover, None);
+    assert_eq!(new.settle(SETTLE).await, Vec::<String>::new());
+    new.welcome(ChannelProtocol::VERSION);
+    assert_eq!(new.settle_until("snapshot done").await, ["snapshot done"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_built_at_38_in_a_session_at_39_ends_its_task_at_once_with_one_snapshot_failed() {
+    let mut host = host("snapshot-built-at-38", 1, Harness::Echo, Boot::Works);
+    host.welcome(38);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("complete 1").await;
+    let started = tokio::time::Instant::now();
+    host.snapshot("session-1");
+    host.welcome(ChannelProtocol::VERSION);
+    let failed = host.settle_until_starts("snapshot failed").await;
+    host.turn("turn-2", "session-1", "two", Vec::new());
+    let seen = host.settle_until_starts("complete").await;
+    assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
+    let later = host.settle(Duration::from_secs(120)).await;
+    let failures = failed
+        .iter()
+        .chain(&seen)
+        .chain(&later)
+        .filter(|line| line.starts_with("snapshot failed"))
+        .count();
+    assert_eq!(failures, 1, "{failed:?} {seen:?} {later:?}");
+    assert!(host.standing().boxes[0].dirty, "a failed snapshot leaves the box dirty");
 }
 
 #[tokio::test]
@@ -1942,6 +2176,58 @@ async fn a_snapshotted_box_idle_for_the_offered_idle_time_is_stopped_and_answers
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_box_whose_snapshot_done_is_never_accepted_stays_dirty_past_its_idle_time() {
+    let mut host = host("idle-refused", 1, Harness::Echo, Boot::Works);
+    host.idle_seconds = NonZeroU32::new(300).expect("five minutes");
+    host.accepting.store(false, Ordering::SeqCst);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    host.log();
+    assert_eq!(host.settle(Duration::from_mins(20)).await, Vec::<String>::new());
+    assert_eq!(host.log(), Vec::<String>::new());
+    assert!(host.standing().boxes[0].dirty);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_box_is_clean_once_its_snapshot_done_is_accepted_and_then_ends_on_idle() {
+    let mut host = host("idle-accepted", 1, Harness::Echo, Boot::Works);
+    host.idle_seconds = NonZeroU32::new(300).expect("five minutes");
+    host.accepting.store(false, Ordering::SeqCst);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    let first = host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    assert_eq!(host.settle(Duration::from_mins(2)).await, Vec::<String>::new());
+    assert!(host.standing().boxes[0].dirty);
+    host.commands
+        .send(Input::SnapshotAccepted(first.snapshot_id))
+        .expect("send");
+    host.settle(SETTLE).await;
+    assert!(!host.standing().boxes[0].dirty);
+    assert_eq!(host.settle(Duration::from_mins(4)).await, ["box gone session-1"]);
+}
+
+#[tokio::test]
+async fn a_teardown_that_arrives_before_the_ack_of_its_snapshot_done_stops_the_box() {
+    let mut host = host("teardown-before-ack", 1, Harness::Echo, Boot::Works);
+    host.accepting.store(false, Ordering::SeqCst);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    let first = host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    host.log();
+    host.teardown("session-1");
+    assert_eq!(host.settle(SETTLE).await, ["box gone session-1"]);
+    host.commands
+        .send(Input::SnapshotAccepted(first.snapshot_id))
+        .expect("send");
+    assert_eq!(host.settle(SETTLE).await, Vec::<String>::new());
+    assert_eq!(host.log(), ["stop session-1"]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_box_snapshotted_late_is_stopped_once_the_idle_time_since_its_turn_runs_out() {
     let mut host = host("idle-late-snapshot", 1, Harness::Echo, Boot::Works);
     host.idle_seconds = NonZeroU32::new(900).expect("fifteen minutes");
@@ -1963,6 +2249,7 @@ async fn a_box_snapshotted_late_keeps_its_idle_deadline_across_a_crash() {
     assert_eq!(old.settle(Duration::from_mins(10)).await, Vec::<String>::new());
     old.snapshot("session-1");
     assert_eq!(old.settle_until("snapshot done").await, ["snapshot done"]);
+    old.settle(SETTLE).await;
     let mut standing = old.standing();
     old.keep_guest(&mut standing.boxes[0], 40);
     let mut new = old.after_crash(standing);
@@ -2444,4 +2731,17 @@ async fn a_box_disk_that_cannot_be_deleted_stops_the_box_runner_with_disk_not_fr
             .is_err_and(|error| error.starts_with("DiskNotFreed: the box of session session-1 ended, then removing")),
         "{stopped:?}"
     );
+}
+
+fn protocol_digit(protocol: &GuestHarnessProtocol) -> usize {
+    [
+        GuestHarnessProtocol::ClaudeStreamJson,
+        GuestHarnessProtocol::PiRpc,
+        GuestHarnessProtocol::PromptOnStdin,
+        GuestHarnessProtocol::CodexExecJson,
+        GuestHarnessProtocol::ShellLines,
+    ]
+    .iter()
+    .position(|known| known == protocol)
+    .expect("a known harness protocol")
 }

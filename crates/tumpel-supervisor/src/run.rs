@@ -18,12 +18,12 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
-    HostReportedHealth, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    ChannelControlMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
+    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
 };
 use tumpel_channel::{
-    Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer, Store,
+    Backoff, ChannelError, Event, HeldIds, HostChannel, Outgoing, Phase, Port, RateBackoff, RateLimit, Signer, Store,
     HEARTBEAT_DEADLINE,
 };
 
@@ -99,7 +99,7 @@ type BoxRunner = JoinHandle<Result<(), String>>;
 struct Updates {
     updater: Arc<HostUpdater>,
     layout: Layout,
-    out: UnboundedSender<ChannelHostMessage>,
+    out: UnboundedSender<Outgoing>,
     restart: UnboundedSender<()>,
     trial: Option<SupervisorUpdatePending>,
     confirmed: watch::Sender<bool>,
@@ -198,7 +198,7 @@ fn hello(
     channel: &mut Channel,
     nonce: &str,
     usage: &Usage,
-    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    from_box: &mut UnboundedReceiver<Outgoing>,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
     let turns = usage.turns.borrow().clone();
@@ -213,7 +213,7 @@ fn hello(
 
 fn drain(
     channel: &mut Channel,
-    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    from_box: &mut UnboundedReceiver<Outgoing>,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
     while let Ok(message) = from_box.try_recv() {
@@ -225,7 +225,7 @@ fn drain(
 fn beat(
     channel: &mut Channel,
     usage: &Usage,
-    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    from_box: &mut UnboundedReceiver<Outgoing>,
     health: HostReportedHealth,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
@@ -248,7 +248,7 @@ fn beat(
 }
 
 enum BoxCommand {
-    Turn(Box<ChannelTurnOffer>),
+    Turn(Box<(ChannelTurnOffer, BootOrder)>),
     Snapshot(ChannelSnapshotRequest),
     Teardown(ChannelBoxTeardown),
     Discard(ChannelBoxDiscard),
@@ -257,10 +257,13 @@ enum BoxCommand {
     Setup(SetupCommand),
     HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>, Abandoned),
+    SnapshotAccepted(EntityId),
+    SnapshotFailed(EntityId),
+    Welcomed(u16),
 }
 
-fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Option<SetupCommand> {
-    Some(SetupCommand::Start(Box::new(SetupOrder {
+fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Result<SetupCommand, String> {
+    Ok(SetupCommand::Start(Box::new(SetupOrder {
         claude_setup_id: offer.claude_setup_id,
         tenant_id: offer.tenant_id,
         box_id: offer.box_id,
@@ -276,16 +279,22 @@ fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Option<SetupCommand> {
     })))
 }
 
-fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Option<Command> {
-    Some(Command::Turn(Box::new(BoxTurn {
+fn turn(offer: ChannelTurnOffer) -> Result<BoxCommand, String> {
+    let image = BootOrder::from_offer(
+        offer.image.clone(),
+        offer.harness.to_string(),
+        offer.harness_version.to_string(),
+    )
+    .map_err(|error| format!("turn {}: {error}", *offer.turn_id))?;
+    Ok(BoxCommand::Turn(Box::new((offer, image))))
+}
+
+fn command(files_dir: &Path, offer: ChannelTurnOffer, image: BootOrder) -> Command {
+    Command::Turn(Box::new(BoxTurn {
         turn_id: offer.turn_id,
         session_id: offer.session_id,
         box_id: offer.box_id,
-        image: BootOrder::from_offer(
-            offer.image,
-            offer.harness.to_string(),
-            offer.harness_version.to_string(),
-        )?,
+        image,
         model: offer.model,
         prompt: offer.prompt,
         credential: offer.credential,
@@ -302,7 +311,7 @@ fn command(files_dir: &Path, offer: ChannelTurnOffer) -> Option<Command> {
         turn_seconds: offer.turn_seconds,
         idle_seconds: offer.idle_seconds,
         box_retention: offer.box_retention,
-    })))
+    }))
 }
 
 async fn boxes(
@@ -315,11 +324,9 @@ async fn boxes(
 ) {
     while let Some(command) = commands.recv().await {
         let next = match command {
-            BoxCommand::Turn(offer) => {
-                let Some(command) = self::command(&files_dir, *offer) else {
-                    continue;
-                };
-                command
+            BoxCommand::Turn(turn) => {
+                let (offer, image) = *turn;
+                self::command(&files_dir, offer, image)
             }
             BoxCommand::Snapshot(request) => Command::Snapshot(request.into()),
             BoxCommand::Teardown(teardown) => Command::Teardown(TeardownOrder {
@@ -353,6 +360,27 @@ async fn boxes(
                 let _ = lifecycle.send(Input::Abandon(reply, abandoned));
                 continue;
             }
+            BoxCommand::SnapshotAccepted(snapshot_id) => {
+                if lifecycle.send(Input::SnapshotAccepted(snapshot_id)).is_err() {
+                    eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
+                    return;
+                }
+                continue;
+            }
+            BoxCommand::SnapshotFailed(snapshot_id) => {
+                if lifecycle.send(Input::SnapshotFailed(snapshot_id)).is_err() {
+                    eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
+                    return;
+                }
+                continue;
+            }
+            BoxCommand::Welcomed(protocol) => {
+                if lifecycle.send(Input::Welcomed(protocol)).is_err() {
+                    eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
+                    return;
+                }
+                continue;
+            }
         };
         if lifecycle.send(Input::Command(next)).is_err() {
             eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
@@ -370,7 +398,7 @@ fn start_boxes(
     box_size: Size,
     store: HttpStore,
     received: UnboundedReceiver<BoxCommand>,
-    out: UnboundedSender<ChannelHostMessage>,
+    out: UnboundedSender<Outgoing>,
     telemetry: Telemetry,
     taken: Option<(SupervisorHandover, Taken)>,
     standing: PathBuf,
@@ -433,7 +461,7 @@ fn boxes_stopped(ended: Result<Result<(), String>, JoinError>) -> Failure {
 async fn terminate(
     commands: &UnboundedSender<BoxCommand>,
     layout: &Layout,
-    out: &UnboundedSender<ChannelHostMessage>,
+    out: &UnboundedSender<Outgoing>,
 ) -> Result<(), Failure> {
     let (reply, answer) = oneshot::channel();
     let _ = commands.send(BoxCommand::HandOver(reply));
@@ -513,7 +541,7 @@ fn named_turns(text: &str) -> Vec<EntityId> {
         .collect()
 }
 
-fn handover_lost(layout: &Layout, out: &UnboundedSender<ChannelHostMessage>, cause: &str, turns: &[EntityId]) {
+fn handover_lost(layout: &Layout, out: &UnboundedSender<Outgoing>, cause: &str, turns: &[EntityId]) {
     eprintln!(
         "tumpel-supervisor: HandoverLost: {cause}; this supervisor fails the {} turns it names and starts without the handed boxes",
         turns.len()
@@ -534,11 +562,7 @@ fn handover_lost(layout: &Layout, out: &UnboundedSender<ChannelHostMessage>, cau
     }
 }
 
-fn read_handover(
-    layout: &Layout,
-    out: &UnboundedSender<ChannelHostMessage>,
-    handed: bool,
-) -> Option<SupervisorHandover> {
+fn read_handover(layout: &Layout, out: &UnboundedSender<Outgoing>, handed: bool) -> Option<SupervisorHandover> {
     let path = layout.handover();
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -735,7 +759,7 @@ fn read_standing(layout: &Layout) -> Option<SupervisorHandover> {
 
 fn taken(
     layout: &Layout,
-    out: &UnboundedSender<ChannelHostMessage>,
+    out: &UnboundedSender<Outgoing>,
     handed: bool,
     mut received: BTreeMap<String, OwnedFd>,
 ) -> Result<Option<(SupervisorHandover, Taken)>, Failure> {
@@ -850,7 +874,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     stopped
 }
 
-fn store_unsent(channel: &mut Channel, from_box: &mut UnboundedReceiver<ChannelHostMessage>) -> Result<(), Failure> {
+fn store_unsent(channel: &mut Channel, from_box: &mut UnboundedReceiver<Outgoing>) -> Result<(), Failure> {
     while let Ok(message) = from_box.try_recv() {
         channel
             .send(message, &mut Outbox::default())
@@ -866,7 +890,7 @@ async fn serve(
     heartbeat: Duration,
     usage: &Usage,
     commands: &UnboundedSender<BoxCommand>,
-    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    from_box: &mut UnboundedReceiver<Outgoing>,
     config: &SupervisorConfig,
     dir: &Path,
     updates: &mut Updates,
@@ -973,13 +997,13 @@ fn closed_by_peer(frame: Option<&CloseFrame>, progressed: bool) -> Result<Ended,
     }
 }
 
-fn box_command(message: ChannelControlMessage) -> Option<BoxCommand> {
-    Some(match message {
+fn box_command(message: ChannelControlMessage) -> Result<Option<BoxCommand>, String> {
+    Ok(Some(match message {
         ChannelControlMessage::Unrecognised(_) => {
             tumpel_channel::update_required();
-            return None;
+            return Ok(None);
         }
-        ChannelControlMessage::TurnOffer(offer) => BoxCommand::Turn(Box::new(offer)),
+        ChannelControlMessage::TurnOffer(offer) => turn(offer)?,
         ChannelControlMessage::SnapshotRequest(request) => BoxCommand::Snapshot(request),
         ChannelControlMessage::BoxTeardown(teardown) => BoxCommand::Teardown(teardown),
         ChannelControlMessage::BoxDiscard(discard) => BoxCommand::Discard(discard),
@@ -998,7 +1022,21 @@ fn box_command(message: ChannelControlMessage) -> Option<BoxCommand> {
         ChannelControlMessage::ClaudeSetupBoxDiscard(discard) => BoxCommand::Setup(SetupCommand::Discard {
             claude_setup_id: discard.claude_setup_id,
         }),
-    })
+    }))
+}
+
+fn accepted(channel: &mut Channel, commands: &UnboundedSender<BoxCommand>) -> Result<(), Failure> {
+    let accepted = channel.take_accepted().into_iter().map(BoxCommand::SnapshotAccepted);
+    let failed = channel.take_failed().into_iter().map(BoxCommand::SnapshotFailed);
+    for command in accepted.chain(failed) {
+        commands.send(command).map_err(|_| {
+            fail(
+                SupervisorFailure::ChannelStateLost,
+                "the box runner stopped before it took an accepted or failed snapshot; systemd restarts the supervisor, which takes the running boxes over",
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn rate_limited(
@@ -1023,7 +1061,7 @@ async fn session(
     heartbeat: Duration,
     usage: &Usage,
     commands: &UnboundedSender<BoxCommand>,
-    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
+    from_box: &mut UnboundedReceiver<Outgoing>,
     updates: &mut Updates,
     limit: &mut RateLimit,
 ) -> Result<Ended, Failure> {
@@ -1051,33 +1089,44 @@ async fn session(
                 Some(Ok(Message::Close(frame))) => Some(closed_by_peer(frame.as_ref(), channel.progressed())),
                 Some(Ok(Message::Text(text))) => {
                     last_received = Instant::now();
-                    match channel.receive(text.as_str()) {
-                        Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
-                        Ok(Event::Welcomed) => {
-                            eprintln!("connected to {url}");
-                            last_beat = Instant::now();
-                            updates.welcomed().await.err().map(Err)
-                        }
-                        Ok(Event::Message(message)) => box_command(*message).and_then(|command| commands.send(command).err()).map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
-                        Ok(Event::FrameRefused { seq, reason }) => {
-                            eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
-                            None
-                        }
-                        Ok(Event::FrameRateLimited { seq: _, reason, frames_per_minute, retry_after }) => {
-                            rate_limited(limit, url, &reason, frames_per_minute, retry_after);
-                            None
-                        }
-                        Ok(Event::ReleasePublished) => {
-                            updates.announced();
-                            None
-                        }
-                        Ok(Event::None | Event::Heartbeat) => None,
-                        Err(ChannelError::Protocol(reason)) => {
-                            let close = CloseFrame { code: CloseCode::from(ChannelCloseCode::PROTOCOL_ERROR), reason: reason.chars().take(120).collect::<String>().into() };
-                            let _ = sink.send(Message::Close(Some(close))).await;
-                            Some(Ok(dropped(channel.progressed(), reason)))
-                        }
-                        Err(error) => Some(Err(fail(SupervisorFailure::ChannelStateLost, error.to_string()))),
+                    let received = channel.receive(text.as_str());
+                    match accepted(channel, commands) {
+                        Err(failure) => Some(Err(failure)),
+                        Ok(()) => match received {
+                            Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
+                            Ok(Event::Welcomed) => {
+                                eprintln!("connected to {url}");
+                                last_beat = Instant::now();
+                                match commands.send(BoxCommand::Welcomed(channel.version())) {
+                                    Err(_) => Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
+                                    Ok(()) => updates.welcomed().await.err().map(Err),
+                                }
+                            }
+                            Ok(Event::Message(message)) => match box_command(*message) {
+                                Ok(Some(command)) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
+                                Ok(None) => None,
+                                Err(error) => Some(Err(fail(SupervisorFailure::ProtocolError, error))),
+                            },
+                            Ok(Event::FrameRefused { seq, reason }) => {
+                                eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
+                                None
+                            }
+                            Ok(Event::FrameRateLimited { seq: _, reason, frames_per_minute, retry_after }) => {
+                                rate_limited(limit, url, &reason, frames_per_minute, retry_after);
+                                None
+                            }
+                            Ok(Event::ReleasePublished) => {
+                                updates.announced();
+                                None
+                            }
+                            Ok(Event::None | Event::Heartbeat) => None,
+                            Err(ChannelError::Protocol(reason)) => {
+                                let close = CloseFrame { code: CloseCode::from(ChannelCloseCode::PROTOCOL_ERROR), reason: reason.chars().take(120).collect::<String>().into() };
+                                let _ = sink.send(Message::Close(Some(close))).await;
+                                Some(Ok(dropped(channel.progressed(), reason)))
+                            }
+                            Err(error) => Some(Err(fail(SupervisorFailure::ChannelStateLost, error.to_string()))),
+                        },
                     }
                 }
                 Some(Ok(_)) => None,
@@ -1093,15 +1142,13 @@ async fn session(
                 } else if channel.phase() == Phase::Open && channel.withholding() && !limit.paused(now) {
                     channel.release(limit.release_budget(TICK), &mut outbox).err().map(|error| Err(store_lost(&error)))
                 } else if channel.phase() == Phase::Open {
-                    channel.transmit_due(Instant::now(), &mut outbox).map_err(|error| store_lost(&error))
-                        .err()
-                        .map(Err)
+                    channel.transmit_due(Instant::now(), &mut outbox).err().map(|error| Err(store_lost(&error)))
                 } else {
                     None
                 }
             }
         };
-        if let Some(ended) = ended {
+        if let Some(ended) = ended.or_else(|| accepted(channel, commands).err().map(Err)) {
             channel.disconnect();
             return ended;
         }
@@ -1145,7 +1192,7 @@ mod tests {
         });
         let booted = |frame: &serde_json::Value| {
             let offer: ChannelClaudeSetupBoxOffer = serde_json::from_value(frame.clone()).expect("the offer parses");
-            let SetupCommand::Start(order) = setup_order(offer).expect("known setup") else {
+            let Ok(SetupCommand::Start(order)) = setup_order(offer) else {
                 panic!("a setup offer starts a setup box");
             };
             let (harness, version) = order.image.harness();
@@ -1181,7 +1228,6 @@ mod tests {
         let usage = tumpel_channel::Usage {
             host: serde_json::from_value(serde_json::json!({"loadAverage": 0.0, "memoryAvailableMib": 1024, "diskBudgetMib": 0, "diskHeldMib": 0, "memoryBudgetMib": 0, "memoryHeldMib": 0}))
                 .expect("usage"),
-
         };
         let mut outbox = Outbox::default();
         channel
@@ -1194,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_protocol_steps_down_one_version_at_a_time_and_a_dropped_connection_goes_back_to_38() {
+    fn a_refused_protocol_steps_down_one_version_at_a_time_and_a_dropped_connection_goes_back_to_39() {
         let mut channel = HostChannel::new(
             tumpel_channel::empty_state(),
             Unsaved,
@@ -1204,7 +1250,7 @@ mod tests {
         );
         let mut backoff = Backoff::default();
         let url = "wss://control.example.test/v1/channel";
-        assert_eq!(hello_version(&mut channel), serde_json::json!(38));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(39));
 
         let refusal = CloseFrame {
             code: CloseCode::from(4426),
@@ -1215,6 +1261,15 @@ mod tests {
         };
         let Next::Reconnect(wait) = next(&mut channel, &mut backoff, url, ended, 0) else {
             panic!("a refusal of the newest protocol reconnects");
+        };
+        assert_eq!(wait, Duration::ZERO);
+        assert_eq!(hello_version(&mut channel), serde_json::json!(38));
+
+        let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
+            panic!("a refusal ends the session");
+        };
+        let Next::Reconnect(wait) = next(&mut channel, &mut backoff, url, ended, 0) else {
+            panic!("a refusal of 38 reconnects at the oldest");
         };
         assert_eq!(wait, Duration::ZERO);
         assert_eq!(hello_version(&mut channel), serde_json::json!(37));
@@ -1237,6 +1292,6 @@ mod tests {
             panic!("a dropped connection reconnects");
         };
         assert_eq!(wait, Duration::from_secs(1));
-        assert_eq!(hello_version(&mut channel), serde_json::json!(38));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(39));
     }
 }

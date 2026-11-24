@@ -252,8 +252,11 @@ pub struct Spend {
 
 impl Spend {
     #[must_use]
-    pub fn new(protocol: GuestHarnessProtocol) -> Self {
-        Self { protocol, usage: None }
+    pub fn new(protocol: &GuestHarnessProtocol) -> Self {
+        Self {
+            protocol: protocol.clone(),
+            usage: None,
+        }
     }
 
     pub fn read(&mut self, line: &str) {

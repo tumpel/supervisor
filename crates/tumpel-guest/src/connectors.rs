@@ -81,10 +81,6 @@ pub fn arguments(protocol: &GuestHarnessProtocol, connectors: &[ChannelDispatchC
         return Vec::new();
     }
     match protocol {
-        GuestHarnessProtocol::Unrecognised(_) => {
-            tumpel_guest::update_required();
-            Vec::new()
-        }
         GuestHarnessProtocol::ClaudeStreamJson => vec![
             "--mcp-config".to_string(),
             json!({ "mcpServers": object(&servers, |url| json!({ "type": "http", "url": url })) }).to_string(),
@@ -94,6 +90,10 @@ pub fn arguments(protocol: &GuestHarnessProtocol, connectors: &[ChannelDispatchC
             .flat_map(|(key, url)| ["-c".to_string(), format!("mcp_servers.{key}.url={}", json!(url))])
             .collect(),
         GuestHarnessProtocol::PiRpc | GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::ShellLines => {
+            Vec::new()
+        }
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_guest::update_required();
             Vec::new()
         }
     }
@@ -145,7 +145,7 @@ pub fn write_pi_config(home: &Path, connectors: &[ChannelDispatchConnector], mou
 
 pub fn variables(protocol: &GuestHarnessProtocol, connectors: &[ChannelDispatchConnector]) -> Vec<(String, String)> {
     let servers = servers(connectors);
-    if servers.is_empty() || protocol != &GuestHarnessProtocol::PromptOnStdin {
+    if servers.is_empty() || *protocol != GuestHarnessProtocol::PromptOnStdin {
         return Vec::new();
     }
     let mcp = object(&servers, |url| json!({ "type": "remote", "url": url, "oauth": false }));

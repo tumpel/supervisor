@@ -2,7 +2,7 @@ use tumpel_api::types::GuestHarnessProtocol;
 
 use super::{metrics, Cost, Spend, Tokens, Usage};
 
-fn read(protocol: GuestHarnessProtocol, transcript: &str) -> Option<Usage> {
+fn read(protocol: &GuestHarnessProtocol, transcript: &str) -> Option<Usage> {
     let mut spend = Spend::new(protocol);
     for line in transcript.lines() {
         spend.read(line);
@@ -30,7 +30,7 @@ fn micro_usd(usage: Usage) -> Option<i64> {
 #[test]
 fn claude_code_reads_the_usage_since_the_last_result_not_the_restored_running_total() {
     let usage = read(
-        GuestHarnessProtocol::ClaudeStreamJson,
+        &GuestHarnessProtocol::ClaudeStreamJson,
         include_str!("fixtures/claude-code.jsonl"),
     )
     .expect("the result line carries usage");
@@ -41,7 +41,7 @@ fn claude_code_reads_the_usage_since_the_last_result_not_the_restored_running_to
 #[test]
 fn pi_sums_every_assistant_message_end_and_ignores_agent_end() {
     let usage =
-        read(GuestHarnessProtocol::PiRpc, include_str!("fixtures/pi.jsonl")).expect("message_end carries usage");
+        read(&GuestHarnessProtocol::PiRpc, include_str!("fixtures/pi.jsonl")).expect("message_end carries usage");
     assert_eq!(usage.tokens, tokens(4_356, 62, 0, 0));
     assert_eq!(micro_usd(usage), Some(1_866));
 }
@@ -49,7 +49,7 @@ fn pi_sums_every_assistant_message_end_and_ignores_agent_end() {
 #[test]
 fn opencode_sums_every_step_finish_and_counts_reasoning_as_output() {
     let usage = read(
-        GuestHarnessProtocol::PromptOnStdin,
+        &GuestHarnessProtocol::PromptOnStdin,
         include_str!("fixtures/opencode.jsonl"),
     )
     .expect("step_finish carries usage");
@@ -60,7 +60,7 @@ fn opencode_sums_every_step_finish_and_counts_reasoning_as_output() {
 #[test]
 fn codex_reports_tokens_without_cost_and_splits_cached_input_out_of_input() {
     let usage = read(
-        GuestHarnessProtocol::CodexExecJson,
+        &GuestHarnessProtocol::CodexExecJson,
         include_str!("fixtures/codex.jsonl"),
     )
     .expect("turn.completed carries usage");
@@ -79,13 +79,13 @@ fn a_codex_turn_is_the_difference_of_the_thread_totals_and_a_shrunk_total_starts
 #[test]
 fn a_claude_result_without_usage_since_the_last_result_reports_nothing() {
     let line = r#"{"type":"result","subtype":"success","total_cost_usd":0.5,"modelUsage":{"m":{"inputTokens":1,"outputTokens":1,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"costUSD":0.5}}}"#;
-    assert_eq!(read(GuestHarnessProtocol::ClaudeStreamJson, line), None);
+    assert_eq!(read(&GuestHarnessProtocol::ClaudeStreamJson, line), None);
 }
 
 #[test]
 fn a_model_without_a_price_leaves_the_claude_turn_unpriced() {
     let line = r#"{"type":"result","model_usage_since_last_result":{"a":{"inputTokens":1,"outputTokens":2,"cacheReadInputTokens":3,"cacheCreationInputTokens":4,"costUSD":0.1},"b":{"inputTokens":1,"outputTokens":2,"cacheReadInputTokens":3,"cacheCreationInputTokens":4}}}"#;
-    let usage = read(GuestHarnessProtocol::ClaudeStreamJson, line).expect("usage");
+    let usage = read(&GuestHarnessProtocol::ClaudeStreamJson, line).expect("usage");
     assert_eq!(usage.tokens, tokens(2, 4, 6, 8));
     assert_eq!(usage.cost, Cost::NotReported);
 }

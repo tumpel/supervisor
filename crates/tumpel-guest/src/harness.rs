@@ -412,7 +412,7 @@ fn codex_thread(value: &Value) -> Option<&str> {
 }
 
 fn record_codex_thread(protocol: &GuestHarnessProtocol, line: &str) -> Result<(), String> {
-    if protocol != &GuestHarnessProtocol::CodexExecJson {
+    if *protocol != GuestHarnessProtocol::CodexExecJson {
         return Ok(());
     }
     let Some(thread) = serde_json::from_str::<Value>(line)
@@ -480,7 +480,10 @@ fn turn_arguments(
     let model = start.model.to_string();
     let connectors = connectors::arguments(protocol, &start.credential.connectors);
     Ok(match protocol {
-        GuestHarnessProtocol::Unrecognised(_) => return Err(tumpel_guest::UPDATE_REQUIRED.to_string()),
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_guest::update_required();
+            return Err(tumpel_guest::UPDATE_REQUIRED.to_string());
+        }
         GuestHarnessProtocol::ShellLines => Vec::new(),
         GuestHarnessProtocol::CodexExecJson => {
             if start.credential.arguments.is_empty() {
@@ -586,7 +589,7 @@ fn ends_turn(protocol: &GuestHarnessProtocol, line: &str) -> bool {
 }
 
 fn answers_no_prompt(protocol: &GuestHarnessProtocol, line: &str) -> bool {
-    if protocol != &GuestHarnessProtocol::ClaudeStreamJson {
+    if *protocol != GuestHarnessProtocol::ClaudeStreamJson {
         return false;
     }
     let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -675,7 +678,7 @@ fn with_spend(ending: Ending, spend: &Spend, protocol: &GuestHarnessProtocol, pr
     let Some(read) = spend.usage() else {
         return Ok(ending);
     };
-    let used = if protocol == &GuestHarnessProtocol::CodexExecJson {
+    let used = if *protocol == GuestHarnessProtocol::CodexExecJson {
         codex_turn_usage(read)?
     } else {
         read
@@ -698,9 +701,6 @@ fn with_spend(ending: Ending, spend: &Spend, protocol: &GuestHarnessProtocol, pr
 
 impl GuestState {
     pub fn new(config: GuestHarness, memory: Memory) -> Result<Self, String> {
-        if matches!(config.protocol, GuestHarnessProtocol::Unrecognised(_)) {
-            return Err(tumpel_guest::UPDATE_REQUIRED.to_string());
-        }
         let home = PathBuf::from(&*config.environment.home);
         Ok(Self {
             config,
@@ -779,15 +779,7 @@ impl GuestState {
             Path::new(STARTED_FILE).exists(),
             read_codex_thread()?.as_deref(),
         )?);
-        let harness = Self::start_process(
-            &self.config,
-            &self.memory,
-            &self.keys,
-            command,
-            environment(&self.config, start),
-            per_turn,
-            start,
-        )?;
+        let harness = self.start_process(command, environment(&self.config, start), per_turn, start)?;
         std::fs::create_dir_all(STATE_DIR).map_err(|error| format!("creating {STATE_DIR}: {error}"))?;
         std::fs::write(STARTED_FILE, b"").map_err(|error| format!("writing {STARTED_FILE}: {error}"))?;
         Ok(harness)
@@ -796,21 +788,11 @@ impl GuestState {
     fn spawn_setup(&self, start: &GuestTurnStart) -> Result<Harness, String> {
         let mut command = Command::new(SETUP_PROGRAM);
         command.arg("run");
-        Self::start_process(
-            &self.config,
-            &self.memory,
-            &self.keys,
-            command,
-            image_environment(&self.config),
-            true,
-            start,
-        )
+        self.start_process(command, image_environment(&self.config), true, start)
     }
 
     fn start_process(
-        config: &GuestHarness,
-        memory: &Memory,
-        keys: &RandomState,
+        &self,
         mut command: Command,
         variables: Vec<(String, String)>,
         per_turn: bool,
@@ -818,11 +800,11 @@ impl GuestState {
     ) -> Result<Harness, String> {
         let program = command.get_program().to_string_lossy().into_owned();
         command.process_group(0);
-        memory.confinement.apply(&mut command);
+        self.memory.confinement.apply(&mut command);
         let mut child = command
             .env_clear()
             .envs(variables)
-            .current_dir(&*config.working_directory)
+            .current_dir(&*self.config.working_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -846,7 +828,7 @@ impl GuestState {
             output,
             sender,
             stderr: tail,
-            launch: launch(keys, start),
+            launch: launch(&self.keys, start),
         })
     }
 
@@ -1030,7 +1012,7 @@ impl GuestState {
             ));
         }
         let mut killed = None;
-        let mut spend = Spend::new(protocol.clone());
+        let mut spend = Spend::new(&protocol);
         let ending = loop {
             let text = match harness.receive(&protocol, turn) {
                 Ok(Output::Line(text)) => text,

@@ -87,14 +87,26 @@ async fn exec_handed_supervisor() {
     let stdout = OwnedFd::from(child.stdout.take().expect("its standard output"));
     let stderr = OwnedFd::from(child.stderr.take().expect("its standard error"));
     let handed = SupervisorHandoverMachine {
-        api_socket: data.join("box63").join("api.sock").display().to_string(),
-        console_tail: String::new(),
-        guest_buffer: String::new(),
+        api_socket: data
+            .join("box63")
+            .join("api.sock")
+            .display()
+            .to_string()
+            .try_into()
+            .expect("a path"),
+        console_tail: String::new().try_into().expect("an empty tail"),
+        guest_buffer: String::new().try_into().expect("an empty buffer"),
         guest_fd: guest.into_raw_fd(),
         process_id: NonZeroU32::new(child.id()).expect("a pid"),
         stderr_fd: stderr.into_raw_fd(),
         stdout_fd: stdout.into_raw_fd(),
-        vsock: data.join("box63").join("v.sock").display().to_string(),
+        vsock: data
+            .join("box63")
+            .join("v.sock")
+            .display()
+            .to_string()
+            .try_into()
+            .expect("a path"),
     };
     unsafe { fd_store::take_notify_socket(true) }.expect("the user manager's notify socket");
     let layout = Layout::new(data.join("tumpel-supervisor"), data.clone(), unit_path());

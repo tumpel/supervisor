@@ -409,18 +409,11 @@ fn a_cancel_kills_a_persistent_harness_and_every_process_it_started() {
         kernel: crate::memory::KernelLog::open(Path::new("/dev/null")).expect("a kernel log"),
         box_mib: 1024,
     };
-    let keys = RandomState::new();
+    let state = super::GuestState::new(config, memory).expect("a guest state");
     let turn = start("m", &json!([]), &json!([]));
-    let mut harness = super::GuestState::start_process(
-        &config,
-        &memory,
-        &keys,
-        std::process::Command::new("sh"),
-        Vec::new(),
-        false,
-        &turn,
-    )
-    .expect("the harness starts");
+    let mut harness = state
+        .start_process(std::process::Command::new("sh"), Vec::new(), false, &turn)
+        .expect("the harness starts");
     harness
         .stdin
         .write_all(b"sleep 300 & echo $!\n")
