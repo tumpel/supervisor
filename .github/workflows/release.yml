@@ -1,7 +1,9 @@
 name: release
 
 on:
-  push:
+  workflow_run:
+    workflows: [checks]
+    types: [completed]
     branches: [main]
 
 concurrency:
@@ -13,6 +15,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
+  SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
   TARGET: x86_64-unknown-linux-gnu
   SHIPPED: >-
     Cargo.toml Cargo.lock rust-toolchain.toml package.json npm-scripts/guest-drive.mjs
@@ -23,6 +26,10 @@ env:
 
 jobs:
   plan:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -31,6 +38,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ env.SOURCE_SHA }}
 
       - uses: taiki-e/install-action@v2
         with:
@@ -55,7 +63,6 @@ jobs:
     if: needs.plan.outputs.version != ''
     permissions:
       contents: write
-      actions: read
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -63,6 +70,8 @@ jobs:
       TAG: v${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
 
       - uses: actions/setup-node@v7
         with:
@@ -98,7 +107,7 @@ jobs:
         run: |
           draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo none)
           case "$draft" in
-            none) gh release create "$TAG" .tmp/release/* --title "$TAG" --generate-notes --target "$GITHUB_SHA" --prerelease --latest=false ;;
+            none) gh release create "$TAG" .tmp/release/* --title "$TAG" --generate-notes --target "$SOURCE_SHA" --prerelease --latest=false ;;
             true) gh release upload "$TAG" .tmp/release/* --clobber && gh release edit "$TAG" --draft=false --prerelease --latest=false ;;
             *) echo "release: $TAG is already published; its binaries stay as they are" >&2; exit 1 ;;
           esac

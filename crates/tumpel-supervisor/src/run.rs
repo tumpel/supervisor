@@ -262,8 +262,12 @@ enum BoxCommand {
     Welcomed(u16),
 }
 
-fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Result<SetupCommand, String> {
-    Ok(SetupCommand::Start(Box::new(SetupOrder {
+fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Option<SetupCommand> {
+    if matches!(offer.harness, Some(ClaudeSetupHarness::Unrecognised(_))) {
+        tumpel_channel::update_required();
+        return None;
+    }
+    Some(SetupCommand::Start(Box::new(SetupOrder {
         claude_setup_id: offer.claude_setup_id,
         tenant_id: offer.tenant_id,
         box_id: offer.box_id,
@@ -279,14 +283,19 @@ fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Result<SetupCommand, String
     })))
 }
 
-fn turn(offer: ChannelTurnOffer) -> Result<BoxCommand, String> {
+fn turn(offer: ChannelTurnOffer) -> Option<BoxCommand> {
+    if matches!(offer.harness, tumpel_api::types::Harness::Unrecognised(_))
+        || matches!(offer.box_retention, tumpel_api::types::BoxRetention::Unrecognised(_))
+    {
+        tumpel_channel::update_required();
+        return None;
+    }
     let image = BootOrder::from_offer(
         offer.image.clone(),
         offer.harness.to_string(),
         offer.harness_version.to_string(),
-    )
-    .map_err(|error| format!("turn {}: {error}", *offer.turn_id))?;
-    Ok(BoxCommand::Turn(Box::new((offer, image))))
+    )?;
+    Some(BoxCommand::Turn(Box::new((offer, image))))
 }
 
 fn command(files_dir: &Path, offer: ChannelTurnOffer, image: BootOrder) -> Command {
@@ -997,11 +1006,11 @@ fn closed_by_peer(frame: Option<&CloseFrame>, progressed: bool) -> Result<Ended,
     }
 }
 
-fn box_command(message: ChannelControlMessage) -> Result<Option<BoxCommand>, String> {
-    Ok(Some(match message {
+fn box_command(message: ChannelControlMessage) -> Option<BoxCommand> {
+    Some(match message {
         ChannelControlMessage::Unrecognised(_) => {
             tumpel_channel::update_required();
-            return Ok(None);
+            return None;
         }
         ChannelControlMessage::TurnOffer(offer) => turn(offer)?,
         ChannelControlMessage::SnapshotRequest(request) => BoxCommand::Snapshot(request),
@@ -1022,7 +1031,7 @@ fn box_command(message: ChannelControlMessage) -> Result<Option<BoxCommand>, Str
         ChannelControlMessage::ClaudeSetupBoxDiscard(discard) => BoxCommand::Setup(SetupCommand::Discard {
             claude_setup_id: discard.claude_setup_id,
         }),
-    }))
+    })
 }
 
 fn accepted(channel: &mut Channel, commands: &UnboundedSender<BoxCommand>) -> Result<(), Failure> {
@@ -1103,9 +1112,8 @@ async fn session(
                                 }
                             }
                             Ok(Event::Message(message)) => match box_command(*message) {
-                                Ok(Some(command)) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
-                                Ok(None) => None,
-                                Err(error) => Some(Err(fail(SupervisorFailure::ProtocolError, error))),
+                                Some(command) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
+                                None => None,
                             },
                             Ok(Event::FrameRefused { seq, reason }) => {
                                 eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
@@ -1164,6 +1172,117 @@ async fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn opened_channel() -> HostChannel<Unsaved, Unsigned> {
+        let mut channel = HostChannel::new(
+            tumpel_channel::empty_state(),
+            Unsaved,
+            Unsigned,
+            "host-1".try_into().expect("host"),
+            "1".to_string(),
+        );
+        channel.connect();
+        let Ok(Event::Challenged(nonce)) =
+            channel.receive(&json!({"type":"Challenge","nonce":"n".repeat(43)}).to_string())
+        else {
+            panic!("challenge");
+        };
+        let usage = tumpel_channel::Usage { host: serde_json::from_value(json!({"loadAverage":0.0,"memoryAvailableMib":1024,"diskBudgetMib":0,"diskHeldMib":0,"memoryBudgetMib":0,"memoryHeldMib":0})).expect("usage") };
+        channel
+            .hello(
+                &nonce,
+                std::num::NonZeroU32::MIN,
+                usage,
+                Vec::new(),
+                &mut Outbox::default(),
+            )
+            .expect("hello");
+        assert!(matches!(channel.receive(&json!({"type":"Welcome","hostId":"host-1","protocolVersion":tumpel_api::types::ChannelProtocol::VERSION}).to_string()), Ok(Event::Welcomed)));
+        channel
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unfamiliar_turn_values_are_acked_without_starting_them_and_known_offers_still_arrive() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let known = json!({
+            "type":"TurnOffer","turnId":"turn-1","sessionId":"session-1","boxId":"box-1",
+            "repository":"https://example.test/repo.git","harness":"ClaudeCode","harnessVersion":"1","model":"model","prompt":"hello",
+            "credential":{"credentialHandoverId":"grant-1","expiresAt":"2026-11-23T12:00:00Z","variables":[],"connectors":[]},
+            "lastLineSeq":0,"snapshots":[],"personaFiles":[],
+            "image":{"kind":"Full","imageDigest":"b".repeat(64),"kernelDigest":"c".repeat(64),"manifestDigest":"d".repeat(64),"imageUrl":"https://example.test/image","kernelUrl":"https://example.test/kernel","manifestUrl":"https://example.test/manifest","downloadExpiresAt":"2026-11-23T12:00:00Z","fetchSeconds":60},
+            "gitAuthorName":"Agent","gitAuthorEmail":"agent@example.test","boxRetention":"Auto","turnSeconds":60,"idleSeconds":60
+        });
+        for (field, future) in [
+            ("type", json!("FutureTurnOffer")),
+            ("harness", json!("FutureHarness")),
+            ("boxRetention", json!("FutureRetention")),
+            ("image", json!({"kind":"FutureImage"})),
+        ] {
+            let logs = crate::test_logs::UpdateLogs::default();
+            let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+            let mut channel = opened_channel();
+            let mut unfamiliar = known.clone();
+            unfamiliar[field] = future;
+            unfamiliar["extra"] = json!(true);
+            let Ok(Event::Message(message)) =
+                channel.receive(&json!({"type":"Frame","seq":1,"ack":0,"message":unfamiliar}).to_string())
+            else {
+                panic!("the channel forwards persisted work");
+            };
+            assert!(box_command(*message).is_none());
+            assert_eq!(channel.state().received.0, 1);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let mut extended = known.clone();
+            extended["extra"] = json!(true);
+            let Ok(Event::Message(message)) =
+                channel.receive(&json!({"type":"Frame","seq":2,"ack":0,"message":extended}).to_string())
+            else {
+                panic!("the known offer reaches the supervisor");
+            };
+            assert!(matches!(box_command(*message), Some(BoxCommand::Turn(_))));
+            assert_eq!(*logs.0.lock().expect("logs"), [tumpel_channel::UPDATE_REQUIRED]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unfamiliar_setup_values_leave_known_setup_work_available() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let known = json!({
+            "type":"ClaudeSetupBoxOffer","claudeSetupId":"setup-1","tenantId":"tenant-1","boxId":"box-1","harness":"ClaudeCode","harnessVersion":"1",
+            "urlSeconds":60,"codeSeconds":60,"expiresAt":"2026-11-23T12:00:00Z","tokenUrl":"https://example.test/token","tokenCredential":"c".repeat(43),
+            "image":{"kind":"Full","imageDigest":"b".repeat(64),"kernelDigest":"c".repeat(64),"manifestDigest":"d".repeat(64),"imageUrl":"https://example.test/image","kernelUrl":"https://example.test/kernel","manifestUrl":"https://example.test/manifest","downloadExpiresAt":"2026-11-23T12:00:00Z","fetchSeconds":60}
+        });
+        for (field, future) in [
+            ("type", json!("FutureSetupOffer")),
+            ("harness", json!("FutureHarness")),
+            ("image", json!({"kind":"FutureImage"})),
+        ] {
+            let logs = crate::test_logs::UpdateLogs::default();
+            let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+            let mut channel = opened_channel();
+            let mut unfamiliar = known.clone();
+            unfamiliar[field] = future;
+            unfamiliar["extra"] = json!(true);
+            let Ok(Event::Message(message)) =
+                channel.receive(&json!({"type":"Frame","seq":1,"ack":0,"message":unfamiliar}).to_string())
+            else {
+                panic!("the channel forwards persisted work");
+            };
+            assert!(box_command(*message).is_none());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let mut extended = known.clone();
+            extended["extra"] = json!(true);
+            let Ok(Event::Message(message)) =
+                channel.receive(&json!({"type":"Frame","seq":2,"ack":0,"message":extended}).to_string())
+            else {
+                panic!("the known offer reaches the supervisor");
+            };
+            assert!(matches!(box_command(*message), Some(BoxCommand::Setup(_))));
+            assert_eq!(channel.state().received.0, 2);
+            assert_eq!(*logs.0.lock().expect("logs"), [tumpel_channel::UPDATE_REQUIRED]);
+        }
+    }
 
     #[test]
     fn a_setup_box_boots_the_harness_its_offer_names_and_claude_code_without_one() {
@@ -1192,7 +1311,7 @@ mod tests {
         });
         let booted = |frame: &serde_json::Value| {
             let offer: ChannelClaudeSetupBoxOffer = serde_json::from_value(frame.clone()).expect("the offer parses");
-            let Ok(SetupCommand::Start(order)) = setup_order(offer) else {
+            let Some(SetupCommand::Start(order)) = setup_order(offer) else {
                 panic!("a setup offer starts a setup box");
             };
             let (harness, version) = order.image.harness();

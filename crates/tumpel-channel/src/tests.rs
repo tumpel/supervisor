@@ -1715,7 +1715,9 @@ async fn unfamiliar_commands_advance_the_cursor_and_every_known_command_keeps_it
         );
         channel.phase = Phase::Open;
         let future = json!({"type":"Frame","seq":1,"ack":0,"extra":true,"message":{"type":format!("Future{}",known["type"].as_str().expect("type")),"extra":true}});
-        assert!(matches!(channel.receive(&future.to_string()), Ok(Event::None)));
+        assert!(
+            matches!(channel.receive(&future.to_string()), Ok(Event::Message(message)) if matches!(*message, ChannelControlMessage::Unrecognised(_)))
+        );
         assert_eq!(channel.state().received.0, 1);
         assert_eq!(disk.0.borrow().as_ref().expect("persisted cursor").received.0, 1);
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -1729,94 +1731,6 @@ async fn unfamiliar_commands_advance_the_cursor_and_every_known_command_keeps_it
         assert_eq!(channel.state().received.0, 2);
         assert_eq!(disk.0.borrow().as_ref().expect("persisted cursor").received.0, 2);
         assert_eq!(channel.phase(), Phase::Open);
-        assert_eq!(*logs.0.lock().expect("logs"), [super::UPDATE_REQUIRED]);
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn unfamiliar_turn_values_are_acked_without_starting_them_and_known_offers_still_arrive() {
-    use tracing_subscriber::layer::SubscriberExt;
-    let known = json!({
-        "type":"TurnOffer","turnId":"turn-1","sessionId":"session-1","boxId":"box-1",
-        "repository":"https://example.test/repo.git","harness":"ClaudeCode","harnessVersion":"1","model":"model","prompt":"hello",
-        "credential":{"credentialHandoverId":"grant-1","expiresAt":"2026-11-23T12:00:00Z","variables":[],"connectors":[]},
-        "lastLineSeq":0,"snapshots":[],"personaFiles":[],
-        "image":{"kind":"Full","imageDigest":"b".repeat(64),"kernelDigest":"c".repeat(64),"manifestDigest":"d".repeat(64),"imageUrl":"https://example.test/image","kernelUrl":"https://example.test/kernel","manifestUrl":"https://example.test/manifest","downloadExpiresAt":"2026-11-23T12:00:00Z","fetchSeconds":60},
-        "gitAuthorName":"Agent","gitAuthorEmail":"agent@example.test","boxRetention":"Auto","turnSeconds":60,"idleSeconds":60
-    });
-    for (field, future) in [
-        ("type", json!("FutureTurnOffer")),
-        ("harness", json!("FutureHarness")),
-        ("boxRetention", json!("FutureRetention")),
-        ("image", json!({"kind":"FutureImage"})),
-    ] {
-        let logs = UpdateLogs::default();
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
-        let mut channel = HostChannel::new(
-            empty_state(),
-            Disk::default(),
-            Recorder::default(),
-            "host-1".try_into().expect("host"),
-            "1".to_string(),
-        );
-        channel.phase = Phase::Open;
-        let mut unfamiliar = known.clone();
-        unfamiliar[field] = future;
-        unfamiliar["extra"] = json!(true);
-        assert!(matches!(
-            channel.receive(&json!({"type":"Frame","seq":1,"ack":0,"message":unfamiliar}).to_string()),
-            Ok(Event::None)
-        ));
-        assert_eq!(channel.state().received.0, 1);
-        assert_eq!(channel.offered, []);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let mut extended = known.clone();
-        extended["extra"] = json!(true);
-        assert!(
-            matches!(channel.receive(&json!({"type":"Frame","seq":2,"ack":0,"message":extended}).to_string()), Ok(Event::Message(message)) if matches!(*message, ChannelControlMessage::TurnOffer(_)))
-        );
-        assert_eq!(channel.offered.len(), 1);
-        assert_eq!(*logs.0.lock().expect("logs"), [super::UPDATE_REQUIRED]);
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn unfamiliar_setup_values_leave_known_setup_work_available() {
-    use tracing_subscriber::layer::SubscriberExt;
-    let known = json!({
-        "type":"ClaudeSetupBoxOffer","claudeSetupId":"setup-1","tenantId":"tenant-1","boxId":"box-1","harness":"ClaudeCode","harnessVersion":"1",
-        "urlSeconds":60,"codeSeconds":60,"expiresAt":"2026-11-23T12:00:00Z","tokenUrl":"https://example.test/token","tokenCredential":"c".repeat(43),
-        "image":{"kind":"Full","imageDigest":"b".repeat(64),"kernelDigest":"c".repeat(64),"manifestDigest":"d".repeat(64),"imageUrl":"https://example.test/image","kernelUrl":"https://example.test/kernel","manifestUrl":"https://example.test/manifest","downloadExpiresAt":"2026-11-23T12:00:00Z","fetchSeconds":60}
-    });
-    for (field, future) in [
-        ("type", json!("FutureSetupOffer")),
-        ("harness", json!("FutureHarness")),
-        ("image", json!({"kind":"FutureImage"})),
-    ] {
-        let logs = UpdateLogs::default();
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
-        let mut channel = HostChannel::new(
-            empty_state(),
-            Disk::default(),
-            Recorder::default(),
-            "host-1".try_into().expect("host"),
-            "1".to_string(),
-        );
-        channel.phase = Phase::Open;
-        let mut unfamiliar = known.clone();
-        unfamiliar[field] = future;
-        unfamiliar["extra"] = json!(true);
-        assert!(matches!(
-            channel.receive(&json!({"type":"Frame","seq":1,"ack":0,"message":unfamiliar}).to_string()),
-            Ok(Event::None)
-        ));
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let mut extended = known.clone();
-        extended["extra"] = json!(true);
-        assert!(
-            matches!(channel.receive(&json!({"type":"Frame","seq":2,"ack":0,"message":extended}).to_string()), Ok(Event::Message(message)) if matches!(*message, ChannelControlMessage::ClaudeSetupBoxOffer(_)))
-        );
-        assert_eq!(channel.state().received.0, 2);
-        assert_eq!(*logs.0.lock().expect("logs"), [super::UPDATE_REQUIRED]);
+        assert!(logs.0.lock().expect("logs").is_empty());
     }
 }

@@ -39,13 +39,12 @@ impl BootOrder {
         }
     }
 
-    /// # Errors
-    /// Fails on an image kind this supervisor does not know.
-    pub fn from_offer(image: ChannelBootImage, harness: String, harness_version: String) -> Result<Self, String> {
-        Ok(match image {
+    #[must_use]
+    pub fn from_offer(image: ChannelBootImage, harness: String, harness_version: String) -> Option<Self> {
+        Some(match image {
             ChannelBootImage::Unrecognised(_) => {
                 tumpel_channel::update_required();
-                return Err(tumpel_channel::UPDATE_REQUIRED.to_string());
+                return None;
             }
             ChannelBootImage::GuestImageDownload(download) => Self::Full(ImageOrder {
                 download,

@@ -186,23 +186,6 @@ fn mismatched(message: &Value, built: u16, session: u16) -> Result<Value, Channe
     serde_json::to_value(&failed).map_err(|error| protocol(format!("encoding a SnapshotFailed: {error}")))
 }
 
-fn understood(message: &ChannelControlMessage) -> bool {
-    use tumpel_api::types::{BoxRetention, ChannelBootImage, ClaudeSetupHarness, Harness};
-    match message {
-        ChannelControlMessage::Unrecognised(_) => false,
-        ChannelControlMessage::TurnOffer(offer) => {
-            !matches!(offer.harness, Harness::Unrecognised(_))
-                && !matches!(offer.box_retention, BoxRetention::Unrecognised(_))
-                && !matches!(offer.image, ChannelBootImage::Unrecognised(_))
-        }
-        ChannelControlMessage::ClaudeSetupBoxOffer(offer) => {
-            !matches!(offer.harness, Some(ClaudeSetupHarness::Unrecognised(_)))
-                && !matches!(offer.image, ChannelBootImage::Unrecognised(_))
-        }
-        _ => true,
-    }
-}
-
 fn is_turn_lines(message: &Value) -> bool {
     message.get("type").and_then(Value::as_str) == Some("TurnLines")
 }
@@ -861,10 +844,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         self.state.received = Sequence(frame.seq.0);
         self.progressed = true;
         self.store.save(&self.state)?;
-        if !understood(&frame.message) {
-            update_required();
-            return Ok(Event::None);
-        }
         match &frame.message {
             ChannelControlMessage::TurnOffer(offer) if !self.offered.contains(&offer.turn_id) => {
                 self.offered.push(offer.turn_id.clone());
