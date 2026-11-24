@@ -622,6 +622,10 @@ struct Descriptor {
 
 impl Descriptor {
     fn read(pid: libc::pid_t, fd: RawFd, named: &str, socket: bool) -> Result<Self, String> {
+        Self::read_flags(pid, fd, named, socket, true)
+    }
+
+    fn read_flags(pid: libc::pid_t, fd: RawFd, named: &str, socket: bool, nonblocking: bool) -> Result<Self, String> {
         if fd < 3 {
             return Err(format!("process {pid} has no recorded descriptor for {named}"));
         }
@@ -639,7 +643,7 @@ impl Descriptor {
         if flags & (libc::O_ACCMODE | libc::O_PATH) != access {
             return Err(format!("process {pid} has the wrong access mode for {named}"));
         }
-        if flags & libc::O_NONBLOCK == 0 {
+        if nonblocking && flags & libc::O_NONBLOCK == 0 {
             return Err(format!("process {pid} has a blocking descriptor for {named}"));
         }
         Ok(Self {
@@ -903,6 +907,11 @@ impl Firecracker {
                 *counts.entry(fd).or_insert(0) += 1;
             }
         }
+        for &fd in counts.keys().filter(|fd| **fd >= 3) {
+            if let Err(error) = fd_store::seal_inherited(fd) {
+                eprintln!("tumpel-supervisor: {error}");
+            }
+        }
         let mut legacy_fds = Vec::new();
         let mut scopes = Vec::new();
         let handed_count = saved.handed_count;
@@ -931,7 +940,7 @@ impl Firecracker {
                     .zip([&mut hand.guest_fd, &mut hand.stdout_fd, &mut hand.stderr_fd])
                 {
                     let result = if counts.get(fd) == Some(&1) {
-                        Descriptor::read(daemon, *fd, named, socket).and_then(|actual| {
+                        Descriptor::read_flags(daemon, *fd, named, socket, false).and_then(|actual| {
                             let expected = saved.observation.as_ref().map(|seen| match role {
                                 fd_store::STDOUT => &seen.stdout,
                                 fd_store::STDERR => &seen.stderr,

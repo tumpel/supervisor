@@ -81,7 +81,7 @@ pub(crate) struct LegacyFd {
     pub fd: OwnedFd,
 }
 
-pub(crate) fn own_inherited(fd: RawFd) -> Result<OwnedFd, String> {
+pub(crate) fn seal_inherited(fd: RawFd) -> Result<(), String> {
     if fd < 3 {
         return Err(format!("the inherited descriptor {fd} is reserved or missing"));
     }
@@ -89,6 +89,17 @@ pub(crate) fn own_inherited(fd: RawFd) -> Result<OwnedFd, String> {
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
         return Err(format!(
             "keeping inherited descriptor {fd} out of child processes failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn own_inherited(fd: RawFd) -> Result<OwnedFd, String> {
+    let mode = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if mode < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, mode | libc::O_NONBLOCK) } < 0 {
+        return Err(format!(
+            "setting inherited descriptor {fd} to nonblocking failed: {}",
             std::io::Error::last_os_error()
         ));
     }

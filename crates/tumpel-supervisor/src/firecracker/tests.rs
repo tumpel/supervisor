@@ -303,12 +303,18 @@ fn a_legacy_child_and_streams_are_preserved_before_failed_attachment() {
     record.machine.stdout_fd = record.out.try_clone().expect("old stdout FD").into_raw_fd();
     record.machine.stderr_fd = record.err.try_clone().expect("old stderr FD").into_raw_fd();
     let guest_fd = record.machine.guest_fd;
+    let flags = unsafe { libc::fcntl(guest_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(guest_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) },
+        0
+    );
     let moved = std::cell::Cell::new(false);
     let mut saved = legacy_startup(&record.machine, 0);
     let streams = Firecracker::prepare_legacy(&mut saved, |pid, scope| {
         assert_eq!(pid, child.pid());
         assert_eq!(scope, "tumpel-box0.scope");
         assert!(!vmm.data.join("box0/api.sock").exists());
+        assert_ne!(unsafe { libc::fcntl(guest_fd, libc::F_GETFL) } & libc::O_NONBLOCK, 0);
         moved.set(true);
         Ok(())
     });
@@ -329,6 +335,7 @@ fn duplicate_legacy_streams_survive_a_rejected_scope_move() {
     let first_hand = handed(&vmm, child.pid());
     let second_hand = handed(&vmm, second.pid());
     let duplicate = first_hand.guest.as_raw_fd();
+    assert_eq!(unsafe { libc::fcntl(duplicate, libc::F_SETFD, 0) }, 0);
     let mut first = first_hand.machine;
     let mut other = second_hand.machine;
     other.guest_fd = duplicate;
@@ -361,7 +368,7 @@ fn duplicate_legacy_streams_survive_a_rejected_scope_move() {
         .boxes
         .iter()
         .all(|saved| saved.record.machine.guest_fd == -1));
-    assert!(unsafe { libc::fcntl(duplicate, libc::F_GETFD) } >= 0);
+    assert_eq!(unsafe { libc::fcntl(duplicate, libc::F_GETFD) }, libc::FD_CLOEXEC);
     assert!(super::process_identity(child.pid()).expect("first process").is_some());
     assert!(super::process_identity(second.pid()).expect("second process").is_some());
 }
