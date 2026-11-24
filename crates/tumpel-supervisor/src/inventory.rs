@@ -114,6 +114,12 @@ impl StartupBoxes {
                                     current.record.dirty = saved.record.dirty;
                                     current.reconnect = true;
                                 }
+                            } else {
+                                eprintln!(
+                                    "tumpel-supervisor: the handover record for session {} on TAP {} supersedes a different saved box {} of session {} on TAP {}",
+                                    current.record.session_id, current.record.tap_index,
+                                    saved.record.box_id, saved.record.session_id, saved.record.tap_index
+                                );
                             }
                         } else {
                             handover.boxes.push(saved);
