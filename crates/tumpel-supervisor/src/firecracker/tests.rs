@@ -212,7 +212,7 @@ async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_bin
 }
 
 #[tokio::test]
-async fn reattach_of_a_box_whose_process_ended_closes_every_handed_descriptor() {
+async fn reattach_of_a_box_whose_process_ended_leaves_the_incoming_descriptors_owned() {
     let vmm = firecracker("reattach-ended");
     let tap = TapPool::new(4096, BOX).claim(BOX, ROOMY).expect("tap");
     let pid = sleeper();
@@ -223,6 +223,8 @@ async fn reattach_of_a_box_whose_process_ended_closes_every_handed_descriptor() 
         panic!("a box whose process ended is not adopted");
     };
     assert!(error.contains("ended during the handover"), "{error}");
+    assert!(unsafe { libc::fcntl(handed.machine.guest_fd, libc::F_GETFD) } >= 0);
+    drop(Taken::from(&handed.machine));
     assert!(closed(&mut handed));
     assert!(reaped(pid));
 }
@@ -264,7 +266,11 @@ fn booted_memory_reads_mem_size_mib_from_the_firecracker_api_of_a_running_box() 
         String::from_utf8_lossy(&request[..read]).into_owned()
     });
     assert_eq!(
-        booted_memory(&socket, i32::try_from(std::process::id()).expect("self pid")),
+        booted_memory(
+            &socket,
+            i32::try_from(std::process::id()).expect("self pid"),
+            super::REPORT_INSPECTION
+        ),
         Ok(NonZeroU32::new(8192).expect("8192"))
     );
     assert!(server
@@ -438,4 +444,30 @@ async fn every_guest_family_survives_unknown_variants_and_extra_fields() {
         assert_eq!(serde_json::to_value(message).expect("message"), known);
         assert_eq!(*logs.0.lock().expect("logs"), vec![tumpel_channel::UPDATE_REQUIRED]);
     }
+}
+
+#[test]
+fn an_unclaimed_scope_keeps_its_open_box_disk_and_leaves_other_sessions_for_cleanup() {
+    let vmm = firecracker("unclaimed-open-disk");
+    let root = vmm.data.join("sessions");
+    for session in ["live", "ended"] {
+        std::fs::create_dir_all(root.join(session)).expect("session directory");
+        std::fs::write(root.join(session).join(super::OVERLAY_DRIVE), b"box disk").expect("disk");
+    }
+    let open = std::fs::File::open(root.join("live").join(super::OVERLAY_DRIVE)).expect("open box disk");
+    let processes = [(2, std::path::PathBuf::from("/proc/self"))];
+    let held = super::sessions_in_scopes(&root, &[2], &processes).expect("the scope's open disk");
+    assert_eq!(
+        held.iter().map(tumpel_api::types::EntityId::as_str).collect::<Vec<_>>(),
+        ["live"]
+    );
+    let ambiguous = super::sessions_in_scopes(&root, &[2, 3], &processes).expect("keep possible disks");
+    assert_eq!(
+        ambiguous
+            .iter()
+            .map(tumpel_api::types::EntityId::as_str)
+            .collect::<Vec<_>>(),
+        ["ended", "live"]
+    );
+    drop(open);
 }

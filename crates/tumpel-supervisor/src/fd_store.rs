@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use sendfd::SendWithFd;
 use tumpel_api::types::{SupervisorHandover, SupervisorHandoverBox};
@@ -49,7 +50,8 @@ fn notify(action: &str, message: &str, fds: &[RawFd]) -> Result<(), String> {
     })?;
     let datagram = UnixDatagram::unbound().map_err(|error| format!("{action}: opening a socket failed: {error}"))?;
     datagram
-        .connect(&socket)
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .and_then(|()| datagram.connect(&socket))
         .and_then(|()| datagram.send_with_fd(message.as_bytes(), fds))
         .map(drop)
         .map_err(|error| format!("{action} at {} failed: {error}", socket.display()))
@@ -97,19 +99,19 @@ pub unsafe fn received() -> Result<BTreeMap<String, OwnedFd>, String> {
 }
 
 #[must_use]
-pub fn restored(mut handover: SupervisorHandover, received: &mut BTreeMap<String, OwnedFd>) -> SupervisorHandover {
+pub fn restored(mut handover: SupervisorHandover, received: &BTreeMap<String, OwnedFd>) -> SupervisorHandover {
     for handed in &mut handover.boxes {
         restore_box(handed, received);
     }
     handover
 }
 
-pub(crate) fn restore_box(handed: &mut SupervisorHandoverBox, received: &mut BTreeMap<String, OwnedFd>) {
+pub(crate) fn restore_box(handed: &mut SupervisorHandoverBox, received: &BTreeMap<String, OwnedFd>) {
     let Ok(tap) = u8::try_from(handed.tap_index) else {
         return;
     };
-    let mut take = |role| received.remove(&name(tap, role)).map_or(-1, IntoRawFd::into_raw_fd);
-    handed.machine.guest_fd = take(GUEST);
-    handed.machine.stdout_fd = take(STDOUT);
-    handed.machine.stderr_fd = take(STDERR);
+    let descriptor = |role| received.get(&name(tap, role)).map_or(-1, AsRawFd::as_raw_fd);
+    handed.machine.guest_fd = descriptor(GUEST);
+    handed.machine.stdout_fd = descriptor(STDOUT);
+    handed.machine.stderr_fd = descriptor(STDERR);
 }

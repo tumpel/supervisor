@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use anyhow::Context;
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use tumpel_api::types::{SupervisorHandover, SupervisorHandoverBox};
@@ -73,7 +74,12 @@ impl StartupBoxes {
     }
 
     pub fn select(layout: &Layout, handed: bool, has_descriptors: bool) -> anyhow::Result<Option<Self>> {
-        let standing = load(&layout.boxes())?;
+        let standing = load(&layout.boxes()).with_context(|| {
+            format!(
+                "restore the saved box inventory at {} before restarting the supervisor",
+                layout.boxes().display()
+            )
+        })?;
         let mut preserve_handover = false;
         if handed || has_descriptors {
             let handover = match load(&layout.handover()) {
