@@ -371,7 +371,6 @@ pub struct HostChannel<S: Store, K: Signer> {
     phase: Phase,
     progressed: bool,
     withheld: Option<i64>,
-    offered: Vec<EntityId>,
     hello_version: u16,
     offering: u16,
     version: u16,
@@ -420,7 +419,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             withheld: None,
             accepted: Vec::new(),
             failed: Vec::new(),
-            offered: Vec::new(),
             hello_version: ChannelProtocol::VERSION,
             offering: ChannelProtocol::VERSION,
             version: ChannelProtocol::VERSION,
@@ -505,9 +503,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     }
 
     fn push(&mut self, message: Value) {
-        if let Some(turn_id) = message.get("turnId").and_then(Value::as_str) {
-            self.offered.retain(|offered| **offered != *turn_id);
-        }
         let seq = self.state.sent.0 + 1;
         self.state.sent = Sequence(seq);
         self.state.unacked.push(ChannelStoredHostFrame {
@@ -628,8 +623,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     }
 
     fn held_turns(&mut self, mut held: Vec<EntityId>) -> Vec<EntityId> {
-        self.offered.retain(|offered| !held.contains(offered));
-        for turn_id in self.unacked_turns().into_iter().chain(self.offered.iter().cloned()) {
+        for turn_id in self.unacked_turns() {
             if !held.contains(&turn_id) {
                 held.push(turn_id);
             }
@@ -844,15 +838,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         self.state.received = Sequence(frame.seq.0);
         self.progressed = true;
         self.store.save(&self.state)?;
-        match &frame.message {
-            ChannelControlMessage::TurnOffer(offer) if !self.offered.contains(&offer.turn_id) => {
-                self.offered.push(offer.turn_id.clone());
-            }
-            ChannelControlMessage::TurnWithdrawn(withdrawn) => {
-                self.offered.retain(|offered| *offered != withdrawn.turn_id);
-            }
-            _ => {}
-        }
         Ok(Event::Message(Box::new(frame.message)))
     }
 }

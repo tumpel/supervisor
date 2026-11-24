@@ -18,8 +18,8 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
-    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
+    HostReportedHealth, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
 };
 use tumpel_channel::{
@@ -172,6 +172,51 @@ enum Ended {
 
 type Channel = HostChannel<ChannelFile, HostKey>;
 
+#[derive(Default)]
+struct Offers(Vec<EntityId>);
+
+impl Offers {
+    fn command(&mut self, message: ChannelControlMessage) -> Option<BoxCommand> {
+        let command = box_command(message)?;
+        match &command {
+            BoxCommand::Turn(turn) if !self.0.contains(&turn.0.turn_id) => self.0.push(turn.0.turn_id.clone()),
+            BoxCommand::Answer(Answer::Withdrawn(withdrawn)) => self.0.retain(|id| *id != withdrawn.turn_id),
+            _ => {}
+        }
+        Some(command)
+    }
+
+    fn held(&mut self, mut running: Vec<EntityId>) -> Vec<EntityId> {
+        self.0.retain(|id| !running.contains(id));
+        running.extend(self.0.iter().cloned());
+        running
+    }
+
+    fn send<S: Store, K: Signer>(
+        &mut self,
+        channel: &mut HostChannel<S, K>,
+        outgoing: Outgoing,
+        port: &mut impl Port,
+    ) -> Result<(), ChannelError> {
+        let (Outgoing::Message(message) | Outgoing::Snapshot(message, _)) = &outgoing;
+        let turn_id = match message {
+            ChannelHostMessage::TurnImageFetching(message) => Some(&message.turn_id),
+            ChannelHostMessage::TurnClaim(message) => Some(&message.turn_id),
+            ChannelHostMessage::TurnRepositoryReady(message) => Some(&message.turn_id),
+            ChannelHostMessage::TurnLines(message) => Some(&message.turn_id),
+            ChannelHostMessage::TurnComplete(message) => Some(&message.turn_id),
+            ChannelHostMessage::TurnRepositoryCloneFailed(message) => Some(&message.turn_id),
+            ChannelHostMessage::TurnFailed(message) => Some(&message.turn_id),
+            ChannelHostMessage::RestoreChunks(message) => Some(&message.turn_id),
+            _ => None,
+        };
+        if let Some(turn_id) = turn_id {
+            self.0.retain(|id| id != turn_id);
+        }
+        channel.send(outgoing, port)
+    }
+}
+
 struct Usage {
     box_capacity: NonZeroU32,
     warm: watch::Receiver<u32>,
@@ -196,13 +241,14 @@ impl Usage {
 
 fn hello(
     channel: &mut Channel,
+    offers: &mut Offers,
     nonce: &str,
     usage: &Usage,
     from_box: &mut UnboundedReceiver<Outgoing>,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
-    let turns = usage.turns.borrow().clone();
-    drain(channel, from_box, outbox)?;
+    drain(channel, offers, from_box, outbox)?;
+    let turns = offers.held(usage.turns.borrow().clone());
     channel
         .hello(nonce, usage.box_capacity, usage.sample()?, turns, outbox)
         .map_err(|error| match error {
@@ -213,28 +259,32 @@ fn hello(
 
 fn drain(
     channel: &mut Channel,
+    offers: &mut Offers,
     from_box: &mut UnboundedReceiver<Outgoing>,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
     while let Ok(message) = from_box.try_recv() {
-        channel.send(message, outbox).map_err(|error| store_lost(&error))?;
+        offers
+            .send(channel, message, outbox)
+            .map_err(|error| store_lost(&error))?;
     }
     Ok(())
 }
 
 fn beat(
     channel: &mut Channel,
+    offers: &mut Offers,
     usage: &Usage,
     from_box: &mut UnboundedReceiver<Outgoing>,
     health: HostReportedHealth,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
+    drain(channel, offers, from_box, outbox)?;
     let held = HeldIds {
         session_ids: usage.sessions.borrow().clone(),
         claude_setup_ids: usage.claude_setups.borrow().clone(),
-        turn_ids: usage.turns.borrow().clone(),
+        turn_ids: offers.held(usage.turns.borrow().clone()),
     };
-    drain(channel, from_box, outbox)?;
     channel
         .heartbeat(
             chrono::Utc::now().fixed_offset(),
@@ -906,8 +956,20 @@ async fn serve(
 ) -> Result<Served, Failure> {
     let mut backoff = Backoff::default();
     let mut limit = RateLimit::default();
+    let mut offers = Offers::default();
     loop {
-        let ended = session(channel, url, heartbeat, usage, commands, from_box, updates, &mut limit).await?;
+        let ended = session(
+            channel,
+            &mut offers,
+            url,
+            heartbeat,
+            usage,
+            commands,
+            from_box,
+            updates,
+            &mut limit,
+        )
+        .await?;
         match next(channel, &mut backoff, url, ended, jitter()) {
             Next::Revoked(reason) => {
                 let key = dir.join(KEY_FILE);
@@ -939,7 +1001,7 @@ async fn serve(
                 loop {
                     tokio::select! {
                         () = tokio::time::sleep_until(wake) => break,
-                        Some(message) = from_box.recv() => channel.send(message, &mut Outbox::default()).map_err(|error| store_lost(&error))?,
+                        Some(message) = from_box.recv() => offers.send(channel, message, &mut Outbox::default()).map_err(|error| store_lost(&error))?,
                     }
                 }
             }
@@ -1066,6 +1128,7 @@ fn rate_limited(
 #[allow(clippy::too_many_arguments)]
 async fn session(
     channel: &mut Channel,
+    offers: &mut Offers,
     url: &str,
     heartbeat: Duration,
     usage: &Usage,
@@ -1102,7 +1165,7 @@ async fn session(
                     match accepted(channel, commands) {
                         Err(failure) => Some(Err(failure)),
                         Ok(()) => match received {
-                            Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
+                            Ok(Event::Challenged(nonce)) => hello(channel, offers, &nonce, usage, from_box, &mut outbox).err().map(Err),
                             Ok(Event::Welcomed) => {
                                 eprintln!("connected to {url}");
                                 last_beat = Instant::now();
@@ -1111,7 +1174,7 @@ async fn session(
                                     Ok(()) => updates.welcomed().await.err().map(Err),
                                 }
                             }
-                            Ok(Event::Message(message)) => match box_command(*message) {
+                            Ok(Event::Message(message)) => match offers.command(*message) {
                                 Some(command) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
                                 None => None,
                             },
@@ -1139,14 +1202,14 @@ async fn session(
                 }
                 Some(Ok(_)) => None,
             },
-            Some(message) = from_box.recv() => channel.send(message, &mut outbox).err().map(|error| Err(store_lost(&error))),
+            Some(message) = from_box.recv() => offers.send(channel, message, &mut outbox).err().map(|error| Err(store_lost(&error))),
             _ = tick.tick() => {
                 let now = chrono::Utc::now();
                 if last_received.elapsed() >= HEARTBEAT_DEADLINE {
                     Some(Ok(dropped(channel.progressed(), format!("nothing arrived for {} seconds", HEARTBEAT_DEADLINE.as_secs()))))
                 } else if channel.phase() == Phase::Open && last_beat.elapsed() >= heartbeat {
                     last_beat = Instant::now();
-                    beat(channel, usage, from_box, limit.health(now), &mut outbox).err().map(Err)
+                    beat(channel, offers, usage, from_box, limit.health(now), &mut outbox).err().map(Err)
                 } else if channel.phase() == Phase::Open && channel.withholding() && !limit.paused(now) {
                     channel.release(limit.release_budget(TICK), &mut outbox).err().map(|error| Err(store_lost(&error)))
                 } else if channel.phase() == Phase::Open {
@@ -1211,7 +1274,7 @@ mod tests {
             "credential":{"credentialHandoverId":"grant-1","expiresAt":"2026-11-23T12:00:00Z","variables":[],"connectors":[]},
             "lastLineSeq":0,"snapshots":[],"personaFiles":[],
             "image":{"kind":"Full","imageDigest":"b".repeat(64),"kernelDigest":"c".repeat(64),"manifestDigest":"d".repeat(64),"imageUrl":"https://example.test/image","kernelUrl":"https://example.test/kernel","manifestUrl":"https://example.test/manifest","downloadExpiresAt":"2026-11-23T12:00:00Z","fetchSeconds":60},
-            "gitAuthorName":"Agent","gitAuthorEmail":"agent@example.test","boxRetention":"Auto","turnSeconds":60,"idleSeconds":60
+            "gitAuthorName":"Agent","gitAuthorEmail":"agent@example.test","boxRetention":"Auto","turnSeconds":60,"idleSeconds":60,"extra":true
         });
         for (field, future) in [
             ("type", json!("FutureTurnOffer")),
@@ -1222,27 +1285,114 @@ mod tests {
             let logs = crate::test_logs::UpdateLogs::default();
             let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
             let mut channel = opened_channel();
+            let mut offers = Offers::default();
+            let usage = tumpel_channel::Usage { host: serde_json::from_value(json!({"loadAverage":0.0,"memoryAvailableMib":1024,"diskBudgetMib":0,"diskHeldMib":0,"memoryBudgetMib":0,"memoryHeldMib":0})).expect("usage") };
+            let mut outbox = Outbox::default();
             let mut unfamiliar = known.clone();
             unfamiliar[field] = future;
-            unfamiliar["extra"] = json!(true);
+            unfamiliar["turnId"] = json!("unknown-turn");
             let Ok(Event::Message(message)) =
                 channel.receive(&json!({"type":"Frame","seq":1,"ack":0,"message":unfamiliar}).to_string())
             else {
                 panic!("the channel forwards persisted work");
             };
-            assert!(box_command(*message).is_none());
+            assert!(offers.command(*message).is_none());
             assert_eq!(channel.state().received.0, 1);
             tokio::time::advance(Duration::from_secs(1)).await;
-            let mut extended = known.clone();
-            extended["extra"] = json!(true);
+            channel
+                .heartbeat(
+                    chrono::DateTime::parse_from_rfc3339("2026-11-23T12:00:01Z").expect("time"),
+                    usage.clone(),
+                    HeldIds {
+                        turn_ids: offers.held(Vec::new()),
+                        ..HeldIds::default()
+                    },
+                    HostReportedHealth::Healthy,
+                    || serde_json::from_value(json!({"instruments":[],"samples":[],"turns":[]})).expect("telemetry"),
+                    &mut outbox,
+                )
+                .expect("heartbeat");
+            let heartbeat: serde_json::Value = serde_json::from_str(&outbox.0.remove(0)).expect("heartbeat");
+            assert_eq!(heartbeat["heldTurnIds"], json!([]));
+            assert_eq!(heartbeat["ack"], 1);
+            channel.disconnect();
+            channel.connect();
+            let Ok(Event::Challenged(nonce)) =
+                channel.receive(&json!({"type":"Challenge","nonce":"n".repeat(43)}).to_string())
+            else {
+                panic!("challenge");
+            };
+            channel
+                .hello(
+                    &nonce,
+                    NonZeroU32::MIN,
+                    usage.clone(),
+                    offers.held(Vec::new()),
+                    &mut outbox,
+                )
+                .expect("hello");
+            let hello: serde_json::Value = serde_json::from_str(&outbox.0.remove(0)).expect("hello");
+            assert_eq!(hello["heldTurnIds"], json!([]));
+            assert!(matches!(channel.receive(&json!({"type":"Welcome","hostId":"host-1","protocolVersion":tumpel_api::types::ChannelProtocol::VERSION}).to_string()), Ok(Event::Welcomed)));
+
             let Ok(Event::Message(message)) =
-                channel.receive(&json!({"type":"Frame","seq":2,"ack":0,"message":extended}).to_string())
+                channel.receive(&json!({"type":"Frame","seq":2,"ack":0,"message":known.clone()}).to_string())
             else {
                 panic!("the known offer reaches the supervisor");
             };
-            assert!(matches!(box_command(*message), Some(BoxCommand::Turn(_))));
+            let Some(BoxCommand::Turn(turn)) = offers.command(*message) else {
+                panic!("the known offer starts a turn");
+            };
+            let Command::Turn(running) = command(Path::new("/tmp/files"), turn.0, turn.1) else {
+                panic!("the runner receives the turn");
+            };
+            assert_eq!(&*running.turn_id, "turn-1");
+            assert_eq!(&*running.session_id, "session-1");
+            channel
+                .heartbeat(
+                    chrono::DateTime::parse_from_rfc3339("2026-11-23T12:00:02Z").expect("time"),
+                    usage,
+                    HeldIds {
+                        turn_ids: offers.held(Vec::new()),
+                        ..HeldIds::default()
+                    },
+                    HostReportedHealth::Healthy,
+                    || serde_json::from_value(json!({"instruments":[],"samples":[],"turns":[]})).expect("telemetry"),
+                    &mut outbox,
+                )
+                .expect("heartbeat");
+            let heartbeat: serde_json::Value = serde_json::from_str(&outbox.0.remove(0)).expect("heartbeat");
+            assert_eq!(heartbeat["heldTurnIds"], json!(["turn-1"]));
+            assert_eq!(heartbeat["ack"], 2);
             assert_eq!(*logs.0.lock().expect("logs"), [tumpel_channel::UPDATE_REQUIRED]);
         }
+    }
+
+    #[test]
+    fn accepted_offers_stop_being_pending_when_withdrawn_running_or_answered() {
+        let turn = EntityId::try_from("turn-1").expect("turn");
+        let mut offers = Offers(vec![turn.clone()]);
+        let withdrawn = serde_json::from_value(json!({"type":"TurnWithdrawn","turnId":"turn-1"})).expect("withdrawn");
+        assert!(matches!(
+            offers.command(withdrawn),
+            Some(BoxCommand::Answer(Answer::Withdrawn(_)))
+        ));
+        assert_eq!(offers.held(Vec::new()), Vec::<EntityId>::new());
+        offers.0.push(turn.clone());
+        assert_eq!(offers.held(vec![turn.clone()]), vec![turn.clone()]);
+        assert_eq!(offers.held(Vec::new()), Vec::<EntityId>::new());
+        offers.0.push(turn);
+        let mut channel = opened_channel();
+        let claim: ChannelHostMessage =
+            serde_json::from_value(json!({"type":"TurnClaim","turnId":"turn-1","boxId":"box-1"})).expect("claim");
+        offers
+            .send(&mut channel, claim.into(), &mut Outbox::default())
+            .expect("send claim");
+        channel
+            .receive(&json!({"type":"Ack","seq":1}).to_string())
+            .expect("ack");
+        assert_eq!(channel.state().unacked, []);
+        assert_eq!(offers.held(Vec::new()), Vec::<EntityId>::new());
     }
 
     #[tokio::test(start_paused = true)]

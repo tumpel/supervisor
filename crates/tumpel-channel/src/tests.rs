@@ -835,35 +835,6 @@ fn unacked_seqs(disk: &Disk) -> Vec<i64> {
 }
 
 #[test]
-fn an_offer_is_held_from_its_receipt_until_the_box_or_a_frame_names_its_turn() {
-    let disk = Disk::default();
-    let mut channel = channel(&disk, &Recorder::default());
-    let mut wire = Wire::default();
-    open(&mut channel, &mut wire);
-    channel.receive(&offer(1, "grant-1")).expect("offer");
-    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
-    let beat = |channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire, turn_ids: Vec<EntityId>| {
-        let held = HeldIds {
-            turn_ids,
-            ..HeldIds::default()
-        };
-        channel
-            .heartbeat(sent_at, usage(), held, HostReportedHealth::Healthy, no_points, wire)
-            .expect("heartbeat");
-        let [heartbeat] = wire.sent().try_into().expect("one heartbeat");
-        heartbeat["heldTurnIds"].clone()
-    };
-    assert_eq!(beat(&mut channel, &mut wire, Vec::new()), json!(["turn-1"]));
-    let turn = EntityId::try_from("turn-1").expect("id");
-    assert_eq!(beat(&mut channel, &mut wire, vec![turn]), json!(["turn-1"]));
-    assert_eq!(
-        beat(&mut channel, &mut wire, Vec::new()),
-        json!([]),
-        "once the box held the turn and let it go, the offer no longer holds it"
-    );
-}
-
-#[test]
 fn a_socket_closed_mid_turn_keeps_the_turn_held_and_resends_its_unacked_output_after_the_reconnect() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
@@ -1014,10 +985,6 @@ fn a_host_rate_limited_for_five_windows_holds_its_output_until_each_retry_after_
     assert_eq!(unacked_seqs(&disk), (1..=20).collect::<Vec<_>>());
 }
 
-fn withdrawn(seq: i64) -> String {
-    json!({"type": "Frame", "seq": seq, "ack": 0, "message": {"type": "TurnWithdrawn", "turnId": "turn-1"}}).to_string()
-}
-
 fn held_in_heartbeat(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire) -> Value {
     let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00+01:00").expect("time");
     channel
@@ -1035,14 +1002,12 @@ fn held_in_heartbeat(channel: &mut HostChannel<Disk, Recorder>, wire: &mut Wire)
 }
 
 #[test]
-fn a_withdrawn_offer_leaves_the_held_turns() {
+fn receiving_an_offer_does_not_claim_the_turn_is_held() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
     open(&mut channel, &mut wire);
     channel.receive(&offer(1, "grant-1")).expect("offer");
-    assert_eq!(held_in_heartbeat(&mut channel, &mut wire), json!(["turn-1"]));
-    channel.receive(&withdrawn(2)).expect("withdrawn");
     assert_eq!(held_in_heartbeat(&mut channel, &mut wire), json!([]));
 }
 

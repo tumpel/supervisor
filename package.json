@@ -18,8 +18,7 @@
     "test": "node --test npm-scripts/release.test.mjs && cargo test --workspace",
     "guest:build": "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p tumpel-guest --target ${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}",
     "guest:drive": "node npm-scripts/guest-drive.mjs",
-    "supervisor:build": "npm run guest:build && npm run guest:drive && TUMPEL_GUEST_DRIVE=\"$PWD/.tmp/guest-drive/${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}.squashfs\" RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p tumpel-supervisor --target ${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}",
-    "test:touched": "node --test npm-scripts/release.test.mjs && cargo test -p tumpel-channel -p tumpel-supervisor"
+    "supervisor:build": "npm run guest:build && npm run guest:drive && TUMPEL_GUEST_DRIVE=\"$PWD/.tmp/guest-drive/${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}.squashfs\" RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p tumpel-supervisor --target ${TUMPEL_TARGET:-x86_64-unknown-linux-gnu}"
   },
   "dependencies": {
     "@tumpel/schemas": "https://github.com/tumpel/protocol/releases/download/v1.0.0-rc.59/tumpel-schemas-1.0.0-rc.59.tgz"
