@@ -127,6 +127,6 @@ pub async fn enrol(endpoint: &str, token_file: &Path, name: Option<String>) -> R
     ensure_unenrolled()?;
     let token = read_token(token_file)?;
     enrol_with_token(endpoint, token, name).await?;
-    eprintln!("start it with tumpel-supervisor run");
+    eprintln!("start it with systemctl --user start tumpel-supervisor");
     Ok(())
 }

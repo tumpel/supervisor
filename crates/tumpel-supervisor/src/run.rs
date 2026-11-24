@@ -1,7 +1,7 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use ring::signature::Ed25519KeyPair;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
@@ -119,13 +119,17 @@ impl Updates {
 
     async fn welcomed(&mut self) -> Result<(), Failure> {
         if let Some(trial) = self.trial.take() {
-            refresh_unit(&self.layout, ROLLED_BACK).await?;
+            let rewritten = update::refresh_unit(&self.layout)
+                .map_err(|detail| fail(SupervisorFailure::UpdateNotOnline, format!("{detail}; {ROLLED_BACK}")))?;
             update::confirm(&self.layout, &trial, &self.out).map_err(|error| {
                 fail(
                     SupervisorFailure::UpdateNotOnline,
                     format!("{error}; the next start puts the previous binary back"),
                 )
             })?;
+            if rewritten {
+                reload_unit(&self.layout, RESTARTED).await?;
+            }
             self.confirmed.send_replace(true);
         }
         self.announced();
@@ -135,9 +139,14 @@ impl Updates {
 
 pub(crate) async fn refresh_unit(layout: &Layout, fix: &str) -> Result<(), Failure> {
     let failed = |detail: String| fail(SupervisorFailure::UpdateNotOnline, format!("{detail}; {fix}"));
-    if !update::refresh_unit(layout).map_err(failed)? {
-        return Ok(());
+    if update::refresh_unit(layout).map_err(failed)? {
+        reload_unit(layout, fix).await?;
     }
+    Ok(())
+}
+
+async fn reload_unit(layout: &Layout, fix: &str) -> Result<(), Failure> {
+    let failed = |detail: String| fail(SupervisorFailure::UpdateNotOnline, format!("{detail}; {fix}"));
     eprintln!(
         "rewrote {} to the unit this binary installs; reloading systemd",
         layout.unit.display()
@@ -571,7 +580,7 @@ fn read_handover(layout: &Layout, out: &UnboundedSender<Outgoing>, handed: bool)
             return None;
         }
     };
-    match serde_json::from_str::<SupervisorHandover>(&text) {
+    match serde_json::from_str::<crate::inventory::Inventory>(&text).map(SupervisorHandover::from) {
         Ok(handover) if handed => Some(handover),
         Ok(handover) => {
             handover_lost(
@@ -606,10 +615,17 @@ pub(crate) fn channel_url(endpoint: &str, host_id: &str) -> Result<String, Failu
     } else {
         return Err(fail(
             SupervisorFailure::NotEnrolled,
-            format!("the endpoint {endpoint} is neither http nor https; enrol again with a valid --endpoint"),
+            "the endpoint is neither http nor https; enrol again with a valid --endpoint",
         ));
     };
-    Ok(format!("{base}/v1/hosts/{host_id}/channel"))
+    let url = format!("{base}/v1/hosts/{host_id}/channel");
+    reqwest::Url::parse(&url).map_err(|_| {
+        fail(
+            SupervisorFailure::NotEnrolled,
+            "supervisor.json contains an invalid endpoint; enrol again with a valid --endpoint",
+        )
+    })?;
+    Ok(url)
 }
 
 pub(crate) fn load_runtime(dir: &Path) -> Result<SupervisorRuntime, Failure> {
@@ -629,11 +645,9 @@ pub(crate) fn load_runtime(dir: &Path) -> Result<SupervisorRuntime, Failure> {
         .and_then(|current| dir::runtime_with_defaults(&path, &current).map_err(unreadable))
 }
 
-pub(crate) fn load() -> Result<(SupervisorConfig, Ed25519KeyPair, SupervisorChannelState), Failure> {
-    let dir = dir::supervisor_dir();
-    let unreadable = |error: anyhow::Error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}"));
-    let config: SupervisorConfig = dir::read_json(&dir.join(CONFIG_FILE), "SupervisorConfig")
-        .map_err(unreadable)?
+pub(crate) fn load_config(dir: &Path) -> Result<SupervisorConfig, Failure> {
+    dir::read_json(&dir.join(CONFIG_FILE), "SupervisorConfig")
+        .map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")))?
         .ok_or_else(|| {
             fail(
                 SupervisorFailure::NotEnrolled,
@@ -642,35 +656,25 @@ pub(crate) fn load() -> Result<(SupervisorConfig, Ed25519KeyPair, SupervisorChan
                     dir.display()
                 ),
             )
-        })?;
+        })
+}
+
+pub(crate) fn load_key(dir: &Path) -> Result<Ed25519KeyPair, Failure> {
     let key: SupervisorHostKey = dir::read_json(&dir.join(KEY_FILE), "SupervisorHostKey")
-        .map_err(unreadable)?
+        .map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")))?
         .ok_or_else(|| {
             fail(
                 SupervisorFailure::HostRevoked,
                 format!(
-                    "{} has no host key, so host {} was revoked or its key deleted; mint a token and enrol again",
-                    dir.join(KEY_FILE).display(),
-                    *config.host_id
+                    "{} has no host key; mint a token and enrol again",
+                    dir.join(KEY_FILE).display()
                 ),
             )
         })?;
-    let state: SupervisorChannelState = dir::read_json(&dir.join(CHANNEL_FILE), "SupervisorChannelState")
-        .map_err(unreadable)?
-        .ok_or_else(|| {
-            fail(
-                SupervisorFailure::ChannelStateLost,
-                format!(
-                    "{} is missing, so frames the control plane has not acked are lost; delete {} and enrol this host again",
-                    dir.join(CHANNEL_FILE).display(),
-                    dir.display()
-                ),
-            )
-        })?;
-    let pkcs8 = STANDARD.decode(key.private_key.as_bytes()).map_err(|error| {
+    let pkcs8 = STANDARD.decode(key.private_key.as_bytes()).map_err(|_| {
         fail(
             SupervisorFailure::NotEnrolled,
-            format!("{KEY_FILE} privateKey is not base64: {error}"),
+            format!("{KEY_FILE} privateKey is not base64; enrol again"),
         )
     })?;
     let pair = Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| {
@@ -679,34 +683,35 @@ pub(crate) fn load() -> Result<(SupervisorConfig, Ed25519KeyPair, SupervisorChan
             format!("{KEY_FILE} privateKey is not an Ed25519 PKCS#8 document; enrol again"),
         )
     })?;
-    Ok((config, pair, state))
+    if STANDARD.encode(pair.public_key().as_ref()) != *key.public_key {
+        return Err(fail(
+            SupervisorFailure::NotEnrolled,
+            format!("{KEY_FILE} publicKey does not match privateKey; enrol again"),
+        ));
+    }
+    Ok(pair)
 }
 
-pub(crate) struct Started {
-    pub(crate) config: SupervisorConfig,
-    pair: Ed25519KeyPair,
-    state: SupervisorChannelState,
-    runtime: SupervisorRuntime,
-    pub(crate) url: String,
-    layout: Layout,
-    pub(crate) running: Sha256Digest,
-    source: HttpSource,
-    box_size: Size,
-    store: HttpStore,
+pub(crate) fn load_channel_state(dir: &Path) -> Result<SupervisorChannelState, Failure> {
+    let state: SupervisorChannelState = dir::read_json(&dir.join(CHANNEL_FILE), "SupervisorChannelState")
+        .map_err(|error| fail(SupervisorFailure::ChannelStateLost, format!("{error:#}")))?
+        .ok_or_else(|| fail(
+            SupervisorFailure::ChannelStateLost,
+            format!("{} is missing, so frames the control plane has not acked are lost; delete {} and enrol this host again",
+                dir.join(CHANNEL_FILE).display(), dir.display())))?;
+    if state.sent.0 == i64::MAX {
+        return Err(fail(
+            SupervisorFailure::ChannelStateLost,
+            "channel.json has exhausted its send sequence",
+        ));
+    }
+    tumpel_channel::resend_from(&state).map_err(|error| store_lost(&error))?;
+    Ok(state)
 }
 
-pub(crate) fn start() -> Result<Started, Failure> {
+pub(crate) fn box_size(runtime: &SupervisorRuntime) -> Result<Size, Failure> {
     let unusable = |detail: String| fail(SupervisorFailure::NotEnrolled, detail);
-    let dir = dir::supervisor_dir();
-    let binary = std::env::current_exe()
-        .map_err(|error| unusable(format!("finding this supervisor's own binary failed: {error}")))?;
-    let running = update::binary_sha256(&binary).map_err(unusable)?;
-    let layout = Layout::new(binary, dir.clone(), dir::supervisor_unit_path());
-    let (config, pair, state) = load()?;
-    let runtime = load_runtime(&dir)?;
-    let url = channel_url(&config.endpoint, &config.host_id)?;
-    let source = HttpSource::new(&config.endpoint).map_err(unusable)?;
-    let box_size = Size {
+    Ok(Size {
         memory_mib: mib(runtime.memory_mib.into()).ok_or_else(|| {
             unusable(format!(
                 "memoryMib {} in runtime.json is not a positive number of MiB; set it to {}",
@@ -720,7 +725,36 @@ pub(crate) fn start() -> Result<Started, Failure> {
                 BoxDiskLimit::DEFAULT_MIB
             ))
         })?,
-    };
+    })
+}
+
+struct Started {
+    config: SupervisorConfig,
+    pair: Ed25519KeyPair,
+    state: SupervisorChannelState,
+    runtime: SupervisorRuntime,
+    url: String,
+    layout: Layout,
+    running: Sha256Digest,
+    source: HttpSource,
+    box_size: Size,
+    store: HttpStore,
+}
+
+fn start() -> Result<Started, Failure> {
+    let unusable = |detail: String| fail(SupervisorFailure::NotEnrolled, detail);
+    let dir = dir::supervisor_dir();
+    let binary = std::env::current_exe()
+        .map_err(|error| unusable(format!("finding this supervisor's own binary failed: {error}")))?;
+    let running = update::binary_sha256(Path::new("/proc/self/exe")).map_err(unusable)?;
+    let layout = Layout::new(binary, dir.clone(), dir::supervisor_unit_path());
+    let config = load_config(&dir)?;
+    let pair = load_key(&dir)?;
+    let state = load_channel_state(&dir)?;
+    let runtime = load_runtime(&dir)?;
+    let url = channel_url(&config.endpoint, &config.host_id)?;
+    let source = HttpSource::new(&config.endpoint).map_err(unusable)?;
+    let box_size = box_size(&runtime)?;
     let store = HttpStore::new().map_err(unusable)?;
     Ok(Started {
         config,
@@ -747,13 +781,16 @@ async fn online_deadline(deadline: Option<tokio::time::Instant>, mut confirmed: 
 }
 
 fn read_standing(layout: &Layout) -> Option<SupervisorHandover> {
-    dir::read_json(&layout.boxes(), "SupervisorHandover").unwrap_or_else(|error| {
-        eprintln!("tumpel-supervisor: {error:#}; the boxes it names are stopped");
-        Some(SupervisorHandover {
-            boxes: Vec::new(),
-            handed_at: chrono::Utc::now().fixed_offset(),
-        })
-    })
+    crate::inventory::load(&layout.boxes()).map_or_else(
+        |error| {
+            eprintln!("tumpel-supervisor: {error:#}; the boxes it names are stopped");
+            Some(SupervisorHandover {
+                boxes: Vec::new(),
+                handed_at: chrono::Utc::now().fixed_offset(),
+            })
+        },
+        |inventory| inventory.map(Into::into),
+    )
 }
 
 fn taken(
@@ -773,6 +810,29 @@ fn taken(
     Ok(taken)
 }
 
+async fn start_update(
+    layout: &Layout,
+    running: &Sha256Digest,
+    out: &UnboundedSender<Outgoing>,
+    handed: bool,
+) -> Result<Option<SupervisorUpdatePending>, Failure> {
+    let trial =
+        match update::startup(layout, running, out).map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))? {
+            Startup::Steady => None,
+            Startup::Trial(pending) => Some(pending),
+        };
+    let installed = layout.unit.try_exists().map_err(|error| {
+        fail(
+            SupervisorFailure::NotEnrolled,
+            format!("reading the installed supervisor unit failed: {error}"),
+        )
+    })?;
+    if (handed || installed) && trial.is_none() {
+        refresh_unit(layout, RESTARTED).await?;
+    }
+    Ok(trial)
+}
+
 pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, OwnedFd>) -> Result<Stopped, Failure> {
     let mut terminated = signal(SignalKind::terminate()).map_err(|error| {
         fail(
@@ -782,16 +842,8 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     })?;
     let (out, mut from_box) = unbounded_channel();
     let started = start()?;
-    let trial = match update::startup(&started.layout, &started.running, &out)
-        .map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?
-    {
-        Startup::Steady => None,
-        Startup::Trial(pending) => Some(pending),
-    };
+    let trial = start_update(&started.layout, &started.running, &out, handed).await?;
     let on_trial = trial.is_some();
-    if handed {
-        refresh_unit(&started.layout, RESTARTED).await?;
-    }
     let taken = taken(&started.layout, &out, handed, received)?;
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
@@ -808,6 +860,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         taken,
         started.layout.boxes(),
     )?;
+    fd_store::ready().map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?;
     let url = started.url;
     let config = started.config;
     let heartbeat = Duration::from_secs(u64::from(started.runtime.heartbeat_interval_seconds.get()));

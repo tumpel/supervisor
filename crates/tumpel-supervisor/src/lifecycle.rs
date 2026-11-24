@@ -1,3 +1,5 @@
+use crate::firecracker::Observation;
+use crate::inventory::{Inventory, RecordedBox};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::io::BufWriter;
@@ -140,6 +142,9 @@ pub trait Machine: Send + 'static {
     fn clear_console(&mut self);
     fn hand_over(self, guest: Self::Guest) -> Result<SupervisorHandoverMachine, String>;
     fn record(&self) -> Result<SupervisorHandoverMachine, String>;
+    fn observation(&self, _guest: &Self::Guest) -> Result<Option<Observation>, String> {
+        Ok(None)
+    }
     fn reconnect(&mut self, guest: &mut Self::Guest) -> impl Future<Output = Result<(), String>> + Send;
 }
 
@@ -417,15 +422,30 @@ fn standing_record(handed: &SupervisorHandoverBox) -> Result<SupervisorHandoverB
     })
 }
 
+pub(crate) fn decode_box(
+    handed: &SupervisorHandoverBox,
+) -> Result<(SupervisorHandoverBox, Boot, VecDeque<Command>), String> {
+    crate::dir::validate_session_id(&handed.session_id)?;
+    let record = standing_record(handed)?;
+    let image = Boot::from_record(handed.image.clone())?;
+    let queue = handed
+        .queued
+        .iter()
+        .cloned()
+        .filter_map(|record| Command::from_record(record, &handed.session_id, &handed.box_id))
+        .collect();
+    Ok((record, image, queue))
+}
+
 #[derive(Clone)]
 struct Standing {
     path: PathBuf,
-    boxes: Arc<std::sync::Mutex<BTreeMap<i32, SupervisorHandoverBox>>>,
+    boxes: Arc<std::sync::Mutex<BTreeMap<i32, RecordedBox>>>,
     idle_ends: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
 }
 
 impl Standing {
-    fn write(&self, change: impl FnOnce(&mut BTreeMap<i32, SupervisorHandoverBox>)) -> Result<(), String> {
+    fn write(&self, change: impl FnOnce(&mut BTreeMap<i32, RecordedBox>)) -> Result<(), String> {
         let mut boxes = self
             .boxes
             .lock()
@@ -433,7 +453,7 @@ impl Standing {
         change(&mut boxes);
         let idle_ends = self.idle_ends.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let written = Instant::now();
-        for record in boxes.values_mut() {
+        for RecordedBox { record, .. } in boxes.values_mut() {
             if let (SupervisorHandoverBoxState::Warm(_), Some(end)) =
                 (&record.state, idle_ends.get(record.session_id.as_str()))
             {
@@ -441,7 +461,7 @@ impl Standing {
             }
         }
         drop(idle_ends);
-        let record = SupervisorHandover {
+        let record = Inventory {
             boxes: boxes.values().cloned().collect(),
             handed_at: now(),
         };
@@ -462,14 +482,16 @@ impl Standing {
 
     fn put<M: Machine>(&self, live: &LiveBox<M>, turn_id: Option<&EntityId>) -> Result<(), String> {
         let mut record = live.record(turn_id)?;
+        let observation = live.machine.observation(&live.guest)?;
         self.write(|boxes| {
             if let Some(kept) = boxes
                 .remove(&record.tap_index)
+                .map(|kept| kept.record)
                 .filter(|kept| kept.session_id == record.session_id)
             {
                 record.queued = kept.queued;
             }
-            boxes.insert(record.tap_index, record);
+            boxes.insert(record.tap_index, RecordedBox { record, observation });
         })
     }
 
@@ -479,6 +501,7 @@ impl Standing {
             .lock()
             .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?
             .values()
+            .map(|box_| &box_.record)
             .filter(|record| record.session_id.as_str() == session)
             .all(|record| record.queued == queued);
         if unchanged {
@@ -487,6 +510,7 @@ impl Standing {
         self.write(|boxes| {
             for record in boxes
                 .values_mut()
+                .map(|box_| &mut box_.record)
                 .filter(|record| record.session_id.as_str() == session)
             {
                 record.queued = queued.to_vec();
@@ -2767,12 +2791,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     handed.idle_milliseconds = handed.idle_milliseconds.saturating_sub(age).max(0);
                 }
                 if let Some(record) = self.adopt(handed, taken) {
-                    standing.insert(record.tap_index, record);
+                    standing.insert(record.record.tap_index, record);
                 }
             }
         }
         let claimed: Vec<u8> = standing.keys().filter_map(|index| u8::try_from(*index).ok()).collect();
-        let sessions: Vec<EntityId> = standing.values().map(|record| record.session_id.clone()).collect();
+        let sessions: Vec<EntityId> = standing.values().map(|box_| box_.record.session_id.clone()).collect();
         self.runner.standing.write(|boxes| *boxes = standing)?;
         self.publish();
         if !recorded {
@@ -2803,20 +2827,20 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    fn adopt(&mut self, handed: SupervisorHandoverBox, taken: Taken) -> Option<SupervisorHandoverBox> {
+    fn adopt(&mut self, handed: SupervisorHandoverBox, taken: Taken) -> Option<RecordedBox> {
         let session = handed.session_id.to_string();
-        let read = standing_record(&handed).and_then(|record| {
-            let image = Boot::from_record(handed.image.clone())?;
-            let queue = handed
-                .queued
-                .iter()
-                .cloned()
-                .filter_map(|record| Command::from_record(record, &handed.session_id, &handed.box_id))
-                .collect();
-            Ok((record, image, queue))
+        let attached = decode_box(&handed).and_then(|read| {
+            let (machine, guest, tap) = self.attach(&handed)?;
+            let observation = match machine.observation(&guest) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    self.pool.release(tap);
+                    return Err(error);
+                }
+            };
+            Ok(((machine, guest, tap), (read, observation)))
         });
-        let attached = read.and_then(|read| self.attach(&handed).map(|attached| (attached, read)));
-        let ((machine, guest, tap), (record, image, queue)) = match attached {
+        let ((machine, guest, tap), ((record, image, queue), observation)) = match attached {
             Ok(attached) => attached,
             Err(error) => {
                 let detail = format!(
@@ -2896,7 +2920,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 self.resume(session);
             }
         }
-        Some(record)
+        Some(RecordedBox { record, observation })
     }
 
     async fn command(&mut self, command: Command) -> Result<(), String> {

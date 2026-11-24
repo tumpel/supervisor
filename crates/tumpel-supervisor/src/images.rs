@@ -124,7 +124,7 @@ pub fn stage(cache: &Path, order: &ImageOrder) -> Result<Staged, Refusal> {
     stage_parts(cache, order.digest(), &order.download.kernel_digest).map_err(|detail| order.failed(detail))
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = std::fs::File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
     let mut context = Context::new(&SHA256);
     let mut buffer = vec![0_u8; 1 << 20];
@@ -216,10 +216,15 @@ fn read_manifest(order: &ImageOrder, staged: &Staged) -> Result<GuestImageManife
 struct Manifests {
     images: Vec<GuestImageManifest>,
     bases: Vec<BaseImageManifest>,
+    invalid: Vec<PathBuf>,
 }
 
 fn manifests(cache: &Path) -> Result<Manifests, String> {
-    let entries = std::fs::read_dir(cache).map_err(|error| format!("reading {}: {error}", cache.display()))?;
+    let entries = match std::fs::read_dir(cache) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Manifests::default()),
+        Err(error) => return Err(format!("reading {}: {error}", cache.display())),
+    };
     let mut manifests = Manifests::default();
     for entry in entries {
         let path = entry
@@ -234,9 +239,28 @@ fn manifests(cache: &Path) -> Result<Manifests, String> {
         } else if let Ok(manifest) = serde_json::from_str::<BaseImageManifest>(&text) {
             manifests.bases.push(manifest);
         } else {
-            remove(&path.with_extension("ext4"))?;
-            remove(&path)?;
+            manifests.invalid.push(path);
         }
+    }
+    Ok(manifests)
+}
+
+pub(crate) fn check_cache(cache: &Path) -> Result<(), String> {
+    let manifests = manifests(cache).map_err(|_| "cannot read image manifests; check imageCacheDir in runtime.json")?;
+    if !manifests.invalid.is_empty() {
+        return Err(format!(
+            "{} cached image manifests have invalid content; replace those manifests",
+            manifests.invalid.len()
+        ));
+    }
+    Ok(())
+}
+
+fn prune_invalid(cache: &Path) -> Result<Manifests, String> {
+    let manifests = manifests(cache)?;
+    for path in &manifests.invalid {
+        remove(&path.with_extension("ext4"))?;
+        remove(path)?;
     }
     Ok(manifests)
 }
@@ -275,7 +299,7 @@ fn drop_image(cache: &Path, image_digest: &str) -> Result<(), String> {
 }
 
 pub(crate) fn supersede(cache: &Path, harness: &str, held: &BTreeSet<String>) -> Result<(), String> {
-    let others = manifests(cache)?;
+    let others = prune_invalid(cache)?;
     let (replaced, kept): (Vec<_>, Vec<_>) = others
         .images
         .into_iter()
@@ -520,7 +544,7 @@ fn place_base(cache: &Path, order: &BaseOrder, staged: &Staged, holds: &Holds) -
     }
     verify(&staged.manifest, "base manifest", &download.manifest_digest)?;
     let manifest = read_base_manifest(order, staged)?;
-    let others = manifests(cache)?;
+    let others = prune_invalid(cache)?;
     let digest = order.digest();
     rename(&staged.image, &cache.join(format!("{digest}.ext4")))?;
     if let Some(kernel) = &staged.kernel {

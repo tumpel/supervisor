@@ -95,6 +95,16 @@ pub fn supervisor_unit_path() -> PathBuf {
         .join(SUPERVISOR_UNIT)
 }
 
+pub(crate) fn validate_session_id(session_id: &tumpel_api::types::EntityId) -> Result<(), String> {
+    if session_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+    {
+        return Ok(());
+    }
+    Err("the session ID is not a safe directory name".to_string())
+}
+
 pub fn ensure_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))

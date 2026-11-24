@@ -219,7 +219,7 @@ struct AnnouncedSupervisor {
     supervisor_version: ReleaseSupervisorSupervisorVersion,
 }
 
-fn announced_release(body: &[u8], url: &str, architecture: &HostArchitecture) -> Result<Release, String> {
+pub(crate) fn announced_release(body: &[u8], url: &str, architecture: &HostArchitecture) -> Result<Release, String> {
     let manifest: AnnouncedRelease = serde_json::from_slice(body).map_err(|error| {
         format!("{url} is no ReleaseManifest: {error}; check that the stage has published a release")
     })?;
@@ -252,12 +252,45 @@ fn announced_release(body: &[u8], url: &str, architecture: &HostArchitecture) ->
     })
 }
 
+pub(crate) fn parse_version(version: &str) -> Result<semver::Version, semver::Error> {
+    semver::Version::parse(version.trim_start_matches('v'))
+}
+
+pub(crate) fn verify_checksum(actual: &str, expected: &Sha256Digest) -> Result<(), String> {
+    if actual == expected.as_str() {
+        return Ok(());
+    }
+    Err(format!("the binary hashes to {actual}, and the release names {expected}; download the binary and manifest for the same release"))
+}
+
+pub(crate) fn verify_version(actual: &str, release: &Release, protocol: u32) -> Result<(), String> {
+    let actual = parse_version(actual).map_err(|_| "the binary has an invalid supervisor version")?;
+    let expected =
+        parse_version(&release.supervisor_version).map_err(|_| "the manifest has an invalid supervisor version")?;
+    if actual != expected {
+        return Err(
+            "the supervisor version differs from the release; use the binary and manifest for the same release"
+                .to_string(),
+        );
+    }
+    verify_protocol(protocol, release)
+}
+
+fn verify_protocol(protocol: u32, release: &Release) -> Result<(), String> {
+    if protocol != release.channel_protocol_version {
+        return Err(format!(
+            "the binary speaks channel protocol {protocol}, and the release speaks {}",
+            release.channel_protocol_version
+        ));
+    }
+    Ok(())
+}
+
 fn version_refusal(running: &str, announced: &str, rollback: bool) -> Option<String> {
-    let parse = |version: &str| semver::Version::parse(version.trim_start_matches('v'));
-    let Ok(running_version) = parse(running) else {
+    let Ok(running_version) = parse_version(running) else {
         return None;
     };
-    let announced_version = match parse(announced) {
+    let announced_version = match parse_version(announced) {
         Ok(version) => version,
         Err(error) => {
             return Some(format!(
@@ -283,13 +316,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 pub fn binary_sha256(path: &Path) -> Result<Sha256Digest, String> {
-    let bytes = std::fs::read(path).map_err(|error| {
-        format!(
-            "reading {} to learn its sha256 failed: {error}; run the supervisor from its installed binary",
-            path.display()
-        )
-    })?;
-    digest_of(&sha256_hex(&bytes))
+    digest_of(&crate::images::sha256_file(path)?)
 }
 
 fn digest_of(hex: &str) -> Result<Sha256Digest, String> {
@@ -368,12 +395,14 @@ fn tail_of(stderr: &[u8], stdout: &[u8]) -> Vec<String> {
         .collect()
 }
 
-async fn drain(stream: Option<impl AsyncRead + Unpin>) -> Vec<u8> {
+async fn drain(stream: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+    const LIMIT: u64 = 64 * 1024;
     let mut bytes = Vec::new();
-    if let Some(mut stream) = stream {
-        let _ = stream.read_to_end(&mut bytes).await;
+    stream.take(LIMIT + 1).read_to_end(&mut bytes).await?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(std::io::Error::other("the report exceeded the output limit"));
     }
-    bytes
+    Ok(bytes)
 }
 
 pub struct Updater<S: Source, I: Idle> {
@@ -469,7 +498,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         if release.sha256 == self.running {
             return Err(Outcome::Current);
         }
-        match read::<SupervisorUpdateRefusal>(&self.layout.refusal(), "SupervisorUpdateRefusal") {
+        match read_refusal(&self.layout) {
             Ok(Some(refusal)) if refusal.to_sha256 == release.sha256 => Err(Outcome::Refused),
             Ok(_) => Ok(release),
             Err(error) => {
@@ -587,15 +616,8 @@ impl<S: Source, I: Idle> Updater<S, I> {
                 ),
             ));
         };
-        if actual != *release.sha256 {
-            return Err(stop(
-                Reason::SupervisorUpdateChecksumMismatch,
-                format!(
-                    "the downloaded supervisor hashes to {actual}, and the release names {}; the release changed during the download or the download broke, so the next trigger downloads it again",
-                    *release.sha256
-                ),
-            ));
-        }
+        verify_checksum(&actual, &release.sha256)
+            .map_err(|error| stop(Reason::SupervisorUpdateChecksumMismatch, error))?;
         self.place_candidate(&bytes).await?;
         self.step(release, SupervisorUpdatePhase::DryRunning, self.idle.boxes());
         if let Err(stopped) = self.dry_run(release).await {
@@ -677,28 +699,50 @@ impl<S: Source, I: Idle> Updater<S, I> {
                     format!("starting {} check failed: {error}", candidate.display()),
                 )
             })?;
-        let stdout = tokio::spawn(drain(child.stdout.take()));
-        let stderr = tokio::spawn(drain(child.stderr.take()));
+        let name = format!("the check of supervisor {}", named(release));
+        let failed = |detail| stop(DryRunFailed, detail);
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| failed(format!("{name} has no stdout pipe")))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| failed(format!("{name} has no stderr pipe")))?;
+        let mut stdout = tokio::spawn(drain(stdout));
+        let mut stderr = tokio::spawn(drain(stderr));
         let waited = timeout(self.limits.dry_run, child.wait()).await;
-        if waited.is_err() {
-            let _ = child.start_kill();
-        }
-        let stdout = timeout(DRAIN, stdout)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
-        let stderr = timeout(DRAIN, stderr)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
+        let cleanup = timeout(DRAIN, async {
+            tokio::join!(&mut stdout, &mut stderr, async {
+                if waited.is_err() {
+                    child.kill().await
+                } else {
+                    Ok(())
+                }
+            })
+        })
+        .await;
+        let Ok((out, err, reaped)) = cleanup else {
+            stdout.abort();
+            stderr.abort();
+            return Err(failed(format!(
+                "{name} did not finish cleanup within {} s",
+                DRAIN.as_secs()
+            )));
+        };
+        reaped.map_err(|error| failed(format!("stopping {name} failed: {error}")))?;
+        let captured = |result: Result<std::io::Result<Vec<u8>>, tokio::task::JoinError>| {
+            result
+                .map_err(|error| failed(format!("reading output from {name} failed: {error}")))?
+                .map_err(|error| failed(format!("reading output from {name} failed: {error}")))
+        };
+        let stdout = captured(out)?;
+        let stderr = captured(err)?;
         let failed = |detail: String| Stop {
             reason: DryRunFailed,
             detail,
             tail: tail_of(&stderr, &stdout),
         };
-        let name = format!("the check of supervisor {}", named(release));
         let status = match waited {
             Err(_) => return Err(failed(format!("{name} ran past {} s", self.limits.dry_run.as_secs()))),
             Ok(Err(error)) => return Err(failed(format!("waiting for {name} failed: {error}"))),
@@ -715,13 +759,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
             .unwrap_or_default();
         let report: SupervisorCheckReport = serde_json::from_str(line)
             .map_err(|error| failed(format!("{name} printed no SupervisorCheckReport: {error}")))?;
-        if report.channel_protocol_version.get() != release.channel_protocol_version {
-            return Err(failed(format!(
-                "{name} speaks channel protocol {}, and the release speaks {}",
-                report.channel_protocol_version, release.channel_protocol_version
-            )));
-        }
-        Ok(())
+        verify_protocol(report.channel_protocol_version.get(), release).map_err(failed)
     }
 
     async fn swap(&self, to: &Sha256Digest) -> Result<(), Stop> {
@@ -787,9 +825,25 @@ fn steady(layout: &Layout) -> Result<Startup, String> {
     Ok(Startup::Steady)
 }
 
+fn read_update_record(path: &Path) -> Result<Option<SupervisorUpdatePending>, String> {
+    read(path, "SupervisorUpdatePending")
+}
+
+fn read_refusal(layout: &Layout) -> Result<Option<SupervisorUpdateRefusal>, String> {
+    read(&layout.refusal(), "SupervisorUpdateRefusal")
+}
+
+pub(crate) fn validate_state(layout: &Layout) -> Result<(), String> {
+    for path in [layout.pending(), layout.trial(), layout.rolled_back()] {
+        read_update_record(&path)?;
+    }
+    read_refusal(layout)?;
+    Ok(())
+}
+
 pub fn startup(layout: &Layout, running: &Sha256Digest, out: &UnboundedSender<Outgoing>) -> Result<Startup, String> {
     let now = Utc::now().fixed_offset();
-    if let Some(record) = read::<SupervisorUpdatePending>(&layout.rolled_back(), "SupervisorUpdatePending")? {
+    if let Some(record) = read_update_record(&layout.rolled_back())? {
         let detail = format!(
             "supervisor {} failed to start or did not reach Welcome within {} s after the swap, so systemd put {} back; this host skips {} until the release names another binary, and journalctl --user -u tumpel-supervisor shows why it stayed offline",
             short(&record.to_sha256),
@@ -817,8 +871,8 @@ pub fn startup(layout: &Layout, running: &Sha256Digest, out: &UnboundedSender<Ou
         );
         remove(&layout.rolled_back())?;
     }
-    let Some(trial) = read::<SupervisorUpdatePending>(&layout.trial(), "SupervisorUpdatePending")? else {
-        return match read::<SupervisorUpdatePending>(&layout.pending(), "SupervisorUpdatePending")? {
+    let Some(trial) = read_update_record(&layout.trial())? else {
+        return match read_update_record(&layout.pending())? {
             Some(pending) if pending.to_sha256 == *running => Ok(Startup::Trial(pending)),
             _ => steady(layout),
         };

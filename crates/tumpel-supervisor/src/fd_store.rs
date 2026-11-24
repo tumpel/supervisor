@@ -52,6 +52,13 @@ fn notify(action: &str, message: &str, fds: &[RawFd]) -> Result<(), String> {
         .map_err(|error| format!("{action} at {} failed: {error}", socket.display()))
 }
 
+pub(crate) fn ready() -> Result<(), String> {
+    if notify_socket().is_none() {
+        return Ok(());
+    }
+    notify("telling systemd the supervisor started", "READY=1", &[])
+}
+
 fn remove(name: &str) -> Result<(), String> {
     notify(
         &format!("asking systemd to drop {name}"),

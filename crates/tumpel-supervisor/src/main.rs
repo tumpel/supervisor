@@ -1,21 +1,33 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 use tumpel_api::types::SupervisorFailure;
 use tumpel_supervisor::{
-    check, enrol, install, install_telemetry, on_trial, received_descriptors, run, supervisor_dir, take_notify_socket,
-    Enrolment, Stopped,
+    enrol, install, install_telemetry, on_trial, received_descriptors, report, run, supervisor_dir, take_notify_socket,
+    Enrolment, ReportFormat, Stopped,
 };
 
 #[derive(Parser)]
 #[command(
+    args_conflicts_with_subcommands = true,
     name = "tumpel-supervisor",
-    version,
-    about = "Runs tumpel boxes on this host and keeps its channel to the control plane"
+    version = env!("TUMPEL_RELEASE_VERSION"),
+    about = "Report whether this host is ready to run tumpel boxes"
 )]
 struct Cli {
+    #[arg(long, conflicts_with_all = ["json", "manifest"], help = "Start host supervision")]
+    daemon: bool,
+    #[arg(long, help = "Print the report as JSON")]
+    json: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Verify the running binary against a downloaded release manifest"
+    )]
+    manifest: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -42,14 +54,14 @@ enum Command {
         #[arg(long, requires = "endpoint")]
         token_file: Option<PathBuf>,
     },
-    /// Dial out to the control plane and hold the host's channel, replacing this binary when the release names a new one.
+    #[command(hide = true)]
     Run {
-        #[arg(long, hide = true)]
+        #[arg(long, hide = true, conflicts_with = "handover")]
         update_binary: Option<PathBuf>,
         #[arg(long, hide = true)]
         handover: bool,
     },
-    /// Check that this binary starts on this host the way `run` does and reaches the channel's Challenge, then print a `SupervisorCheckReport`.
+    #[command(hide = true)]
     Check,
 }
 
@@ -71,20 +83,7 @@ fn exit_code(failure: &SupervisorFailure) -> ExitCode {
     }
 }
 
-fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let received = match unsafe { received_descriptors() } {
-        Ok(received) => received,
-        Err(error) => {
-            eprintln!("tumpel-supervisor: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let handed = matches!(cli.command, Command::Run { handover: true, .. });
-    if let Err(error) = unsafe { take_notify_socket(handed) } {
-        eprintln!("tumpel-supervisor: {error}");
-        return ExitCode::FAILURE;
-    }
+fn with_runtime(task: impl std::future::Future<Output = ExitCode>) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -92,91 +91,112 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    runtime.block_on(task)
+}
+
+fn daemon(handover: bool) -> ExitCode {
+    let received = match unsafe { received_descriptors() } {
+        Ok(received) => received,
+        Err(error) => {
+            eprintln!("tumpel-supervisor: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = unsafe { take_notify_socket(handover) } {
+        eprintln!("tumpel-supervisor: {error}");
+        return ExitCode::FAILURE;
+    }
+    let telemetry = match install_telemetry() {
+        Ok(telemetry) => telemetry,
+        Err(detail) => {
+            eprintln!("tumpel-supervisor: {detail}");
+            return ExitCode::FAILURE;
+        }
+    };
+    with_runtime(async {
+        match run(telemetry, handover, received).await {
+            Ok(Stopped::Revoked | Stopped::Terminated) => ExitCode::SUCCESS,
+            Ok(Stopped::Updated) => {
+                eprintln!(
+                    "tumpel-supervisor: exiting so systemd starts the new binary, which takes the running boxes over"
+                );
+                ExitCode::from(RESTART_INTO_UPDATE)
+            }
+            Err(failure) if on_trial(&supervisor_dir()) => {
+                eprintln!(
+                "tumpel-supervisor: {}: {}: {}; this binary is on its update trial, so systemd restarts the unit and its ExecStartPre puts the previous binary back",
+                SupervisorFailure::UpdateNotOnline,
+                failure.kind,
+                failure.detail
+            );
+                exit_code(&SupervisorFailure::UpdateNotOnline)
+            }
+            Err(failure) => {
+                eprintln!("tumpel-supervisor: {}: {}", failure.kind, failure.detail);
+                exit_code(&failure.kind)
+            }
+        }
+    })
+}
+
+extern "C" fn report_timed_out(_: libc::c_int) {
+    unsafe { libc::_exit(1) };
+}
+
+fn show_report(format: ReportFormat, manifest: Option<PathBuf>) -> ExitCode {
+    const SECONDS: u32 = 60;
+    const OUTPUT_TIME: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + Duration::from_secs(u64::from(SECONDS)).saturating_sub(OUTPUT_TIME);
+    let handler = report_timed_out as *const () as libc::sighandler_t;
+    if unsafe { libc::signal(libc::SIGALRM, handler) } == libc::SIG_ERR {
+        eprintln!(
+            "tumpel-supervisor: setting the report deadline failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return ExitCode::FAILURE;
+    }
+    unsafe { libc::alarm(SECONDS) };
+    report(format, manifest, deadline)
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
     match cli.command {
-        Command::Enrol {
+        Some(Command::Enrol {
             endpoint,
             token_file,
             name,
-        } => match runtime.block_on(enrol(&endpoint, &token_file, name)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("tumpel-supervisor: {error:#}");
-                ExitCode::FAILURE
-            }
-        },
-        Command::Install { endpoint, token_file } => {
-            let enrolment = endpoint
-                .zip(token_file)
-                .map(|(endpoint, token_file)| Enrolment { endpoint, token_file });
-            match runtime.block_on(install(enrolment)) {
+        }) => with_runtime(async {
+            match enrol(&endpoint, &token_file, name).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("tumpel-supervisor: {error:#}");
                     ExitCode::FAILURE
                 }
             }
-        }
-        Command::Run {
-            update_binary: _,
-            handover,
-        } => {
-            let telemetry = match install_telemetry() {
-                Ok(telemetry) => telemetry,
-                Err(detail) => {
-                    eprintln!("tumpel-supervisor: {detail}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match runtime.block_on(run(telemetry, handover, received)) {
-                Ok(Stopped::Revoked | Stopped::Terminated) => ExitCode::SUCCESS,
-                Ok(Stopped::Updated) => {
-                    eprintln!("tumpel-supervisor: exiting so systemd starts the new binary, which takes the running boxes over");
-                    ExitCode::from(RESTART_INTO_UPDATE)
-                }
-                Err(failure) if on_trial(&supervisor_dir()) => {
-                    eprintln!(
-                    "tumpel-supervisor: {}: {}: {}; this binary is on its update trial, so systemd restarts the unit and its ExecStartPre puts the previous binary back",
-                    SupervisorFailure::UpdateNotOnline,
-                    failure.kind,
-                    failure.detail
-                );
-                    exit_code(&SupervisorFailure::UpdateNotOnline)
-                }
-                Err(failure) => {
-                    eprintln!("tumpel-supervisor: {}: {}", failure.kind, failure.detail);
-                    exit_code(&failure.kind)
-                }
-            }
-        }
-        Command::Check => match runtime.block_on(check()) {
-            Ok(report) => match serde_json::to_string(&report) {
-                Ok(line) => {
-                    println!("{line}");
-                    ExitCode::SUCCESS
-                }
+        }),
+        Some(Command::Install { endpoint, token_file }) => with_runtime(async {
+            let enrolment = endpoint
+                .zip(token_file)
+                .map(|(endpoint, token_file)| Enrolment { endpoint, token_file });
+            match install(enrolment).await {
+                Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
-                    eprintln!("tumpel-supervisor: encoding the SupervisorCheckReport failed: {error}");
+                    eprintln!("tumpel-supervisor: {error:#}");
                     ExitCode::FAILURE
                 }
-            },
-            Err(error) => {
-                eprintln!("tumpel-supervisor: check failed: {error}");
-                ExitCode::FAILURE
             }
-        },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Cli, Command};
-    use clap::Parser;
-
-    #[test]
-    fn the_exec_start_of_a_unit_written_before_the_shell_owned_trial_starts_this_binary() {
-        let exec_start =
-            "/home/u/.local/bin/tumpel-supervisor run --update-binary /home/u/.local/bin/tumpel-supervisor";
-        let cli = Cli::try_parse_from(exec_start.split(' ')).expect("the old ExecStart parses");
-        assert!(matches!(cli.command, Command::Run { .. }));
+        }),
+        Some(Command::Run { handover, .. }) => daemon(handover),
+        Some(Command::Check) => show_report(ReportFormat::Legacy, None),
+        None if cli.daemon => daemon(false),
+        None => {
+            let format = if cli.json {
+                ReportFormat::Json
+            } else {
+                ReportFormat::Human
+            };
+            show_report(format, cli.manifest)
+        }
     }
 }

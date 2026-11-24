@@ -10,6 +10,7 @@ mod guest_drive;
 mod harness_result;
 mod images;
 mod install;
+mod inventory;
 pub mod layers;
 mod lifecycle;
 mod persona_files;
@@ -22,14 +23,14 @@ mod update;
 mod usage;
 
 pub use boot::BootOrder;
-pub use check::check;
+pub use check::{report, ReportFormat};
 pub use dir::supervisor_dir;
 pub use enrol::enrol;
 pub use exchange::{Answer, Answers};
 pub use fd_store::{
     keep as keep_descriptor, received as received_descriptors, restored as restored_descriptors, take_notify_socket,
 };
-pub use firecracker::{Firecracker, FirecrackerBox, VsockGuest};
+pub use firecracker::{Firecracker, FirecrackerBox, Observation, VsockGuest};
 pub use images::{ImageOrder, Refusal};
 pub use install::{install, Enrolment};
 pub use lifecycle::{

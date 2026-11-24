@@ -261,11 +261,101 @@ fn booted_memory_reads_mem_size_mib_from_the_firecracker_api_of_a_running_box() 
             .expect("the answer");
         String::from_utf8_lossy(&request[..read]).into_owned()
     });
-    assert_eq!(booted_memory(&socket), Ok(NonZeroU32::new(8192).expect("8192")));
+    assert_eq!(
+        booted_memory(&socket, i32::try_from(std::process::id()).expect("self pid")),
+        Ok(NonZeroU32::new(8192).expect("8192"))
+    );
     assert!(server
         .join()
         .expect("the server")
         .starts_with("GET /machine-config HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn observation_checks_live_descriptors_and_uses_only_a_separate_api_connection() {
+    use std::os::fd::FromRawFd;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let vmm = firecracker("observe-live");
+    let box_dir = vmm.data.join("box0");
+    std::fs::create_dir_all(&box_dir).expect("the box directory");
+    let listener = tokio::net::UnixListener::bind(box_dir.join("api.sock")).expect("the fixture Firecracker API");
+    let pid = i32::try_from(std::process::id()).expect("this process owns the fixture descriptors and API");
+    let mut handed = handed(&vmm, pid, true);
+    let machine = &handed.machine;
+    let guest = UnixStream::from(unsafe { OwnedFd::from_raw_fd(machine.guest_fd) });
+    let mut stdout = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(machine.stdout_fd) });
+    let mut stderr = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(machine.stderr_fd) });
+    let flags = |fd| unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    let guest_flags = flags(guest.as_raw_fd());
+    let stdout_flags = flags(stdout.as_raw_fd());
+    handed.peer.write_all(&handed.rest).expect("guest bytes waiting");
+    handed.stdout.write_all(b"stdout").expect("stdout waiting");
+    handed.stderr.write_all(b"stderr").expect("stderr waiting");
+    let start = super::process_start(pid).expect("process start");
+    let observed = super::Observation {
+        supervisor_pid: pid,
+        supervisor_start: start,
+        machine_start: start,
+        guest: super::Descriptor::read(pid, machine.guest_fd, "guest", true).expect("guest descriptor"),
+        stdout: super::Descriptor::read(pid, machine.stdout_fd, "stdout", false).expect("stdout descriptor"),
+        stderr: super::Descriptor::read(pid, machine.stderr_fd, "stderr", false).expect("stderr descriptor"),
+    };
+    let scope = own_cgroup();
+    let mut stale = observed.clone();
+    stale.machine_start += 1;
+    assert!(vmm
+        .inspect_attachment(0, machine, Some(&stale), &scope)
+        .expect_err("stale PID identity")
+        .contains("different Firecracker or supervisor process"));
+    stale = observed.clone();
+    stale.guest.fd = machine.stdout_fd;
+    assert!(vmm
+        .inspect_attachment(0, machine, Some(&stale), &scope)
+        .expect_err("wrong descriptor")
+        .contains("is no socket"));
+    let machine = machine.clone();
+    let observation = tokio::task::spawn_blocking(move || vmm.inspect_attachment(0, &machine, Some(&observed), &scope));
+    let serve = async {
+        let (mut connection, _) = listener.accept().await.expect("separate API connection");
+        let mut request = vec![0; b"GET /machine-config HTTP/1.1\r\n".len()];
+        connection.read_exact(&mut request).await.expect("request");
+        assert_eq!(request, b"GET /machine-config HTTP/1.1\r\n");
+        let body = r#"{"mem_size_mib":8192}"#;
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        connection.write_all(response.as_bytes()).await.expect("response");
+    };
+    let (observed, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(observation, serve)
+    })
+    .await
+    .expect("inspection completes");
+    observed.expect("observation worker").expect("valid observation");
+
+    assert_eq!(flags(guest.as_raw_fd()), guest_flags);
+    assert_eq!(flags(stdout.as_raw_fd()), stdout_flags);
+    drop((handed.stdout, handed.stderr));
+    let mut output = String::new();
+    stdout.read_to_string(&mut output).expect("stdout read");
+    assert_eq!(output, "stdout");
+    output.clear();
+    stderr.read_to_string(&mut output).expect("stderr read");
+    assert_eq!(output, "stderr");
+    guest
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .expect("bound the read");
+    let mut remaining = vec![0; handed.rest.len()];
+    (&guest).read_exact(&mut remaining).expect("guest bytes read");
+    assert_eq!(remaining, handed.rest);
+    handed.peer.set_nonblocking(true).expect("bound the peer read");
+    assert_eq!(
+        handed
+            .peer
+            .read(&mut [0; 1])
+            .expect_err("no message to the guest")
+            .kind(),
+        ErrorKind::WouldBlock
+    );
 }
 
 #[test]

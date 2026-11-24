@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
@@ -241,16 +242,40 @@ struct MachineConfig {
     mem_size_mib: NonZeroU32,
 }
 
-fn booted_memory(socket: &Path) -> Result<NonZeroU32, String> {
+fn booted_memory(socket: &Path, pid: libc::pid_t) -> Result<NonZeroU32, String> {
     use std::io::{BufRead, Read, Write};
     let failed = |error: std::io::Error| {
         format!(
-            "Firecracker did not answer GET /machine-config on {} within {} s: {error}",
-            socket.display(),
+            "Firecracker did not answer GET /machine-config within {} s: {error}",
             API_ANSWER.as_secs()
         )
     };
     let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(failed)?;
+    let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut size = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+        .map_err(|error| format!("reading Firecracker peer credentials: {error}"))?;
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut peer).cast(),
+            &raw mut size,
+        )
+    } < 0
+    {
+        return Err(format!(
+            "reading Firecracker peer credentials: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if peer.pid != pid {
+        return Err(format!(
+            "the Firecracker API socket belongs to process {}, expected {pid}",
+            peer.pid
+        ));
+    }
+    stream.set_write_timeout(Some(API_ANSWER)).map_err(failed)?;
     stream.set_read_timeout(Some(API_ANSWER)).map_err(failed)?;
     stream
         .write_all(b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n")
@@ -266,15 +291,23 @@ fn booted_memory(socket: &Path) -> Result<NonZeroU32, String> {
             break;
         }
         if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
-            length = value.trim().parse().unwrap_or(0);
+            length = value
+                .trim()
+                .parse()
+                .map_err(|_| "Firecracker sent an invalid Content-Length")?;
+            if length > 64 * 1024 {
+                return Err("Firecracker sent an oversized machine configuration".to_string());
+            }
         }
     }
     let mut answer = vec![0u8; length];
     reader.read_exact(&mut answer).map_err(failed)?;
-    answered("GET", "/machine-config", &status, &answer)?;
+    if !status.starts_with("HTTP/1.1 200 ") && !status.starts_with("HTTP/1.0 200 ") {
+        return Err("Firecracker refused GET /machine-config".to_string());
+    }
     serde_json::from_slice::<MachineConfig>(&answer)
         .map(|config| config.mem_size_mib)
-        .map_err(|error| format!("Firecracker answered GET /machine-config without a positive mem_size_mib: {error}"))
+        .map_err(|_| "Firecracker answered GET /machine-config without a positive mem_size_mib".to_string())
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), String> {
@@ -295,15 +328,7 @@ fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 fn session_dir(data: &Path, session_id: &EntityId) -> Result<PathBuf, String> {
-    if !session_id
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
-    {
-        return Err(format!(
-            "session id {:?} is not a safe directory name; the control plane mints ids of letters, digits, - and _",
-            **session_id
-        ));
-    }
+    crate::dir::validate_session_id(session_id)?;
     Ok(data.join("sessions").join(&**session_id))
 }
 
@@ -487,9 +512,83 @@ fn watch(
     Ok(watcher.abort_handle())
 }
 
-fn in_scope(pid: libc::pid_t, scope: &str) -> bool {
+fn process_scope(pid: libc::pid_t, scope: &str) -> Result<bool, String> {
     std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .is_ok_and(|cgroups| cgroups.lines().any(|line| line.ends_with(&format!("/{scope}"))))
+        .map(|cgroups| cgroups.lines().any(|line| line.ends_with(&format!("/{scope}"))))
+        .map_err(|error| format!("reading the cgroup of process {pid}: {error}"))
+}
+
+fn in_scope(pid: libc::pid_t, scope: &str) -> bool {
+    process_scope(pid, scope).is_ok_and(|inside| inside)
+}
+
+fn process_start(pid: libc::pid_t) -> Result<u64, String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|error| format!("reading the identity of process {pid}: {error}"))?;
+    let mut fields = stat.rsplit_once(") ").map_or("", |(_, rest)| rest).split_whitespace();
+    if matches!(fields.next(), Some("Z" | "X" | "x") | None) {
+        return Err(format!("process {pid} is no longer running"));
+    }
+    fields
+        .nth(18)
+        .and_then(|field| field.parse().ok())
+        .ok_or_else(|| format!("process {pid} has no readable start time"))
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Observation {
+    supervisor_pid: libc::pid_t,
+    supervisor_start: u64,
+    machine_start: u64,
+    guest: Descriptor,
+    stdout: Descriptor,
+    stderr: Descriptor,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
+struct Descriptor {
+    fd: RawFd,
+    device: u64,
+    inode: u64,
+}
+
+impl Descriptor {
+    fn read(pid: libc::pid_t, fd: RawFd, named: &str, socket: bool) -> Result<Self, String> {
+        if fd < 3 {
+            return Err(format!("process {pid} has no recorded descriptor for {named}"));
+        }
+        let metadata = std::fs::metadata(format!("/proc/{pid}/fd/{fd}"))
+            .map_err(|error| format!("reading {named} from process {pid}: {error}"))?;
+        descriptor_kind(&metadata, named, socket)?;
+        let fdinfo = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}"))
+            .map_err(|error| format!("reading the access mode for {named} from process {pid}: {error}"))?;
+        let flags = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:"))
+            .and_then(|flags| i32::from_str_radix(flags.trim(), 8).ok())
+            .ok_or_else(|| format!("process {pid} has no readable access mode for {named}"))?;
+        let access = if socket { libc::O_RDWR } else { libc::O_RDONLY };
+        if flags & (libc::O_ACCMODE | libc::O_PATH) != access {
+            return Err(format!("process {pid} has the wrong access mode for {named}"));
+        }
+        Ok(Self {
+            fd,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+fn descriptor_kind(metadata: &std::fs::Metadata, named: &str, socket: bool) -> Result<(), String> {
+    let kind = metadata.file_type();
+    if (socket && kind.is_socket()) || (!socket && kind.is_fifo()) {
+        return Ok(());
+    }
+    Err(format!(
+        "the descriptor handed over as {named} is no {}",
+        if socket { "socket" } else { "pipe" }
+    ))
 }
 
 fn move_into_scope(pid: libc::pid_t, scope: &str) -> Result<(), String> {
@@ -544,18 +643,8 @@ fn take(fd: i32) -> Option<OwnedFd> {
 
 fn adopt(fd: Option<OwnedFd>, named: &str, socket: bool) -> Result<OwnedFd, String> {
     let fd = fd.ok_or_else(|| format!("{named} was handed over as a descriptor this process does not hold open"))?;
-    let file = std::fs::File::from(fd);
-    let kind = file
-        .metadata()
-        .map_err(|error| format!("reading {named}: {error}"))?
-        .file_type();
-    if (socket && kind.is_socket()) || (!socket && kind.is_fifo()) {
-        return Ok(OwnedFd::from(file));
-    }
-    Err(format!(
-        "the descriptor handed over as {named} is no {}",
-        if socket { "socket" } else { "pipe" }
-    ))
+    Descriptor::read(unsafe { libc::getpid() }, fd.as_raw_fd(), named, socket)?;
+    Ok(fd)
 }
 
 struct Taken {
@@ -576,6 +665,16 @@ impl Taken {
 
 fn handed_pid(handed: &SupervisorHandoverMachine) -> Option<libc::pid_t> {
     libc::pid_t::try_from(handed.process_id.get()).ok()
+}
+
+fn recorded_buffers(handed: &SupervisorHandoverMachine) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let guest = STANDARD
+        .decode(handed.guest_buffer.as_bytes())
+        .map_err(|_| "guestBuffer is not base64")?;
+    let console = STANDARD
+        .decode(handed.console_tail.as_bytes())
+        .map_err(|_| "consoleTail is not base64")?;
+    Ok((guest, console))
 }
 
 fn tail_of(fd: &OwnedFd, console: &Arc<Mutex<VecDeque<u8>>>, named: &str) -> Result<(), String> {
@@ -607,6 +706,58 @@ impl Firecracker {
 }
 
 impl Firecracker {
+    fn attachment_pid(&self, index: u8, handed: &SupervisorHandoverMachine) -> Result<libc::pid_t, String> {
+        let dir = self.data.join(format!("box{index}"));
+        if Path::new(&handed.api_socket) != dir.join("api.sock") || Path::new(&handed.vsock) != dir.join("v.sock") {
+            return Err(format!(
+                "box {index} has unexpected socket paths; check dataDir in runtime.json"
+            ));
+        }
+        handed_pid(handed).ok_or_else(|| format!("process id {} is out of range", handed.process_id))
+    }
+
+    pub(crate) fn observe(&self, box_: &crate::inventory::RecordedBox) -> Result<(), String> {
+        let record = &box_.record;
+        let index = u8::try_from(record.tap_index).map_err(|_| "the box has an invalid TAP index")?;
+        self.inspect_attachment(index, &record.machine, box_.observation.as_ref(), &scope_of(index))?;
+        self.booted_disk(&record.session_id)
+            .map_err(|_| "cannot read the box disk; check the recorded session and dataDir in runtime.json")?;
+        Ok(())
+    }
+
+    fn inspect_attachment(
+        &self,
+        index: u8,
+        handed: &SupervisorHandoverMachine,
+        observed: Option<&Observation>,
+        scope: &str,
+    ) -> Result<(), String> {
+        let pid = self.attachment_pid(index, handed)?;
+        let start = process_start(pid)?;
+        if !process_scope(pid, scope)? {
+            return Err(format!("Firecracker process {pid} is outside {scope}"));
+        }
+        let observed = observed.ok_or("the box record has no process and descriptor identities; start the installed service to refresh the box records")?;
+        if start != observed.machine_start || process_start(observed.supervisor_pid)? != observed.supervisor_start {
+            return Err(format!("box {index} has a different Firecracker or supervisor process"));
+        }
+        for (descriptor, named, socket) in [
+            (&observed.guest, "the guest connection", true),
+            (&observed.stdout, "the box's standard output", false),
+            (&observed.stderr, "the box's standard error", false),
+        ] {
+            if Descriptor::read(observed.supervisor_pid, descriptor.fd, named, socket)? != *descriptor {
+                return Err(format!("box {index} has a different descriptor for {named}"));
+            }
+        }
+        recorded_buffers(handed)?;
+        booted_memory(Path::new(&handed.api_socket), pid)?;
+        if process_start(pid)? != start || process_start(observed.supervisor_pid)? != observed.supervisor_start {
+            return Err(format!("box {index} changed process during inspection"));
+        }
+        Ok(())
+    }
+
     fn attach_box(
         &self,
         session_id: &EntityId,
@@ -614,19 +765,9 @@ impl Firecracker {
         handed: &SupervisorHandoverMachine,
         taken: &mut Taken,
     ) -> Result<(FirecrackerBox, VsockGuest), String> {
-        let mut machine = self.machine(session_id, tap)?;
-        if Path::new(&handed.api_socket) != machine.api_socket() || Path::new(&handed.vsock) != machine.vsock() {
-            return Err(format!(
-                "it was handed over with API socket {} and vsock {}, and this supervisor runs box {} at {} and {}; set dataDir in runtime.json back to what the previous binary used",
-                handed.api_socket,
-                handed.vsock,
-                tap.index(),
-                machine.api_socket().display(),
-                machine.vsock().display()
-            ));
-        }
-        let pid = handed_pid(handed).ok_or_else(|| format!("process id {} is out of range", handed.process_id))?;
+        let pid = self.attachment_pid(tap.index(), handed)?;
         let owner = alive(pid, &scope_of(tap.index()))?;
+        let mut machine = self.machine(session_id, tap)?;
         let guest = adopt(taken.guest.take(), "the guest connection", true)?;
         let stdout = adopt(taken.stdout.take(), "the box's standard output", false)?;
         let stderr = adopt(taken.stderr.take(), "the box's standard error", false)?;
@@ -635,16 +776,13 @@ impl Firecracker {
             .set_nonblocking(true)
             .map_err(|error| format!("making the guest connection non-blocking: {error}"))?;
         let stream = UnixStream::from_std(stream).map_err(|error| format!("adopting the guest connection: {error}"))?;
+        let (guest_buffer, console_tail) = recorded_buffers(handed)?;
         let mut decoder = Decoder::default();
-        decoder.push(
-            &STANDARD
-                .decode(handed.guest_buffer.as_bytes())
-                .map_err(|error| format!("guestBuffer is not base64: {error}"))?,
-        );
+        decoder.push(&guest_buffer);
         tail_of(&stdout, &machine.console, "the box's standard output")?;
         tail_of(&stderr, &machine.console, "the box's standard error")?;
         if let Ok(mut tail) = machine.console.lock() {
-            tail.extend(STANDARD.decode(handed.console_tail.as_bytes()).unwrap_or_default());
+            tail.extend(console_tail);
         }
         machine.stdout = Some(stdout);
         machine.stderr = Some(stderr);
@@ -709,7 +847,8 @@ impl Vmm for Firecracker {
     }
 
     fn booted_memory(&self, handed: &SupervisorHandoverMachine) -> Result<NonZeroU32, String> {
-        booted_memory(Path::new(&handed.api_socket))
+        let pid = handed_pid(handed).ok_or_else(|| format!("process id {} is out of range", handed.process_id))?;
+        booted_memory(Path::new(&handed.api_socket), pid)
     }
 
     fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String> {
@@ -1165,6 +1304,25 @@ impl Machine for FirecrackerBox {
             stdout_fd: -1,
             vsock: bounded("the vsock path", self.vsock().display().to_string())?,
         })
+    }
+
+    fn observation(&self, guest: &VsockGuest) -> Result<Option<Observation>, String> {
+        let supervisor_pid = i32::try_from(std::process::id()).map_err(|error| error.to_string())?;
+        let machine_pid = self
+            .process
+            .as_ref()
+            .and_then(Process::id)
+            .and_then(|pid| i32::try_from(pid).ok())
+            .ok_or("the box has no running Firecracker process")?;
+        let fd = |pipe: &Option<OwnedFd>| pipe.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+        Ok(Some(Observation {
+            supervisor_pid,
+            supervisor_start: process_start(supervisor_pid)?,
+            machine_start: process_start(machine_pid)?,
+            guest: Descriptor::read(supervisor_pid, guest.stream.as_raw_fd(), "the guest connection", true)?,
+            stdout: Descriptor::read(supervisor_pid, fd(&self.stdout), "the box's standard output", false)?,
+            stderr: Descriptor::read(supervisor_pid, fd(&self.stderr), "the box's standard error", false)?,
+        }))
     }
 
     async fn reconnect(&mut self, guest: &mut VsockGuest) -> Result<(), String> {

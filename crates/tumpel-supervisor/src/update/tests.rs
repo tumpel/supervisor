@@ -452,6 +452,10 @@ async fn a_binary_swapped_in_under_the_old_unit_ends_its_trial_and_rewrites_the_
     assert_eq!(trial.from_sha256, old);
     assert_eq!(refresh_unit(&layout), Ok(true));
     assert_eq!(text(&layout.unit), supervisor_unit_text(&layout.binary));
+    assert!(text(&layout.unit).contains(&format!(
+        "ExecStart={} --daemon\nKillMode=control-group\n",
+        layout.binary.display()
+    )));
     confirm(&layout, &trial, &out).expect("the trial ends");
     assert_eq!(seen(&mut events), vec![Seen::Step(SupervisorUpdatePhase::Online)]);
     assert!(!layout.state.join(PENDING_FILE).exists());
