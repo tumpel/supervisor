@@ -12,7 +12,7 @@ fn report_rejects_a_file_where_the_guest_drive_directory_belongs() {
     let guest = images.join("guest");
     std::fs::write(&guest, b"obstruction").expect("obstruct the guest directory");
 
-    let error = check_location(&images, "candidate.squashfs").expect_err("guest directory is unusable");
+    let error = check_location(&images).expect_err("guest directory is unusable");
 
     assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
     assert_eq!(std::fs::read(&guest).expect("read the obstruction"), b"obstruction");

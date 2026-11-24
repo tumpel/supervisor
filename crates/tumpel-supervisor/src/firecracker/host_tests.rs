@@ -125,7 +125,7 @@ async fn exec_handed_supervisor() {
     let old_tap = pool.claim_device(63, mib).expect("tap 63");
     let old_session = "restart-test-old".try_into().expect("session id");
     let _old = vmm
-        .reattach(&old_session, &old_tap, &handed)
+        .reattach(&old_session, &old_tap, &handed, crate::lifecycle::Taken::LegacyHandover)
         .expect("the supervisor takes the old box over");
     let new_tap = pool.claim_device(62, mib).expect("tap 62");
     let new_session = "restart-test-new".try_into().expect("session id");

@@ -396,12 +396,12 @@ async fn a_release_notice_prepares_the_candidate_without_replacing_the_binary() 
     let layout = layout("notice-idle");
     let idle = FakeIdle::default();
     let mut run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
-    assert_eq!(run.updater.announced(GRACE).await, Outcome::Restart);
+    assert!(matches!(run.updater.announced(GRACE).await, Outcome::Restart(_)));
     assert!(!seen(&mut run.events).contains(&Seen::Step(SupervisorUpdatePhase::WaitingForIdle)));
     assert_eq!(text(&layout.binary), OLD_BINARY);
     assert_eq!(text(&layout.candidate), good_script());
     assert_eq!(run.updater.announced(GRACE).await, Outcome::Busy);
-    assert_eq!(run.updater.now().await, Outcome::Restart);
+    assert!(matches!(run.updater.now().await, Outcome::Restart(_)));
     assert_eq!(run.updater.source.downloads.load(Ordering::SeqCst), 1);
 }
 
@@ -418,7 +418,10 @@ async fn an_announced_rollback_prepares_an_older_supervisor_version() {
         ..FakeSource::binary(&good_script())
     };
     let run = updater(&layout, source, &idle, limits());
-    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
+    assert!(matches!(
+        run.updater.announced(Duration::ZERO).await,
+        Outcome::Restart(_)
+    ));
     assert_eq!(text(&layout.binary), OLD_BINARY);
     assert_eq!(text(&layout.candidate), good_script());
 }
@@ -442,7 +445,7 @@ async fn a_release_notice_to_a_busy_host_waits_out_the_grace_period_then_updates
     );
     assert_eq!(text(&layout.binary), OLD_BINARY);
     tokio::time::resume();
-    assert_eq!(notice.await, Outcome::Restart);
+    assert!(matches!(notice.await, Outcome::Restart(_)));
     assert!(started.elapsed() >= GRACE);
     assert_eq!(text(&layout.binary), OLD_BINARY);
     assert_eq!(text(&layout.candidate), good_script());
@@ -463,7 +466,7 @@ async fn a_release_notice_to_a_busy_host_updates_once_its_turns_finish_inside_th
     }
     busy.0.send_replace(0);
     tokio::time::resume();
-    assert_eq!(notice.await, Outcome::Restart);
+    assert!(matches!(notice.await, Outcome::Restart(_)));
     assert!(started.elapsed() < GRACE);
     assert_eq!(text(&layout.binary), OLD_BINARY);
     assert_eq!(text(&layout.candidate), good_script());
@@ -560,9 +563,8 @@ async fn an_update_goes_only_to_a_newer_supervisor_version() {
         OLD_BINARY,
         "an announced downgrade leaves the running binary"
     );
-    assert_eq!(
-        run.updater.now().await,
-        Outcome::Restart,
+    assert!(
+        matches!(run.updater.now().await, Outcome::Restart(_)),
         "a downgrade the control plane demands is prepared"
     );
     assert_eq!(text(&layout.binary), OLD_BINARY);

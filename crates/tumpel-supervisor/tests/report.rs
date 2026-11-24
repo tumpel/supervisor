@@ -31,7 +31,11 @@ struct Host {
 
 impl Host {
     fn new(name: &str, endpoint: &str) -> io::Result<Self> {
-        let root = std::env::temp_dir().join(format!("tumpel-report-{}-{name}", std::process::id()));
+        Self::in_dir(&std::env::temp_dir(), name, endpoint)
+    }
+
+    fn in_dir(dir: &Path, name: &str, endpoint: &str) -> io::Result<Self> {
+        let root = dir.join(format!("tumpel-report-{}-{name}", std::process::id()));
         fs::create_dir(&root)?;
         let host = Self { root };
         for dir in ["state", "data", "images"] {
@@ -152,7 +156,7 @@ fn a_failed_local_check_still_reports_the_other_checks() {
         let report = String::from_utf8(output.stdout).expect("report text");
         assert_eq!(output.status.code(), Some(1), "{report}");
         for check in CHECKS {
-            let status = if check == failed || (cfg!(guest_drive) && file == "images" && check == "guest drive") {
+            let status = if check == failed || (file == "images" && check == "guest drive") {
                 "FAIL"
             } else {
                 "PASS"
@@ -186,6 +190,29 @@ fn a_readable_but_unwritable_image_cache_fails_the_report() {
     assert!(report.contains("Permission denied"), "{report}");
     assert_eq!(contents(&host.root).expect("read state after report"), before);
     fs::set_permissions(images, fs::Permissions::from_mode(0o755)).expect("allow fixture cleanup");
+}
+
+#[test]
+fn a_read_only_guest_drive_directory_fails_without_writing() {
+    let host = Host::new("readonly-guest", "http://127.0.0.1:9").expect("test host");
+    let binary = host.root.join("supervisor");
+    fs::copy(BINARY, &binary).expect("fixture binary");
+    let guest = host.root.join("images/guest");
+    fs::set_permissions(host.root.join("images"), fs::Permissions::from_mode(0o777))
+        .expect("make the cache writable to the report process");
+    fs::create_dir(&guest).expect("create the guest drive directory");
+    fs::set_permissions(&guest, fs::Permissions::from_mode(0o555)).expect("make the directory read-only");
+    let before = contents(&host.root).expect("read initial state");
+    let mut candidate = host.command(&binary);
+    if unsafe { libc::geteuid() } == 0 {
+        candidate.uid(65534);
+    }
+    let output = candidate.output().expect("report exits");
+    let report = String::from_utf8(output.stdout).expect("report text");
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert!(report.contains("FAIL guest drive: "), "{report}");
+    assert!(report.contains("PASS image cache: "), "{report}");
+    assert_eq!(contents(&host.root).expect("read state after report"), before);
 }
 
 #[tokio::test]
@@ -273,3 +300,6 @@ async fn startup_io_failures_exit_for_systemd_restart_before_consuming_a_handove
         assert_eq!(fs::read(handover).expect("handover remains for restart"), before);
     }
 }
+
+#[path = "report/handover.rs"]
+mod handover;

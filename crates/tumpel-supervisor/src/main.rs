@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use tumpel_api::types::SupervisorFailure;
+use tumpel_api::types::{ChannelSupervisorUpdateStepReleaseVersion, Sha256Digest, SupervisorFailure};
 use tumpel_supervisor::{
     check, enrol, install, install_telemetry, received_descriptors, report, run, take_notify_socket, Enrolment,
-    RunFailure, Stopped,
+    ExecHandover, RunFailure, Stopped,
 };
 
 #[derive(Parser)]
@@ -48,12 +48,24 @@ enum Command {
         update_binary: Option<PathBuf>,
         #[arg(long, hide = true)]
         handover: bool,
+        #[command(flatten)]
+        takeover: HandoverArgs,
     },
     /// Check that this binary starts on this host the way `run` does and reaches the channel's Challenge, then print a `SupervisorCheckReport`.
     Check,
 }
 
-const RESTART_INTO_UPDATE: u8 = 75;
+#[derive(clap::Args)]
+struct HandoverArgs {
+    #[arg(long, hide = true, requires_all = ["handover", "from_version", "release_version", "settle_started"])]
+    from_sha256: Option<Sha256Digest>,
+    #[arg(long, hide = true, requires = "from_sha256")]
+    from_version: Option<String>,
+    #[arg(long, hide = true, requires = "from_sha256")]
+    release_version: Option<ChannelSupervisorUpdateStepReleaseVersion>,
+    #[arg(long, hide = true, requires = "from_sha256")]
+    settle_started: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
 
 fn exit_code(failure: &SupervisorFailure) -> ExitCode {
     match failure {
@@ -122,6 +134,7 @@ fn main() -> ExitCode {
         Command::Run {
             update_binary: _,
             handover,
+            takeover,
         } => {
             let telemetry = match install_telemetry() {
                 Ok(telemetry) => telemetry,
@@ -130,12 +143,20 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match runtime.block_on(run(telemetry, handover, received)) {
+            let takeover = takeover
+                .from_sha256
+                .zip(takeover.from_version)
+                .zip(takeover.release_version.zip(takeover.settle_started))
+                .map(
+                    |((from_sha256, from_version), (release_version, settle_started))| ExecHandover {
+                        from_sha256,
+                        from_version,
+                        release_version,
+                        settle_started,
+                    },
+                );
+            match runtime.block_on(run(telemetry, handover, takeover, received)) {
                 Ok(Stopped::Revoked | Stopped::Terminated) => ExitCode::SUCCESS,
-                Ok(Stopped::Updated) => {
-                    eprintln!("tumpel-supervisor: exiting so systemd starts the new binary, which takes the running boxes over");
-                    ExitCode::from(RESTART_INTO_UPDATE)
-                }
                 Err(RunFailure::Startup(detail)) => {
                     eprintln!("tumpel-supervisor: startup failed. {detail}. On failure, systemd restarts the supervisor and it takes over the running boxes.");
                     ExitCode::FAILURE

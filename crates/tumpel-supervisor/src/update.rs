@@ -104,6 +104,7 @@ pub trait Idle: Send + Sync {
     fn settled(&self) -> impl Future<Output = ()> + Send;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {
     pub version: ChannelSupervisorUpdateStepReleaseVersion,
     pub sha256: Sha256Digest,
@@ -312,7 +313,7 @@ pub enum Outcome {
     Refused,
     Busy,
     Failed(SupervisorUpdateFailureReason),
-    Restart,
+    Restart(Release),
 }
 
 struct Stop {
@@ -358,7 +359,7 @@ pub struct Updater<S: Source, I: Idle> {
     version: &'static str,
     idle: I,
     out: UnboundedSender<Outgoing>,
-    prepared: Mutex<bool>,
+    prepared: Mutex<Option<Release>>,
 }
 
 impl<S: Source, I: Idle> Updater<S, I> {
@@ -379,14 +380,14 @@ impl<S: Source, I: Idle> Updater<S, I> {
             version,
             idle,
             out,
-            prepared: Mutex::new(false),
+            prepared: Mutex::new(None),
         }
     }
 
     pub async fn now(&self) -> Outcome {
         let mut prepared = self.prepared.lock().await;
-        if *prepared {
-            return Outcome::Restart;
+        if let Some(release) = &*prepared {
+            return Outcome::Restart(release.clone());
         }
         match self.due().await {
             Ok(release) => self.apply(&release, &mut prepared).await,
@@ -398,7 +399,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         let Ok(mut prepared) = self.prepared.try_lock() else {
             return Outcome::Busy;
         };
-        if *prepared {
+        if prepared.is_some() {
             return Outcome::Busy;
         }
         let release = match self.due().await {
@@ -459,7 +460,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         }
     }
 
-    async fn apply(&self, release: &Release, prepared: &mut bool) -> Outcome {
+    async fn apply(&self, release: &Release, prepared: &mut Option<Release>) -> Outcome {
         if let Err(stopped) = self.prepare(release).await {
             let reason = stopped.reason.clone();
             self.fail(&release.sha256, stopped);
@@ -472,8 +473,8 @@ impl<S: Source, I: Idle> Updater<S, I> {
             named(release)
         );
         self.step(release, SupervisorUpdatePhase::Restarting, self.idle.boxes());
-        *prepared = true;
-        Outcome::Restart
+        *prepared = Some(release.clone());
+        Outcome::Restart(release.clone())
     }
 
     fn step(&self, release: &Release, phase: SupervisorUpdatePhase, boxes: u32) {

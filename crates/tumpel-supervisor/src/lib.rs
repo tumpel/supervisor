@@ -38,7 +38,7 @@ pub use lifecycle::{
 };
 pub use pool::{Disk, PoolExhausted, Size, Tap, TapPool};
 pub use report::report;
-pub use run::{run, Failure, RunFailure, Stopped};
+pub use run::{run, ExecHandover, Failure, RunFailure, Stopped};
 pub use snapshot::{Entry, Ext4Upper, Kind, Manifest, Scan, Upper};
 pub use store::{DownloadError, HttpStore, Store, UploadError};
 pub use telemetry::{install as install_telemetry, Telemetry};

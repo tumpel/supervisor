@@ -19,44 +19,26 @@ fn name(drive: &[u8]) -> String {
 }
 
 pub(crate) fn check(images: &Path) -> Result<&'static str, String> {
-    match DRIVE {
-        Some(drive) if drive.starts_with(b"hsqs") => check_location(images, &name(drive)).map_err(|error| {
-            format!(
-                "cannot use the guest drive directory in {}: {error}. Make imageCacheDir in runtime.json writable",
-                images.display()
-            )
-        }),
-        Some(_) => Err("the embedded drive is not SquashFS; install a supervisor built by the release workflow".into()),
-        None => Ok("this development build has no embedded guest drive"),
+    if DRIVE.is_some_and(|drive| !drive.starts_with(b"hsqs")) {
+        return Err("the embedded drive is not SquashFS. Install a supervisor built by the release workflow".into());
     }
+    check_location(images).map_err(|error| {
+        format!(
+            "cannot use the guest drive directory in {}: {error}. Make imageCacheDir in runtime.json writable",
+            images.display()
+        )
+    })
 }
 
-fn check_location(images: &Path, name: &str) -> io::Result<&'static str> {
+fn check_location(images: &Path) -> io::Result<&'static str> {
     let dir = images.join("guest");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            crate::dir::check_access(images, libc::W_OK | libc::X_OK)?;
-            return Ok("the cache can hold the embedded guest drive");
-        }
+    let location = match std::fs::read_dir(&dir) {
+        Ok(_) => &dir,
+        Err(error) if error.kind() == ErrorKind::NotFound => images,
         Err(error) => return Err(error),
     };
-    let mut installed = false;
-    let mut stale = false;
-    for entry in entries {
-        if entry?.file_name() == name {
-            installed = true;
-        } else {
-            stale = true;
-        }
-    }
-    let mode = if installed && !stale {
-        libc::X_OK
-    } else {
-        libc::W_OK | libc::X_OK
-    };
-    crate::dir::check_access(&dir, mode)?;
-    Ok("the guest drive directory is ready")
+    crate::dir::check_access(location, libc::W_OK | libc::X_OK)?;
+    Ok("the cache can hold the embedded guest drive")
 }
 
 fn place(images: &Path, drive: &[u8]) -> Result<PathBuf, String> {

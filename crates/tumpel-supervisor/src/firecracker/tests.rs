@@ -219,6 +219,15 @@ async fn handover_keeps_open_descriptors_and_adopts_the_buffered_guest_frame() {
     for fd in descriptors {
         assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, libc::FD_CLOEXEC);
     }
+    let unrelated = std::fs::File::open("/dev/null").expect("unrelated descriptor");
+    crate::run::inherit_descriptors(descriptors).expect("make the recorded descriptors inheritable");
+    for fd in descriptors {
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, 0);
+    }
+    assert_eq!(
+        unsafe { libc::fcntl(unrelated.as_raw_fd(), libc::F_GETFD) },
+        libc::FD_CLOEXEC
+    );
     assert_eq!(exported.guest_buffer, handed.machine.guest_buffer);
     let bytes = serde_json::to_vec(&exported).expect("the exported record is serializable");
     let record = serde_json::from_slice(&bytes).expect("the successor reads the exported record");
@@ -250,7 +259,7 @@ async fn reattach_of_a_box_whose_process_ended_closes_every_handed_descriptor() 
     zombie(pid);
     let mut handed = handed(&vmm, pid, true);
     let session = "session-1".try_into().expect("session id");
-    let Err(error) = vmm.reattach(&session, &tap, &handed.machine) else {
+    let Err(error) = vmm.reattach(&session, &tap, &handed.machine, crate::lifecycle::Taken::Crashed) else {
         panic!("a box whose process ended is not adopted");
     };
     assert!(error.contains("ended during the handover"), "{error}");
@@ -265,7 +274,7 @@ async fn reattach_with_the_wrong_descriptor_kills_and_reaps_the_live_child_and_c
     let pid = sleeper();
     let mut handed = handed(&vmm, pid, false);
     let session = "session-1".try_into().expect("session id");
-    let Err(error) = vmm.reattach(&session, &tap, &handed.machine) else {
+    let Err(error) = vmm.reattach(&session, &tap, &handed.machine, crate::lifecycle::Taken::Crashed) else {
         panic!("a pipe handed as the guest connection is refused");
     };
     assert!(error.contains("is no socket"), "{error}");
