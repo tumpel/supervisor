@@ -45,12 +45,11 @@ fn write_report(mut out: impl Write) -> io::Result<bool> {
                 let cache = Path::new(&*runtime.image_cache_dir);
                 std::fs::read_dir(cache)
                     .map_err(|error| format!("reading {} failed: {error}", cache.display()))?;
-                guest_drive::check_location(cache)
+                guest_drive::access(cache)
                     .map(|()| "the cache can hold the guest drive")
                     .map_err(|error| {
                         format!(
-                            "cannot use the guest drive directory under {}: {error}. Set imageCacheDir in runtime.json to a cache with a writable guest directory",
-                            cache.display()
+                            "{error}. Set imageCacheDir in runtime.json to a cache with a readable, writable and searchable guest directory"
                         )
                     })
             }),

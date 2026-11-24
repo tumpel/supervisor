@@ -134,27 +134,43 @@ fn a_healthy_bare_report_passes_without_writing_or_connecting() {
 }
 
 #[test]
-fn a_bare_report_checks_guest_drive_write_access_as_an_unprivileged_user() {
+fn a_bare_report_checks_guest_drive_access_as_an_unprivileged_user() {
     let host = Host::new("guest-cache", "http://127.0.0.1:9").expect("test host");
     let binary = host.root.join("supervisor");
     fs::copy(BINARY, &binary).expect("fixture binary");
     let images = host.root.join("images");
-    fs::set_permissions(&images, fs::Permissions::from_mode(0o777)).expect("make the parent writable");
     let guest = images.join("guest");
-    fs::create_dir(&guest).expect("guest drive directory");
 
-    for (mode, exit_status, status) in [(0o777, 0, "PASS"), (0o555, 1, "FAIL")] {
-        fs::set_permissions(&guest, fs::Permissions::from_mode(mode)).expect("set guest directory access");
+    for (dir, mode, exit_status) in [
+        (&images, 0o555, 1),
+        (&guest, 0o777, 0),
+        (&guest, 0o555, 1),
+        (&guest, 0o333, 1),
+    ] {
+        fs::create_dir_all(dir).expect("cache or guest directory");
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode)).expect("set directory access");
         let mut candidate = host.command(&binary);
         if unsafe { libc::geteuid() } == 0 {
             candidate.uid(65534);
         }
 
-        let output = candidate.output().expect("report exits");
+        let output = candidate.output();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o777)).expect("restore directory access");
+        let output = output.expect("report exits");
         let report = String::from_utf8(output.stdout).expect("report text");
 
         assert_eq!(output.status.code(), Some(exit_status), "{report}");
-        assert!(report.contains(&format!("{status} image cache: ")), "{report}");
+        if exit_status == 0 {
+            assert!(report.contains("PASS image cache: "), "{report}");
+        } else {
+            assert!(
+                report.contains(&format!(
+                    "FAIL image cache: {} needs read, write and search access",
+                    dir.display()
+                )),
+                "{report}"
+            );
+        }
     }
 }
 

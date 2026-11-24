@@ -28,17 +28,18 @@ pub(crate) fn check() -> Result<&'static str, String> {
     }
 }
 
-pub(crate) fn check_location(images: &Path) -> io::Result<()> {
+pub(crate) fn access(images: &Path) -> Result<(), String> {
     let guest = images.join(DIRECTORY);
-    match access(&guest) {
-        Err(error) if error.kind() == ErrorKind::NotFound => access(images),
-        checked => checked,
-    }
+    let (dir, result) = match check_permissions(&guest) {
+        Err(error) if error.kind() == ErrorKind::NotFound => (images, check_permissions(images)),
+        checked => (guest.as_path(), checked),
+    };
+    result.map_err(|error| format!("{} needs read, write and search access: {error}", dir.display()))
 }
 
-fn access(dir: &Path) -> io::Result<()> {
+fn check_permissions(dir: &Path) -> io::Result<()> {
     let path = CString::new(dir.join(".").as_os_str().as_encoded_bytes())?;
-    if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } == 0 {
+    if unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK | libc::X_OK) } == 0 {
         return Ok(());
     }
     Err(io::Error::last_os_error())
