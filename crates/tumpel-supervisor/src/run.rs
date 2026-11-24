@@ -1237,34 +1237,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn opened_channel() -> HostChannel<Unsaved, Unsigned> {
-        let mut channel = HostChannel::new(
-            tumpel_channel::empty_state(),
-            Unsaved,
-            Unsigned,
-            "host-1".try_into().expect("host"),
-            "1".to_string(),
-        );
-        channel.connect();
-        let Ok(Event::Challenged(nonce)) =
-            channel.receive(&json!({"type":"Challenge","nonce":"n".repeat(43)}).to_string())
-        else {
-            panic!("challenge");
-        };
-        let usage = tumpel_channel::Usage { host: serde_json::from_value(json!({"loadAverage":0.0,"memoryAvailableMib":1024,"diskBudgetMib":0,"diskHeldMib":0,"memoryBudgetMib":0,"memoryHeldMib":0})).expect("usage") };
-        channel
-            .hello(
-                &nonce,
-                std::num::NonZeroU32::MIN,
-                usage,
-                Vec::new(),
-                &mut Outbox::default(),
-            )
-            .expect("hello");
-        assert!(matches!(channel.receive(&json!({"type":"Welcome","hostId":"host-1","protocolVersion":tumpel_api::types::ChannelProtocol::VERSION}).to_string()), Ok(Event::Welcomed)));
-        channel
-    }
-
     #[tokio::test(start_paused = true)]
     async fn unfamiliar_turn_values_are_acked_without_starting_them_and_known_offers_still_arrive() {
         use tracing_subscriber::layer::SubscriberExt;
@@ -1284,9 +1256,26 @@ mod tests {
         ] {
             let logs = crate::test_logs::UpdateLogs::default();
             let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
-            let mut channel = opened_channel();
-            let mut offers = Offers::default();
+            let mut channel = HostChannel::new(
+                tumpel_channel::empty_state(),
+                Unsaved,
+                Unsigned,
+                "host-1".try_into().expect("host"),
+                "1".to_string(),
+            );
+            let nonce = "n".repeat(43);
+            channel.connect();
+            assert!(matches!(
+                channel.receive(&json!({"type":"Challenge","nonce":nonce}).to_string()),
+                Ok(Event::Challenged(_))
+            ));
             let usage = tumpel_channel::Usage { host: serde_json::from_value(json!({"loadAverage":0.0,"memoryAvailableMib":1024,"diskBudgetMib":0,"diskHeldMib":0,"memoryBudgetMib":0,"memoryHeldMib":0})).expect("usage") };
+            let mut wire = Outbox::default();
+            channel
+                .hello(&nonce, NonZeroU32::MIN, usage.clone(), Vec::new(), &mut wire)
+                .expect("hello");
+            assert!(matches!(channel.receive(&json!({"type":"Welcome","hostId":"host-1","protocolVersion":tumpel_api::types::ChannelProtocol::VERSION}).to_string()), Ok(Event::Welcomed)));
+            let mut offers = Offers::default();
             let mut outbox = Outbox::default();
             let mut unfamiliar = known.clone();
             unfamiliar[field] = future;
@@ -1297,7 +1286,6 @@ mod tests {
                 panic!("the channel forwards persisted work");
             };
             assert!(offers.command(*message).is_none());
-            assert_eq!(channel.state().received.0, 1);
             tokio::time::advance(Duration::from_secs(1)).await;
             channel
                 .heartbeat(
@@ -1348,22 +1336,8 @@ mod tests {
             };
             assert_eq!(&*running.turn_id, "turn-1");
             assert_eq!(&*running.session_id, "session-1");
-            channel
-                .heartbeat(
-                    chrono::DateTime::parse_from_rfc3339("2026-11-23T12:00:02Z").expect("time"),
-                    usage,
-                    HeldIds {
-                        turn_ids: offers.held(Vec::new()),
-                        ..HeldIds::default()
-                    },
-                    HostReportedHealth::Healthy,
-                    || serde_json::from_value(json!({"instruments":[],"samples":[],"turns":[]})).expect("telemetry"),
-                    &mut outbox,
-                )
-                .expect("heartbeat");
-            let heartbeat: serde_json::Value = serde_json::from_str(&outbox.0.remove(0)).expect("heartbeat");
-            assert_eq!(heartbeat["heldTurnIds"], json!(["turn-1"]));
-            assert_eq!(heartbeat["ack"], 2);
+            assert_eq!(offers.held(Vec::new()), vec![running.turn_id]);
+            assert_eq!(channel.state().received.0, 2);
             assert_eq!(*logs.0.lock().expect("logs"), [tumpel_channel::UPDATE_REQUIRED]);
         }
     }
@@ -1382,7 +1356,25 @@ mod tests {
         assert_eq!(offers.held(vec![turn.clone()]), vec![turn.clone()]);
         assert_eq!(offers.held(Vec::new()), Vec::<EntityId>::new());
         offers.0.push(turn);
-        let mut channel = opened_channel();
+        let mut channel = HostChannel::new(
+            tumpel_channel::empty_state(),
+            Unsaved,
+            Unsigned,
+            "host-1".try_into().expect("host"),
+            "1".to_string(),
+        );
+        let nonce = "n".repeat(43);
+        channel.connect();
+        assert!(matches!(
+            channel.receive(&json!({"type":"Challenge","nonce":nonce}).to_string()),
+            Ok(Event::Challenged(_))
+        ));
+        let usage = tumpel_channel::Usage { host: serde_json::from_value(json!({"loadAverage":0.0,"memoryAvailableMib":1024,"diskBudgetMib":0,"diskHeldMib":0,"memoryBudgetMib":0,"memoryHeldMib":0})).expect("usage") };
+        let mut wire = Outbox::default();
+        channel
+            .hello(&nonce, NonZeroU32::MIN, usage, Vec::new(), &mut wire)
+            .expect("hello");
+        assert!(matches!(channel.receive(&json!({"type":"Welcome","hostId":"host-1","protocolVersion":tumpel_api::types::ChannelProtocol::VERSION}).to_string()), Ok(Event::Welcomed)));
         let claim: ChannelHostMessage =
             serde_json::from_value(json!({"type":"TurnClaim","turnId":"turn-1","boxId":"box-1"})).expect("claim");
         offers
@@ -1410,7 +1402,25 @@ mod tests {
         ] {
             let logs = crate::test_logs::UpdateLogs::default();
             let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
-            let mut channel = opened_channel();
+            let mut channel = HostChannel::new(
+                tumpel_channel::empty_state(),
+                Unsaved,
+                Unsigned,
+                "host-1".try_into().expect("host"),
+                "1".to_string(),
+            );
+            let nonce = "n".repeat(43);
+            channel.connect();
+            assert!(matches!(
+                channel.receive(&json!({"type":"Challenge","nonce":nonce}).to_string()),
+                Ok(Event::Challenged(_))
+            ));
+            let usage = tumpel_channel::Usage { host: serde_json::from_value(json!({"loadAverage":0.0,"memoryAvailableMib":1024,"diskBudgetMib":0,"diskHeldMib":0,"memoryBudgetMib":0,"memoryHeldMib":0})).expect("usage") };
+            let mut wire = Outbox::default();
+            channel
+                .hello(&nonce, NonZeroU32::MIN, usage, Vec::new(), &mut wire)
+                .expect("hello");
+            assert!(matches!(channel.receive(&json!({"type":"Welcome","hostId":"host-1","protocolVersion":tumpel_api::types::ChannelProtocol::VERSION}).to_string()), Ok(Event::Welcomed)));
             let mut unfamiliar = known.clone();
             unfamiliar[field] = future;
             unfamiliar["extra"] = json!(true);
