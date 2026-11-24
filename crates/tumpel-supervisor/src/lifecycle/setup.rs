@@ -85,12 +85,14 @@ pub enum SetupInput {
 struct Stop {
     reason: ClaudeSetupFailureReason,
     detail: String,
+    cleanup: Result<(), String>,
 }
 
 fn stop(reason: ClaudeSetupFailureReason, detail: impl Into<String>) -> Stop {
     Stop {
         reason,
         detail: detail.into(),
+        cleanup: Ok(()),
     }
 }
 
@@ -152,16 +154,24 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 };
                 (failure, stopped)
             }
-            Err(failed) => (Some(failed), Ok(())),
+            Err(mut failed) => {
+                let cleanup = std::mem::replace(&mut failed.cleanup, Ok(()));
+                (Some(failed), cleanup)
+            }
         };
-        if let Some(failed) = failure {
+        let failure = match (failure, &stopped) {
+            (Some(failed), stopped) => Some((failed.reason, then(failed.detail, stopped.clone()))),
+            (None, Err(error)) => Some((ClaudeSetupFailureReason::ClaudeCodeExited, error.clone())),
+            (None, Ok(())) => None,
+        };
+        if let Some((reason, detail)) = failure {
             emit(
                 &self.out,
                 ChannelClaudeSetupBoxFailed {
                     claude_setup_id: id,
-                    detail: reported("the Claude setup failure detail", &failed.detail),
+                    detail: reported("the Claude setup failure detail", &detail),
                     failed_at: now(),
-                    reason: failed.reason,
+                    reason,
                     type_: ChannelClaudeSetupBoxFailedType::ClaudeSetupBoxFailed,
                 },
             );
@@ -209,7 +219,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             BoxEnd::SetupBootFailed,
         )
         .await;
-        Err(missing(then(format!("{failed}. Console: {tail}"), stopped)))
+        Err(Stop {
+            cleanup: stopped,
+            ..missing(format!("{failed}. Console: {tail}"))
+        })
     }
 
     async fn hand_setup(
@@ -230,10 +243,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 BoxEnd::SetupNotHanded,
             )
             .await;
-            return Err(stop(
-                ClaudeSetupFailureReason::SetupUrlMissing,
-                then(format!("the offer of Claude setup {} carried a token credential the guest protocol refuses; update the supervisor and the control plane together", *order.claude_setup_id), stopped),
-            ));
+            return Err(Stop {
+                cleanup: stopped,
+                ..stop(
+                    ClaudeSetupFailureReason::SetupUrlMissing,
+                    format!("the offer of Claude setup {} carried a token credential the guest protocol refuses; update the supervisor and the control plane together", *order.claude_setup_id),
+                )
+            });
         };
         let start = GuestInput::ClaudeSetupStart(GuestClaudeSetupStart {
             claude_setup_id: order.claude_setup_id.clone(),
@@ -252,16 +268,16 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 BoxEnd::SetupNotHanded,
             )
             .await;
-            return Err(stop(
-                ClaudeSetupFailureReason::SetupUrlMissing,
-                then(
+            return Err(Stop {
+                cleanup: stopped,
+                ..stop(
+                    ClaudeSetupFailureReason::SetupUrlMissing,
                     format!(
                         "handing Claude setup {} to the guest failed: {error}. Console: {tail}",
                         *order.claude_setup_id
                     ),
-                    stopped,
-                ),
-            ));
+                )
+            });
         }
         Ok((machine, guest))
     }

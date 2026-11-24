@@ -296,8 +296,9 @@ impl Machine for MemoryMachine {
         self.drive.clone()
     }
 
-    fn stop(self) -> impl Future<Output = Stopped> + Send {
-        if self.boot == Boot::RefusesStop {
+    fn stop(&mut self) -> impl Future<Output = Stopped> + Send {
+        if self.boot == Boot::RefusesStop && self.session == "session-1" {
+            note(&self.log, "stop attempt session-1".to_string());
             return std::future::ready(Stopped {
                 exit: "did not stop".to_string(),
                 cleared: Err("the VM stop timed out".to_string()),
@@ -397,6 +398,7 @@ impl Vmm for MemoryVmm {
         tap: &Tap,
         handed: &SupervisorHandoverMachine,
         _: Option<&crate::firecracker::Observation>,
+        _: bool,
     ) -> Result<(MemoryMachine, MemoryGuest), String> {
         let (guest, _) = self
             .hands
@@ -801,6 +803,10 @@ fn channel(
                     swapped(snapshot_id, built)
                 }
                 Outgoing::Message(message) | Outgoing::Snapshot(message, _) => message,
+                Outgoing::InterruptedTurn(failed, persisted) => {
+                    persisted.saved();
+                    failed.into()
+                }
             };
             let _ = sender.send(message);
         }
@@ -1914,6 +1920,43 @@ async fn a_supervisor_started_after_a_crash_keeps_every_box_and_fails_only_the_c
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_second_crash_can_still_report_an_interrupted_turn() {
+    let mut old = host("interrupted-turn-durability", 1, Harness::SlowClone, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("claim turn-1").await;
+    tokio::time::sleep(SLOW_CLONE / 2).await;
+    let mut saved = old.standing();
+    old.keep_guest(&mut saved.boxes[0], 40);
+    old.runner.abort();
+
+    let (out, mut pending) = unbounded_channel();
+    let mut recovering = Lifecycle::new(
+        old.vmm.clone(),
+        old.store.clone(),
+        old.settings,
+        TapPool::new(4096, BOX),
+        out,
+        old.vmm.staging.join("boxes.json"),
+    );
+    recovering
+        .start(Some((saved, Taken::Crashed)))
+        .expect("the first restart");
+    let first_failure = pending.try_recv().expect("the interrupted turn is queued");
+    assert!(matches!(first_failure, Outgoing::InterruptedTurn(..)));
+    drop(first_failure);
+    drop(recovering);
+
+    let retry = old.standing();
+    assert!(
+        matches!(&retry.boxes[0].state, SupervisorHandoverBoxState::Turn(turn) if turn.turn_id.as_str() == "turn-1")
+    );
+    let mut restarted = old.after_crash(retry);
+    restarted.settle_until_starts("failed HarnessExited:").await;
+    restarted.turn("turn-2", "session-1", "two", Vec::new());
+    restarted.settle_until("complete 1").await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_host_with_no_record_of_boxes_starts_without_the_systemd_user_manager_and_the_next_start_sweeps() {
     let first = host("start-without-record", 1, Harness::SlowClone, Boot::Works);
     tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2105,7 +2148,7 @@ async fn a_live_box_with_an_unattachable_turn_is_reported_held_and_the_turn_fail
     let kept = &standing.boxes[0];
     assert_eq!(kept.record.box_id.as_str(), "box-session-1");
     assert!(kept.record.dirty && kept.reconnect);
-    assert!(matches!(kept.record.state, SupervisorHandoverBoxState::Warm(_)));
+    assert!(matches!(kept.record.state, SupervisorHandoverBoxState::Turn(_)));
     new.runner.abort();
     new = start_host(
         new.vmm.clone(),
@@ -2147,20 +2190,48 @@ async fn a_live_box_with_an_unattachable_turn_is_reported_held_and_the_turn_fail
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_failed_stop_keeps_the_standing_box_and_disk() {
-    let mut host = host("failed-stop", 1, Harness::Echo, Boot::RefusesStop);
+async fn a_failed_stop_is_bounded_and_leaves_another_turn_running() {
+    let mut host = host("failed-stop", 2, Harness::SlowClone, Boot::RefusesStop);
     host.turn("turn-1", "session-1", "one", Vec::new());
     host.settle_until("complete 1").await;
+    host.turn("turn-2", "session-2", "two", Vec::new());
+    host.settle_until("claim turn-2").await;
+    tokio::task::yield_now().await;
+    host.log();
+
     host.discard("session-1");
-    let result = (&mut host.runner).await.expect("lifecycle task");
-    assert_eq!(result, Err("the VM stop timed out".to_string()));
-    assert_eq!(host.standing().boxes[0].box_id.as_str(), "box-session-1");
+    tokio::task::yield_now().await;
+    assert_eq!(host.log(), ["stop attempt session-1"]);
+    host.settle_until("complete 1").await;
+    assert!(!host.runner.is_finished(), "the runner still serves the healthy box");
+    assert!(host.sessions.borrow().iter().any(|id| id.as_str() == "session-1"));
+    tokio::time::sleep(Duration::from_secs(55)).await;
+    let failure = host
+        .settle_until_starts("teardown failed BoxDirty: BoxStopFailed")
+        .await;
+    assert!(failure[0].contains("box-session-1"));
+    assert!(failure[0].contains("10 attempts"));
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert_eq!(
+        host.log()
+            .iter()
+            .filter(|entry| *entry == "stop attempt session-1")
+            .count(),
+        9,
+        "only nine retries follow the first attempt"
+    );
+    assert!(!host.runner.is_finished());
+    assert!(host
+        .standing()
+        .boxes
+        .iter()
+        .any(|saved| saved.box_id.as_str() == "box-session-1"));
     assert!(host
         .vmm
         .drives
         .lock()
         .expect("drives")
-        .contains_key(&host.vmm.staging.join("session-1").join("overlay"),));
+        .contains_key(&host.vmm.staging.join("session-1").join("overlay")));
 }
 
 #[tokio::test(start_paused = true)]
@@ -3069,8 +3140,8 @@ async fn a_restore_that_outlasts_the_dispatch_credential_fails_dispatch_credenti
 }
 
 #[tokio::test]
-async fn a_box_disk_that_cannot_be_deleted_stops_the_box_runner_with_disk_not_freed() {
-    let host = host("disk-not-freed", 1, Harness::Echo, Boot::Works);
+async fn a_disk_cleanup_failure_is_reported_without_stopping_the_box_runner() {
+    let mut host = host("disk-not-freed", 1, Harness::Echo, Boot::Works);
     std::fs::write(
         host.vmm.staging.join("session-1"),
         b"a file where the disk directory goes",
@@ -3079,16 +3150,9 @@ async fn a_box_disk_that_cannot_be_deleted_stops_the_box_runner_with_disk_not_fr
 
     host.teardown("session-1");
 
-    let stopped = tokio::time::timeout(SETTLE, host.runner)
-        .await
-        .expect("the box runner stops")
-        .expect("the box runner ends without a panic");
-    assert!(
-        stopped
-            .as_ref()
-            .is_err_and(|error| error.starts_with("DiskNotFreed: the box of session session-1 ended, then removing")),
-        "{stopped:?}"
-    );
+    let failed = host.settle_until_starts("teardown failed BoxDirty: DiskNotFreed").await;
+    assert!(failed[0].contains("session-1"));
+    assert!(!host.runner.is_finished());
 }
 
 fn protocol_digit(protocol: &GuestHarnessProtocol) -> usize {

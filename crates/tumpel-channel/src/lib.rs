@@ -122,10 +122,29 @@ fn append_lines(batch: &mut Value, added: &ChannelTurnLines) -> bool {
     true
 }
 
+pub struct AfterSave(Box<dyn FnOnce() + Send>);
+
+impl std::fmt::Debug for AfterSave {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AfterSave").finish_non_exhaustive()
+    }
+}
+
+impl AfterSave {
+    pub fn new(action: impl FnOnce() + Send + 'static) -> Self {
+        Self(Box::new(action))
+    }
+
+    pub fn saved(self) {
+        (self.0)();
+    }
+}
+
 #[derive(Debug)]
 pub enum Outgoing {
     Message(ChannelHostMessage),
     Snapshot(ChannelHostMessage, u16),
+    InterruptedTurn(tumpel_api::types::ChannelTurnFailed, AfterSave),
 }
 
 impl From<ChannelHostMessage> for Outgoing {
@@ -498,6 +517,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
     /// # Errors
     /// Fails when the state cannot be saved or the port refuses the frame.
     pub fn send(&mut self, outgoing: impl Into<Outgoing>, port: &mut impl Port) -> Result<(), ChannelError> {
+        let mut after_save = None;
         match outgoing.into() {
             Outgoing::Message(ChannelHostMessage::TurnLines(lines)) => self.store_lines(lines)?,
             Outgoing::Message(ChannelHostMessage::SnapshotPacks(_) | ChannelHostMessage::SnapshotDone(_)) => {
@@ -506,6 +526,18 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                 ));
             }
             Outgoing::Message(message) => self.push(to_value(&message)?),
+            Outgoing::InterruptedTurn(failed, saved) => {
+                let already_queued = self.state.unacked.iter().any(|frame| {
+                    matches!(
+                        frame.message.get("type").and_then(Value::as_str),
+                        Some("TurnComplete" | "TurnFailed")
+                    ) && frame.message.get("turnId").and_then(Value::as_str) == Some(failed.turn_id.as_str())
+                });
+                if !already_queued {
+                    self.push(to_value(&ChannelHostMessage::TurnFailed(failed))?);
+                }
+                after_save = Some(saved);
+            }
             Outgoing::Snapshot(message, built) => {
                 let message = build_snapshot(&message, built)?;
                 let message = if self.phase == Phase::Open && reuses_packs(built) != reuses_packs(self.version) {
@@ -518,6 +550,9 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             }
         }
         self.store.save(&self.state)?;
+        if let Some(saved) = after_save {
+            saved.saved();
+        }
         self.transmit_due(Instant::now(), port)
     }
 

@@ -14,6 +14,24 @@ use super::{adopt, alive, booted_memory, take, Firecracker, Owner, Taken};
 use crate::lifecycle::{Guest, Machine, Vmm};
 use crate::pool::{Disk, Size, TapPool};
 
+#[test]
+fn both_api_transports_reject_unbounded_or_ambiguous_responses() {
+    for reply in [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 65537\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+    ] {
+        assert!(super::Response::default().read(reply).is_err(), "{reply:?}");
+    }
+    let mut response = super::Response::default();
+    assert!(response
+        .read(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n12")
+        .expect("valid head")
+        .is_none());
+    assert_eq!(response.read(b"3").expect("complete body"), Some((200, &b"123"[..])));
+}
+
 const BOX: Size = Size {
     memory_mib: NonZeroU32::new(4096).expect("a positive size"),
     disk_mib: NonZeroU32::new(32_768).expect("a positive size"),
@@ -195,7 +213,7 @@ async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_bin
     let pid = sleeper();
     let mut handed = handed(&vmm, pid, true);
     let session = "session-1".try_into().expect("session id");
-    let (machine, mut guest) = vmm
+    let (mut machine, mut guest) = vmm
         .attach_box(&session, &tap, &handed.machine, &mut Taken::from(&handed.machine))
         .expect("the box is adopted");
     handed
@@ -219,7 +237,7 @@ async fn reattach_of_a_box_whose_process_ended_leaves_the_incoming_descriptors_o
     zombie(pid);
     let mut handed = handed(&vmm, pid, true);
     let session = "session-1".try_into().expect("session id");
-    let Err(error) = vmm.reattach(&session, &tap, &handed.machine, None) else {
+    let Err(error) = vmm.reattach(&session, &tap, &handed.machine, None, false) else {
         panic!("a box whose process ended is not adopted");
     };
     assert!(error.contains("ended during the handover"), "{error}");
@@ -272,10 +290,12 @@ async fn a_socket_with_the_wrong_saved_identity_is_refused() {
         stderr: super::Descriptor::read(supervisor_pid, handed.machine.stderr_fd, "stderr", false).expect("pipe"),
     };
     let session = "session-1".try_into().expect("session id");
-    let Err(error) = vmm.reattach(&session, &tap, &handed.machine, Some(&observation)) else {
+    let Err(error) = vmm.reattach(&session, &tap, &handed.machine, Some(&observation), false) else {
         panic!("the different guest socket is refused");
     };
     assert!(error.contains("differs from the saved box"), "{error}");
+    super::verify_descriptors(&handed.machine, Some(&observation), true)
+        .expect("crash recovery accepts the guest socket in the descriptor store");
     assert_eq!(alive(pid, SCOPE), Ok(Owner::Child));
     peer.write_all(b"still open").expect("socket remains open");
     drop(Taken::from(&handed.machine));
@@ -291,7 +311,7 @@ async fn a_failed_attachment_preserves_the_live_child_and_console_descriptors() 
     let pid = sleeper();
     let mut handed = handed(&vmm, pid, false);
     let session = "session-1".try_into().expect("session id");
-    let Err(error) = vmm.reattach(&session, &tap, &handed.machine, None) else {
+    let Err(error) = vmm.reattach(&session, &tap, &handed.machine, None, false) else {
         panic!("a pipe handed as the guest connection is refused");
     };
     assert!(error.contains("is no socket"), "{error}");
