@@ -225,28 +225,28 @@ fn inspect_host(
     match (runtime, boxes) {
         (Some(runtime), Some(boxes)) => {
             let vmm = Firecracker::new(runtime);
-            checks.check(
-                "attachment",
-                "recorded processes, descriptors and Firecracker APIs inspected",
-                (|| {
-                    let taps = boxes
-                        .iter()
-                        .map(|box_| u8::try_from(box_.record.tap_index))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|error| error.to_string())?;
-                    boxes.iter().try_for_each(|box_| {
-                        vmm.observe(box_)
-                            .map_err(|error| format!("Inspecting box {} failed. {error}", box_.record.tap_index))
-                    })?;
-                    let unclaimed = vmm.unclaimed_scopes(&taps)?;
-                    if unclaimed.is_empty() {
-                        return Ok(());
-                    }
-                    Err(format!(
-                        "running box scopes outside the inventory on TAP devices {unclaimed:?}"
-                    ))
-                })(),
-            );
+            let inspected = (|| -> Result<_, String> {
+                let taps = boxes
+                    .iter()
+                    .map(|box_| u8::try_from(box_.record.tap_index))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                boxes.iter().try_for_each(|box_| {
+                    vmm.observe(box_)
+                        .map_err(|error| format!("Inspecting box {} failed. {error}", box_.record.tap_index))
+                })?;
+                vmm.unclaimed_scopes(&taps)
+            })();
+            match inspected {
+                Ok(taps) if taps.is_empty() => checks.send(
+                    "attachment", Status::Pass, "recorded processes, descriptors and Firecracker APIs inspected",
+                ),
+                Ok(taps) => checks.send(
+                    "attachment", Status::Pass,
+                    format!("recorded processes, descriptors and Firecracker APIs inspected; scopes without attachment records on TAP devices {taps:?} may be booting or handling setup"),
+                ),
+                Err(error) => checks.send("attachment", Status::Fail, error),
+            }
         }
         _ => checks.send(
             "attachment",

@@ -219,7 +219,7 @@ async fn reattach_of_a_box_whose_process_ended_leaves_the_incoming_descriptors_o
     zombie(pid);
     let mut handed = handed(&vmm, pid, true);
     let session = "session-1".try_into().expect("session id");
-    let Err(error) = vmm.reattach(&session, &tap, &handed.machine) else {
+    let Err(error) = vmm.reattach(&session, &tap, &handed.machine, None) else {
         panic!("a box whose process ended is not adopted");
     };
     assert!(error.contains("ended during the handover"), "{error}");
@@ -230,13 +230,68 @@ async fn reattach_of_a_box_whose_process_ended_leaves_the_incoming_descriptors_o
 }
 
 #[tokio::test]
+async fn aborting_a_boot_stops_the_launcher_before_the_api_opens() {
+    let vmm = firecracker("aborted-launch");
+    let tap = TapPool::new(4096, BOX).claim(BOX, ROOMY).expect("tap");
+    let session = "session-1".try_into().expect("session id");
+    let mut machine = vmm.machine(&session, &tap).expect("machine");
+    let launcher = tokio::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("launcher");
+    let pid = i32::try_from(launcher.id().expect("launcher PID")).expect("valid PID");
+    let mut boot = Box::pin(async move { machine.follow_spawn(launcher).await });
+    assert!(tokio::time::timeout(std::time::Duration::ZERO, &mut boot)
+        .await
+        .is_err());
+    drop(boot);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while super::process_start(pid).is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the incomplete launcher is stopped");
+}
+
+#[tokio::test]
+async fn a_socket_with_the_wrong_saved_identity_is_refused() {
+    let vmm = firecracker("reattach-wrong-identity");
+    let tap = TapPool::new(4096, BOX).claim(BOX, ROOMY).expect("tap");
+    let pid = sleeper();
+    let handed = handed(&vmm, pid, true);
+    let (unrelated, mut peer) = UnixStream::pair().expect("a different socket");
+    let supervisor_pid = unsafe { libc::getpid() };
+    let observation = super::Observation {
+        supervisor_pid,
+        supervisor_start: super::process_start(supervisor_pid).expect("supervisor start"),
+        machine_start: super::process_start(pid).expect("box start"),
+        guest: super::Descriptor::read(supervisor_pid, unrelated.as_raw_fd(), "guest", true).expect("socket"),
+        stdout: super::Descriptor::read(supervisor_pid, handed.machine.stdout_fd, "stdout", false).expect("pipe"),
+        stderr: super::Descriptor::read(supervisor_pid, handed.machine.stderr_fd, "stderr", false).expect("pipe"),
+    };
+    let session = "session-1".try_into().expect("session id");
+    let Err(error) = vmm.reattach(&session, &tap, &handed.machine, Some(&observation)) else {
+        panic!("the different guest socket is refused");
+    };
+    assert!(error.contains("differs from the saved box"), "{error}");
+    assert_eq!(alive(pid, SCOPE), Ok(Owner::Child));
+    peer.write_all(b"still open").expect("socket remains open");
+    drop(Taken::from(&handed.machine));
+    zombie(pid);
+    assert!(alive(pid, SCOPE).is_err());
+    assert!(reaped(pid));
+}
+
+#[tokio::test]
 async fn a_failed_attachment_preserves_the_live_child_and_console_descriptors() {
     let vmm = firecracker("reattach-wrong");
     let tap = TapPool::new(4096, BOX).claim(BOX, ROOMY).expect("tap");
     let pid = sleeper();
     let mut handed = handed(&vmm, pid, false);
     let session = "session-1".try_into().expect("session id");
-    let Err(error) = vmm.reattach(&session, &tap, &handed.machine) else {
+    let Err(error) = vmm.reattach(&session, &tap, &handed.machine, None) else {
         panic!("a pipe handed as the guest connection is refused");
     };
     assert!(error.contains("is no socket"), "{error}");
@@ -456,14 +511,20 @@ fn an_unclaimed_scope_keeps_its_open_box_disk_and_leaves_other_sessions_for_clea
     }
     let open = std::fs::File::open(root.join("live").join(super::OVERLAY_DRIVE)).expect("open box disk");
     let processes = [(2, std::path::PathBuf::from("/proc/self"))];
-    let held = super::sessions_in_scopes(&root, &[2], &processes).expect("the scope's open disk");
+    let held = super::scope_reservations(&root, &processes).expect("the scope's open disk");
     assert_eq!(
-        held.iter().map(tumpel_api::types::EntityId::as_str).collect::<Vec<_>>(),
+        held[&2]
+            .iter()
+            .map(tumpel_api::types::EntityId::as_str)
+            .collect::<Vec<_>>(),
         ["live"]
     );
-    let ambiguous = super::sessions_in_scopes(&root, &[2, 3], &processes).expect("keep possible disks");
+    let ambiguous_scope = (3, vmm.data.join("gone-process"));
+    let ambiguous =
+        super::scope_reservations(&root, &[processes[0].clone(), ambiguous_scope]).expect("keep possible disks");
+    assert_eq!(ambiguous[&2], held[&2]);
     assert_eq!(
-        ambiguous
+        ambiguous[&3]
             .iter()
             .map(tumpel_api::types::EntityId::as_str)
             .collect::<Vec<_>>(),
