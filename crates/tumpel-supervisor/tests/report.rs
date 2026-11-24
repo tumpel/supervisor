@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn legacy_preflight_accepts_a_warm_box_without_observation_and_a_prunable_cache_entry() {
         let host = Host::new("warm-preflight", "http://127.0.0.1:9");
-        let warm = json!({"handedAt":"2026-11-16T09:30:00Z", "boxes":[recorded_box(&recorded_image())]});
+        let mut warm = json!({"handedAt":"2026-11-16T09:30:00Z", "boxes":[recorded_box(&recorded_image())]});
         host.state("boxes.json", &warm);
         fs::write(host.root.join("images/broken.json"), "{").expect("prunable manifest");
         fs::write(host.root.join("images/broken.ext4"), "fixture drive").expect("image file");
@@ -482,6 +482,17 @@ mod tests {
         assert!(preflight.status.success(), "{preflight:?}");
         let response: SupervisorCheckReport = serde_json::from_slice(&preflight.stdout).expect("legacy response");
         assert_eq!(response.supervisor_version.as_str(), VERSION);
+        warm["boxes"][0]["state"]["kind"] = json!("FutureState");
+        host.state("boxes.json", &warm);
+        assert!(host
+            .command(&["check"])
+            .output()
+            .expect("preflight exits")
+            .status
+            .success());
+        let report = host.command(&["--json"]).output().expect("report exits");
+        let report: Value = serde_json::from_slice(&report.stdout).expect("JSON report");
+        assert_eq!(report["checks"]["inventory"]["status"], "FAIL");
     }
 
     #[test]

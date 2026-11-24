@@ -997,7 +997,7 @@ impl Vmm for Firecracker {
         Ok(scopes.into_iter().collect())
     }
 
-    fn discard_setup(&self, index: u8) -> Result<(), String> {
+    fn discard_incomplete_boot(&self, index: u8) -> Result<(), String> {
         if self.unclaimed_scopes(&[])?.contains(&index) {
             stop_scopes(&[scope_of(index)])?;
         }

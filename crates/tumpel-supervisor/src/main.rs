@@ -265,6 +265,7 @@ mod tests {
                     .env_clear()
                     .env("TUMPEL_SUPERVISOR_DIR", &dir)
                     .env("TUMPEL_TEST_STARTUP_MODE", mode)
+                    .env("NOTIFY_SOCKET", dir.join("notify"))
                     .kill_on_drop(true)
                     .output(),
             )
