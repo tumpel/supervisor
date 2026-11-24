@@ -382,6 +382,7 @@ async fn download(store: &impl Store, urls: Urls<'_>, staged: &Staged) -> Result
     futures_util::future::try_join3(image, manifest, kernel)
         .await
         .map(|_| ())
+        .map_err(String::from)
 }
 
 fn timed_out(order: &ImageOrder) -> Refusal {

@@ -9,7 +9,7 @@ use tumpel_api::types::TurnFailureReason;
 use super::{adopt, cached, resolve, stage, ImageOrder};
 use crate::boot::Holds;
 use crate::snapshot::hex;
-use crate::store::{Store, UploadError};
+use crate::store::{DownloadError, Store, UploadError};
 
 fn sha256(bytes: &[u8]) -> String {
     hex(digest(&SHA256, bytes).as_ref())
@@ -209,12 +209,18 @@ impl Store for Unreachable {
         std::future::ready(Err(UploadError::Rejected(format!("PUT {url} is not served"))))
     }
 
-    fn download(&self, url: &str, _: &Path) -> impl Future<Output = Result<(), String>> + Send {
-        std::future::ready(Err(format!("GET {url} is not served")))
+    fn download(&self, url: &str, _: &Path) -> impl Future<Output = Result<(), DownloadError>> + Send {
+        std::future::ready(Err(DownloadError::Refused(format!("GET {url} is not served"))))
     }
 
-    fn download_range(&self, url: &str, _: &Path, _: u64, _: u64) -> impl Future<Output = Result<(), String>> + Send {
-        std::future::ready(Err(format!("GET {url} is not served")))
+    fn download_range(
+        &self,
+        url: &str,
+        _: &Path,
+        _: u64,
+        _: u64,
+    ) -> impl Future<Output = Result<(), DownloadError>> + Send {
+        std::future::ready(Err(DownloadError::Refused(format!("GET {url} is not served"))))
     }
 }
 
