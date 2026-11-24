@@ -191,20 +191,49 @@ fn closed(handed: &mut Handed) -> bool {
 }
 
 #[tokio::test]
-async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_binary_left_off() {
+async fn handover_keeps_open_descriptors_and_adopts_the_buffered_guest_frame() {
     let vmm = firecracker("reattach-live");
     let tap = TapPool::new(4096, BOX).claim(BOX, ROOMY).expect("tap");
-    let pid = sleeper();
+    let child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the box process starts");
+    let pid = libc::pid_t::try_from(child.id().expect("the box process ID")).expect("a pid");
     let mut handed = handed(&vmm, pid, true);
     let session = "session-1".try_into().expect("session id");
-    let (machine, mut guest) = vmm
+    let (machine, guest) = vmm
         .attach_box(&session, &tap, &handed.machine, &mut Taken::from(&handed.machine))
         .expect("the box is adopted");
+    let exported = machine.hand_over(guest).expect("the box is exported");
+    assert_eq!(alive(pid, SCOPE), Ok(Owner::Child));
+    let descriptors = [exported.guest_fd, exported.stdout_fd, exported.stderr_fd];
+    assert_eq!(
+        descriptors,
+        [
+            handed.machine.guest_fd,
+            handed.machine.stdout_fd,
+            handed.machine.stderr_fd
+        ]
+    );
+    for fd in descriptors {
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, libc::FD_CLOEXEC);
+    }
+    assert_eq!(exported.guest_buffer, handed.machine.guest_buffer);
+    let bytes = serde_json::to_vec(&exported).expect("the exported record is serializable");
+    let record = serde_json::from_slice(&bytes).expect("the successor reads the exported record");
+    let (machine, mut guest) = vmm
+        .attach_box(&session, &tap, &record, &mut Taken::from(&record))
+        .expect("the successor adopts the same box");
     handed
         .peer
         .write_all(&handed.rest)
         .expect("the guest writes the rest of its frame");
-    let GuestMessage::TurnLine(line) = guest.receive().await.expect("a message") else {
+    let GuestMessage::TurnLine(line) = tokio::time::timeout(std::time::Duration::from_secs(1), guest.receive())
+        .await
+        .expect("the buffered frame completes")
+        .expect("a message")
+    else {
         panic!("the guest sent its line");
     };
     assert_eq!(line.text.as_str(), "one");

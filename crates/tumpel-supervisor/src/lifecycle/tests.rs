@@ -2019,6 +2019,62 @@ async fn a_warm_box_handed_over_with_a_queued_teardown_is_stopped_and_answers_bo
 }
 
 #[tokio::test(start_paused = true)]
+async fn stale_queued_discards_and_teardowns_are_answered_at_export() {
+    let mut old = host("handover-stale-commands", 1, Harness::Echo, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    old.accepting.store(false, Ordering::SeqCst);
+    let snapshot = old.snapshot("session-1");
+    old.settle_until("snapshot done").await;
+    old.log();
+
+    let handover = old.ask_handover();
+    let order = |id: &str| TeardownOrder {
+        session_id: "session-1".try_into().expect("session id"),
+        box_id: id.try_into().expect("stale box id"),
+    };
+    old.send(Command::Teardown(order("stale-teardown")));
+    old.send(Command::Discard(order("stale-discard")));
+    assert_eq!(old.settle(SETTLE).await, Vec::<String>::new());
+    old.commands
+        .send(Input::SnapshotAccepted(snapshot.snapshot_id))
+        .expect("snapshot accepted");
+    let handed = handover.await.expect("the box is handed over");
+    assert_eq!(handed.boxes.len(), 1);
+    assert_eq!(handed.boxes[0].box_id.as_str(), "box-session-1");
+    assert_eq!(handed.boxes[0].queued, []);
+    for id in ["stale-teardown", "stale-discard"] {
+        let reply = tokio::time::timeout(SETTLE, old.received.recv())
+            .await
+            .expect("export answers the stale command");
+        let Some(ChannelHostMessage::BoxGone(gone)) = reply else {
+            panic!("export must answer the stale command for {id}");
+        };
+        assert_eq!(gone.session_id.as_str(), "session-1");
+        assert_eq!(gone.box_id.as_str(), id);
+    }
+    assert_eq!(old.standing().boxes[0].queued, []);
+
+    let mut new = old.successor(&handed);
+    new.turn("turn-2", "session-1", "two", Vec::new());
+    assert_eq!(
+        new.settle_until("complete 1").await,
+        ["claim turn-2", "line 1 two", "complete 1"]
+    );
+    assert_eq!(
+        new.log(),
+        [
+            "hand over session-1",
+            "reattach session-1 on tumpel0",
+            "keep boxes [0] and stop the rest",
+            "resume session-1",
+            "reconnect session-1",
+            "pause session-1",
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_snapshot_handed_over_in_the_queue_waits_for_the_control_plane_welcome() {
     let mut old = host("handover-queued-snapshot", 1, Harness::Echo, Boot::Works);
     old.turn("turn-1", "session-1", "one", Vec::new());

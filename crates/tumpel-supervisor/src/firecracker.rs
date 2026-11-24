@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -1190,11 +1190,22 @@ impl Machine for FirecrackerBox {
             )?,
             ..self.record()?
         };
+        let stdout = self.stdout.take().ok_or("the box has no standard output descriptor")?;
+        let stderr = self.stderr.take().ok_or("the box has no standard error descriptor")?;
+        let stream = guest
+            .stream
+            .into_std()
+            .map_err(|error| format!("detaching the guest connection for handover: {error}"))?;
         self.unwatch();
         if let Some(process) = self.process.take() {
             process.keep();
         }
-        Ok(machine)
+        Ok(SupervisorHandoverMachine {
+            guest_fd: stream.into_raw_fd(),
+            stdout_fd: stdout.into_raw_fd(),
+            stderr_fd: stderr.into_raw_fd(),
+            ..machine
+        })
     }
 }
 

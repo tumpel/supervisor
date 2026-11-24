@@ -234,6 +234,7 @@ pub struct SnapshotOrder {
     pub upload_expires_at: DateTime<FixedOffset>,
 }
 
+#[derive(Clone)]
 pub struct TeardownOrder {
     pub session_id: EntityId,
     pub box_id: EntityId,
@@ -260,6 +261,13 @@ impl From<ChannelSnapshotRequest> for SnapshotOrder {
 }
 
 impl Command {
+    fn stale_teardown(&self, box_id: &EntityId) -> Option<&TeardownOrder> {
+        match self {
+            Self::Teardown(order) | Self::Discard(order) if &order.box_id != box_id => Some(order),
+            _ => None,
+        }
+    }
+
     fn record(&self) -> Result<Option<SupervisorHandoverCommand>, String> {
         Ok(match self {
             Self::Turn(_) => None,
@@ -445,6 +453,10 @@ impl Standing {
             .lock()
             .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?;
         change(&mut boxes);
+        self.persist(&mut boxes)
+    }
+
+    fn persist(&self, boxes: &mut BTreeMap<i32, SupervisorHandoverBox>) -> Result<(), String> {
         let idle_ends = self.idle_ends.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let written = Instant::now();
         for record in boxes.values_mut() {
@@ -487,25 +499,30 @@ impl Standing {
         })
     }
 
-    fn queue(&self, session: &str, queued: &[SupervisorHandoverCommand]) -> Result<(), String> {
-        let unchanged = self
+    fn queue(&self, session: &str, commands: &VecDeque<Command>) -> Result<(), String> {
+        let mut boxes = self
             .boxes
             .lock()
-            .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?
-            .values()
+            .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?;
+        let mut changed = false;
+        for record in boxes
+            .values_mut()
             .filter(|record| record.session_id.as_str() == session)
-            .all(|record| record.queued == queued);
-        if unchanged {
-            return Ok(());
-        }
-        self.write(|boxes| {
-            for record in boxes
-                .values_mut()
-                .filter(|record| record.session_id.as_str() == session)
-            {
-                record.queued = queued.to_vec();
+        {
+            let queued = Command::records(
+                commands
+                    .iter()
+                    .filter(|command| command.stale_teardown(&record.box_id).is_none()),
+            )?;
+            if record.queued != queued {
+                record.queued = queued;
+                changed = true;
             }
-        })
+        }
+        if changed {
+            self.persist(&mut boxes)?;
+        }
+        Ok(())
     }
 }
 
@@ -2649,6 +2666,16 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
+    fn resolve_stale_orders(&self, queue: &mut VecDeque<Command>, box_id: &EntityId) {
+        queue.retain(|command| {
+            let Some(order) = command.stale_teardown(box_id) else {
+                return true;
+            };
+            self.box_gone(order.clone());
+            false
+        });
+    }
+
     fn finish_handover(&mut self) -> Result<(), String> {
         let Some((reply, timer)) = self.handing.take() else {
             return Ok(());
@@ -2661,8 +2688,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             let Some(mut slot) = self.slots.remove(&session) else {
                 continue;
             };
-            slot.paused = false;
-            let queue = std::mem::take(&mut slot.queue);
+            let mut queue = slot.queue;
             let Some(live) = slot.live.take() else {
                 self.answer_lost(&session, queue);
                 continue;
@@ -2688,6 +2714,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             let idle = slot
                 .idle_end
                 .map_or(live.idle, |end| end.saturating_duration_since(Instant::now()));
+            self.resolve_stale_orders(&mut queue, &live.box_id);
             let queued = Command::records(&queue);
             let LiveBox {
                 session_id,
@@ -3511,11 +3538,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     fn record_queue(&self, session: &str) -> Result<(), String> {
-        let queued: Vec<SupervisorHandoverCommand> = self
-            .slots
-            .get(session)
-            .map_or_else(|| Ok(Vec::new()), |slot| Command::records(&slot.queue))?;
-        self.runner.standing.queue(session, &queued)
+        self.runner.standing.queue(
+            session,
+            self.slots.get(session).map_or(&VecDeque::new(), |slot| &slot.queue),
+        )
     }
 }
 
