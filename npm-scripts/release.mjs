@@ -92,7 +92,7 @@ const github = ({ token, method = "GET", path, body }) => {
   return text ? JSON.parse(text) : undefined;
 };
 
-export const assertPublishedRelease = (release, tag) => {
+const assertPublishedRelease = (release, tag) => {
   if (release.draft || !release.prerelease || release.tag_name !== tag)
     die("deploy dispatch requires a published release candidate");
   const names = [
@@ -110,22 +110,22 @@ export const assertPublishedRelease = (release, tag) => {
     die("the published release candidate is missing its uploaded assets");
 };
 
-export const assertSourceSha = (commit, sha) => {
+const assertSourceSha = (commit, sha) => {
   if (commit.sha !== sha) die("the published release tag does not name this source SHA");
 };
 
-const dispatchDeploy = ({ token, readToken, sha, tag, repository }) => {
+export const dispatchDeploy = ({ token, readToken, sha, tag, repository }, request = github) => {
   if (!token) {
     console.log("::notice::DEPLOY_DISPATCH_TOKEN is empty; skipping deploy dispatch");
     return;
   }
   if (repository !== "tumpel/supervisor" || !/^[a-f0-9]{40}$/.test(sha) || !/^v\d+\.\d+\.\d+-rc\.\d+$/.test(tag))
     die("deploy dispatch needs the supervisor source SHA and release-candidate tag");
-  const release = github({ token: readToken, path: `repos/${repository}/releases/tags/${tag}` });
+  const release = request({ token: readToken, path: `repos/${repository}/releases/tags/${tag}` });
   assertPublishedRelease(release, tag);
-  const commit = github({ token: readToken, path: `repos/${repository}/commits/${tag}` });
+  const commit = request({ token: readToken, path: `repos/${repository}/commits/${tag}` });
   assertSourceSha(commit, sha);
-  github({
+  request({
     token,
     path: "repos/tumpel/deploy/dispatches",
     method: "POST",
@@ -159,7 +159,7 @@ const cli = async ([command, ...args]) => {
   if (command === "pins" && args.length === 0) return pins();
   if (command === "stamp" && args.length === 1) return stamp(args[0]);
   if (command === "assets" && args.length === 2) return assets(args[0], args[1]);
-  return die("usage: release.mjs pins | stamp <X.Y.Z[-rc.N]> | assets <X.Y.Z[-rc.N]> <dir>");
+  return die("usage: release.mjs pins | stamp <X.Y.Z[-rc.N]> | assets <X.Y.Z[-rc.N]> <dir> | dispatch-deploy");
 };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

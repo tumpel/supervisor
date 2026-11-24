@@ -7,7 +7,12 @@ on:
     branches: [main]
 
 concurrency:
-  group: release
+  group: >-
+    ${{ github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        'release' || format('release-skipped-{0}', github.run_id) }}
   cancel-in-progress: false
 
 permissions:
@@ -29,6 +34,7 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -50,12 +56,13 @@ jobs:
           set -f
           stable=$(convco version --ignore-prereleases)
           next=$(convco version --bump --ignore-prereleases $(printf -- '-P %s ' $SHIPPED))
-          nearest=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude 'v*-main.*')
+          version="$next-rc.$(git rev-list --count "v$stable..HEAD")"
+          nearest=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude 'v*-main.*' --exclude "v$version")
           if [ "$next" = "$stable" ] || git diff --quiet "$nearest" HEAD -- $SHIPPED; then
             echo "release: nothing shipped needs a new version since $nearest" >&2
             echo "version=" >> "$GITHUB_OUTPUT"
           else
-            echo "version=$next-rc.$(git rev-list --count "v$stable..HEAD")" | tee -a "$GITHUB_OUTPUT"
+            echo "version=$version" | tee -a "$GITHUB_OUTPUT"
           fi
 
   candidate:
@@ -101,19 +108,35 @@ jobs:
       - name: Stage the binaries, their sha256 and release.json
         run: node npm-scripts/release.mjs assets "$VERSION" .tmp/release
 
-      - name: Publish the GitHub pre-release with the binaries
+      - id: publish
+        name: Publish the GitHub pre-release with the binaries
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          ref="refs/tags/$TAG"
+          refs=$(git ls-remote --tags origin "$ref" "$ref^{}")
+          tagged=$(awk -v ref="$ref" '$2 == ref { direct = $1 } $2 == ref "^{}" { peeled = $1 } END { print peeled ? peeled : direct }' <<< "$refs")
+          if [ -z "$tagged" ]; then
+            git push origin "$SOURCE_SHA:$ref"
+          elif [ "$tagged" != "$SOURCE_SHA" ]; then
+            echo "release: $TAG points to $tagged but this candidate was built from $SOURCE_SHA; check the candidate tag" >&2
+            exit 1
+          fi
+          draft=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$TAG\") | .draft")
           case "$draft" in
-            none) gh release create "$TAG" .tmp/release/* --title "$TAG" --generate-notes --target "$SOURCE_SHA" --prerelease --latest=false ;;
-            true) gh release upload "$TAG" .tmp/release/* --clobber && gh release edit "$TAG" --draft=false --prerelease --latest=false ;;
-            *) echo "release: $TAG is already published; its binaries stay as they are" >&2; exit 1 ;;
+            "") gh release create "$TAG" .tmp/release/* --title "$TAG" --generate-notes --verify-tag --prerelease --latest=false ;;
+            true)
+              gh release upload "$TAG" .tmp/release/* --clobber
+              gh release edit "$TAG" --draft=false --prerelease --latest=false
+              ;;
+            false) echo "release: $TAG is already published"; exit 0 ;;
+            *) echo "release: GitHub returned multiple releases for $TAG; check the candidate releases" >&2; exit 1 ;;
           esac
+          echo "published=true" >> "$GITHUB_OUTPUT"
 
       - id: dispatch-deploy
         name: Dispatch component-released to deploy
+        if: success() && steps.publish.outputs.published == 'true'
         continue-on-error: true
         env:
           DEPLOY_DISPATCH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
