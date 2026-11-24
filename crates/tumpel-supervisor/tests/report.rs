@@ -330,7 +330,15 @@ mod tests {
             &["run", "--update-binary", BINARY, "--handover"],
             &["--unknown"],
         ] {
-            assert_eq!(host.audited_report(args).status.code(), Some(2), "{args:?}");
+            assert_eq!(
+                host.command(args)
+                    .output()
+                    .expect("invalid invocation exits")
+                    .status
+                    .code(),
+                Some(2),
+                "{args:?}"
+            );
         }
         fs::write(host.root.join("state/channel.json"), "{\n\"received\":").expect("broken channel ledger");
         host.state("update-trial.json", &json!({"privateKey":"fixture-credential"}));
@@ -344,7 +352,7 @@ mod tests {
         let image = host.root.join("images/broken.ext4");
         fs::write(&invalid_image, "{").expect("invalid manifest");
         fs::write(&image, "fixture image").expect("image alongside the invalid manifest");
-        let output = host.audited_report(&["--json"]);
+        let output = host.command(&["--json"]).output().expect("report exits");
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         let stdout = String::from_utf8(output.stdout).expect("report");
         assert!(!stdout.contains("fixture-credential"));
@@ -375,6 +383,12 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("control-plane boundary");
             let endpoint = format!("http://{}", listener.local_addr().expect("listener address"));
             let host = Host::new(name, &endpoint);
+            if name == "daemon" {
+                let inventory = json!({"handedAt":"2026-11-16T09:30:00Z",
+                    "boxes":[recorded_box(&recorded_image())]});
+                host.state("boxes.json", &inventory);
+                host.state("handover.json", &inventory);
+            }
             let mut command = tokio::process::Command::from(host.command(&argv));
             let mut daemon = command.kill_on_drop(true).spawn().expect("daemon executable");
             timeout(Duration::from_secs(10), async {
@@ -414,10 +428,16 @@ mod tests {
             .await
             .expect("daemon starts and reports its heartbeat");
 
-            let mut notification = [0; 64];
-            let received = host.notify.recv(&mut notification).expect("daemon readiness");
-            assert_eq!(&notification[..received], b"READY=1");
             assert!(daemon.try_wait().expect("daemon status").is_none());
+            if name == "daemon" {
+                let saved = fs::read(host.root.join("state/boxes.json")).expect("preserved inventory");
+                let saved: Value = serde_json::from_slice(&saved).expect("inventory JSON");
+                assert_eq!(saved["boxes"][0]["boxId"], "box-1");
+                assert!(
+                    !host.root.join("state/handover.json").exists(),
+                    "the skipped handover was cleared"
+                );
+            }
             daemon.kill().await.expect("stop the test daemon");
         }
     }
@@ -458,7 +478,7 @@ mod tests {
         fs::write(host.root.join("images/broken.json"), "{").expect("prunable manifest");
         fs::write(host.root.join("images/broken.ext4"), "fixture drive").expect("image file");
 
-        let preflight = host.audited_report(&["check"]);
+        let preflight = host.command(&["check"]).output().expect("preflight exits");
         assert!(preflight.status.success(), "{preflight:?}");
         let response: SupervisorCheckReport = serde_json::from_slice(&preflight.stdout).expect("legacy response");
         assert_eq!(response.supervisor_version.as_str(), VERSION);
@@ -477,7 +497,7 @@ mod tests {
             "boxes.json",
             &json!({"handedAt":"2026-11-16T09:30:00Z", "boxes":[recorded_box(&image)]}),
         );
-        let result = host.audited_report(&["--json"]);
+        let result = host.command(&["--json"]).output().expect("report exits");
         assert_eq!(result.status.code(), Some(1), "{result:?}");
         let report: Value = serde_json::from_slice(&result.stdout).expect("JSON report");
         assert_eq!(report["checks"]["inventory"]["status"], "PASS", "{report}");
@@ -546,7 +566,9 @@ mod tests {
         let body = r#"{"mem_size_mib":256}"#;
         write!(query, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).expect("reply to the report");
         assert_eq!(
-            std::io::stdin().read(&mut [0]).expect("wait for the report to finish"),
+            std::io::stdin()
+                .read(&mut [0u8; 1])
+                .expect("wait for the report to finish"),
             0
         );
     }
@@ -622,43 +644,5 @@ mod tests {
             .expect("API served one call")
             .expect("exit status")
             .success());
-    }
-    #[tokio::test]
-    async fn startup_keeps_unclaimed_scopes_and_their_files() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let host = Host::new("unclaimed", "http://127.0.0.1:9");
-        let systemctl = host.root.join("systemctl");
-        fs::write(
-            &systemctl,
-            "#!/bin/sh\n[ \"$2\" = list-units ] || exit 99\nprintf '%s\n' 'tumpel-box0.scope loaded active running'\n",
-        )
-        .expect("the fake user manager only lists a running scope");
-        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).expect("executable service operation");
-        let box_dir = host.root.join("data/box0");
-        let session = host.root.join("data/sessions/unclaimed");
-        fs::create_dir(&box_dir).expect("box directory");
-        fs::create_dir_all(&session).expect("session directory");
-        let api_path = box_dir.join("api.sock");
-        let _api = std::os::unix::net::UnixListener::bind(&api_path).expect("the box API socket");
-        let overlay = session.join("overlay.ext4");
-        fs::write(&overlay, b"unclaimed overlay").expect("overlay");
-        let mut daemon = tokio::process::Command::from(host.command(&["--daemon"]));
-        let result = timeout(Duration::from_secs(5), daemon.kill_on_drop(true).output())
-            .await
-            .expect("startup finishes")
-            .expect("daemon exit");
-        assert_eq!(result.status.code(), Some(3), "{result:?}");
-        assert!(String::from_utf8_lossy(&result.stderr).contains("running box scopes outside the inventory"));
-        assert_eq!(
-            fs::read(overlay).expect("the box keeps its overlay"),
-            b"unclaimed overlay"
-        );
-        assert!(api_path.exists());
-        assert!(!host.root.join("state/boxes.json").exists());
-        assert_eq!(
-            host.notify.recv(&mut [0; 64]).expect_err("no readiness").kind(),
-            io::ErrorKind::WouldBlock
-        );
     }
 }

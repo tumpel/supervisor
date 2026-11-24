@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use chrono::{DateTime, FixedOffset};
@@ -22,15 +23,49 @@ pub(crate) struct RecordedBox {
     pub observation: Option<Observation>,
 }
 
-impl From<Inventory> for SupervisorHandover {
-    fn from(inventory: Inventory) -> Self {
+impl From<SupervisorHandover> for Inventory {
+    fn from(handover: SupervisorHandover) -> Self {
         Self {
-            boxes: inventory.boxes.into_iter().map(|box_| box_.record).collect(),
-            handed_at: inventory.handed_at,
+            boxes: handover
+                .boxes
+                .into_iter()
+                .map(|record| RecordedBox {
+                    record,
+                    observation: None,
+                })
+                .collect(),
+            handed_at: handover.handed_at,
         }
     }
 }
 
+impl RecordedBox {
+    pub fn same_machine(&self, other: &Self) -> bool {
+        self.record.tap_index == other.record.tap_index
+            && self.record.session_id == other.record.session_id
+            && self.record.box_id == other.record.box_id
+            && self.record.machine.process_id == other.record.machine.process_id
+    }
+}
+
 pub(crate) fn load(path: &Path) -> anyhow::Result<Option<Inventory>> {
-    dir::read_json(path, "SupervisorHandover")
+    let inventory: Option<Inventory> = dir::read_json(path, "SupervisorHandover")?;
+    if let Some(inventory) = inventory.as_ref() {
+        validate(inventory.boxes.iter().map(|box_| &box_.record)).map_err(anyhow::Error::msg)?;
+    }
+    Ok(inventory)
+}
+
+pub(crate) fn validate<'a>(records: impl IntoIterator<Item = &'a SupervisorHandoverBox>) -> Result<(), String> {
+    let mut taps = HashSet::new();
+    let mut sessions = HashSet::new();
+    for record in records {
+        if !(0..i32::from(crate::pool::TAP_POOL)).contains(&record.tap_index)
+            || !taps.insert(record.tap_index)
+            || !sessions.insert(&record.session_id)
+        {
+            return Err("the box inventory has an invalid or duplicate TAP index or a duplicate session".to_string());
+        }
+    }
+    Ok(())
 }

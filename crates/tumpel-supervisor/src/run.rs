@@ -32,9 +32,10 @@ use crate::exchange::{Answer, Answers, Cancels};
 use crate::fd_store;
 use crate::firecracker::Firecracker;
 use crate::guest_drive;
+use crate::inventory::{self, Inventory};
 use crate::lifecycle::{
     turn_failed, Abandoned, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder,
-    Taken, TeardownOrder, Vmm,
+    Taken, TeardownOrder,
 };
 use crate::pool::{memory_budget_mib, mib, Held, Size, TapPool};
 use crate::store::{jitter, HttpStore};
@@ -119,17 +120,13 @@ impl Updates {
 
     async fn welcomed(&mut self) -> Result<(), Failure> {
         if let Some(trial) = self.trial.take() {
-            let rewritten = update::refresh_unit(&self.layout)
-                .map_err(|detail| fail(SupervisorFailure::UpdateNotOnline, format!("{detail}; {ROLLED_BACK}")))?;
+            refresh_unit(&self.layout, ROLLED_BACK).await?;
             update::confirm(&self.layout, &trial, &self.out).map_err(|error| {
                 fail(
                     SupervisorFailure::UpdateNotOnline,
                     format!("{error}; the next start puts the previous binary back"),
                 )
             })?;
-            if rewritten {
-                reload_unit(&self.layout, RESTARTED).await?;
-            }
             self.confirmed.send_replace(true);
         }
         self.announced();
@@ -139,9 +136,18 @@ impl Updates {
 
 pub(crate) async fn refresh_unit(layout: &Layout, fix: &str) -> Result<(), Failure> {
     let failed = |detail: String| fail(SupervisorFailure::UpdateNotOnline, format!("{detail}; {fix}"));
-    if update::refresh_unit(layout).map_err(failed)? {
-        reload_unit(layout, fix).await?;
+    let marker = layout.unit.with_extension("service.reload-pending");
+    let pending = marker
+        .try_exists()
+        .map_err(|error| failed(format!("reading {}: {error}", marker.display())))?;
+    let current = crate::install::supervisor_unit_text(&layout.binary);
+    if !pending && std::fs::read_to_string(&layout.unit).is_ok_and(|unit| unit == current) {
+        return Ok(());
     }
+    std::fs::write(&marker, []).map_err(|error| failed(format!("writing {}: {error}", marker.display())))?;
+    update::refresh_unit(layout).map_err(&failed)?;
+    reload_unit(layout, fix).await?;
+    std::fs::remove_file(&marker).map_err(|error| failed(format!("removing {}: {error}", marker.display())))?;
     Ok(())
 }
 
@@ -408,7 +414,7 @@ fn start_boxes(
     received: UnboundedReceiver<BoxCommand>,
     out: UnboundedSender<Outgoing>,
     telemetry: Telemetry,
-    taken: Option<(SupervisorHandover, Taken)>,
+    taken: Option<(Inventory, Taken)>,
     standing: PathBuf,
 ) -> Result<(Usage, IdleGate, BoxRunner), Failure> {
     let unreadable = |error: anyhow::Error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}"));
@@ -420,15 +426,10 @@ fn start_boxes(
         layer_cache_mib: runtime.layer_cache_mib,
     };
     let box_capacity = pool.capacity();
-    let vmm = Firecracker::new(runtime);
-    if taken.is_none() {
-        vmm.check_unclaimed(&[])
-            .map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
-    }
-    let mut lifecycle = Lifecycle::new(vmm, store, settings, pool, out, standing);
+    let mut lifecycle = Lifecycle::new(Firecracker::new(runtime), store, settings, pool, out, standing);
     lifecycle
-        .start(taken)
-        .map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
+        .start_inventory(taken)
+        .map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
     let usage = Usage {
         box_capacity,
         warm: lifecycle.warm(),
@@ -734,24 +735,40 @@ fn taken(
     layout: &Layout,
     handed: bool,
     mut received: BTreeMap<String, OwnedFd>,
-) -> Result<Option<(SupervisorHandover, Taken)>, Failure> {
+) -> Result<Option<(Inventory, Taken)>, Failure> {
     let load = |path: &Path| {
-        crate::inventory::load(path)
-            .map(|saved| saved.map(SupervisorHandover::from))
-            .map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")))
+        inventory::load(path).map_err(|error| fail(SupervisorFailure::ChannelStateLost, format!("{error:#}")))
     };
+    let standing = load(&layout.boxes())?;
     if handed || !received.is_empty() {
-        if let Some(handover) = load(&layout.handover())? {
-            let handover = if received.is_empty() {
-                handover
-            } else {
-                fd_store::restored(handover, &mut received)
-            };
+        let handover = load(&layout.handover())?;
+        if let Some(mut handover) = handover.filter(|handover| {
+            standing
+                .as_ref()
+                .is_none_or(|saved| handed || saved.handed_at <= handover.handed_at)
+        }) {
+            let inherited = received.is_empty();
+            for box_ in &mut handover.boxes {
+                if let Some(saved) = standing
+                    .iter()
+                    .flat_map(|inventory| &inventory.boxes)
+                    .find(|saved| saved.same_machine(box_))
+                {
+                    box_.observation.clone_from(&saved.observation);
+                }
+                if !inherited {
+                    fd_store::restore_box(&mut box_.record, &mut received);
+                }
+            }
             return Ok(Some((handover, Taken::Handed)));
         }
     }
-    let standing = load(&layout.boxes())?;
-    Ok(standing.map(|standing| (fd_store::restored(standing, &mut received), Taken::Crashed)))
+    Ok(standing.map(|mut inventory| {
+        for box_ in &mut inventory.boxes {
+            fd_store::restore_box(&mut box_.record, &mut received);
+        }
+        (inventory, Taken::Crashed)
+    }))
 }
 
 async fn start_update(
@@ -795,7 +812,7 @@ pub async fn run(
         .is_some()
         .then(|| tokio::time::Instant::now() + Limits::HOST.online);
     let taken = taken(&started.layout, handed, received)?;
-    let forget_handover = matches!(taken, Some((_, Taken::Handed)));
+
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
         .await
@@ -811,10 +828,7 @@ pub async fn run(
         taken,
         started.layout.boxes(),
     )?;
-    if forget_handover {
-        update::forget_handover(&started.layout).map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
-    }
-    fd_store::ready().map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?;
+    update::forget_handover(&started.layout).map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
     started_daemon();
     let url = started.url;
     let config = started.config;

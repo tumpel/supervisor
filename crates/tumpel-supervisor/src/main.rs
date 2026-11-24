@@ -95,6 +95,7 @@ fn with_runtime(task: impl std::future::Future<Output = ExitCode>) -> ExitCode {
 }
 
 const DAEMON_START_SECONDS: u32 = 120;
+const STARTUP_TIMED_OUT: libc::c_int = 11;
 const REPORT_SECONDS: u32 = 60;
 
 fn daemon(handover: bool, seconds: u32) -> ExitCode {
@@ -151,7 +152,19 @@ extern "C" fn report_timed_out(_: libc::c_int) {
 }
 
 extern "C" fn daemon_timed_out(_: libc::c_int) {
-    unsafe { libc::_exit(10) };
+    let message =
+        b"tumpel-supervisor: startup reached its time limit; check state storage and Firecracker before restarting\n";
+    let mut stderr = libc::pollfd {
+        fd: libc::STDERR_FILENO,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    unsafe {
+        if libc::poll(&raw mut stderr, 1, 0) > 0 && stderr.revents & libc::POLLOUT != 0 {
+            libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+        }
+        libc::_exit(STARTUP_TIMED_OUT);
+    }
 }
 
 fn arm_deadline(seconds: u32, handler: extern "C" fn(libc::c_int)) -> std::io::Result<()> {
@@ -243,7 +256,7 @@ mod tests {
         let blocked = dir.join("supervisor.json");
         let path = std::ffi::CString::new(blocked.as_os_str().as_encoded_bytes()).expect("FIFO path");
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        for (mode, code) in [("daemon", 10), ("report", 1)] {
+        for (mode, code) in [("daemon", super::STARTUP_TIMED_OUT), ("report", 1)] {
             let mut command = tokio::process::Command::new(std::env::current_exe().expect("test binary"));
             let output = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -259,7 +272,9 @@ mod tests {
             .expect("the blocked loader is bounded")
             .expect("the child starts");
             assert_eq!(output.status.code(), Some(code), "{output:?}");
-            if mode == "report" {
+            if mode == "daemon" {
+                assert!(String::from_utf8_lossy(&output.stderr).contains("startup reached its time limit"));
+            } else {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let json = stdout.lines().find(|line| line.starts_with('{')).expect("JSON report");
                 let report: serde_json::Value = serde_json::from_str(json).expect("complete JSON report");

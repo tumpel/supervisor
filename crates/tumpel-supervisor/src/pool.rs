@@ -314,6 +314,12 @@ impl TapPool {
         Ok(Tap { index, size })
     }
 
+    pub(crate) fn reserve_scope(&mut self, index: u8) {
+        if self.held.insert(index) {
+            self.hold(self.box_size);
+        }
+    }
+
     fn hold(&mut self, size: Size) {
         self.held_mib += u64::from(size.memory_mib.get());
         self.reserved_disk

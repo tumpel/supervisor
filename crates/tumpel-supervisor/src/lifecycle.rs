@@ -1,6 +1,6 @@
 use crate::firecracker::Observation;
 use crate::inventory::{Inventory, RecordedBox};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::BufWriter;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -196,10 +196,16 @@ pub trait Vmm: Send + Sync + 'static {
         tap: &Tap,
         handed: &SupervisorHandoverMachine,
     ) -> Result<(Self::Machine, <Self::Machine as Machine>::Guest), String>;
-    fn booted_memory(&self, index: u8, handed: &SupervisorHandoverMachine) -> Result<Option<NonZeroU32>, String>;
+    fn booted_memory(
+        &self,
+        index: u8,
+        handed: &SupervisorHandoverMachine,
+        observation: Option<&Observation>,
+    ) -> Result<Option<NonZeroU32>, String>;
     fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String>;
     fn disk(&self, drives: &[String]) -> Result<Disk, String>;
-    fn check_unclaimed(&self, claimed: &[u8]) -> Result<(), String>;
+    fn unclaimed_scopes(&self, claimed: &[u8]) -> Result<Vec<u8>, String>;
+    fn discard_setup(&self, index: u8) -> Result<(), String>;
     fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
     fn staging(&self, session_id: &EntityId) -> Result<PathBuf, String>;
@@ -2303,12 +2309,13 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     turns: watch::Sender<Vec<EntityId>>,
     holdings: watch::Sender<Held>,
     setups: HashMap<String, UnboundedSender<SetupInput>>,
-    setup_tasks: HashMap<String, JoinHandle<()>>,
+    setup_tasks: HashMap<String, (u8, JoinHandle<()>)>,
     mode: Mode,
     parking: watch::Sender<bool>,
     handing: Option<(oneshot::Sender<SupervisorHandover>, AbortHandle)>,
     session_protocol: Option<u16>,
     adopted: Vec<String>,
+    protected_sessions: HashSet<String>,
 }
 
 impl<V: Vmm, S: Store> Lifecycle<V, S> {
@@ -2365,6 +2372,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             handing: None,
             session_protocol: None,
             adopted: Vec::new(),
+            protected_sessions: HashSet::new(),
         }
     }
 
@@ -2477,7 +2485,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 Some(setup) = setups.recv() => self.setup_command(setup),
                 Some(event) = finished.recv() => self.event(event).await?,
             }
-            self.settle_handover()?;
+            self.settle_handover();
             self.publish();
         }
         for inputs in self.setups.values() {
@@ -2574,27 +2582,28 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         .abort_handle()
     }
 
-    fn settle_handover(&mut self) -> Result<(), String> {
-        if self.handing.is_none() || !self.setups.is_empty() || self.slots.values().any(|slot| slot.busy) {
-            return Ok(());
+    fn settle_handover(&mut self) {
+        if self.handing.is_some() && self.setups.is_empty() && !self.slots.values().any(|slot| slot.busy) {
+            self.finish_handover();
         }
-        self.finish_handover()
     }
 
-    async fn handover_expired(&mut self) -> Result<(), String> {
+    async fn handover_expired(&mut self) {
         if self.handing.is_none() {
-            return Ok(());
+            return;
         }
-        let setups: Vec<(String, JoinHandle<()>)> = self.setup_tasks.drain().collect();
-        for (claude_setup_id, task) in setups {
+        for (claude_setup_id, (index, task)) in self.setup_tasks.drain() {
             task.abort();
             let _ = task.await;
             self.setups.remove(&claude_setup_id);
-            self.free_disk(&claude_setup_id)?;
+            if let Err(error) = self.runner.vmm.discard_setup(index) {
+                eprintln!("tumpel-supervisor: discarding the setup box on TAP {index} failed: {error}; kept its files");
+            }
         }
         let busy = self.slots.values().filter(|slot| slot.busy).count();
         if busy == 0 {
-            return self.finish_handover();
+            self.finish_handover();
+            return;
         }
         eprintln!(
             "tumpel-supervisor: HandoverTimedOut: {busy} boxes are still booting or snapshotting {} s into the handover; this supervisor keeps them running and hands every box over once each reaches a point it can be handed over",
@@ -2604,7 +2613,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         if let Some((_, waiting)) = self.handing.as_mut() {
             *waiting = timer;
         }
-        Ok(())
     }
 
     async fn abandon(&mut self, reply: oneshot::Sender<()>, abandoned: Abandoned) {
@@ -2664,9 +2672,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    fn finish_handover(&mut self) -> Result<(), String> {
+    fn finish_handover(&mut self) {
         let Some((reply, timer)) = self.handing.take() else {
-            return Ok(());
+            return;
         };
         timer.abort();
         let mut boxes = Vec::new();
@@ -2723,9 +2731,21 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     .hand_over(guest)
                     .map(|machine| (machine, queued, credential_file, image))
             });
-            let (machine, queued, credential_file, image) = handed.map_err(|error| {
-                format!("handing over box {box_id} of session {session} failed: {error}; the next start can use the saved box record")
-            })?;
+            let (machine, queued, credential_file, image) = match handed {
+                Ok(handed) => handed,
+                Err(error) => {
+                    eprintln!("tumpel-supervisor: handing over box {box_id} of session {session} failed: {error}; kept its saved box record");
+                    if let SupervisorHandoverBoxState::Turn(turn) = state {
+                        turn_failed(
+                            &self.runner.out,
+                            &turn.turn_id,
+                            TurnFailureReason::HarnessExited,
+                            format!("handing over box {box_id} failed: {error}; send the turn again"),
+                        );
+                    }
+                    continue;
+                }
+            };
             boxes.push(SupervisorHandoverBox {
                 box_id,
                 box_retention,
@@ -2744,7 +2764,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             boxes,
             handed_at: now(),
         });
-        Ok(())
     }
 
     fn resume(&mut self, session: String) {
@@ -2768,23 +2787,64 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     /// # Errors
     /// Fails when a live box cannot be attached, an unknown scope remains, or the inventory cannot be saved.
     pub fn start(&mut self, taken: Option<(SupervisorHandover, Taken)>) -> Result<(), String> {
+        self.start_inventory(taken.map(|(record, state)| (record.into(), state)))
+    }
+
+    pub(crate) fn start_inventory(&mut self, taken: Option<(Inventory, Taken)>) -> Result<(), String> {
         let recorded = taken.is_some();
         let mut standing = BTreeMap::new();
+        let mut claimed = Vec::new();
+        let handed = matches!(taken, Some((_, Taken::Handed)));
         if let Some((handover, taken)) = taken {
+            crate::inventory::validate(handover.boxes.iter().map(|box_| &box_.record))?;
             let age = milliseconds((now() - handover.handed_at).to_std().unwrap_or(Duration::ZERO));
-            for mut handed in handover.boxes {
+            for RecordedBox {
+                record: mut handed,
+                observation,
+            } in handover.boxes
+            {
                 if matches!(handed.state, SupervisorHandoverBoxState::Warm(_)) {
                     handed.idle_milliseconds = handed.idle_milliseconds.saturating_sub(age).max(0);
                 }
-                if let Some(record) = self.adopt(handed, taken)? {
-                    standing.insert(record.record.tap_index, record);
+                match self.adopt(handed.clone(), taken, observation.as_ref()) {
+                    Ok(Some(record)) => {
+                        claimed.extend(u8::try_from(record.record.tap_index));
+                        standing.insert(record.record.tap_index, record);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.protect_box(&handed, &error);
+                        standing.insert(
+                            handed.tap_index,
+                            RecordedBox {
+                                record: handed,
+                                observation,
+                            },
+                        );
+                    }
                 }
             }
         }
-        let claimed: Vec<u8> = standing.keys().filter_map(|index| u8::try_from(*index).ok()).collect();
-        let sessions: Vec<EntityId> = standing.values().map(|box_| box_.record.session_id.clone()).collect();
-        if recorded {
-            self.runner.vmm.check_unclaimed(&claimed)?;
+        let unclaimed = self.reconcile_scopes(&claimed)?;
+        if handed && !unclaimed.is_empty() {
+            if let Some(previous) =
+                crate::inventory::load(&self.runner.standing.path).map_err(|error| format!("{error:#}"))?
+            {
+                for saved in previous.boxes {
+                    if u8::try_from(saved.record.tap_index).is_ok_and(|tap| unclaimed.contains(&tap))
+                        && !standing.contains_key(&saved.record.tap_index)
+                    {
+                        self.protected_sessions.insert(saved.record.session_id.to_string());
+                        standing.insert(saved.record.tap_index, saved);
+                    }
+                }
+            }
+        }
+        if recorded && unclaimed.is_empty() && self.protected_sessions.is_empty() {
+            let sessions = standing
+                .values()
+                .map(|box_| box_.record.session_id.clone())
+                .collect::<Vec<_>>();
             self.runner.vmm.remove_leftovers(&claimed, &sessions)?;
         }
         self.runner.standing.write(|boxes| *boxes = standing)?;
@@ -2792,9 +2852,33 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         Ok(())
     }
 
-    fn attach(&mut self, handed: &SupervisorHandoverBox) -> Result<Option<Attached<V::Machine>>, String> {
+    fn protect_box(&mut self, box_: &SupervisorHandoverBox, error: &str) {
+        eprintln!(
+            "tumpel-supervisor: box {} of session {} is kept after attachment failed: {error}",
+            box_.box_id, box_.session_id
+        );
+        if let Ok(index) = u8::try_from(box_.tap_index) {
+            self.pool.reserve_scope(index);
+        }
+        self.protected_sessions.insert(box_.session_id.to_string());
+    }
+
+    fn reconcile_scopes(&mut self, claimed: &[u8]) -> Result<Vec<u8>, String> {
+        let unclaimed = self.runner.vmm.unclaimed_scopes(claimed)?;
+        for &index in &unclaimed {
+            self.pool.reserve_scope(index);
+            eprintln!("tumpel-supervisor: keeping unclaimed tumpel-box{index}.scope and reserving its TAP");
+        }
+        Ok(unclaimed)
+    }
+
+    fn attach(
+        &mut self,
+        handed: &SupervisorHandoverBox,
+        observation: Option<&Observation>,
+    ) -> Result<Option<Attached<V::Machine>>, String> {
         let index = u8::try_from(handed.tap_index).map_err(|_| "the box has an invalid TAP index")?;
-        let Some(memory_mib) = self.runner.vmm.booted_memory(index, &handed.machine)? else {
+        let Some(memory_mib) = self.runner.vmm.booted_memory(index, &handed.machine, observation)? else {
             return Ok(None);
         };
         let disk_mib = self.runner.vmm.booted_disk(&handed.session_id)?;
@@ -2810,7 +2894,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    fn adopt(&mut self, handed: SupervisorHandoverBox, taken: Taken) -> Result<Option<RecordedBox>, String> {
+    fn adopt(
+        &mut self,
+        handed: SupervisorHandoverBox,
+        taken: Taken,
+        previous: Option<&Observation>,
+    ) -> Result<Option<RecordedBox>, String> {
         let session = handed.session_id.to_string();
         let context = |error| {
             format!(
@@ -2819,7 +2908,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             )
         };
         let (record, image, queue) = decode_box(&handed).map_err(context)?;
-        let Some((machine, guest, tap)) = self.attach(&handed).map_err(context)? else {
+        let Some((machine, guest, tap)) = self.attach(&handed, previous).map_err(context)? else {
             if let SupervisorHandoverBoxState::Turn(turn) = &handed.state {
                 turn_failed(
                     &self.runner.out,
@@ -2901,6 +2990,34 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             return Ok(());
         }
         let session = command.session();
+        if self.protected_sessions.contains(&session) {
+            let detail = "could not attach its saved box; restore its descriptors and restart the supervisor";
+            match command {
+                Command::Turn(turn) => self.refuse_turn(&turn.turn_id, detail),
+                Command::Snapshot(order) => emit(
+                    &self.runner.out,
+                    ChannelSnapshotFailed {
+                        detail: reported("the snapshot failure detail", detail),
+                        failed_at: now(),
+                        reason: ChannelSnapshotFailureReason::BoxNotFound,
+                        snapshot_id: order.snapshot_id,
+                        type_: ChannelSnapshotFailedType::SnapshotFailed,
+                    },
+                ),
+                Command::Teardown(order) | Command::Discard(order) => emit(
+                    &self.runner.out,
+                    ChannelBoxTeardownFailed {
+                        detail: reported("the teardown failure detail", detail),
+                        failed_at: now(),
+                        reason: ChannelBoxTeardownFailureReason::BoxDirty,
+                        session_id: order.session_id,
+                        box_id: order.box_id,
+                        type_: ChannelBoxTeardownFailedType::BoxTeardownFailed,
+                    },
+                ),
+            }
+            return Ok(());
+        }
         let slot = self.slots.entry(session.clone()).or_default();
         if slot.busy || slot.parked.is_some() {
             slot.queue.push_back(command);
@@ -2994,6 +3111,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let runner = self.runner.clone();
         let events = self.events.clone();
         let named = id.clone();
+        let index = tap.index();
         let task = tokio::spawn(async move {
             let (tap, stopped) = runner.claude_setup(tap, order, received).await;
             let _ = events.send(Event::SetupFinished {
@@ -3002,7 +3120,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 tap,
             });
         });
-        self.setup_tasks.insert(id, task);
+        self.setup_tasks.insert(id, (index, task));
     }
 
     fn spawn(
@@ -3330,7 +3448,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 stopped?;
                 self.free_disk(&claude_setup_id)
             }
-            Event::HandoverExpired => self.handover_expired().await,
+            Event::HandoverExpired => {
+                self.handover_expired().await;
+                Ok(())
+            }
             Event::IdleExpired { session, box_id } => self.idle_expired(&session, box_id).await,
         }
     }

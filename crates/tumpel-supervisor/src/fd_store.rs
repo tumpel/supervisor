@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use sendfd::SendWithFd;
-use tumpel_api::types::SupervisorHandover;
+use tumpel_api::types::{SupervisorHandover, SupervisorHandoverBox};
 
 pub const GUEST: &str = "guest";
 pub const STDOUT: &str = "stdout";
@@ -52,13 +52,6 @@ fn notify(action: &str, message: &str, fds: &[RawFd]) -> Result<(), String> {
         .map_err(|error| format!("{action} at {} failed: {error}", socket.display()))
 }
 
-pub(crate) fn ready() -> Result<(), String> {
-    if notify_socket().is_none() {
-        return Ok(());
-    }
-    notify("telling systemd the supervisor started", "READY=1", &[])
-}
-
 fn remove(name: &str) -> Result<(), String> {
     notify(
         &format!("asking systemd to drop {name}"),
@@ -103,13 +96,17 @@ pub unsafe fn received() -> Result<BTreeMap<String, OwnedFd>, String> {
 #[must_use]
 pub fn restored(mut handover: SupervisorHandover, received: &mut BTreeMap<String, OwnedFd>) -> SupervisorHandover {
     for handed in &mut handover.boxes {
-        let Ok(tap) = u8::try_from(handed.tap_index) else {
-            continue;
-        };
-        let mut take = |role| received.remove(&name(tap, role)).map_or(-1, IntoRawFd::into_raw_fd);
-        handed.machine.guest_fd = take(GUEST);
-        handed.machine.stdout_fd = take(STDOUT);
-        handed.machine.stderr_fd = take(STDERR);
+        restore_box(handed, received);
     }
     handover
+}
+
+pub(crate) fn restore_box(handed: &mut SupervisorHandoverBox, received: &mut BTreeMap<String, OwnedFd>) {
+    let Ok(tap) = u8::try_from(handed.tap_index) else {
+        return;
+    };
+    let mut take = |role| received.remove(&name(tap, role)).map_or(-1, IntoRawFd::into_raw_fd);
+    handed.machine.guest_fd = take(GUEST);
+    handed.machine.stdout_fd = take(STDOUT);
+    handed.machine.stderr_fd = take(STDERR);
 }
