@@ -453,7 +453,8 @@ struct Adopted {
 
 impl Adopted {
     async fn end(&self) -> Result<String, String> {
-        if !self.is_running()? {
+        let child = self.owner == Owner::Child;
+        if read_process_identity(self.pid, child)?.is_none_or(|identity| identity.start != self.start) {
             return Ok("had already ended".to_string());
         }
         match &self.owner {
@@ -641,6 +642,10 @@ struct ProcessIdentity {
 }
 
 fn process_identity(pid: libc::pid_t) -> Result<Option<ProcessIdentity>, String> {
+    read_process_identity(pid, false)
+}
+
+fn read_process_identity(pid: libc::pid_t, include_exited: bool) -> Result<Option<ProcessIdentity>, String> {
     let text = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -650,7 +655,8 @@ fn process_identity(pid: libc::pid_t) -> Result<Option<ProcessIdentity>, String>
         .rsplit_once(") ")
         .ok_or_else(|| format!("process {pid} has no readable identity"))?;
     let mut fields = fields.split_whitespace();
-    if matches!(fields.next(), Some("Z" | "X" | "x")) {
+    let state = fields.next();
+    if !include_exited && matches!(state, Some("Z" | "X" | "x")) {
         return Ok(None);
     }
     let parent = fields.next().and_then(|field| field.parse().ok());

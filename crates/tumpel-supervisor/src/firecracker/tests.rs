@@ -171,6 +171,25 @@ fn handed(vmm: &Firecracker, pid: libc::pid_t) -> Handed {
 }
 
 #[tokio::test]
+async fn stopping_an_already_exited_child_reaps_it_without_signalling_another_process() {
+    let mut child = VmChild::new();
+    let pid = child.pid();
+    let start = super::process_start(pid).expect("process start");
+    child.0.kill().expect("end the fixture VM");
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let id = libc::id_t::try_from(pid).expect("a PID");
+    let waited = unsafe { libc::waitid(libc::P_PID, id, &raw mut info, libc::WEXITED | libc::WNOWAIT) };
+    assert_eq!(waited, 0);
+    let adopted = super::Adopted {
+        pid,
+        start,
+        owner: Owner::Child,
+    };
+    assert!(adopted.end().await.expect("the child is reaped").contains("signal 9"));
+    assert!(super::process_identity(pid).expect("stopped child").is_none());
+}
+
+#[tokio::test]
 async fn aborting_a_boot_stops_the_launcher_before_the_api_opens() {
     let vmm = firecracker("aborted-launch");
     let tap = TapPool::new(4096, BOX).claim(BOX, ROOMY).expect("tap");
