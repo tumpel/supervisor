@@ -1877,6 +1877,7 @@ dependencies = [
  "libc",
  "reqwest",
  "ring",
+ "rustix",
  "sd-notify",
  "semver",
  "sendfd",

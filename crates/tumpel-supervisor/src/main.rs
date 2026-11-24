@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tumpel_api::types::SupervisorFailure;
 use tumpel_supervisor::{
     enrol, install, install_telemetry, on_trial, received_descriptors, report, run, supervisor_dir, take_notify_socket,
-    Enrolment, ReportFormat, Stopped,
+    Enrolment, ReportFormat, Stopped, DAEMON_START_SECONDS,
 };
 
 #[derive(Parser)]
@@ -94,9 +94,9 @@ fn with_runtime(task: impl std::future::Future<Output = ExitCode>) -> ExitCode {
     runtime.block_on(task)
 }
 
-const DAEMON_START_SECONDS: u32 = 120;
 const STARTUP_TIMED_OUT: libc::c_int = 11;
 const REPORT_SECONDS: u32 = 60;
+const LEGACY_CHECK_SECONDS: u32 = 55;
 
 fn daemon(handover: bool, seconds: u32) -> ExitCode {
     if let Err(error) = arm_deadline(seconds, daemon_timed_out) {
@@ -218,7 +218,7 @@ fn main() -> ExitCode {
             }
         }),
         Some(Command::Run { handover, .. }) => daemon(handover, DAEMON_START_SECONDS),
-        Some(Command::Check) => show_report(ReportFormat::Legacy, None, REPORT_SECONDS),
+        Some(Command::Check) => show_report(ReportFormat::Legacy, None, LEGACY_CHECK_SECONDS),
         None if cli.daemon => daemon(false, DAEMON_START_SECONDS),
         None => {
             let format = if cli.json {

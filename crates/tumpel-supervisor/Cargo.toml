@@ -23,6 +23,7 @@ fastcdc.workspace = true
 futures-util.workspace = true
 hostname.workspace = true
 libc.workspace = true
+rustix = { version = "1.1.6", features = ["net"] }
 reqwest = { workspace = true, features = ["stream"] }
 ring.workspace = true
 semver.workspace = true

@@ -36,7 +36,7 @@ An enrolled host updates itself to the supervisor its control plane stage pins, 
 
 ## Host report
 
-Run `tumpel-supervisor` to check the host's local state once. Use `--json` for machine-readable results or `--manifest PATH` to verify the binary against a downloaded release manifest. Start supervision through the installed systemd user unit so systemd holds the running boxes’ descriptors. The unit uses the `run` alias so it can also start older releases during rollback.
+Run `tumpel-supervisor` to check the host's local state once. Use `--json` for machine-readable results or `--manifest PATH` to verify the binary against a downloaded release manifest. Start supervision through the installed systemd user unit so systemd holds the running boxes’ descriptors. The unit uses the `run` alias so it can also start older releases during rollback. The updater's legacy `check` reads local startup state. The daemon checks connectivity when it reconnects.
 
 ## Restart and stop
 

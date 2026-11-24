@@ -3,6 +3,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use sendfd::SendWithFd;
 use tumpel_api::types::{SupervisorHandover, SupervisorHandoverBox};
@@ -49,7 +50,8 @@ fn notify(action: &str, message: &str, fds: &[RawFd]) -> Result<(), String> {
     })?;
     let datagram = UnixDatagram::unbound().map_err(|error| format!("{action}: opening a socket failed: {error}"))?;
     datagram
-        .connect(&socket)
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .and_then(|()| datagram.connect(&socket))
         .and_then(|()| datagram.send_with_fd(message.as_bytes(), fds))
         .map(drop)
         .map_err(|error| format!("{action} at {} failed: {error}", socket.display()))

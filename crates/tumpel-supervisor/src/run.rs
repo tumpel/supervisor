@@ -47,7 +47,10 @@ const TICK: Duration = Duration::from_millis(500);
 const UNIT_RELOAD: Duration = Duration::from_secs(30);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 const ROLLED_BACK: &str = "the next start puts the previous binary back";
-const RESTARTED: &str = "this supervisor stops, and systemd starts it again, which rewrites the unit once more";
+const STARTUP_FILES_SECONDS: u32 = 30;
+pub const DAEMON_START_SECONDS: u32 = guest_drive::WRITE_SECONDS
+    + crate::firecracker::TAKEOVER_INSPECTION_SECONDS * crate::pool::TAP_POOL as u32
+    + STARTUP_FILES_SECONDS;
 
 pub struct Failure {
     pub kind: SupervisorFailure,
@@ -427,9 +430,13 @@ fn start_boxes(
     };
     let box_capacity = pool.capacity();
     let mut lifecycle = Lifecycle::new(Firecracker::new(runtime), store, settings, pool, out, layout.boxes());
+    let preserve_handover = taken.as_ref().is_some_and(|saved| saved.preserve_handover);
     lifecycle
         .start_inventory(taken)
         .map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
+    if !preserve_handover {
+        update::forget_handover(layout).map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
+    }
     let usage = Usage {
         box_capacity,
         warm: lifecycle.warm(),
@@ -745,26 +752,38 @@ fn taken(layout: &Layout, handed: bool, received: &BTreeMap<String, OwnedFd>) ->
     Ok(saved)
 }
 
-async fn start_update(
-    layout: &Layout,
-    running: &Sha256Digest,
-    out: &UnboundedSender<Outgoing>,
-) -> Result<Option<SupervisorUpdatePending>, Failure> {
-    let trial =
-        match update::startup(layout, running, out).map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))? {
-            Startup::Steady => None,
-            Startup::Trial(pending) => Some(pending),
+fn refresh_steady_unit(layout: Layout) {
+    tokio::spawn(async move {
+        let fix = "check the systemd user manager and run systemctl --user daemon-reload";
+        let refreshed = match layout.unit.try_exists() {
+            Ok(true) => refresh_unit(&layout, fix).await.map_err(|failure| failure.detail),
+            Ok(false) => Ok(()),
+            Err(error) => Err(format!("reading the installed unit failed: {error}; {fix}")),
         };
-    let installed = layout.unit.try_exists().map_err(|error| {
-        fail(
-            SupervisorFailure::NotEnrolled,
-            format!("reading the installed supervisor unit failed: {error}"),
-        )
-    })?;
-    if installed && trial.is_none() {
-        refresh_unit(layout, RESTARTED).await?;
-    }
-    Ok(trial)
+        if let Err(error) = refreshed {
+            eprintln!("tumpel-supervisor: {error}");
+        }
+    });
+}
+
+async fn prepare_startup(
+    started: &Started,
+    handed: bool,
+    received: &BTreeMap<String, OwnedFd>,
+    out: &UnboundedSender<Outgoing>,
+) -> Result<(Option<SupervisorUpdatePending>, Option<StartupBoxes>), Failure> {
+    let trial = match update::startup(&started.layout, &started.running, out)
+        .map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?
+    {
+        Startup::Steady => None,
+        Startup::Trial(pending) => Some(pending),
+    };
+    let taken = taken(&started.layout, handed, received)?;
+
+    guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
+        .await
+        .map_err(|error| fail(SupervisorFailure::GuestDriveUnwritable, error))?;
+    Ok((trial, taken))
 }
 
 pub async fn run(
@@ -781,16 +800,8 @@ pub async fn run(
     })?;
     let (out, mut from_box) = unbounded_channel();
     let started = start()?;
-    let trial = start_update(&started.layout, &started.running, &out).await?;
-    let deadline = trial
-        .is_some()
-        .then(|| tokio::time::Instant::now() + Limits::HOST.online);
-    let taken = taken(&started.layout, handed, &received)?;
-    let preserve_handover = taken.as_ref().is_some_and(|saved| saved.preserve_handover);
+    let (trial, taken) = prepare_startup(&started, handed, &received, &out).await?;
     let dir = dir::supervisor_dir();
-    guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
-        .await
-        .map_err(|error| fail(SupervisorFailure::GuestDriveUnwritable, error))?;
     let (commands, from_channel) = unbounded_channel();
     let (usage, idle, mut runner) = start_boxes(
         &started.runtime,
@@ -803,10 +814,13 @@ pub async fn run(
         &started.layout,
     )?;
     drop(received);
-    if !preserve_handover {
-        update::forget_handover(&started.layout).map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
-    }
     started_daemon();
+    if trial.is_none() {
+        refresh_steady_unit(started.layout.clone());
+    }
+    let deadline = trial
+        .as_ref()
+        .map(|_| tokio::time::Instant::now() + Limits::HOST.online);
     let url = started.url;
     let config = started.config;
     let heartbeat = Duration::from_secs(u64::from(started.runtime.heartbeat_interval_seconds.get()));
