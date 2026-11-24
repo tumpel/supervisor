@@ -63,9 +63,10 @@ fn exit_code(failure: &SupervisorFailure) -> ExitCode {
         SupervisorFailure::ProtocolError => ExitCode::from(6),
         SupervisorFailure::UsageUnreadable => ExitCode::from(7),
         SupervisorFailure::GuestDriveUnwritable => ExitCode::from(8),
-        SupervisorFailure::UpdateNotOnline => ExitCode::FAILURE,
-        SupervisorFailure::Unrecognised(_) => {
-            eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
+        failure => {
+            if matches!(failure, SupervisorFailure::Unrecognised(_)) {
+                eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
+            }
             ExitCode::FAILURE
         }
     }

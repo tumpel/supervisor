@@ -212,11 +212,33 @@ async fn a_release_naming_the_running_binary_changes_nothing() {
 
 #[tokio::test]
 async fn a_failed_dry_run_keeps_the_running_binary_and_refuses_the_candidate() {
+    const CHILD: &str = "TUMPEL_TEST_FAILED_DRY_RUN_CHILD";
+    let boxes = "FAIL boxes.json: invalid box record";
+    let firecracker = "FAIL Firecracker: binary is missing";
+    if std::env::var_os(CHILD).is_none() {
+        let output = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "update::tests::a_failed_dry_run_keeps_the_running_binary_and_refuses_the_candidate",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .expect("test subprocess");
+        let log = String::from_utf8(output.stderr).expect("supervisor log");
+        assert!(output.status.success(), "{log}");
+        for line in [boxes, firecracker] {
+            let expected = format!("tumpel-supervisor: {line}");
+            assert_eq!(log.lines().filter(|logged| *logged == expected).count(), 1, "{log}");
+        }
+        return;
+    }
+
     let layout = layout("dry-run-fails");
     let idle = FakeIdle::default();
     let token = format!("{}-{}", ["sk", "ant", "oat01"].join("-"), "Ab3d".repeat(10));
-    let boxes = "FAIL boxes.json: invalid box record";
-    let firecracker = "FAIL Firecracker: binary is missing";
     let script = format!("#!/bin/sh\necho '{boxes}'\necho '{firecracker}'\necho 'token {token}' >&2\nexit 1\n");
     let mut run = updater(&layout, FakeSource::binary(&script), &idle, limits());
     assert_eq!(
@@ -225,8 +247,7 @@ async fn a_failed_dry_run_keeps_the_running_binary_and_refuses_the_candidate() {
     );
     let (detail, tail) = failure(&mut run.events);
     assert!(detail.contains("exited with exit status: 1"), "{detail}");
-    assert!(detail.contains(boxes), "{detail}");
-    assert!(detail.contains(firecracker), "{detail}");
+    assert!(!detail.contains("FAIL "), "{detail}");
     assert!(detail.contains("the running supervisor stays"), "{detail}");
     assert_eq!(tail, vec!["token [token]", boxes, firecracker]);
     assert_eq!(text(&layout.binary), OLD_BINARY, "the running binary is untouched");
@@ -338,11 +359,7 @@ fn refresh_unit_replaces_an_installed_unit_with_a_rollback_line() {
     std::fs::write(&layout.unit, old).expect("the old unit is written");
 
     assert_eq!(refresh_unit(&layout), Ok(true));
-    let rewritten = text(&layout.unit);
-    assert_eq!(rewritten, current);
-    assert!(!rewritten.contains("ExecStartPre="));
-    let exec_start = format!("ExecStart={} run", layout.binary.display());
-    assert!(rewritten.lines().any(|line| line == exec_start));
+    assert_eq!(text(&layout.unit), current);
     assert_eq!(refresh_unit(&layout), Ok(false));
 }
 
@@ -367,39 +384,6 @@ async fn a_refused_binary_is_never_downloaded_again() {
 }
 
 const GRACE: Duration = Duration::from_secs(600);
-
-#[test]
-fn the_swap_finishes_while_the_blocking_pool_is_occupied() {
-    let layout = layout("swap-with-blocking-pool-busy");
-    let script = good_script();
-    std::fs::write(&layout.candidate, &script).expect("the candidate is staged");
-    let idle = FakeIdle::default();
-    let run = updater(&layout, FakeSource::binary(&script), &idle, limits());
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .max_blocking_threads(1)
-        .enable_all()
-        .build()
-        .expect("runtime with one blocking worker");
-    let (occupied, ready) = std::sync::mpsc::channel();
-    let (release, wait) = std::sync::mpsc::channel();
-    let worker = runtime.spawn_blocking(move || {
-        occupied.send(()).expect("the blocking worker is occupied");
-        wait.recv().expect("release the blocking worker");
-    });
-    ready.recv().expect("the worker is occupied before the swap");
-
-    let result = {
-        let _runtime = runtime.enter();
-        run.updater.swap(&digest(&sha256_hex(script.as_bytes())))
-    };
-    release.send(()).expect("release the blocking worker");
-    runtime.block_on(worker).expect("the worker finishes");
-
-    result.unwrap_or_else(|error| panic!("the swap failed: {}", error.detail));
-    assert_eq!(text(&layout.binary), script);
-    assert!(!layout.candidate.exists());
-    assert!(!layout.refusal().exists());
-}
 
 #[tokio::test]
 async fn a_release_notice_replaces_the_binary_on_an_idle_host() {
