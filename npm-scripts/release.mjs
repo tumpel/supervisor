@@ -3,7 +3,6 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -93,22 +92,9 @@ const github = ({ token, method = "GET", path, body }) => {
   return text ? JSON.parse(text) : undefined;
 };
 
-export const dispatchDeploy = async (
-  { token, readToken, sha, tag, repository },
-  { request = github, wait = sleep, notice = console.log } = {},
-) => {
-  if (!token) {
-    notice("::notice::DEPLOY_DISPATCH_TOKEN is empty; skipping deploy dispatch");
-    return;
-  }
-  if (repository !== "tumpel/supervisor" || !/^[a-f0-9]{40}$/.test(sha) || !/^v\d+\.\d+\.\d+-rc\.\d+$/.test(tag))
-    die("deploy dispatch needs the supervisor source SHA and release-candidate tag");
-  const api = (path, method, body) => request({ token: method === "POST" ? token : readToken, path, method, body });
-  const release = await api(`repos/${repository}/releases/tags/${tag}`);
+const assertPublishedRelease = (release, tag) => {
   if (release.draft || !release.prerelease || release.tag_name !== tag)
     die("deploy dispatch requires a published release candidate");
-  const commit = await api(`repos/${repository}/commits/${tag}`);
-  if (commit.sha !== sha) die("the published release tag does not name this source SHA");
   const names = [
     "release.json",
     "tumpel-supervisor-x86_64-linux",
@@ -122,34 +108,43 @@ export const dispatchDeploy = async (
     )
   )
     die("the published release candidate is missing its uploaded assets");
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const { workflow_runs: runs } = await api(
-      `repos/${repository}/actions/workflows/checks.yml/runs?head_sha=${sha}&event=push`,
-    );
-    const run = runs.find((run) => run.head_sha === sha && run.head_branch === "main" && run.event === "push");
-    if (run?.status === "completed") {
-      if (run.conclusion !== "success") die("checks failed for the released source SHA; deploy dispatch stopped");
-      await api("repos/tumpel/deploy/dispatches", "POST", {
-        event_type: "component-released",
-        client_payload: {
-          component: "supervisor",
-          repository,
-          sha,
-          tag,
-          assets: release.assets.map((asset) => ({
-            name: asset.name,
-            url: asset.browser_download_url,
-            size: asset.size,
-            digest: asset.digest,
-          })),
-        },
-      });
-      return;
-    }
-    if (attempt === 9)
-      die("checks for the released source SHA did not finish after 10 observations; deploy dispatch stopped");
-    await wait(1000 * 2 ** attempt);
+};
+
+const assertSourceSha = (commit, sha) => {
+  if (commit.sha !== sha) die("the published release tag does not name this source SHA");
+};
+
+export const dispatchDeploy = ({ token, readToken, sha, tag, repository }, request = github) => {
+  if (!token) {
+    console.log("::notice::DEPLOY_DISPATCH_TOKEN is empty; skipping deploy dispatch");
+    return;
   }
+  if (repository !== "tumpel/supervisor" || !/^[a-f0-9]{40}$/.test(sha) || !/^v\d+\.\d+\.\d+-rc\.\d+$/.test(tag))
+    die("deploy dispatch needs the supervisor source SHA and release-candidate tag");
+  const release = request({ token: readToken, path: `repos/${repository}/releases/tags/${tag}` });
+  assertPublishedRelease(release, tag);
+  const commit = request({ token: readToken, path: `repos/${repository}/commits/${tag}` });
+  assertSourceSha(commit, sha);
+  request({
+    token,
+    path: "repos/tumpel/deploy/dispatches",
+    method: "POST",
+    body: {
+      event_type: "component-released",
+      client_payload: {
+        component: "supervisor",
+        repository,
+        sha,
+        tag,
+        assets: release.assets.map((asset) => ({
+          name: asset.name,
+          url: asset.browser_download_url,
+          size: asset.size,
+          digest: asset.digest,
+        })),
+      },
+    },
+  });
 };
 
 const cli = async ([command, ...args]) => {
@@ -157,14 +152,14 @@ const cli = async ([command, ...args]) => {
     return dispatchDeploy({
       token: process.env.DEPLOY_DISPATCH_TOKEN,
       readToken: process.env.GH_TOKEN,
-      sha: process.env.GITHUB_SHA,
+      sha: process.env.SOURCE_SHA,
       tag: process.env.TAG,
       repository: process.env.GITHUB_REPOSITORY,
     });
   if (command === "pins" && args.length === 0) return pins();
   if (command === "stamp" && args.length === 1) return stamp(args[0]);
   if (command === "assets" && args.length === 2) return assets(args[0], args[1]);
-  return die("usage: release.mjs pins | stamp <X.Y.Z[-rc.N]> | assets <X.Y.Z[-rc.N]> <dir>");
+  return die("usage: release.mjs pins | stamp <X.Y.Z[-rc.N]> | assets <X.Y.Z[-rc.N]> <dir> | dispatch-deploy");
 };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

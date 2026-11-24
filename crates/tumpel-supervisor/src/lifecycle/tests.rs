@@ -651,6 +651,7 @@ struct Host {
     capacity: u32,
     settings: Settings,
     sessions: tokio::sync::watch::Receiver<Vec<EntityId>>,
+    turns: tokio::sync::watch::Receiver<Vec<EntityId>>,
     holdings: tokio::sync::watch::Receiver<Held>,
     runner: tokio::task::JoinHandle<Result<(), String>>,
     answering: Arc<AtomicBool>,
@@ -939,6 +940,7 @@ fn start_host(
     let received = acking(received, Arc::clone(&accepting), commands.clone());
     lifecycle.start(taken).expect("the lifecycle starts");
     let sessions = lifecycle.sessions();
+    let turns = lifecycle.turns();
     let holdings = lifecycle.holdings();
     let cancels = lifecycle.cancels();
     if let Some(protocol) = welcome {
@@ -962,6 +964,7 @@ fn start_host(
         capacity,
         settings,
         sessions,
+        turns,
         holdings,
         runner,
         answering,
@@ -1318,7 +1321,17 @@ async fn a_turn_for_a_paused_box_resumes_it() {
 async fn the_claim_goes_out_before_the_boot_and_the_harness_starts_only_once_both_are_done() {
     let mut host = host("claim-before-boot", 1, Harness::Echo, Boot::Slow);
     note(&host.log, "offer late-1".to_string());
-    host.turn("late-1", "session-1", "one", Vec::new());
+    let turn = host.box_turn("late-1", "session-1", "one", Vec::new(), 300);
+    let id = turn.turn_id.clone();
+    let (handoff, mut handled) = tokio::sync::watch::channel(false);
+    host.commands
+        .send(Input::Turn(Box::new(turn), handoff))
+        .expect("the runner receives the turn");
+    handled
+        .wait_for(|handled| *handled)
+        .await
+        .expect("the runner acknowledges the offer");
+    assert_eq!(*host.turns.borrow(), [id]);
     assert_eq!(
         host.settle(LATE_CLAIM + SETTLE).await,
         ["claim late-1", "line 1 one", "complete 1"]

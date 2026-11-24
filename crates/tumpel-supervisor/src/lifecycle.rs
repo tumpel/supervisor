@@ -2204,6 +2204,7 @@ pub struct Abandoned {
 
 pub enum Input {
     Command(Command),
+    Turn(Box<BoxTurn>, watch::Sender<bool>),
     HandOver(oneshot::Sender<SupervisorHandover>),
     Abandon(oneshot::Sender<()>, Abandoned),
     SnapshotAccepted(EntityId),
@@ -2434,9 +2435,14 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         self.publish();
         loop {
+            let mut handoff = None;
             tokio::select! {
                 input = inputs.recv() => match input {
                     Some(Input::Command(command)) => self.command(command).await?,
+                    Some(Input::Turn(turn, reply)) => {
+                        self.command(Command::Turn(turn)).await?;
+                        handoff = Some(reply);
+                    }
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
                     Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
                     Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id).await?,
@@ -2449,6 +2455,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             }
             self.settle_handover()?;
             self.publish();
+            if let Some(reply) = handoff {
+                reply.send_replace(true);
+            }
         }
         for inputs in self.setups.values() {
             let _ = inputs.send(SetupInput::Discard);

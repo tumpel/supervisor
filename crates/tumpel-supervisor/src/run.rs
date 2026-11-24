@@ -8,6 +8,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch};
@@ -15,6 +16,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
     ChannelControlMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
@@ -171,6 +173,60 @@ enum Ended {
 
 type Channel = HostChannel<ChannelFile, HostKey>;
 
+#[derive(Default)]
+struct Offers(BTreeMap<EntityId, watch::Receiver<bool>>);
+
+impl Offers {
+    fn command(&mut self, message: ChannelControlMessage) -> Option<BoxCommand> {
+        Some(match message {
+            ChannelControlMessage::Unrecognised(_) => {
+                tumpel_channel::update_required();
+                return None;
+            }
+            ChannelControlMessage::TurnOffer(offer) => {
+                let image = turn_image(&offer)?;
+                let (reply, received) = watch::channel(false);
+                self.0.insert(offer.turn_id.clone(), received);
+                BoxCommand::Turn(Box::new((offer, image)), reply)
+            }
+            ChannelControlMessage::SnapshotRequest(request) => BoxCommand::Snapshot(request),
+            ChannelControlMessage::BoxTeardown(teardown) => BoxCommand::Teardown(teardown),
+            ChannelControlMessage::BoxDiscard(discard) => BoxCommand::Discard(discard),
+            ChannelControlMessage::SnapshotChunksHeld(held) => BoxCommand::Answer(Answer::ChunksHeld(held)),
+            ChannelControlMessage::SnapshotPackUploads(uploads) => BoxCommand::Answer(Answer::PackUploads(uploads)),
+            ChannelControlMessage::RestoreDownloads(downloads) => BoxCommand::Answer(Answer::Downloads(downloads)),
+            ChannelControlMessage::TurnWithdrawn(withdrawn) => {
+                self.0.remove(&withdrawn.turn_id);
+                BoxCommand::Answer(Answer::Withdrawn(withdrawn))
+            }
+            ChannelControlMessage::TurnClaimed(claimed) => BoxCommand::Answer(Answer::Claimed(claimed)),
+            ChannelControlMessage::TurnCancel(cancel) => BoxCommand::Cancel(cancel.turn_id),
+            ChannelControlMessage::ClaudeSetupBoxOffer(offer) => BoxCommand::Setup(setup_order(offer)?),
+            ChannelControlMessage::ClaudeSetupBoxCode(code) => BoxCommand::Setup(SetupCommand::Code {
+                claude_setup_id: code.claude_setup_id,
+                code: code.code,
+                mint_budget_seconds: code.mint_budget_seconds,
+            }),
+            ChannelControlMessage::ClaudeSetupBoxDiscard(discard) => BoxCommand::Setup(SetupCommand::Discard {
+                claude_setup_id: discard.claude_setup_id,
+            }),
+        })
+    }
+
+    fn retire_handled(&mut self) {
+        self.0.retain(|_, handoff| !*handoff.borrow());
+    }
+
+    fn held(&self, mut running: Vec<EntityId>) -> Vec<EntityId> {
+        for turn in self.0.keys() {
+            if !running.contains(turn) {
+                running.push(turn.clone());
+            }
+        }
+        running
+    }
+}
+
 struct Usage {
     box_capacity: NonZeroU32,
     warm: watch::Receiver<u32>,
@@ -195,13 +251,15 @@ impl Usage {
 
 fn hello(
     channel: &mut Channel,
+    offers: &mut Offers,
     nonce: &str,
     usage: &Usage,
     from_box: &mut UnboundedReceiver<Outgoing>,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
-    let turns = usage.turns.borrow().clone();
+    offers.retire_handled();
     drain(channel, from_box, outbox)?;
+    let turns = offers.held(usage.turns.borrow().clone());
     channel
         .hello(nonce, usage.box_capacity, usage.sample()?, turns, outbox)
         .map_err(|error| match error {
@@ -223,17 +281,19 @@ fn drain(
 
 fn beat(
     channel: &mut Channel,
+    offers: &mut Offers,
     usage: &Usage,
     from_box: &mut UnboundedReceiver<Outgoing>,
     health: HostReportedHealth,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
+    offers.retire_handled();
+    drain(channel, from_box, outbox)?;
     let held = HeldIds {
         session_ids: usage.sessions.borrow().clone(),
         claude_setup_ids: usage.claude_setups.borrow().clone(),
-        turn_ids: usage.turns.borrow().clone(),
+        turn_ids: offers.held(usage.turns.borrow().clone()),
     };
-    drain(channel, from_box, outbox)?;
     channel
         .heartbeat(
             chrono::Utc::now().fixed_offset(),
@@ -247,7 +307,7 @@ fn beat(
 }
 
 enum BoxCommand {
-    Turn(Box<(ChannelTurnOffer, BootOrder)>),
+    Turn(Box<(ChannelTurnOffer, BootOrder)>, watch::Sender<bool>),
     Snapshot(ChannelSnapshotRequest),
     Teardown(ChannelBoxTeardown),
     Discard(ChannelBoxDiscard),
@@ -261,8 +321,12 @@ enum BoxCommand {
     Welcomed(u16),
 }
 
-fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Result<SetupCommand, String> {
-    Ok(SetupCommand::Start(Box::new(SetupOrder {
+fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Option<SetupCommand> {
+    if matches!(offer.harness, Some(ClaudeSetupHarness::Unrecognised(_))) {
+        tumpel_channel::update_required();
+        return None;
+    }
+    Some(SetupCommand::Start(Box::new(SetupOrder {
         claude_setup_id: offer.claude_setup_id,
         tenant_id: offer.tenant_id,
         box_id: offer.box_id,
@@ -278,18 +342,22 @@ fn setup_order(offer: ChannelClaudeSetupBoxOffer) -> Result<SetupCommand, String
     })))
 }
 
-fn turn(offer: ChannelTurnOffer) -> Result<BoxCommand, String> {
-    let image = BootOrder::from_offer(
+fn turn_image(offer: &ChannelTurnOffer) -> Option<BootOrder> {
+    if matches!(offer.harness, tumpel_api::types::Harness::Unrecognised(_))
+        || matches!(offer.box_retention, tumpel_api::types::BoxRetention::Unrecognised(_))
+    {
+        tumpel_channel::update_required();
+        return None;
+    }
+    BootOrder::from_offer(
         offer.image.clone(),
         offer.harness.to_string(),
         offer.harness_version.to_string(),
     )
-    .map_err(|error| format!("turn {}: {error}", *offer.turn_id))?;
-    Ok(BoxCommand::Turn(Box::new((offer, image))))
 }
 
-fn command(files_dir: &Path, offer: ChannelTurnOffer, image: BootOrder) -> Command {
-    Command::Turn(Box::new(BoxTurn {
+fn box_turn(files_dir: &Path, offer: ChannelTurnOffer, image: BootOrder) -> BoxTurn {
+    BoxTurn {
         turn_id: offer.turn_id,
         session_id: offer.session_id,
         box_id: offer.box_id,
@@ -310,7 +378,7 @@ fn command(files_dir: &Path, offer: ChannelTurnOffer, image: BootOrder) -> Comma
         turn_seconds: offer.turn_seconds,
         idle_seconds: offer.idle_seconds,
         box_retention: offer.box_retention,
-    }))
+    }
 }
 
 async fn boxes(
@@ -323,19 +391,19 @@ async fn boxes(
 ) {
     while let Some(command) = commands.recv().await {
         let next = match command {
-            BoxCommand::Turn(turn) => {
+            BoxCommand::Turn(turn, reply) => {
                 let (offer, image) = *turn;
-                self::command(&files_dir, offer, image)
+                Input::Turn(Box::new(box_turn(&files_dir, offer, image)), reply)
             }
-            BoxCommand::Snapshot(request) => Command::Snapshot(request.into()),
-            BoxCommand::Teardown(teardown) => Command::Teardown(TeardownOrder {
+            BoxCommand::Snapshot(request) => Input::Command(Command::Snapshot(request.into())),
+            BoxCommand::Teardown(teardown) => Input::Command(Command::Teardown(TeardownOrder {
                 session_id: teardown.session_id,
                 box_id: teardown.box_id,
-            }),
-            BoxCommand::Discard(discard) => Command::Discard(TeardownOrder {
+            })),
+            BoxCommand::Discard(discard) => Input::Command(Command::Discard(TeardownOrder {
                 session_id: discard.session_id,
                 box_id: discard.box_id,
-            }),
+            })),
             BoxCommand::Setup(setup) => {
                 if setups.send(setup).is_err() {
                     eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
@@ -381,7 +449,7 @@ async fn boxes(
                 continue;
             }
         };
-        if lifecycle.send(Input::Command(next)).is_err() {
+        if lifecycle.send(next).is_err() {
             eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
             return;
         }
@@ -896,8 +964,26 @@ async fn serve(
 ) -> Result<Served, Failure> {
     let mut backoff = Backoff::default();
     let mut limit = RateLimit::default();
+    let mut offers = Offers::default();
     loop {
-        let ended = session(channel, url, heartbeat, usage, commands, from_box, updates, &mut limit).await?;
+        let ended = match connect(url).await {
+            Ok(stream) => {
+                session(
+                    stream,
+                    channel,
+                    &mut offers,
+                    url,
+                    heartbeat,
+                    usage,
+                    commands,
+                    from_box,
+                    updates,
+                    &mut limit,
+                )
+                .await?
+            }
+            Err(ended) => ended,
+        };
         match next(channel, &mut backoff, url, ended, jitter()) {
             Next::Revoked(reason) => {
                 let key = dir.join(KEY_FILE);
@@ -991,34 +1077,6 @@ fn closed_by_peer(frame: Option<&CloseFrame>, progressed: bool) -> Result<Ended,
     }
 }
 
-fn box_command(message: ChannelControlMessage) -> Result<Option<BoxCommand>, String> {
-    Ok(Some(match message {
-        ChannelControlMessage::Unrecognised(_) => {
-            tumpel_channel::update_required();
-            return Ok(None);
-        }
-        ChannelControlMessage::TurnOffer(offer) => turn(offer)?,
-        ChannelControlMessage::SnapshotRequest(request) => BoxCommand::Snapshot(request),
-        ChannelControlMessage::BoxTeardown(teardown) => BoxCommand::Teardown(teardown),
-        ChannelControlMessage::BoxDiscard(discard) => BoxCommand::Discard(discard),
-        ChannelControlMessage::SnapshotChunksHeld(held) => BoxCommand::Answer(Answer::ChunksHeld(held)),
-        ChannelControlMessage::SnapshotPackUploads(uploads) => BoxCommand::Answer(Answer::PackUploads(uploads)),
-        ChannelControlMessage::RestoreDownloads(downloads) => BoxCommand::Answer(Answer::Downloads(downloads)),
-        ChannelControlMessage::TurnWithdrawn(withdrawn) => BoxCommand::Answer(Answer::Withdrawn(withdrawn)),
-        ChannelControlMessage::TurnClaimed(claimed) => BoxCommand::Answer(Answer::Claimed(claimed)),
-        ChannelControlMessage::TurnCancel(cancel) => BoxCommand::Cancel(cancel.turn_id),
-        ChannelControlMessage::ClaudeSetupBoxOffer(offer) => BoxCommand::Setup(setup_order(offer)?),
-        ChannelControlMessage::ClaudeSetupBoxCode(code) => BoxCommand::Setup(SetupCommand::Code {
-            claude_setup_id: code.claude_setup_id,
-            code: code.code,
-            mint_budget_seconds: code.mint_budget_seconds,
-        }),
-        ChannelControlMessage::ClaudeSetupBoxDiscard(discard) => BoxCommand::Setup(SetupCommand::Discard {
-            claude_setup_id: discard.claude_setup_id,
-        }),
-    }))
-}
-
 fn accepted(channel: &mut Channel, commands: &UnboundedSender<BoxCommand>) -> Result<(), Failure> {
     let accepted = channel.take_accepted().into_iter().map(BoxCommand::SnapshotAccepted);
     let failed = channel.take_failed().into_iter().map(BoxCommand::SnapshotFailed);
@@ -1048,9 +1106,25 @@ fn rate_limited(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+async fn connect(url: &str) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Ended> {
+    match tokio::time::timeout(CONNECT_DEADLINE, tokio_tungstenite::connect_async(url)).await {
+        Ok(Ok((stream, _))) => Ok(stream),
+        Ok(Err(error)) => Err(dropped(false, format!("dialing failed: {error}"))),
+        Err(_) => Err(dropped(
+            false,
+            format!("connect timed out after {}s", CONNECT_DEADLINE.as_secs()),
+        )),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the session reuses supervisor state across connections"
+)]
 async fn session(
+    stream: WebSocketStream<impl AsyncRead + AsyncWrite + Unpin>,
     channel: &mut Channel,
+    offers: &mut Offers,
     url: &str,
     heartbeat: Duration,
     usage: &Usage,
@@ -1059,21 +1133,11 @@ async fn session(
     updates: &mut Updates,
     limit: &mut RateLimit,
 ) -> Result<Ended, Failure> {
-    let stream = match tokio::time::timeout(CONNECT_DEADLINE, tokio_tungstenite::connect_async(url)).await {
-        Ok(Ok((stream, _))) => stream,
-        Ok(Err(error)) => return Ok(dropped(false, format!("dialing failed: {error}"))),
-        Err(_) => {
-            return Ok(dropped(
-                false,
-                format!("connect timed out after {}s", CONNECT_DEADLINE.as_secs()),
-            ))
-        }
-    };
     let (mut sink, mut source) = stream.split();
     channel.connect();
     let mut outbox = Outbox::default();
-    let mut last_received = Instant::now();
-    let mut last_beat = Instant::now();
+    let mut last_received = tokio::time::Instant::now();
+    let mut last_beat = tokio::time::Instant::now();
     let mut tick = tokio::time::interval(TICK);
     loop {
         let ended = tokio::select! {
@@ -1082,24 +1146,23 @@ async fn session(
                 Some(Err(error)) => Some(Ok(dropped(channel.progressed(), error.to_string()))),
                 Some(Ok(Message::Close(frame))) => Some(closed_by_peer(frame.as_ref(), channel.progressed())),
                 Some(Ok(Message::Text(text))) => {
-                    last_received = Instant::now();
+                    last_received = tokio::time::Instant::now();
                     let received = channel.receive(text.as_str());
                     match accepted(channel, commands) {
                         Err(failure) => Some(Err(failure)),
                         Ok(()) => match received {
-                            Ok(Event::Challenged(nonce)) => hello(channel, &nonce, usage, from_box, &mut outbox).err().map(Err),
+                            Ok(Event::Challenged(nonce)) => hello(channel, offers, &nonce, usage, from_box, &mut outbox).err().map(Err),
                             Ok(Event::Welcomed) => {
                                 eprintln!("connected to {url}");
-                                last_beat = Instant::now();
+                                last_beat = tokio::time::Instant::now();
                                 match commands.send(BoxCommand::Welcomed(channel.version())) {
                                     Err(_) => Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
                                     Ok(()) => updates.welcomed().await.err().map(Err),
                                 }
                             }
-                            Ok(Event::Message(message)) => match box_command(*message) {
-                                Ok(Some(command)) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
-                                Ok(None) => None,
-                                Err(error) => Some(Err(fail(SupervisorFailure::ProtocolError, error))),
+                            Ok(Event::Message(message)) => match offers.command(*message) {
+                                Some(command) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
+                                None => None,
                             },
                             Ok(Event::FrameRefused { seq, reason }) => {
                                 eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
@@ -1131,8 +1194,8 @@ async fn session(
                 if last_received.elapsed() >= HEARTBEAT_DEADLINE {
                     Some(Ok(dropped(channel.progressed(), format!("nothing arrived for {} seconds", HEARTBEAT_DEADLINE.as_secs()))))
                 } else if channel.phase() == Phase::Open && last_beat.elapsed() >= heartbeat {
-                    last_beat = Instant::now();
-                    beat(channel, usage, from_box, limit.health(now), &mut outbox).err().map(Err)
+                    last_beat = tokio::time::Instant::now();
+                    beat(channel, offers, usage, from_box, limit.health(now), &mut outbox).err().map(Err)
                 } else if channel.phase() == Phase::Open && channel.withholding() && !limit.paused(now) {
                     channel.release(limit.release_budget(TICK), &mut outbox).err().map(|error| Err(store_lost(&error)))
                 } else if channel.phase() == Phase::Open {
@@ -1158,6 +1221,298 @@ async fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    const TEST_BEAT: Duration = Duration::from_secs(1);
+
+    struct SessionTest {
+        channel: Channel,
+        offers: Offers,
+        usage: Usage,
+        turns: watch::Sender<Vec<EntityId>>,
+        commands: UnboundedSender<BoxCommand>,
+        from_box: UnboundedReceiver<Outgoing>,
+        updates: Updates,
+    }
+
+    impl SessionTest {
+        fn new(name: &str) -> (Self, UnboundedReceiver<BoxCommand>) {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/channel-tests")
+                .join(name);
+            std::fs::create_dir_all(&root).expect("test state directory");
+            let layout = Layout::new(root.join("supervisor"), root.clone(), root.join("unit"));
+            let (commands, received) = unbounded_channel();
+            let (out, from_box) = unbounded_channel();
+            let (turns, held) = watch::channel(Vec::new());
+            let channel = HostChannel::new(
+                tumpel_channel::empty_state(),
+                ChannelFile(root.join(CHANNEL_FILE)),
+                HostKey(Ed25519KeyPair::from_seed_unchecked(&[1; 32]).expect("host key")),
+                "host-1".try_into().expect("host ID"),
+                "1".to_string(),
+            );
+            let updates = Updates {
+                updater: Arc::new(Updater::new(
+                    HttpSource::new("http://127.0.0.1:0").expect("update source"),
+                    layout.clone(),
+                    Limits::HOST,
+                    "a".repeat(64).try_into().expect("binary digest"),
+                    "1",
+                    IdleGate::new(watch::channel(0).1, watch::channel(0).1),
+                    out.clone(),
+                )),
+                layout,
+                out,
+                restart: unbounded_channel().0,
+                trial: None,
+                confirmed: watch::channel(false).0,
+                grace: Duration::ZERO,
+            };
+            let usage = Usage {
+                box_capacity: NonZeroU32::MIN,
+                warm: watch::channel(0).1,
+                running: watch::channel(0).1,
+                sessions: watch::channel(Vec::new()).1,
+                claude_setups: watch::channel(Vec::new()).1,
+                turns: held,
+                holdings: watch::channel(Held::default()).1,
+                data_dir: root,
+                telemetry: Telemetry::new(8),
+            };
+            (
+                Self {
+                    channel,
+                    offers: Offers::default(),
+                    usage,
+                    turns,
+                    commands,
+                    from_box,
+                    updates,
+                },
+                received,
+            )
+        }
+
+        async fn exchange(&mut self, control: impl AsyncFnOnce(Peer, &watch::Sender<Vec<EntityId>>)) {
+            use tokio_tungstenite::tungstenite::protocol::Role;
+            let (client, server) = tokio::io::duplex(16_384);
+            let client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+            let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+            let mut limit = RateLimit::default();
+            let (ended, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::join!(
+                    session(
+                        client,
+                        &mut self.channel,
+                        &mut self.offers,
+                        "test control plane",
+                        TEST_BEAT,
+                        &self.usage,
+                        &self.commands,
+                        &mut self.from_box,
+                        &mut self.updates,
+                        &mut limit,
+                    ),
+                    control(Peer(server), &self.turns),
+                )
+            })
+            .await
+            .expect("the control plane exchange finished");
+            match ended {
+                Ok(Ended::Dropped { reason, .. }) => assert_eq!(reason, "the control plane closed the connection"),
+                Err(error) => panic!("{}", error.detail),
+                _ => panic!("the control plane must close the test connection"),
+            }
+        }
+    }
+
+    struct Peer(WebSocketStream<tokio::io::DuplexStream>);
+
+    impl Peer {
+        async fn send(&mut self, message: serde_json::Value) {
+            self.0
+                .send(Message::Text(message.to_string().into()))
+                .await
+                .expect("send");
+        }
+
+        async fn read(&mut self, kind: &str) -> serde_json::Value {
+            let text = self
+                .0
+                .next()
+                .await
+                .expect("wire frame")
+                .expect("WebSocket")
+                .into_text()
+                .expect("text");
+            let frame: serde_json::Value = serde_json::from_str(&text).expect("JSON frame");
+            assert_eq!(frame["type"], kind);
+            frame
+        }
+
+        async fn hello(&mut self, held: serde_json::Value) {
+            self.send(json!({"type":"Challenge","nonce":"n".repeat(43)})).await;
+            assert_eq!(self.read("Hello").await["heldTurnIds"], held);
+            self.send(json!({
+                "type":"Welcome","hostId":"host-1","protocolVersion":tumpel_api::types::ChannelProtocol::VERSION
+            }))
+            .await;
+        }
+
+        async fn frame(&mut self, seq: u8, message: serde_json::Value) {
+            self.send(json!({"type":"Frame","seq":seq,"ack":0,"message":message}))
+                .await;
+        }
+
+        async fn heartbeat(&mut self, ack: u8, held: serde_json::Value) {
+            self.0.send(Message::Ping("beat".into())).await.expect("ping");
+            assert_eq!(
+                self.0.next().await.expect("pong").expect("WebSocket"),
+                Message::Pong("beat".into())
+            );
+            tokio::time::advance(TEST_BEAT).await;
+            let beat = self.read("Heartbeat").await;
+            assert_eq!(beat["ack"], ack);
+            assert_eq!(beat["heldTurnIds"], held);
+        }
+
+        async fn close(mut self) {
+            self.0.close(None).await.expect("close");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn turn_offers_hold_through_heartbeat_and_reconnect_until_the_runner_takes_them() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let known = json!({
+            "type":"TurnOffer","turnId":"turn-1","sessionId":"session-1","boxId":"box-1",
+            "repository":"https://example.test/repo.git","harness":"ClaudeCode","harnessVersion":"1","model":"model","prompt":"hello",
+            "credential":{"credentialHandoverId":"grant-1","expiresAt":"2026-11-23T12:00:00Z","variables":[],"connectors":[]},
+            "lastLineSeq":0,"snapshots":[],"personaFiles":[],
+            "image":{"kind":"Full","imageDigest":"b".repeat(64),"kernelDigest":"c".repeat(64),"manifestDigest":"d".repeat(64),"imageUrl":"https://example.test/image","kernelUrl":"https://example.test/kernel","manifestUrl":"https://example.test/manifest","downloadExpiresAt":"2026-11-23T12:00:00Z","fetchSeconds":60},
+            "gitAuthorName":"Agent","gitAuthorEmail":"agent@example.test","boxRetention":"Auto","turnSeconds":60,"idleSeconds":60,"extra":true
+        });
+        for (field, future) in [
+            ("type", json!("FutureTurnOffer")),
+            ("harness", json!("FutureHarness")),
+            ("boxRetention", json!("FutureRetention")),
+            ("image", json!({"kind":"FutureImage"})),
+        ] {
+            let logs = crate::test_logs::UpdateLogs::default();
+            let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+            let (mut test, commands) = SessionTest::new("turns");
+            let (to_runner, mut runner) = unbounded_channel();
+            let (to_setups, _setups) = unbounded_channel();
+            let boxes = tokio::spawn(boxes(
+                PathBuf::from("/tmp/files"),
+                Answers::default(),
+                Cancels::default(),
+                commands,
+                to_runner,
+                to_setups,
+            ));
+            let mut unfamiliar = known.clone();
+            unfamiliar[field] = future;
+            unfamiliar["turnId"] = json!("unknown-turn");
+            let mut running = None;
+            test.exchange(async |mut peer, _| {
+                peer.hello(json!([])).await;
+                assert!(matches!(runner.recv().await, Some(Input::Welcomed(_))));
+                peer.frame(1, unfamiliar).await;
+                peer.heartbeat(1, json!([])).await;
+                assert!(runner.try_recv().is_err());
+                assert_eq!(*logs.0.lock().expect("logs"), [tumpel_channel::UPDATE_REQUIRED]);
+
+                peer.frame(2, known.clone()).await;
+                let Some(Input::Turn(turn, reply)) = runner.recv().await else {
+                    panic!("the runner receives the known turn");
+                };
+                assert_eq!(&*turn.turn_id, "turn-1");
+                assert_eq!(&*turn.session_id, "session-1");
+                running = Some((turn.turn_id, reply));
+                peer.heartbeat(2, json!(["turn-1"])).await;
+                peer.close().await;
+            })
+            .await;
+            let (turn, reply) = running.expect("runner handoff pending");
+            test.exchange(async |mut peer, turns| {
+                peer.hello(json!(["turn-1"])).await;
+                assert!(matches!(runner.recv().await, Some(Input::Welcomed(_))));
+                turns.send_replace(vec![turn]);
+                reply.send_replace(true);
+                peer.heartbeat(2, json!(["turn-1"])).await;
+                turns.send_replace(Vec::new());
+                peer.heartbeat(2, json!([])).await;
+
+                let mut withdrawn = known.clone();
+                withdrawn["turnId"] = json!("turn-2");
+                peer.frame(3, withdrawn).await;
+                let Some(Input::Turn(_, _handoff)) = runner.recv().await else {
+                    panic!("the runner receives the second turn");
+                };
+                peer.heartbeat(3, json!(["turn-2"])).await;
+                peer.frame(4, json!({"type":"TurnWithdrawn","turnId":"turn-2"})).await;
+                peer.heartbeat(4, json!([])).await;
+                peer.close().await;
+            })
+            .await;
+            drop(test);
+            boxes.await.expect("box command forwarding stopped");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unfamiliar_setup_values_leave_known_setup_work_available() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let known = json!({
+            "type":"ClaudeSetupBoxOffer","claudeSetupId":"setup-1","tenantId":"tenant-1","boxId":"box-1","harness":"ClaudeCode","harnessVersion":"1",
+            "urlSeconds":60,"codeSeconds":60,"expiresAt":"2026-11-23T12:00:00Z","tokenUrl":"https://example.test/token","tokenCredential":"c".repeat(43),
+            "image":{"kind":"Full","imageDigest":"b".repeat(64),"kernelDigest":"c".repeat(64),"manifestDigest":"d".repeat(64),"imageUrl":"https://example.test/image","kernelUrl":"https://example.test/kernel","manifestUrl":"https://example.test/manifest","downloadExpiresAt":"2026-11-23T12:00:00Z","fetchSeconds":60},
+            "extra":true
+        });
+        for (field, future) in [
+            ("type", json!("FutureSetupOffer")),
+            ("harness", json!("FutureHarness")),
+            ("image", json!({"kind":"FutureImage"})),
+        ] {
+            let logs = crate::test_logs::UpdateLogs::default();
+            let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+            let (mut test, commands) = SessionTest::new("setups");
+            let (to_runner, mut runner) = unbounded_channel();
+            let (to_setups, mut setups) = unbounded_channel();
+            let boxes = tokio::spawn(boxes(
+                PathBuf::from("/tmp/files"),
+                Answers::default(),
+                Cancels::default(),
+                commands,
+                to_runner,
+                to_setups,
+            ));
+            let mut unfamiliar = known.clone();
+            unfamiliar[field] = future;
+            unfamiliar["claudeSetupId"] = json!("unknown-setup");
+            test.exchange(async |mut peer, _| {
+                peer.hello(json!([])).await;
+                assert!(matches!(runner.recv().await, Some(Input::Welcomed(_))));
+                peer.frame(1, unfamiliar).await;
+                peer.heartbeat(1, json!([])).await;
+                assert!(setups.try_recv().is_err());
+                assert_eq!(*logs.0.lock().expect("logs"), [tumpel_channel::UPDATE_REQUIRED]);
+
+                peer.frame(2, known.clone()).await;
+                let Some(SetupCommand::Start(order)) = setups.recv().await else {
+                    panic!("the runner receives the known setup");
+                };
+                assert_eq!(&*order.claude_setup_id, "setup-1");
+                peer.heartbeat(2, json!([])).await;
+                peer.close().await;
+            })
+            .await;
+            drop(test);
+            boxes.await.expect("box command forwarding stopped");
+        }
+    }
 
     #[test]
     fn a_setup_box_boots_the_harness_its_offer_names_and_claude_code_without_one() {
@@ -1186,7 +1541,7 @@ mod tests {
         });
         let booted = |frame: &serde_json::Value| {
             let offer: ChannelClaudeSetupBoxOffer = serde_json::from_value(frame.clone()).expect("the offer parses");
-            let Ok(SetupCommand::Start(order)) = setup_order(offer) else {
+            let Some(SetupCommand::Start(order)) = setup_order(offer) else {
                 panic!("a setup offer starts a setup box");
             };
             let (harness, version) = order.image.harness();
