@@ -605,6 +605,7 @@ impl Left {
 }
 
 pub type Attached<M> = (M, <M as Machine>::Guest, Tap);
+type Prepared<M> = (SupervisorHandoverBox, Boot, VecDeque<Command>, Attached<M>);
 
 struct Parked {
     turn_id: EntityId,
@@ -2930,44 +2931,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 if matches!(handed.state, SupervisorHandoverBoxState::Warm(_)) {
                     handed.idle_milliseconds = handed.idle_milliseconds.saturating_sub(age).max(0);
                 }
-                let attempt = (|| {
-                    let tap = u8::try_from(handed.tap_index).map_err(|error| error.to_string())?;
-                    if !self
-                        .runner
-                        .vmm
-                        .recorded_process(tap, &handed.machine, saved.observation.as_ref())?
-                    {
-                        return Ok(None);
-                    }
-                    let (record, image, queue) = decode_box(&handed)?;
-                    let descriptors = [
-                        handed.machine.guest_fd,
-                        handed.machine.stdout_fd,
-                        handed.machine.stderr_fd,
-                    ];
-                    if inherited && descriptors.iter().any(|fd| inherited_fds.contains(fd)) {
-                        return Err("an inherited descriptor belongs to more than one box".to_string());
-                    }
-                    let attached = self.runner.vmm.reattach(
-                        &handed.session_id,
-                        handed.tap_index,
-                        &handed.machine,
-                        saved.observation.as_ref(),
-                        &mut self.pool,
-                        inherited,
-                    )?;
-                    let Some((machine, guest, tap)) = attached else {
-                        return Ok(None);
-                    };
-                    if inherited {
-                        if let Err(error) = machine.register_inherited(&guest) {
-                            self.pool.release(tap);
-                            return Err(error);
-                        }
-                        inherited_fds.extend(descriptors);
-                    }
-                    Ok(Some((record, image, queue, (machine, guest, tap))))
-                })();
+                let attempt =
+                    self.prepare_attachment(&handed, saved.observation.as_ref(), inherited, &mut inherited_fds);
                 let (record, image, queue, (machine, guest, tap)) = match attempt {
                     Ok(Some(attached)) => attached,
                     Ok(None) => {
@@ -3014,6 +2979,47 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         self.publish();
         Ok(())
+    }
+
+    fn prepare_attachment(
+        &mut self,
+        handed: &SupervisorHandoverBox,
+        observation: Option<&Observation>,
+        inherited: bool,
+        inherited_fds: &mut HashSet<i32>,
+    ) -> Result<Option<Prepared<V::Machine>>, String> {
+        let tap = u8::try_from(handed.tap_index).map_err(|error| error.to_string())?;
+        if !self.runner.vmm.recorded_process(tap, &handed.machine, observation)? {
+            return Ok(None);
+        }
+        let (record, image, queue) = decode_box(handed)?;
+        let descriptors = [
+            handed.machine.guest_fd,
+            handed.machine.stdout_fd,
+            handed.machine.stderr_fd,
+        ];
+        if inherited && descriptors.iter().any(|fd| inherited_fds.contains(fd)) {
+            return Err("an inherited descriptor belongs to more than one box".to_string());
+        }
+        let attached = self.runner.vmm.reattach(
+            &handed.session_id,
+            handed.tap_index,
+            &handed.machine,
+            observation,
+            &mut self.pool,
+            inherited,
+        )?;
+        let Some((machine, guest, tap)) = attached else {
+            return Ok(None);
+        };
+        if inherited {
+            if let Err(error) = machine.register_inherited(&guest) {
+                self.pool.release(tap);
+                return Err(error);
+            }
+            inherited_fds.extend(descriptors);
+        }
+        Ok(Some((record, image, queue, (machine, guest, tap))))
     }
 
     fn finish_startup(
