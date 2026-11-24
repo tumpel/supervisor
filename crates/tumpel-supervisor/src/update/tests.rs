@@ -14,7 +14,7 @@ use tumpel_channel::Outgoing;
 
 use super::{
     announced_release, named, refresh_unit, sha256_hex, version_refusal, Idle, Layout, Limits, Outcome, Release,
-    Source, Updater, REFUSAL_FILE,
+    Source, Updater, REFUSAL_FILE, TAIL_LINES,
 };
 use crate::install::supervisor_unit_text;
 
@@ -213,6 +213,7 @@ async fn a_release_naming_the_running_binary_changes_nothing() {
 #[tokio::test]
 async fn a_failed_dry_run_keeps_the_running_binary_and_refuses_the_candidate() {
     const CHILD: &str = "TUMPEL_TEST_FAILED_DRY_RUN_CHILD";
+    let startup = "FAIL startup: invalid config";
     let boxes = "FAIL boxes.json: invalid box record";
     let firecracker = "FAIL Firecracker: binary is missing";
     if std::env::var_os(CHILD).is_none() {
@@ -229,7 +230,7 @@ async fn a_failed_dry_run_keeps_the_running_binary_and_refuses_the_candidate() {
             .expect("test subprocess");
         let log = String::from_utf8(output.stderr).expect("supervisor log");
         assert!(output.status.success(), "{log}");
-        for line in [boxes, firecracker] {
+        for line in [startup, boxes, firecracker] {
             let expected = format!("tumpel-supervisor: {line}");
             assert_eq!(log.lines().filter(|logged| *logged == expected).count(), 1, "{log}");
         }
@@ -239,7 +240,10 @@ async fn a_failed_dry_run_keeps_the_running_binary_and_refuses_the_candidate() {
     let layout = layout("dry-run-fails");
     let idle = FakeIdle::default();
     let token = format!("{}-{}", ["sk", "ant", "oat01"].join("-"), "Ab3d".repeat(10));
-    let script = format!("#!/bin/sh\necho '{boxes}'\necho '{firecracker}'\necho 'token {token}' >&2\nexit 1\n");
+    let passing = "echo 'PASS another check: ok'\n".repeat(TAIL_LINES - 3);
+    let script = format!(
+        "#!/bin/sh\necho '{startup}'\n{passing}echo 'token {token}'\necho '{boxes}'\necho '{firecracker}'\nexit 1\n"
+    );
     let mut run = updater(&layout, FakeSource::binary(&script), &idle, limits());
     assert_eq!(
         run.updater.announced(Duration::ZERO).await,
@@ -249,7 +253,9 @@ async fn a_failed_dry_run_keeps_the_running_binary_and_refuses_the_candidate() {
     assert!(detail.contains("exited with exit status: 1"), "{detail}");
     assert!(!detail.contains("FAIL "), "{detail}");
     assert!(detail.contains("the running supervisor stays"), "{detail}");
-    assert_eq!(tail, vec!["token [token]", boxes, firecracker]);
+    assert_eq!(tail.len(), TAIL_LINES);
+    assert!(!tail.iter().any(|line| line == startup), "{tail:?}");
+    assert_eq!(&tail[TAIL_LINES - 3..], ["token [token]", boxes, firecracker]);
     assert_eq!(text(&layout.binary), OLD_BINARY, "the running binary is untouched");
     assert!(!layout.candidate.exists());
     let refusal: SupervisorUpdateRefusal =

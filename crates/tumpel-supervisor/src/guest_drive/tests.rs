@@ -2,8 +2,22 @@ use std::path::Path;
 
 use ring::digest::{digest, SHA256};
 
-use super::place;
+use super::{check_location, place};
 use crate::snapshot::hex;
+
+#[test]
+fn report_rejects_a_file_where_the_guest_drive_directory_belongs() {
+    let images = std::env::temp_dir().join(format!("tumpel-guest-drive-report-{}", std::process::id()));
+    std::fs::create_dir(&images).expect("image cache");
+    let guest = images.join("guest");
+    std::fs::write(&guest, b"obstruction").expect("obstruct the guest directory");
+
+    let error = check_location(&images, "candidate.squashfs").expect_err("guest directory is unusable");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+    assert_eq!(std::fs::read(&guest).expect("read the obstruction"), b"obstruction");
+    std::fs::remove_dir_all(images).expect("remove the fixture");
+}
 
 #[test]
 fn places_its_own_drive_once_and_deletes_the_others() {

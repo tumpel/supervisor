@@ -38,15 +38,17 @@ fn write_report(mut out: impl Write) -> io::Result<bool> {
         ),
         (BOXES_FILE, read_boxes(&state.join(BOXES_FILE))),
         (HANDOVER_FILE, read_boxes(&state.join(HANDOVER_FILE))),
-        ("guest drive", guest_drive::check()),
+        (
+            "guest drive",
+            runtime
+                .map_err(unavailable)
+                .and_then(|runtime| guest_drive::check(Path::new(&*runtime.image_cache_dir))),
+        ),
         (
             "image cache",
-            runtime.map_err(unavailable).and_then(|runtime| {
-                let cache = Path::new(&*runtime.image_cache_dir);
-                std::fs::read_dir(cache)
-                    .map(|_| "cache directory is readable")
-                    .map_err(|error| format!("reading {} failed: {error}", cache.display()))
-            }),
+            runtime
+                .map_err(unavailable)
+                .and_then(|runtime| check_image_cache(Path::new(&*runtime.image_cache_dir))),
         ),
         (
             "Firecracker",
@@ -89,4 +91,12 @@ fn check_firecracker(path: &Path) -> Result<&'static str, String> {
         return Err(format!("{} is not an executable file; {fix}", path.display()));
     }
     Ok("configured binary is executable")
+}
+
+fn check_image_cache(cache: &Path) -> Result<&'static str, String> {
+    let fix = "set imageCacheDir in runtime.json to a readable, writable directory";
+    std::fs::read_dir(cache)
+        .and_then(|_| dir::check_access(cache, libc::W_OK | libc::X_OK))
+        .map_err(|error| format!("cannot use {}: {error}. {fix}", cache.display()))?;
+    Ok("cache directory is readable and writable")
 }

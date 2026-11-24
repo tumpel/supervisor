@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -152,12 +152,40 @@ fn a_failed_local_check_still_reports_the_other_checks() {
         let report = String::from_utf8(output.stdout).expect("report text");
         assert_eq!(output.status.code(), Some(1), "{report}");
         for check in CHECKS {
-            let status = if check == failed { "FAIL" } else { "PASS" };
+            let status = if check == failed || (cfg!(guest_drive) && file == "images" && check == "guest drive") {
+                "FAIL"
+            } else {
+                "PASS"
+            };
             assert!(report.contains(&format!("{status} {check}: ")), "{report}");
         }
         assert!(report.ends_with(&format!("PASS channel protocol {}\n", ChannelProtocol::VERSION)));
         assert_eq!(contents(&host.root).expect("read state after report"), before);
     }
+}
+
+#[test]
+fn a_readable_but_unwritable_image_cache_fails_the_report() {
+    let host = Host::new("readonly-cache", "http://127.0.0.1:9").expect("test host");
+    let binary = host.root.join("supervisor");
+    fs::copy(BINARY, &binary).expect("fixture binary");
+    let images = host.root.join("images");
+    fs::set_permissions(&images, fs::Permissions::from_mode(0o555)).expect("make the image cache read-only");
+    let before = contents(&host.root).expect("read initial state");
+    let mut candidate = host.command(&binary);
+    if unsafe { libc::geteuid() } == 0 {
+        candidate.uid(65534);
+    }
+
+    let output = candidate.output().expect("report exits");
+    let report = String::from_utf8(output.stdout).expect("report text");
+
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert!(report.contains("PASS startup: "), "{report}");
+    assert!(report.contains("FAIL image cache: "), "{report}");
+    assert!(report.contains("Permission denied"), "{report}");
+    assert_eq!(contents(&host.root).expect("read state after report"), before);
+    fs::set_permissions(images, fs::Permissions::from_mode(0o755)).expect("allow fixture cleanup");
 }
 
 #[tokio::test]
