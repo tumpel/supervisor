@@ -12,6 +12,8 @@ use futures_util::{SinkExt, StreamExt};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{ChannelProtocol, GuestProtocol, SupervisorCheckReport};
 
@@ -65,6 +67,7 @@ impl Host {
                 "dataDir": host.root.join("data"),
                 "imageCacheDir": host.root.join("images"),
                 "firecrackerPath": firecracker,
+                "heartbeatIntervalSeconds": 1,
             }),
         )?;
         Ok(host)
@@ -248,22 +251,13 @@ async fn startup_io_failures_exit_for_systemd_restart_before_consuming_a_handove
 
 #[tokio::test]
 async fn the_restarted_supervisor_confirms_online_after_welcome_and_removes_the_pending_marker() {
-    use ring::digest::{digest, SHA256};
-
     let plane = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("control plane");
     let host = Host::new("updated", &format!("http://{}", plane.local_addr().expect("address"))).expect("fixture host");
     let binary = host.root.join("supervisor");
     fs::copy(BINARY, &binary).expect("installed updated supervisor");
-    let bytes = fs::read(&binary).expect("installed binary bytes");
-    let digits = b"0123456789abcdef";
-    let running: String = digest(&SHA256, &bytes)
-        .as_ref()
-        .iter()
-        .flat_map(|byte| [digits[usize::from(byte >> 4)], digits[usize::from(byte & 15)]])
-        .map(char::from)
-        .collect();
+    let running = sha256(&fs::read(&binary).expect("installed binary bytes"));
     let previous = "a".repeat(64);
     let pending = host.root.join("state/update-pending.json");
     host.state(
@@ -273,52 +267,158 @@ async fn the_restarted_supervisor_confirms_online_after_welcome_and_removes_the_
         }),
     )
     .expect("pending update from the predecessor");
+    host.state(
+        "channel.json",
+        &json!({
+            "received":0, "sent":1, "unacked":[{
+                "type":"Frame", "ack":0, "seq":1, "message":{
+                    "type":"SupervisorUpdateStep", "phase":"Restarting", "fromSha256":previous,
+                    "toSha256":running, "releaseVersion":env!("TUMPEL_RELEASE_VERSION"), "boxesRunning":0,
+                    "at":"2026-11-24T15:00:00Z"
+                }
+            }]
+        }),
+    )
+    .expect("a restarting frame awaits replay");
     for name in ["handover.json", "boxes.json"] {
         fs::remove_file(host.root.join("state").join(name)).expect("no boxes to adopt in this test");
     }
     fs::create_dir_all(host.root.join("config/systemd/user")).expect("unit directory");
     let manager = host.root.join("systemctl");
-    fs::write(&manager, b"#!/bin/sh\nexit 0\n").expect("fixture user manager");
+    let calls = host.root.join("systemctl-args");
+    let online = host.root.join("online");
+    fs::write(
+        &manager,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$MANAGER_CALLS\"\n\
+         [ \"$2\" = reset-failed ] || exit 0\n\
+         for wait in 1 2 3 4 5; do\n\
+           [ ! -f \"$ONLINE\" ] || exit 0\n\
+           /bin/sleep 1\n\
+         done\nexit 23\n",
+    )
+    .expect("fixture user manager");
     fs::set_permissions(manager, fs::Permissions::from_mode(0o755)).expect("manager executable");
     let mut command = tokio::process::Command::from(host.command(&binary));
     let mut child = command
         .arg("run")
         .env("PATH", &host.root)
+        .env("MANAGER_CALLS", &calls)
+        .env("ONLINE", &online)
         .kill_on_drop(true)
         .spawn()
         .expect("systemd starts the updated supervisor");
     tokio::time::timeout(Duration::from_secs(10), async {
         let (stream, _) = plane.accept().await.expect("supervisor connection");
-        let mut wire = tokio_tungstenite::accept_async(stream).await.expect("WebSocket");
-        wire.send(Message::text(
-            json!({"type":"Challenge","nonce":"n".repeat(43)}).to_string(),
-        ))
-        .await
-        .expect("challenge");
-        let hello = wire.next().await.expect("hello").expect("hello frame");
-        let hello: Value = serde_json::from_str(hello.to_text().expect("hello text")).expect("hello JSON");
-        assert_eq!(hello["type"], "Hello");
+        let mut wire = hello(stream).await;
         assert!(pending.exists());
-        assert!(tokio::time::timeout(Duration::from_millis(75), wire.next())
-            .await
-            .is_err());
-        wire.send(Message::text(
-            json!({"type":"Welcome","hostId":"host-1","protocolVersion":ChannelProtocol::VERSION}).to_string(),
-        ))
-        .await
-        .expect("welcome");
-        let frame = wire.next().await.expect("online").expect("online frame");
-        let frame: Value = serde_json::from_str(frame.to_text().expect("online text")).expect("online JSON");
+        assert_eq!(
+            fs::read_to_string(&calls).expect("manager calls"),
+            "--user\ndaemon-reload\n"
+        );
+        welcome(&mut wire).await;
+        http(&plane, "/v1/releases/current", "404 Not Found", b"").await;
+        assert_eq!(next_frame(&mut wire).await["message"]["phase"], "Restarting");
+        let frame = next_frame(&mut wire).await;
         assert_eq!(frame["message"]["type"], "SupervisorUpdateStep");
         assert_eq!(frame["message"]["phase"], "Online");
         assert_eq!(frame["message"]["fromSha256"], previous);
         assert_eq!(frame["message"]["toSha256"], running);
         assert_eq!(frame["message"]["releaseVersion"], env!("TUMPEL_RELEASE_VERSION"));
         assert!(!pending.exists());
+        fs::write(&online, "").expect("allow reset to finish after Online arrives");
+        wire.send(Message::text(json!({"type":"Ack","seq":frame["seq"]}).to_string()))
+            .await
+            .expect("acknowledge Online");
+        assert_eq!(next_frame(&mut wire).await["type"], "Heartbeat");
+        let expected = "--user\ndaemon-reload\n--user\nreset-failed\ntumpel-supervisor.service\n";
+        assert_eq!(fs::read_to_string(&calls).expect("manager calls"), expected);
+
+        wire.close(None).await.expect("reconnect the supervisor");
+        let (stream, _) = plane.accept().await.expect("supervisor reconnects");
+        let mut wire = hello(stream).await;
+        assert!(!pending.exists());
+        welcome(&mut wire).await;
+        http(&plane, "/v1/releases/current", "404 Not Found", b"").await;
+        assert_eq!(next_frame(&mut wire).await["type"], "Heartbeat");
         let pid = i32::try_from(child.id().expect("supervisor PID")).expect("PID fits");
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
         assert!(child.wait().await.expect("supervisor exits").success());
+        assert_eq!(fs::read_to_string(&calls).expect("manager calls"), expected);
     })
     .await
     .expect("restarted supervisor confirms after Welcome");
 }
+
+type Wire = tokio_tungstenite::WebSocketStream<TcpStream>;
+
+#[cfg(test)]
+async fn hello(stream: TcpStream) -> Wire {
+    let mut wire = tokio_tungstenite::accept_async(stream).await.expect("WebSocket");
+    wire.send(Message::text(
+        json!({"type":"Challenge","nonce":"n".repeat(43)}).to_string(),
+    ))
+    .await
+    .expect("challenge");
+    assert_eq!(next_frame(&mut wire).await["type"], "Hello");
+    wire
+}
+
+#[cfg(test)]
+async fn welcome(wire: &mut Wire) {
+    wire.send(Message::text(
+        json!({"type":"Welcome","hostId":"host-1","protocolVersion":ChannelProtocol::VERSION}).to_string(),
+    ))
+    .await
+    .expect("welcome");
+}
+
+#[cfg(test)]
+async fn next_frame(wire: &mut Wire) -> Value {
+    let frame = wire.next().await.expect("host message").expect("host frame");
+    serde_json::from_str(frame.to_text().expect("frame text")).expect("frame JSON")
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use ring::digest::{digest, SHA256};
+
+    let digits = b"0123456789abcdef";
+    digest(&SHA256, bytes)
+        .as_ref()
+        .iter()
+        .flat_map(|byte| [digits[usize::from(byte >> 4)], digits[usize::from(byte & 15)]])
+        .map(char::from)
+        .collect()
+}
+
+#[cfg(test)]
+async fn http(plane: &TcpListener, path: &str, status: &str, body: &[u8]) {
+    let (stream, _) = plane.accept().await.expect("supervisor HTTP connection");
+    let mut stream = BufReader::new(stream);
+    let mut line = String::new();
+    stream.read_line(&mut line).await.expect("HTTP request line");
+    assert_eq!(line, format!("GET {path} HTTP/1.1\r\n"));
+    loop {
+        line.clear();
+        assert_ne!(stream.read_line(&mut line).await.expect("HTTP request header"), 0);
+        if line == "\r\n" {
+            break;
+        }
+    }
+    let mut stream = stream.into_inner();
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("HTTP response headers");
+    stream.write_all(body).await.expect("HTTP response body");
+}
+
+#[cfg(test)]
+#[cfg(feature = "host-tests")]
+#[path = "host/restart_counters.rs"]
+mod restart_counters;

@@ -355,14 +355,7 @@ async fn an_unreadable_refusal_file_is_reported_and_not_skipped_silently() {
 fn refresh_unit_replaces_an_installed_unit_with_a_rollback_line() {
     let layout = layout("old-unit");
     let current = supervisor_unit_text(&layout.binary);
-    assert!(!current.contains("RestartSteps="));
-    assert!(!current.contains("RestartMaxDelaySec="));
-    assert!(current.contains("RestartSec=5"));
-    let old = current.replacen(
-        "[Service]\n",
-        "[Service]\nExecStartPre=/bin/sh -c 'exit 0'\nRestartSteps=10\nRestartMaxDelaySec=30min\n",
-        1,
-    );
+    let old = current.replacen("[Service]\n", "[Service]\nExecStartPre=/bin/sh -c 'exit 0'\n", 1);
     std::fs::write(&layout.unit, old).expect("the old unit is written");
 
     assert_eq!(refresh_unit(&layout), Ok(true));

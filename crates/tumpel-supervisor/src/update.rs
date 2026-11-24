@@ -721,13 +721,13 @@ impl<S: Source, I: Idle> Updater<S, I> {
         Ok(())
     }
 
-    pub(crate) fn confirm(&self, send: impl FnOnce(ChannelHostMessage) -> Result<(), String>) -> Result<(), String> {
+    pub(crate) fn confirm(&self, send: impl FnOnce(ChannelHostMessage) -> Result<(), String>) -> Result<bool, String> {
         let path = self.layout.pending();
         let Some(pending) = read::<SupervisorUpdatePending>(&path, "SupervisorUpdatePending")? else {
-            return Ok(());
+            return Ok(false);
         };
         if pending.to_sha256 != self.running {
-            return Ok(());
+            return Ok(false);
         }
         let release_version = self
             .version
@@ -742,7 +742,8 @@ impl<S: Source, I: Idle> Updater<S, I> {
             phase: SupervisorUpdatePhase::Online,
             at: Utc::now().fixed_offset(),
         }))?;
-        remove(&path)
+        remove(&path)?;
+        Ok(true)
     }
 }
 

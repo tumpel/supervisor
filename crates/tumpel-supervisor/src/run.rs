@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
     ChannelControlMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
-    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    Sequence, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, TurnFailureReason,
 };
 use tumpel_channel::{
@@ -28,7 +28,7 @@ use tumpel_channel::{
 };
 
 use crate::boot::BootOrder;
-use crate::dir::{self, ChannelFile, CHANNEL_FILE, CONFIG_FILE, KEY_FILE, RUNTIME_FILE};
+use crate::dir::{self, ChannelFile, CHANNEL_FILE, CONFIG_FILE, KEY_FILE, RUNTIME_FILE, SUPERVISOR_UNIT};
 use crate::exchange::{Answer, Answers, Cancels};
 use crate::fd_store;
 use crate::firecracker::Firecracker;
@@ -44,7 +44,7 @@ use crate::update::{self, HttpSource, Layout, Limits, Outcome, Release, Source, 
 use crate::usage;
 
 const TICK: Duration = Duration::from_millis(500);
-const UNIT_RELOAD: Duration = Duration::from_secs(30);
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 
 pub struct Failure {
@@ -114,6 +114,30 @@ struct Updates<S: Source> {
 }
 
 impl<S: Source + 'static> Updates<S> {
+    fn welcomed(
+        self: &Arc<Self>,
+        channel: &mut Channel,
+        commands: &UnboundedSender<BoxCommand>,
+        outbox: &mut Outbox,
+        pending_online: &mut Option<Sequence>,
+    ) -> Result<(), Failure> {
+        commands.send(BoxCommand::Welcomed(channel.version())).map_err(|_| {
+            fail(
+                SupervisorFailure::ProtocolError,
+                "the box task stopped; restart the supervisor",
+            )
+        })?;
+        if self
+            .updater
+            .confirm(|message| channel.send(message, outbox).map_err(|error| error.to_string()))
+            .map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?
+        {
+            *pending_online = Some(channel.state().sent.clone());
+        }
+        self.announced();
+        Ok(())
+    }
+
     fn announced(self: &Arc<Self>) {
         if self.handover.borrow().is_some() {
             return;
@@ -150,24 +174,28 @@ pub(crate) async fn refresh_unit(layout: &Layout) -> Result<(), String> {
         "rewrote {} to the unit this binary installs; reloading systemd",
         layout.unit.display()
     );
-    let reloaded = tokio::time::timeout(
-        UNIT_RELOAD,
+    systemctl(&["daemon-reload"]).await.map_err(failed)
+}
+
+async fn systemctl(args: &[&str]) -> Result<(), String> {
+    let command = args.join(" ");
+    let status = tokio::time::timeout(
+        SYSTEMCTL_TIMEOUT,
         tokio::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
+            .arg("--user")
+            .args(args)
             .kill_on_drop(true)
             .status(),
     )
     .await;
-    match reloaded {
+    match status {
         Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => Err(failed(format!("systemctl --user daemon-reload exited with {status}"))),
-        Ok(Err(error)) => Err(failed(format!(
-            "starting systemctl --user daemon-reload failed: {error}"
-        ))),
-        Err(_) => Err(failed(format!(
-            "systemctl --user daemon-reload ran past {} s",
-            UNIT_RELOAD.as_secs()
-        ))),
+        Ok(Ok(status)) => Err(format!("systemctl --user {command} exited with {status}")),
+        Ok(Err(error)) => Err(format!("starting systemctl --user {command} failed: {error}")),
+        Err(_) => Err(format!(
+            "systemctl --user {command} ran past {} s",
+            SYSTEMCTL_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -802,7 +830,6 @@ pub async fn run(
         },
     )
     .await
-    .map_err(Into::into)
 }
 
 #[expect(
@@ -820,10 +847,10 @@ async fn run_channel<S: Source + 'static>(
     layout: &Layout,
     runner: &mut BoxRunner,
     terminated: impl Future<Output = ()>,
-) -> Result<Stopped, Failure> {
+) -> Result<Stopped, RunFailure> {
     let mut terminated = std::pin::pin!(terminated);
     let mut ready = updates.handover.subscribe();
-    let stopped = 'connect: loop {
+    let stopped: Result<_, RunFailure> = 'connect: loop {
         let mut serving = std::pin::pin!(serve(
             channel,
             url,
@@ -840,10 +867,10 @@ async fn run_channel<S: Source + 'static>(
         loop {
             let reason = tokio::select! {
                 biased;
-                ended = &mut *runner => break 'connect Err(boxes_stopped(ended)),
+                ended = &mut *runner => break 'connect Err(boxes_stopped(ended).into()),
                 () = &mut terminated, if settling.is_none() => HandoverFor::Stop,
                 readiness = ready.wait_for(|state| matches!(state, Some(Handover::Update(_)))), if settling.is_none() => {
-                    if let Err(error) = readiness { break 'connect Err(fail(SupervisorFailure::ChannelStateLost, error.to_string())); }
+                    if let Err(error) = readiness { break 'connect Err(fail(SupervisorFailure::ChannelStateLost, error.to_string()).into()); }
                     HandoverFor::Update
                 }
                 served = &mut serving, if connected => {
@@ -851,7 +878,7 @@ async fn run_channel<S: Source + 'static>(
                     match served {
                         Ok(Served::Revoked) => break 'connect Ok(None),
                         Ok(Served::Offline) => continue,
-                        Err(error) if restarts(&error.kind) => {
+                        Err(RunFailure::Supervisor(error)) if restarts(&error.kind) => {
                             failure = Some(error);
                             if settling.is_some() { continue; }
                             HandoverFor::Stop
@@ -863,10 +890,11 @@ async fn run_channel<S: Source + 'static>(
                     match answer {
                         Ok(record) => break 'connect dir::write_json(&layout.handover(), &record)
                             .map_err(|error| fail(SupervisorFailure::ChannelStateLost, format!("{error:#}")))
-                            .and(failure.map_or(Ok(Some(record)), Err)),
+                            .and(failure.map_or(Ok(Some(record)), Err))
+                            .map_err(Into::into),
                         Err(error) => {
-                            let Some(Handover::Update(release)) = updates.handover.send_replace(None) else { break 'connect Err(error); };
-                            if failure.is_some() { break 'connect Err(error); }
+                            let Some(Handover::Update(release)) = updates.handover.send_replace(None) else { break 'connect Err(RunFailure::Supervisor(error)); };
+                            if failure.is_some() { break 'connect Err(error.into()); }
                             updates.updater.settle_timed_out(&release, error.detail);
                             if !connected { continue 'connect; }
                             settling = None;
@@ -914,11 +942,23 @@ async fn serve(
     from_box: &mut UnboundedReceiver<Outgoing>,
     dir: &Path,
     updates: &Arc<Updates<impl Source + 'static>>,
-) -> Result<Served, Failure> {
+) -> Result<Served, RunFailure> {
     let mut backoff = Backoff::default();
     let mut limit = RateLimit::default();
+    let mut pending_online = None;
     loop {
-        let ended = session(channel, url, heartbeat, usage, commands, from_box, updates, &mut limit).await?;
+        let ended = session(
+            channel,
+            url,
+            heartbeat,
+            usage,
+            commands,
+            from_box,
+            updates,
+            &mut limit,
+            &mut pending_online,
+        )
+        .await?;
         if matches!(ended, Ended::Refused(_)) && updates.handover.borrow().is_some() {
             return Ok(Served::Offline);
         }
@@ -943,7 +983,7 @@ async fn serve(
                     updates.ready(updates.updater.now().await);
                 }
                 if updates.handover.borrow().is_none() {
-                    return Err(fail(SupervisorFailure::ProtocolError, reason));
+                    return Err(fail(SupervisorFailure::ProtocolError, reason).into());
                 }
                 return Ok(Served::Offline);
             }
@@ -1081,7 +1121,8 @@ async fn session(
     from_box: &mut UnboundedReceiver<Outgoing>,
     updates: &Arc<Updates<impl Source + 'static>>,
     limit: &mut RateLimit,
-) -> Result<Ended, Failure> {
+    pending_online: &mut Option<Sequence>,
+) -> Result<Ended, RunFailure> {
     let stream = match tokio::time::timeout(CONNECT_DEADLINE, tokio_tungstenite::connect_async(url)).await {
         Ok(Ok((stream, _))) => stream,
         Ok(Err(error)) => return Ok(dropped(false, format!("dialing failed: {error}"))),
@@ -1114,14 +1155,7 @@ async fn session(
                             Ok(Event::Welcomed) => {
                                 eprintln!("connected to {url}");
                                 last_beat = Instant::now();
-                                if commands.send(BoxCommand::Welcomed(channel.version())).is_err() {
-                                    Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
-                                } else if let Err(error) = updates.updater.confirm(|message| channel.send(message, &mut outbox).map_err(|error| error.to_string())) {
-                                    Some(Err(fail(SupervisorFailure::ChannelStateLost, error)))
-                                } else {
-                                    updates.announced();
-                                    None
-                                }
+                                updates.welcomed(channel, commands, &mut outbox, pending_online).err().map(Err)
                             }
                             Ok(Event::Message(message)) => match box_command(*message) {
                                 Ok(Some(command)) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
@@ -1171,13 +1205,19 @@ async fn session(
         };
         if let Some(ended) = ended.or_else(|| accepted(channel, commands).err().map(Err)) {
             channel.disconnect();
-            return ended;
+            return ended.map_err(Into::into);
         }
         for text in outbox.0.drain(..) {
             if let Err(error) = sink.send(Message::Text(text.into())).await {
                 channel.disconnect();
                 return Ok(dropped(channel.progressed(), format!("sending failed: {error}")));
             }
+        }
+        if pending_online.as_ref().is_some_and(|seq| channel.transmitted(seq)) {
+            systemctl(&["reset-failed", SUPERVISOR_UNIT])
+                .await
+                .map_err(RunFailure::Startup)?;
+            *pending_online = None;
         }
     }
 }
