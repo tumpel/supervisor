@@ -14,6 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tumpel_api::types::{
     ChannelHostMessage, ChannelSupervisorUpdateFailed, ChannelSupervisorUpdateFailedType, ChannelSupervisorUpdateStep,
@@ -108,7 +109,6 @@ pub trait Idle: Send + Sync {
     fn settled(&self) -> impl Future<Output = ()> + Send;
 }
 
-#[derive(Debug, PartialEq, Eq)]
 pub struct Release {
     pub version: ChannelSupervisorUpdateStepReleaseVersion,
     pub sha256: Sha256Digest,
@@ -315,8 +315,9 @@ fn synced(path: &Path) -> Result<(), String> {
 pub enum Outcome {
     Current,
     Refused,
+    Busy,
     Failed(SupervisorUpdateFailureReason),
-    Restart(Release),
+    Restart,
 }
 
 struct Stop {
@@ -362,6 +363,7 @@ pub struct Updater<S: Source, I: Idle> {
     version: &'static str,
     idle: I,
     out: UnboundedSender<Outgoing>,
+    running_update: Mutex<Option<Release>>,
 }
 
 impl<S: Source, I: Idle> Updater<S, I> {
@@ -382,17 +384,29 @@ impl<S: Source, I: Idle> Updater<S, I> {
             version,
             idle,
             out,
+            running_update: Mutex::new(None),
         }
     }
 
     pub async fn now(&self) -> Outcome {
-        match self.due().await {
-            Ok(release) => self.apply(release).await,
-            Err(outcome) => outcome,
+        let mut running = self.running_update.lock().await;
+        if running.is_some() {
+            return Outcome::Restart;
         }
+        let release = match self.due().await {
+            Ok(release) => release,
+            Err(outcome) => return outcome,
+        };
+        self.apply(release, &mut running).await
     }
 
     pub async fn announced(&self, grace: Duration) -> Outcome {
+        let Ok(mut running) = self.running_update.try_lock() else {
+            return Outcome::Busy;
+        };
+        if running.is_some() {
+            return Outcome::Busy;
+        }
         let release = match self.due().await {
             Ok(release) => release,
             Err(outcome) => return outcome,
@@ -419,7 +433,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
                 () = self.idle.settled() => {}
             }
         }
-        self.apply(release).await
+        self.apply(release, &mut running).await
     }
 
     async fn due(&self) -> Result<Release, Outcome> {
@@ -451,21 +465,25 @@ impl<S: Source, I: Idle> Updater<S, I> {
         }
     }
 
-    async fn apply(&self, release: Release) -> Outcome {
+    async fn apply(&self, release: Release, running: &mut Option<Release>) -> Outcome {
         if let Err(stopped) = self.prepare(&release).await {
             let reason = stopped.reason.clone();
             self.fail(&release.sha256, stopped);
             return Outcome::Failed(reason);
         }
         self.step(&release, SupervisorUpdatePhase::Restarting, self.idle.boxes());
-        Outcome::Restart(release)
+        *running = Some(release);
+        Outcome::Restart
     }
 
-    pub(crate) fn settle_timed_out(&self, release: &Release, error: String) {
+    pub(crate) async fn settle_timed_out(&self, error: String) -> Result<(), String> {
+        let mut running = self.running_update.lock().await;
+        let release = running.take().ok_or("no supervisor update is staged")?;
         self.fail(
             &release.sha256,
             stop(SupervisorUpdateFailureReason::SupervisorUpdateIdleTimedOut, error),
         );
+        Ok(())
     }
 
     fn step(&self, release: &Release, phase: SupervisorUpdatePhase, boxes: u32) {
@@ -693,29 +711,34 @@ impl<S: Source, I: Idle> Updater<S, I> {
         Ok(())
     }
 
-    pub(crate) fn swap(&self, release: &Release, boxes: usize, parked_turns: usize) -> Result<(), String> {
-        std::fs::rename(&self.layout.candidate, &self.layout.binary).map_err(|error| {
-            self.refuse(
-                &release.sha256,
-                stop(
-                    SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed,
-                    format!(
-                        "moving {} over {} failed: {error}",
-                        self.layout.candidate.display(),
-                        self.layout.binary.display()
-                    ),
-                ),
-            )
-            .detail
-        })?;
+    pub(crate) async fn swap(&self, boxes: usize) -> Result<(), String> {
+        let running = self.running_update.lock().await;
+        let release = running.as_ref().ok_or("no supervisor update is staged")?;
+        let path = self.layout.pending();
         let pending = SupervisorUpdatePending {
             from_sha256: self.running.clone(),
             to_sha256: release.sha256.clone(),
             swapped_at: Utc::now().fixed_offset(),
         };
-        dir::write_json(&self.layout.pending(), &pending).map_err(|error| format!("{error:#}"))?;
+        dir::write_json(&path, &pending).map_err(|error| format!("{error:#}"))?;
+        if let Err(error) = std::fs::rename(&self.layout.candidate, &self.layout.binary) {
+            let cleanup = remove(&path)
+                .err()
+                .map_or_else(String::new, |error| format!(". {error}"));
+            let detail = format!(
+                "moving {} over {} failed: {error}{cleanup}",
+                self.layout.candidate.display(),
+                self.layout.binary.display()
+            );
+            return Err(self
+                .refuse(
+                    &release.sha256,
+                    stop(SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed, detail),
+                )
+                .detail);
+        }
         eprintln!(
-            "tumpel-supervisor: handing {boxes} boxes ({parked_turns} parked turns) from {} {} to {} {}",
+            "tumpel-supervisor: swapping supervisor {} ({}) for {} ({}) with {boxes} boxes running",
             self.version, self.running, release.supervisor_version, release.sha256,
         );
         Ok(())
@@ -773,4 +796,4 @@ pub fn refresh_unit(layout: &Layout) -> Result<bool, String> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;

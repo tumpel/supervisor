@@ -3,7 +3,6 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use ring::signature::Ed25519KeyPair;
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -11,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{oneshot, watch, Mutex};
+use tokio::sync::{oneshot, watch, Notify};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -19,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
     ChannelControlMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
-    Sequence, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, TurnFailureReason,
 };
 use tumpel_channel::{
@@ -28,23 +27,23 @@ use tumpel_channel::{
 };
 
 use crate::boot::BootOrder;
-use crate::dir::{self, ChannelFile, CHANNEL_FILE, CONFIG_FILE, KEY_FILE, RUNTIME_FILE, SUPERVISOR_UNIT};
+use crate::dir::{self, ChannelFile, CHANNEL_FILE, CONFIG_FILE, KEY_FILE, RUNTIME_FILE};
 use crate::exchange::{Answer, Answers, Cancels};
 use crate::fd_store;
 use crate::firecracker::Firecracker;
 use crate::guest_drive;
 use crate::lifecycle::{
-    turn_failed, BoxTurn, Budgets, Command, HandoverFor, HandoverReply, IdleGate, Input, Lifecycle, Settings,
+    turn_failed, BoxTurn, Budgets, Command, HandoverReply, IdleGate, Input, Lifecycle, Settings, SettleFor,
     SetupCommand, SetupOrder, Taken, TeardownOrder,
 };
 use crate::pool::{memory_budget_mib, mib, Held, Size, TapPool};
 use crate::store::{jitter, HttpStore};
 use crate::telemetry::Telemetry;
-use crate::update::{self, HttpSource, Layout, Limits, Outcome, Release, Source, Updater};
+use crate::update::{self, HttpSource, Layout, Limits, Outcome, Updater};
 use crate::usage;
 
 const TICK: Duration = Duration::from_millis(500);
-const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
+const UNIT_RELOAD: Duration = Duration::from_secs(30);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 
 pub struct Failure {
@@ -96,30 +95,36 @@ pub enum Stopped {
 
 enum Served {
     Revoked,
-    Offline,
+    Refused,
+}
+
+enum Exit {
+    Stop(Stopped),
+    Swap(usize),
+}
+
+enum HandoverFor {
+    Update,
+    Refused,
+    Terminate,
+    Failed(Failure),
+    RunnerStopped(Failure),
 }
 
 type BoxRunner = JoinHandle<Result<(), String>>;
 
-enum Handover {
-    Stop,
-    Update(Release),
-}
-
-struct Updates<S: Source> {
-    updater: Updater<S, IdleGate>,
-    handover: watch::Sender<Option<Handover>>,
-    checking: Mutex<()>,
+struct Updates {
+    updater: Updater<HttpSource, IdleGate>,
+    handover: Notify,
     grace: Duration,
 }
 
-impl<S: Source + 'static> Updates<S> {
+impl Updates {
     fn welcomed(
         self: &Arc<Self>,
         channel: &mut Channel,
         commands: &UnboundedSender<BoxCommand>,
         outbox: &mut Outbox,
-        pending_online: &mut Option<Sequence>,
     ) -> Result<(), Failure> {
         commands.send(BoxCommand::Welcomed(channel.version())).map_err(|_| {
             fail(
@@ -127,40 +132,23 @@ impl<S: Source + 'static> Updates<S> {
                 "the box task stopped; restart the supervisor",
             )
         })?;
-        if self
-            .updater
+        self.updater
             .confirm(|message| channel.send(message, outbox).map_err(|error| error.to_string()))
-            .map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?
-        {
-            *pending_online = Some(channel.state().sent.clone());
-        }
+            .map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
         self.announced();
         Ok(())
     }
 
     fn announced(self: &Arc<Self>) {
-        if self.handover.borrow().is_some() {
-            return;
-        }
         let updates = Arc::clone(self);
         tokio::spawn(async move {
-            if let Ok(_checking) = updates.checking.try_lock() {
-                if updates.handover.borrow().is_none() {
-                    updates.ready(updates.updater.announced(updates.grace).await);
-                }
-            }
+            updates.ready(&updates.updater.announced(updates.grace).await);
         });
     }
 
-    fn ready(&self, outcome: Outcome) {
-        if let Outcome::Restart(release) = outcome {
-            self.handover.send_if_modified(|handover| {
-                if handover.is_some() {
-                    return false;
-                }
-                *handover = Some(Handover::Update(release));
-                true
-            });
+    fn ready(&self, outcome: &Outcome) {
+        if *outcome == Outcome::Restart {
+            self.handover.notify_one();
         }
     }
 }
@@ -174,28 +162,24 @@ pub(crate) async fn refresh_unit(layout: &Layout) -> Result<(), String> {
         "rewrote {} to the unit this binary installs; reloading systemd",
         layout.unit.display()
     );
-    systemctl(&["daemon-reload"]).await.map_err(failed)
-}
-
-async fn systemctl(args: &[&str]) -> Result<(), String> {
-    let command = args.join(" ");
-    let status = tokio::time::timeout(
-        SYSTEMCTL_TIMEOUT,
+    let reloaded = tokio::time::timeout(
+        UNIT_RELOAD,
         tokio::process::Command::new("systemctl")
-            .arg("--user")
-            .args(args)
+            .args(["--user", "daemon-reload"])
             .kill_on_drop(true)
             .status(),
     )
     .await;
-    match status {
+    match reloaded {
         Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => Err(format!("systemctl --user {command} exited with {status}")),
-        Ok(Err(error)) => Err(format!("starting systemctl --user {command} failed: {error}")),
-        Err(_) => Err(format!(
-            "systemctl --user {command} ran past {} s",
-            SYSTEMCTL_TIMEOUT.as_secs()
-        )),
+        Ok(Ok(status)) => Err(failed(format!("systemctl --user daemon-reload exited with {status}"))),
+        Ok(Err(error)) => Err(failed(format!(
+            "starting systemctl --user daemon-reload failed: {error}"
+        ))),
+        Err(_) => Err(failed(format!(
+            "systemctl --user daemon-reload ran past {} s",
+            UNIT_RELOAD.as_secs()
+        ))),
     }
 }
 
@@ -290,7 +274,7 @@ enum BoxCommand {
     Answer(Answer),
     Cancel(EntityId),
     Setup(SetupCommand),
-    HandOver(HandoverFor, HandoverReply),
+    HandOver(SettleFor, HandoverReply),
     SnapshotAccepted(EntityId),
     SnapshotFailed(EntityId),
     Welcomed(u16),
@@ -488,7 +472,10 @@ fn boxes_stopped(ended: Result<Result<(), String>, JoinError>) -> Failure {
     )
 }
 
-async fn settle(commands: &UnboundedSender<BoxCommand>, reason: HandoverFor) -> Result<SupervisorHandover, Failure> {
+async fn settle(
+    commands: &UnboundedSender<BoxCommand>,
+    reason: SettleFor,
+) -> Result<Result<SupervisorHandover, String>, Failure> {
     let stopped = || {
         fail(
             SupervisorFailure::ChannelStateLost,
@@ -499,10 +486,14 @@ async fn settle(commands: &UnboundedSender<BoxCommand>, reason: HandoverFor) -> 
     commands
         .send(BoxCommand::HandOver(reason, reply))
         .map_err(|_| stopped())?;
-    answer
-        .await
-        .map_err(|_| stopped())?
-        .map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))
+    answer.await.map_err(|_| stopped())
+}
+
+fn terminate(layout: &Layout, result: Result<SupervisorHandover, String>) -> Result<usize, Failure> {
+    let record = result.map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
+    dir::write_json(&layout.handover(), &record)
+        .map_err(|error| fail(SupervisorFailure::ChannelStateLost, format!("{error:#}")))?;
+    Ok(record.boxes.len())
 }
 
 fn restarts(kind: &SupervisorFailure) -> bool {
@@ -760,6 +751,7 @@ fn taken(
     Ok(taken)
 }
 
+#[expect(clippy::too_many_lines, reason = "setup, handover and exit share the channel state")]
 pub async fn run(
     telemetry: Telemetry,
     handed: bool,
@@ -811,116 +803,88 @@ pub async fn run(
             idle,
             out,
         ),
-        handover: watch::Sender::new(None),
-        checking: Mutex::new(()),
+        handover: Notify::new(),
         grace,
     });
-    run_channel(
-        &mut channel,
-        &url,
-        heartbeat,
-        &usage,
-        &commands,
-        &mut from_box,
-        &updates,
-        &started.layout,
-        &mut runner,
-        async {
-            terminated.recv().await;
-        },
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the channel and lifecycle own distinct runtime state"
-)]
-async fn run_channel<S: Source + 'static>(
-    channel: &mut Channel,
-    url: &str,
-    heartbeat: Duration,
-    usage: &Usage,
-    commands: &UnboundedSender<BoxCommand>,
-    from_box: &mut UnboundedReceiver<Outgoing>,
-    updates: &Arc<Updates<S>>,
-    layout: &Layout,
-    runner: &mut BoxRunner,
-    terminated: impl Future<Output = ()>,
-) -> Result<Stopped, RunFailure> {
-    let mut terminated = std::pin::pin!(terminated);
-    let mut ready = updates.handover.subscribe();
-    let stopped: Result<_, RunFailure> = 'connect: loop {
+    let layout = &started.layout;
+    let stopped: Result<_, Failure> = async {
         let mut serving = std::pin::pin!(serve(
-            channel,
-            url,
+            &mut channel,
+            &url,
             heartbeat,
-            usage,
-            commands,
-            from_box,
+            &usage,
+            &commands,
+            &mut from_box,
             &layout.state,
-            updates
+            &updates
         ));
-        let mut settling = None;
-        let mut connected = true;
-        let mut failure = None;
         loop {
-            let reason = tokio::select! {
+            let cause = tokio::select! {
                 biased;
-                ended = &mut *runner => break 'connect Err(boxes_stopped(ended).into()),
-                () = &mut terminated, if settling.is_none() => HandoverFor::Stop,
-                readiness = ready.wait_for(|state| matches!(state, Some(Handover::Update(_)))), if settling.is_none() => {
-                    if let Err(error) = readiness { break 'connect Err(fail(SupervisorFailure::ChannelStateLost, error.to_string()).into()); }
-                    HandoverFor::Update
-                }
-                served = &mut serving, if connected => {
-                    connected = false;
-                    match served {
-                        Ok(Served::Revoked) => break 'connect Ok(None),
-                        Ok(Served::Offline) => continue,
-                        Err(RunFailure::Supervisor(error)) if restarts(&error.kind) => {
-                            failure = Some(error);
-                            if settling.is_some() { continue; }
-                            HandoverFor::Stop
-                        }
-                        Err(error) => break 'connect Err(error),
-                    }
-                }
-                Some(answer) = futures_util::future::OptionFuture::from(settling.as_mut()) => {
-                    match answer {
-                        Ok(record) => break 'connect dir::write_json(&layout.handover(), &record)
-                            .map_err(|error| fail(SupervisorFailure::ChannelStateLost, format!("{error:#}")))
-                            .and(failure.map_or(Ok(Some(record)), Err))
-                            .map_err(Into::into),
-                        Err(error) => {
-                            let Some(Handover::Update(release)) = updates.handover.send_replace(None) else { break 'connect Err(RunFailure::Supervisor(error)); };
-                            if failure.is_some() { break 'connect Err(error.into()); }
-                            updates.updater.settle_timed_out(&release, error.detail);
-                            if !connected { continue 'connect; }
-                            settling = None;
-                            continue;
-                        }
-                    }
-                }
+                ended = &mut runner => HandoverFor::RunnerStopped(boxes_stopped(ended)),
+                Some(()) = terminated.recv() => HandoverFor::Terminate,
+                served = &mut serving => match served {
+                    Ok(Served::Refused) => HandoverFor::Refused,
+                    Ok(Served::Revoked) => return Ok(Exit::Stop(Stopped::Revoked)),
+                    Err(error) => HandoverFor::Failed(error),
+                },
+                () = updates.handover.notified() => HandoverFor::Update,
             };
-            if reason == HandoverFor::Stop {
-                updates.handover.send_replace(Some(Handover::Stop));
+            let reason = match cause {
+                HandoverFor::RunnerStopped(error) => return Err(error),
+                HandoverFor::Failed(error) => {
+                    if restarts(&error.kind) {
+                        terminate(layout, settle(&commands, SettleFor::Stop).await?)?;
+                    }
+                    return Err(error);
+                }
+                HandoverFor::Refused => break Ok(Exit::Swap(*usage.running.borrow() as usize)),
+                HandoverFor::Update => SettleFor::Update,
+                HandoverFor::Terminate => SettleFor::Stop,
+            };
+            let mut settling = std::pin::pin!(settle(&commands, reason));
+            let result = tokio::select! {
+                biased;
+                served = &mut serving => match served {
+                    Ok(Served::Refused) => break Ok(Exit::Swap(*usage.running.borrow() as usize)),
+                    Ok(Served::Revoked) => return Ok(Exit::Stop(Stopped::Revoked)),
+                    Err(error) => {
+                        if restarts(&error.kind) {
+                            terminate(layout, settling.await?)?;
+                        }
+                        return Err(error);
+                    }
+                },
+                result = &mut settling => result?,
+            };
+            match (result, reason) {
+                (Err(error), SettleFor::Update) => updates
+                    .updater
+                    .settle_timed_out(error)
+                    .await
+                    .map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?,
+                (result, SettleFor::Update) => break Ok(Exit::Swap(terminate(layout, result)?)),
+                (result, SettleFor::Stop) => {
+                    let boxes = terminate(layout, result)?;
+                    eprintln!("tumpel-supervisor: stopped and left {boxes} boxes running for the next start");
+                    return Ok(Exit::Stop(Stopped::Terminated));
+                }
             }
-            settling = Some(Box::pin(settle(commands, reason)));
         }
-    };
-    store_unsent(channel, from_box)?;
-    let Some(record) = stopped? else {
-        return Ok(Stopped::Revoked);
-    };
-    if let Some(Handover::Update(release)) = updates.handover.send_replace(None) {
-        updates
-            .updater
-            .swap(&release, record.boxes.len(), handed_turns(&record).len())
-            .map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
-        return Ok(Stopped::Updated);
     }
-    Ok(Stopped::Terminated)
+    .await;
+    store_unsent(&mut channel, &mut from_box)?;
+    match stopped? {
+        Exit::Swap(boxes) => {
+            updates
+                .updater
+                .swap(boxes)
+                .await
+                .map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
+            Ok(Stopped::Updated)
+        }
+        Exit::Stop(stopped) => Ok(stopped),
+    }
 }
 
 fn store_unsent(channel: &mut Channel, from_box: &mut UnboundedReceiver<Outgoing>) -> Result<(), Failure> {
@@ -941,60 +905,42 @@ async fn serve(
     commands: &UnboundedSender<BoxCommand>,
     from_box: &mut UnboundedReceiver<Outgoing>,
     dir: &Path,
-    updates: &Arc<Updates<impl Source + 'static>>,
-) -> Result<Served, RunFailure> {
+    updates: &Arc<Updates>,
+) -> Result<Served, Failure> {
     let mut backoff = Backoff::default();
     let mut limit = RateLimit::default();
-    let mut pending_online = None;
     loop {
-        let ended = session(
-            channel,
-            url,
-            heartbeat,
-            usage,
-            commands,
-            from_box,
-            updates,
-            &mut limit,
-            &mut pending_online,
-        )
-        .await?;
-        if matches!(ended, Ended::Refused(_)) && updates.handover.borrow().is_some() {
-            return Ok(Served::Offline);
-        }
-        let wait = match next(channel, &mut backoff, url, ended, jitter()) {
+        let ended = session(channel, url, heartbeat, usage, commands, from_box, updates, &mut limit).await?;
+        match next(channel, &mut backoff, url, ended, jitter()) {
             Next::Revoked(reason) => {
                 let key = dir.join(KEY_FILE);
                 std::fs::remove_file(&key).map_err(|error| {
                     fail(
                         SupervisorFailure::HostRevoked,
                         format!(
-                            "the control plane at {url} revoked this host ({reason}) and deleting {} failed: {error}",
+                            "the host was revoked ({reason}) and deleting {} failed: {error}",
                             key.display()
                         ),
                     )
                 })?;
-                eprintln!("the control plane at {url} revoked this host: {reason}; deleted its key and stopped");
+                eprintln!("the host was revoked: {reason}; deleted its key and stopped");
                 return Ok(Served::Revoked);
             }
             Next::Update(reason) => {
-                let _checking = updates.checking.lock().await;
-                if updates.handover.borrow().is_none() {
-                    updates.ready(updates.updater.now().await);
+                eprintln!("the control plane refused this supervisor's protocol ({reason}); updating now");
+                if updates.updater.now().await == Outcome::Restart {
+                    return Ok(Served::Refused);
                 }
-                if updates.handover.borrow().is_none() {
-                    return Err(fail(SupervisorFailure::ProtocolError, reason).into());
-                }
-                return Ok(Served::Offline);
+                return Err(fail(SupervisorFailure::ProtocolError, reason));
             }
-
-            Next::Reconnect(wait) => wait,
-        };
-        let wake = tokio::time::Instant::now() + wait;
-        loop {
-            tokio::select! {
-                () = tokio::time::sleep_until(wake) => break,
-                Some(message) = from_box.recv() => channel.send(message, &mut Outbox::default()).map_err(|error| store_lost(&error))?,
+            Next::Reconnect(wait) => {
+                let wake = tokio::time::Instant::now() + wait;
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep_until(wake) => break,
+                        Some(message) = from_box.recv() => channel.send(message, &mut Outbox::default()).map_err(|error| store_lost(&error))?,
+                    }
+                }
             }
         }
     }
@@ -1119,10 +1065,9 @@ async fn session(
     usage: &Usage,
     commands: &UnboundedSender<BoxCommand>,
     from_box: &mut UnboundedReceiver<Outgoing>,
-    updates: &Arc<Updates<impl Source + 'static>>,
+    updates: &Arc<Updates>,
     limit: &mut RateLimit,
-    pending_online: &mut Option<Sequence>,
-) -> Result<Ended, RunFailure> {
+) -> Result<Ended, Failure> {
     let stream = match tokio::time::timeout(CONNECT_DEADLINE, tokio_tungstenite::connect_async(url)).await {
         Ok(Ok((stream, _))) => stream,
         Ok(Err(error)) => return Ok(dropped(false, format!("dialing failed: {error}"))),
@@ -1155,7 +1100,7 @@ async fn session(
                             Ok(Event::Welcomed) => {
                                 eprintln!("connected to {url}");
                                 last_beat = Instant::now();
-                                updates.welcomed(channel, commands, &mut outbox, pending_online).err().map(Err)
+                                updates.welcomed(channel, commands, &mut outbox).err().map(Err)
                             }
                             Ok(Event::Message(message)) => match box_command(*message) {
                                 Ok(Some(command)) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
@@ -1205,7 +1150,7 @@ async fn session(
         };
         if let Some(ended) = ended.or_else(|| accepted(channel, commands).err().map(Err)) {
             channel.disconnect();
-            return ended.map_err(Into::into);
+            return ended;
         }
         for text in outbox.0.drain(..) {
             if let Err(error) = sink.send(Message::Text(text.into())).await {
@@ -1213,152 +1158,12 @@ async fn session(
                 return Ok(dropped(channel.progressed(), format!("sending failed: {error}")));
             }
         }
-        if pending_online.as_ref().is_some_and(|seq| channel.transmitted(seq)) {
-            systemctl(&["reset-failed", SUPERVISOR_UNIT])
-                .await
-                .map_err(RunFailure::Startup)?;
-            *pending_online = None;
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn update_and_sigterm_keep_reporting_until_snapshot_acceptance() {
-        for update in [true, false] {
-            live_handover(update).await;
-        }
-    }
-
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the test drives the real channel, lifecycle and updater together"
-    )]
-    async fn live_handover(update: bool) {
-        use crate::lifecycle::tests::pending_snapshot;
-        use crate::update::tests::{good_script, FakeSource};
-        use serde_json::{json, Value};
-        use tumpel_api::types::ChannelProtocol;
-
-        let name = if update { "heartbeat-update" } else { "heartbeat-stop" };
-        let (mut host, snapshot_id) = pending_snapshot(name).await;
-        let lifecycle = &host.commands;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("control-plane listener");
-        let address = listener.local_addr().expect("address");
-        let url = format!("ws://{address}");
-        let dir = std::env::temp_dir().join(format!("tumpel-{name}-{}", std::process::id()));
-        std::fs::create_dir(&dir).expect("state directory");
-        let layout = Layout::new(dir.join("supervisor"), dir.clone(), dir.join("unit"));
-        let key = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).expect("fixture key");
-        let mut channel = HostChannel::new(
-            tumpel_channel::empty_state(),
-            ChannelFile(dir.join(CHANNEL_FILE)),
-            HostKey(Ed25519KeyPair::from_pkcs8(key.as_ref()).expect("fixture key pair")),
-            "host-1".parse().expect("host id"),
-            "0.1.0".to_string(),
-        );
-        let usage = Usage {
-            box_capacity: NonZeroU32::MIN,
-            warm: watch::channel(1).1,
-            running: watch::channel(1).1,
-            sessions: host.sessions.clone(),
-            claude_setups: watch::channel(Vec::new()).1,
-            turns: watch::channel(Vec::new()).1,
-            holdings: watch::channel(Held::default()).1,
-            data_dir: dir.clone(),
-            telemetry: Telemetry::new(8),
-        };
-        let (commands, mut requested) = unbounded_channel();
-        let (out, mut from_box) = unbounded_channel();
-        let (stop, terminated) = oneshot::channel();
-        let updates = Arc::new(Updates {
-            updater: Updater::new(
-                FakeSource::binary(&good_script()),
-                layout.clone(),
-                Limits::HOST,
-                "a".repeat(64).parse().expect("running digest"),
-                "0.1.0",
-                IdleGate::new(usage.running.clone(), watch::channel(0).1),
-                out,
-            ),
-            handover: watch::Sender::new(None),
-            checking: Mutex::new(()),
-            grace: Duration::ZERO,
-        });
-        let peer = async {
-            let (stream, _) = listener.accept().await.expect("connection");
-            let mut socket = tokio_tungstenite::accept_async(stream).await.expect("WebSocket");
-            socket
-                .send(Message::text(
-                    json!({"type":"Challenge","nonce":"n".repeat(43)}).to_string(),
-                ))
-                .await
-                .expect("challenge");
-            assert!(socket.next().await.expect("Hello").is_ok());
-            if !update {
-                stop.send(()).expect("SIGTERM");
-            }
-            socket
-                .send(Message::text(
-                    json!({
-                        "type":"Welcome","hostId":"host-1","protocolVersion":ChannelProtocol::VERSION
-                    })
-                    .to_string(),
-                ))
-                .await
-                .expect("Welcome");
-            while let Some(command) = requested.recv().await {
-                if let BoxCommand::HandOver(reason, reply) = command {
-                    assert_eq!(reason == HandoverFor::Update, update);
-                    lifecycle
-                        .send(Input::HandOver(reason, reply))
-                        .expect("real lifecycle settles");
-                    break;
-                }
-            }
-            loop {
-                let frame = socket.next().await.expect("channel stays live").expect("frame");
-                let frame: Value = serde_json::from_str(frame.to_text().expect("frame text")).expect("frame JSON");
-                if frame["type"] == "Heartbeat" {
-                    assert_eq!(frame["heldSessionIds"], json!(["session-1"]));
-                    break;
-                }
-            }
-            lifecycle
-                .send(Input::SnapshotAccepted(snapshot_id))
-                .expect("terminal acceptance");
-        };
-        let stopped = run_channel(
-            &mut channel,
-            &url,
-            Duration::from_millis(100),
-            &usage,
-            &commands,
-            &mut from_box,
-            &updates,
-            &layout,
-            &mut host.runner,
-            async {
-                let _ = terminated.await;
-            },
-        );
-        let (stopped, ()) = Box::pin(tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::join!(stopped, peer)
-        }))
-        .await
-        .expect("handover finishes after the heartbeat and acceptance");
-        assert!(matches!(
-            (update, stopped),
-            (true, Ok(Stopped::Updated)) | (false, Ok(Stopped::Terminated))
-        ));
-        std::fs::remove_dir_all(dir).expect("remove fixture");
-        host.runner.abort();
-    }
 
     #[test]
     fn a_setup_box_boots_the_harness_its_offer_names_and_claude_code_without_one() {

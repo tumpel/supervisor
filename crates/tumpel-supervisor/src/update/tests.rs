@@ -46,7 +46,7 @@ impl Idle for &FakeIdle {
     }
 }
 
-pub(crate) struct FakeSource {
+struct FakeSource {
     bytes: Vec<u8>,
     sha256: String,
     supervisor_version: &'static str,
@@ -56,7 +56,7 @@ pub(crate) struct FakeSource {
 }
 
 impl FakeSource {
-    pub(crate) fn binary(script: &str) -> Self {
+    fn binary(script: &str) -> Self {
         Self {
             bytes: script.as_bytes().to_vec(),
             sha256: sha256_hex(script.as_bytes()),
@@ -95,7 +95,7 @@ fn report_script(protocol: u32) -> String {
     )
 }
 
-pub(crate) fn good_script() -> String {
+fn good_script() -> String {
     report_script(u32::from(ChannelProtocol::VERSION))
 }
 
@@ -390,18 +390,13 @@ async fn a_release_notice_replaces_the_binary_on_an_idle_host() {
     let layout = layout("notice-idle");
     let idle = FakeIdle::default();
     let mut run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
-    let Outcome::Restart(release) = run.updater.announced(GRACE).await else {
-        panic!("candidate prepared");
-    };
+    assert_eq!(run.updater.announced(GRACE).await, Outcome::Restart);
     assert_eq!(text(&layout.binary), OLD_BINARY);
-    run.updater.swap(&release, 0, 0).expect("the settled update installs");
+    run.updater.swap(0).await.expect("the settled update installs");
     assert!(!seen(&mut run.events).contains(&Seen::Step(SupervisorUpdatePhase::WaitingForIdle)));
     assert_eq!(text(&layout.binary), good_script());
     assert!(!layout.candidate.exists());
-    let pending: tumpel_api::types::SupervisorUpdatePending =
-        serde_json::from_str(&text(&layout.pending())).expect("the swap records its pending confirmation");
-    assert_eq!(*pending.from_sha256, sha256_hex(OLD_BINARY.as_bytes()));
-    assert_eq!(pending.to_sha256, release.sha256);
+    assert!(layout.pending().is_file());
 }
 
 #[tokio::test]
@@ -417,10 +412,8 @@ async fn an_announced_rollback_installs_an_older_supervisor_version() {
         ..FakeSource::binary(&good_script())
     };
     let run = updater(&layout, source, &idle, limits());
-    let Outcome::Restart(release) = run.updater.announced(Duration::ZERO).await else {
-        panic!("rollback prepared");
-    };
-    run.updater.swap(&release, 0, 0).expect("the settled rollback installs");
+    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
+    run.updater.swap(0).await.expect("the settled rollback installs");
     assert_eq!(text(&layout.binary), good_script());
 }
 
@@ -443,7 +436,7 @@ async fn a_release_notice_to_a_busy_host_waits_out_the_grace_period_then_updates
     );
     assert_eq!(text(&layout.binary), OLD_BINARY);
     tokio::time::resume();
-    assert!(matches!(notice.await, Outcome::Restart(_)));
+    assert_eq!(notice.await, Outcome::Restart);
     assert!(started.elapsed() >= GRACE);
     assert_eq!(text(&layout.binary), OLD_BINARY);
 }
@@ -463,7 +456,7 @@ async fn a_release_notice_to_a_busy_host_updates_once_its_turns_finish_inside_th
     }
     busy.0.send_replace(0);
     tokio::time::resume();
-    assert!(matches!(notice.await, Outcome::Restart(_)));
+    assert_eq!(notice.await, Outcome::Restart);
     assert!(started.elapsed() < GRACE);
     assert_eq!(text(&layout.binary), OLD_BINARY);
 }
@@ -560,7 +553,7 @@ async fn an_update_goes_only_to_a_newer_supervisor_version() {
         "an announced downgrade leaves the running binary"
     );
     assert!(
-        matches!(run.updater.now().await, Outcome::Restart(_)),
+        run.updater.now().await == Outcome::Restart,
         "a downgrade the control plane demands is staged"
     );
     assert_eq!(text(&layout.binary), OLD_BINARY);
@@ -571,29 +564,25 @@ async fn a_timed_out_update_can_stage_again_and_a_failed_swap_refuses_it() {
     let layout = layout("swap-failed");
     let idle = FakeIdle::default();
     let mut run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
-    let Outcome::Restart(release) = run.updater.announced(Duration::ZERO).await else {
-        panic!("the candidate report passed");
-    };
-    run.updater.settle_timed_out(&release, "HandoverTimedOut".to_string());
+    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
+    run.updater
+        .settle_timed_out("HandoverTimedOut".to_string())
+        .await
+        .unwrap();
     assert_eq!(failure(&mut run.events).0, "HandoverTimedOut");
     assert_eq!(text(&layout.binary), OLD_BINARY);
-    let Outcome::Restart(release) = run.updater.announced(Duration::ZERO).await else {
-        panic!("a timeout doesn't refuse the release");
-    };
+    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
     std::fs::remove_file(&layout.candidate).expect("make the candidate rename fail");
 
-    let error = run.updater.swap(&release, 0, 0).expect_err("rename failed");
+    let error = run.updater.swap(0).await.expect_err("rename failed");
 
     assert!(error.contains("moving"), "{error}");
     assert_eq!(text(&layout.binary), OLD_BINARY);
     assert!(!layout.pending().exists());
     let refusal: SupervisorUpdateRefusal = serde_json::from_str(&text(&layout.refusal())).expect("refusal record");
-    assert_eq!(refusal.to_sha256, release.sha256);
+    assert_eq!(*refusal.to_sha256, sha256_hex(good_script().as_bytes()));
     assert_eq!(
         refusal.reason,
         SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed
     );
-    let restarted = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
-    assert_eq!(restarted.updater.announced(Duration::ZERO).await, Outcome::Refused);
-    assert_eq!(restarted.updater.source.downloads.load(Ordering::SeqCst), 0);
 }

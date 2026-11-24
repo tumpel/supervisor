@@ -2231,7 +2231,7 @@ pub enum Taken {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum HandoverFor {
+pub enum SettleFor {
     Update,
     Stop,
 }
@@ -2240,7 +2240,7 @@ pub type HandoverReply = oneshot::Sender<Result<SupervisorHandover, String>>;
 
 pub enum Input {
     Command(Command),
-    HandOver(HandoverFor, HandoverReply),
+    HandOver(SettleFor, HandoverReply),
     SnapshotAccepted(EntityId),
     SnapshotFailed(EntityId),
     Welcomed(u16),
@@ -2310,7 +2310,7 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     setups: HashMap<String, UnboundedSender<SetupInput>>,
     mode: Mode,
     parking: watch::Sender<bool>,
-    handing: Option<(HandoverFor, HandoverReply, AbortHandle)>,
+    handing: Option<(SettleFor, HandoverReply, AbortHandle)>,
     session_protocol: Option<u16>,
     adopted: Vec<String>,
 }
@@ -2536,7 +2536,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
     }
 
-    fn start_handover(&mut self, reason: HandoverFor, reply: HandoverReply) {
+    fn start_handover(&mut self, reason: SettleFor, reply: HandoverReply) {
         self.mode = Mode::HandingOver;
         self.parking.send_replace(true);
         eprintln!(
@@ -2587,22 +2587,13 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let Some((reason, reply, _)) = self.handing.take() else {
             return Ok(());
         };
-        let busy = self
-            .slots
-            .iter()
-            .filter(|(_, slot)| slot.settling())
-            .map(|(session, slot)| match (&slot.snapshot, &slot.task) {
-                (Some(Awaited::Pending(id)), _) => format!("session {session} snapshot {id}"),
-                (_, Some((Running::Turn(turn_id, _), _))) => format!("session {session} turn {turn_id}"),
-                _ => format!("session {session}"),
-            })
-            .collect::<Vec<_>>();
-        let setups: Vec<_> = self.setups.keys().collect();
+        let busy = self.slots.values().filter(|slot| slot.settling()).count();
         let error = format!(
-            "HandoverTimedOut: the {} s limit elapsed. Busy boxes: {busy:?}. Busy setups: {setups:?}",
+            "HandoverTimedOut: {busy} boxes and {} setups did not settle within {} s",
+            self.setups.len(),
             self.handover_report_interval().as_secs()
         );
-        if reason == HandoverFor::Stop {
+        if reason == SettleFor::Stop {
             let recorded = self
                 .runner
                 .standing
@@ -2610,25 +2601,18 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 .lock()
                 .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?;
             for (running, _) in self.slots.values().filter_map(|slot| slot.task.as_ref()) {
-                let Running::Turn(turn_id, box_id) = running else {
-                    continue;
-                };
-                if !recorded.values().any(|box_| {
-                    &box_.box_id == box_id
-                        && matches!(&box_.state, SupervisorHandoverBoxState::Turn(turn) if &turn.turn_id == turn_id)
-                }) {
-                    turn_failed(
-                        &self.runner.out,
-                        turn_id,
-                        TurnFailureReason::HarnessExited,
-                        format!(
-                            "the supervisor stopped before recording the box for turn {turn_id}. Send the turn again"
-                        ),
-                    );
+                if let Running::Turn(turn_id, box_id) = running {
+                    if !recorded.values().any(|box_| {
+                        &box_.box_id == box_id
+                            && matches!(&box_.state, SupervisorHandoverBoxState::Turn(turn) if &turn.turn_id == turn_id)
+                    }) {
+                        turn_failed(&self.runner.out, turn_id, TurnFailureReason::HarnessExited,
+                            format!("the supervisor stopped before recording the box for turn {turn_id}. Send the turn again"));
+                    }
                 }
             }
-            drop(reply.send(Err(error.clone())));
-            return Err(error);
+            drop(reply.send(Err(error)));
+            return Ok(());
         }
         self.mode = Mode::TakingTurns;
         self.parking.send_replace(false);
@@ -2931,12 +2915,15 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         let session = command.session();
         let slot = self.slots.entry(session.clone()).or_default();
-        if let Command::Teardown(order) | Command::Discard(order) = &command {
-            if slot.box_id() != Some(&order.box_id) {
-                return self.dispatch(session, command).await;
-            }
-        }
         if self.mode == Mode::HandingOver || slot.busy || slot.parked.is_some() {
+            let command = match command {
+                Command::Teardown(order) | Command::Discard(order) if slot.box_id() != Some(&order.box_id) => {
+                    self.prune(&session);
+                    self.box_gone(order);
+                    return Ok(());
+                }
+                command => command,
+            };
             slot.queue.push_back(command);
             return self.record_queue(&session);
         }
@@ -3235,8 +3222,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     async fn start_discard(&mut self, session: String, order: TeardownOrder) -> Result<(), String> {
         match self.live_box(&session) {
             Some(live) if live.box_id == order.box_id => self.teardown(&session, BoxEnd::Discard).await?,
-            None if !self.slots.get(&session).is_some_and(|slot| slot.busy) => self.free_disk(&session)?,
-            Some(_) | None => {}
+            Some(_) => {}
+            None => self.free_disk(&session)?,
         }
         self.prune(&session);
         self.box_gone(order);
@@ -3256,11 +3243,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .filter(|live| live.box_id == order.box_id)
             .map(|live| live.dirty)
         else {
-            if !self
-                .slots
-                .get(&session)
-                .is_some_and(|slot| slot.busy || slot.live.is_some())
-            {
+            if self.live_box(&session).is_none() {
                 self.free_disk(&session)?;
             }
             self.prune(&session);
@@ -3546,4 +3529,4 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;

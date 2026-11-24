@@ -610,11 +610,6 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         self.withheld.is_some()
     }
 
-    #[must_use]
-    pub fn transmitted(&self, seq: &Sequence) -> bool {
-        self.phase == Phase::Open && self.sealed >= seq.0 && self.withheld.is_none_or(|from| from > seq.0)
-    }
-
     /// # Errors
     /// Fails when the port refuses a frame.
     pub fn release(&mut self, budget: usize, port: &mut impl Port) -> Result<(), ChannelError> {
