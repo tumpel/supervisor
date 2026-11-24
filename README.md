@@ -36,11 +36,11 @@ An enrolled host updates itself to the supervisor its control plane stage pins, 
 
 ## Host report
 
-Run `tumpel-supervisor` to check the host's local state once. Use `--json` for machine-readable results or `--manifest PATH` to verify the binary against a downloaded release manifest. Start supervision through the installed systemd user unit, which runs `tumpel-supervisor --daemon`.
+Run `tumpel-supervisor` to check the host's local state once. Use `--json` for machine-readable results or `--manifest PATH` to verify the binary against a downloaded release manifest. Start supervision through the installed systemd user unit, or start it directly with `tumpel-supervisor --daemon`. The unit uses the `run` alias so it can also start older releases during rollback.
 
 ## Restart and stop
 
-Each box runs in its own systemd user scope, `tumpel-box<k>.scope`, outside the `tumpel-supervisor` unit, and systemd holds the box's connections while it runs. A restart of the unit, a rerun of `install`, a stop and start or a crash leaves the boxes running, and the next start takes them over. After a restart, each running turn continues where it was. After a crash, a turn that was running fails and the control plane offers it again, and its box stays warm for the next turn. If a live box cannot be taken over, the supervisor stops startup and keeps the box and its saved record. A stopped unit leaves its boxes running until it starts again. To end every box, run `systemctl --user stop 'tumpel-box*.scope'`.
+Each box runs in its own systemd user scope, `tumpel-box<k>.scope`, outside the `tumpel-supervisor` unit, and systemd holds the box's connections while it runs. A restart of the unit, a rerun of `install`, a stop and start or a crash leaves the boxes running, and the next start takes them over. After a restart, each running turn continues where it was. After a crash, a turn that was running fails and the control plane offers it again, and its box stays warm for the next turn. If startup cannot attach a live box, it keeps the box running and preserves its saved record. A stopped unit leaves its boxes running until it starts again. To end every box, run `systemctl --user stop 'tumpel-box*.scope'`.
 
 ## Releases
 

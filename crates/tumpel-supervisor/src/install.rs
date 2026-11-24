@@ -585,9 +585,9 @@ StartLimitIntervalSec=3h
 StartLimitBurst=11
 
 [Service]
-Type=notify
+Type=simple
 ExecStartPre=/bin/sh -c '{rollback}' {binary} {previous}
-ExecStart={binary} --daemon
+ExecStart={binary} run
 KillMode=control-group
 ExecStopPost=/bin/sh -c 'if [ \"$$EXIT_CODE\" = exited ] && [ \"$$EXIT_STATUS\" = 6 ]; then sleep 60; fi'
 Restart=on-failure

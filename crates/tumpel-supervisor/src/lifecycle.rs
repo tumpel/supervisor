@@ -440,6 +440,13 @@ pub(crate) fn decode_box(
     Ok((record, image, queue))
 }
 
+fn report_observation<M: Machine>(machine: &M, guest: &M::Guest, tap: i32) -> Option<Observation> {
+    machine.observation(guest).unwrap_or_else(|error| {
+        eprintln!("tumpel-supervisor: cannot inspect box {tap} for the report: {error}");
+        None
+    })
+}
+
 #[derive(Clone)]
 struct Standing {
     path: PathBuf,
@@ -485,7 +492,7 @@ impl Standing {
 
     fn put<M: Machine>(&self, live: &LiveBox<M>, turn_id: Option<&EntityId>) -> Result<(), String> {
         let mut record = live.record(turn_id)?;
-        let observation = live.machine.observation(&live.guest)?;
+        let observation = report_observation(&live.machine, &live.guest, record.tap_index);
         self.write(|boxes| {
             if let Some(kept) = boxes
                 .remove(&record.tap_index)
@@ -2835,7 +2842,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     }
                 }
             }
-            let observation = machine.observation(&guest).map_err(context)?;
+            let observation = report_observation(&machine, &guest, record.tap_index);
             standing.insert(record.tap_index, RecordedBox { record, observation });
             prepared.push((handed, image, queue, (machine, guest, tap)));
         }

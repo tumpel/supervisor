@@ -337,6 +337,13 @@ impl Machine for MemoryMachine {
         .expect("a recorded machine"))
     }
 
+    fn observation(&self, _: &MemoryGuest) -> Result<Option<crate::firecracker::Observation>, String> {
+        if self.session == "missing-observation" {
+            return Err("the process metadata is unavailable".to_string());
+        }
+        Ok(None)
+    }
+
     fn reconnect(&mut self, guest: &mut MemoryGuest) -> impl Future<Output = Result<(), String>> + Send {
         note(&self.log, format!("reconnect {}", self.session));
         *guest = self.guest();
@@ -1948,6 +1955,33 @@ async fn a_warm_box_handed_over_takes_the_next_turn_without_a_boot() {
             "reconnect session-1",
             "pause session-1"
         ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_observation_error_does_not_stop_a_box_at_boot_or_takeover() {
+    let mut old = host("observation-error", 1, Harness::Echo, Boot::Works);
+    old.turn("turn-1", "missing-observation", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    old.log();
+
+    let mut new = old.hand_over().await;
+    assert_eq!(new.standing().boxes.len(), 1);
+    new.turn("turn-2", "missing-observation", "two", Vec::new());
+    assert_eq!(
+        new.settle_until("complete 1").await,
+        ["claim turn-2", "line 1 two", "complete 1"]
+    );
+    let log = new.log();
+    assert!(
+        log.iter()
+            .any(|entry| entry == "reattach missing-observation on tumpel0"),
+        "{log:?}"
+    );
+    assert!(
+        !log.iter()
+            .any(|entry| entry.starts_with("stop ") || entry.starts_with("boot ")),
+        "{log:?}"
     );
 }
 

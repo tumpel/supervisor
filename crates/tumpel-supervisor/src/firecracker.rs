@@ -248,7 +248,8 @@ fn booted_memory(socket: &Path, pid: libc::pid_t) -> Result<NonZeroU32, String> 
     use std::io::{BufRead, Read, Write};
     let failed = |error: std::io::Error| {
         format!(
-            "Firecracker did not answer GET /machine-config within {} s: {error}",
+            "reading GET /machine-config from {} within {} s: {error}",
+            socket.display(),
             API_ANSWER.as_secs()
         )
     };
@@ -309,7 +310,12 @@ fn booted_memory(socket: &Path, pid: libc::pid_t) -> Result<NonZeroU32, String> 
     }
     serde_json::from_slice::<MachineConfig>(&answer)
         .map(|config| config.mem_size_mib)
-        .map_err(|_| "Firecracker answered GET /machine-config without a positive mem_size_mib".to_string())
+        .map_err(|error| {
+            format!(
+                "invalid Firecracker GET /machine-config response from {}: {error}",
+                socket.display()
+            )
+        })
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), String> {
@@ -665,10 +671,10 @@ fn handed_pid(handed: &SupervisorHandoverMachine) -> Option<libc::pid_t> {
 fn recorded_buffers(handed: &SupervisorHandoverMachine) -> Result<(Vec<u8>, Vec<u8>), String> {
     let guest = STANDARD
         .decode(handed.guest_buffer.as_bytes())
-        .map_err(|_| "guestBuffer is not base64")?;
+        .map_err(|error| format!("guestBuffer is not base64: {error}"))?;
     let console = STANDARD
         .decode(handed.console_tail.as_bytes())
-        .map_err(|_| "consoleTail is not base64")?;
+        .map_err(|error| format!("consoleTail is not base64: {error}"))?;
     Ok((guest, console))
 }
 
@@ -721,7 +727,7 @@ impl Firecracker {
             return Err("the recorded Firecracker process is no longer running".to_string());
         }
         self.booted_disk(&record.session_id)
-            .map_err(|_| "cannot read the box disk; check the recorded session and dataDir in runtime.json")?;
+            .map_err(|error| format!("{error}; check the recorded session and dataDir in runtime.json"))?;
         Ok(())
     }
 
