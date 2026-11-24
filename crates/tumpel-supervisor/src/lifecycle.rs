@@ -1,5 +1,5 @@
 use crate::firecracker::Observation;
-use crate::inventory::{Inventory, RecordedBox};
+use crate::inventory::{Inventory, RecordedBox, StartupBoxes};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::BufWriter;
@@ -205,7 +205,7 @@ pub trait Vmm: Send + Sync + 'static {
     fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String>;
     fn disk(&self, drives: &[String]) -> Result<Disk, String>;
     fn unclaimed_scopes(&self, claimed: &[u8]) -> Result<Vec<u8>, String>;
-    fn discard_setup(&self, index: u8) -> Result<(), String>;
+    fn discard_incomplete_boot(&self, index: u8) -> Result<(), String>;
     fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
     fn staging(&self, session_id: &EntityId) -> Result<PathBuf, String>;
@@ -639,6 +639,7 @@ struct Slot<M: Machine> {
     paused: bool,
     parked: Option<Box<Parked>>,
     task: Option<(Running, JoinHandle<()>)>,
+    boot_tap: Option<u8>,
     queue: VecDeque<Command>,
     idle: Option<AbortHandle>,
     idle_end: Option<Instant>,
@@ -651,6 +652,11 @@ enum Awaited {
 }
 
 impl<M: Machine> Slot<M> {
+    fn begin_boot(&mut self, tap: &Tap) {
+        self.busy = true;
+        self.boot_tap = Some(tap.index());
+    }
+
     fn turns(&self) -> Vec<EntityId> {
         let running = self.task.iter().filter_map(|(running, _)| match running {
             Running::Turn(turn_id) => Some(turn_id.clone()),
@@ -673,6 +679,7 @@ impl<M: Machine> Default for Slot<M> {
             paused: false,
             parked: None,
             task: None,
+            boot_tap: None,
             queue: VecDeque::new(),
             idle: None,
             idle_end: None,
@@ -2596,7 +2603,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             task.abort();
             let _ = task.await;
             self.setups.remove(&claude_setup_id);
-            if let Err(error) = self.runner.vmm.discard_setup(index) {
+            if let Err(error) = self.runner.vmm.discard_incomplete_boot(index) {
                 eprintln!("tumpel-supervisor: discarding the setup box on TAP {index} failed: {error}; kept its files");
             }
         }
@@ -2625,6 +2632,21 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 (Some((running, task)), _) => {
                     task.abort();
                     let _ = task.await;
+                    if let Some(index) = slot.boot_tap.take() {
+                        let recorded = self
+                            .runner
+                            .standing
+                            .boxes
+                            .lock()
+                            .map_or(true, |boxes| boxes.contains_key(&i32::from(index)));
+                        if !recorded {
+                            if let Err(error) = self.runner.vmm.discard_incomplete_boot(index) {
+                                eprintln!(
+                                    "tumpel-supervisor: discarding the incomplete boot on TAP {index} failed: {error}"
+                                );
+                            }
+                        }
+                    }
                     match running {
                         Running::Turn(turn_id) => Some(turn_id),
                         Running::Snapshot => None,
@@ -2787,22 +2809,34 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     /// # Errors
     /// Fails when a live box cannot be attached, an unknown scope remains, or the inventory cannot be saved.
     pub fn start(&mut self, taken: Option<(SupervisorHandover, Taken)>) -> Result<(), String> {
-        self.start_inventory(taken.map(|(record, state)| (record.into(), state)))
+        self.start_inventory(taken.map(|(record, state)| StartupBoxes::from_record(record.into(), state)))
     }
 
-    pub(crate) fn start_inventory(&mut self, taken: Option<(Inventory, Taken)>) -> Result<(), String> {
+    pub(crate) fn start_inventory(&mut self, taken: Option<StartupBoxes>) -> Result<(), String> {
         let recorded = taken.is_some();
         let mut standing = BTreeMap::new();
         let mut claimed = Vec::new();
-        let handed = matches!(taken, Some((_, Taken::Handed)));
-        if let Some((handover, taken)) = taken {
-            crate::inventory::validate(handover.boxes.iter().map(|box_| &box_.record))?;
-            let age = milliseconds((now() - handover.handed_at).to_std().unwrap_or(Duration::ZERO));
-            for RecordedBox {
-                record: mut handed,
-                observation,
-            } in handover.boxes
+        if let Some(StartupBoxes {
+            inventory,
+            handed_count,
+            ..
+        }) = taken
+        {
+            let age = milliseconds((now() - inventory.handed_at).to_std().unwrap_or(Duration::ZERO));
+            crate::inventory::validate(inventory.boxes.iter().map(|box_| &box_.record))?;
+            for (
+                index,
+                RecordedBox {
+                    record: mut handed,
+                    observation,
+                },
+            ) in inventory.boxes.into_iter().enumerate()
             {
+                let taken = if index < handed_count {
+                    Taken::Handed
+                } else {
+                    Taken::Crashed
+                };
                 if matches!(handed.state, SupervisorHandoverBoxState::Warm(_)) {
                     handed.idle_milliseconds = handed.idle_milliseconds.saturating_sub(age).max(0);
                 }
@@ -2826,20 +2860,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             }
         }
         let unclaimed = self.reconcile_scopes(&claimed)?;
-        if handed && !unclaimed.is_empty() {
-            if let Some(previous) =
-                crate::inventory::load(&self.runner.standing.path).map_err(|error| format!("{error:#}"))?
-            {
-                for saved in previous.boxes {
-                    if u8::try_from(saved.record.tap_index).is_ok_and(|tap| unclaimed.contains(&tap))
-                        && !standing.contains_key(&saved.record.tap_index)
-                    {
-                        self.protected_sessions.insert(saved.record.session_id.to_string());
-                        standing.insert(saved.record.tap_index, saved);
-                    }
-                }
-            }
-        }
         if recorded && unclaimed.is_empty() && self.protected_sessions.is_empty() {
             let sessions = standing
                 .values()
@@ -3234,7 +3254,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 return Ok(());
             }
         };
-        self.slots.entry(session.clone()).or_default().busy = true;
+        self.slots.entry(session.clone()).or_default().begin_boot(&tap);
         let running = Running::Turn(turn.turn_id.clone());
         self.spawn(
             session,
@@ -3506,6 +3526,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let slot = self.slots.entry(session.clone()).or_default();
         slot.busy = false;
         slot.task = None;
+        slot.boot_tap = None;
         let mut freed = None;
         match outcome {
             Outcome::Parked(live, parked) => {

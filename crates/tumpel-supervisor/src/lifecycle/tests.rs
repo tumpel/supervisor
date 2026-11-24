@@ -438,7 +438,7 @@ impl Vmm for MemoryVmm {
         Ok(self.unclaimed.clone())
     }
 
-    fn discard_setup(&self, index: u8) -> Result<(), String> {
+    fn discard_incomplete_boot(&self, index: u8) -> Result<(), String> {
         note(&self.log, format!("discard setup scope {index}"));
         Ok(())
     }
@@ -1887,6 +1887,28 @@ async fn a_failed_handover_keeps_its_record_and_hands_over_other_boxes() {
     assert_eq!(handover.boxes[0].session_id.as_str(), "session-2");
     assert_eq!(old.standing().boxes.len(), 2);
     assert!(!old.log().iter().any(|entry| entry.starts_with("stop ")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn abandoning_an_incomplete_boot_explicitly_discards_its_scope() {
+    let mut host = host("abandoned-incomplete", 1, Harness::Echo, Boot::Hangs);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("claim turn-1").await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(host.standing().boxes.len(), 0);
+    assert!(host.log().iter().any(|entry| entry == "boot session-1 on tumpel0"));
+    let (reply, completed) = tokio::sync::oneshot::channel();
+    host.commands
+        .send(Input::Abandon(
+            reply,
+            super::Abandoned {
+                reason: TurnFailureReason::HarnessExited,
+                cause: "the daemon is stopping".to_string(),
+            },
+        ))
+        .expect("abandon");
+    completed.await.expect("the explicit discard completes");
+    assert_eq!(host.log(), ["discard setup scope 0"]);
 }
 
 #[tokio::test(start_paused = true)]

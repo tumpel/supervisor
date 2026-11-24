@@ -32,10 +32,10 @@ use crate::exchange::{Answer, Answers, Cancels};
 use crate::fd_store;
 use crate::firecracker::Firecracker;
 use crate::guest_drive;
-use crate::inventory::{self, Inventory};
+use crate::inventory::StartupBoxes;
 use crate::lifecycle::{
     turn_failed, Abandoned, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder,
-    Taken, TeardownOrder,
+    TeardownOrder,
 };
 use crate::pool::{memory_budget_mib, mib, Held, Size, TapPool};
 use crate::store::{jitter, HttpStore};
@@ -414,7 +414,7 @@ fn start_boxes(
     received: UnboundedReceiver<BoxCommand>,
     out: UnboundedSender<Outgoing>,
     telemetry: Telemetry,
-    taken: Option<(Inventory, Taken)>,
+    taken: Option<StartupBoxes>,
     standing: PathBuf,
 ) -> Result<(Usage, IdleGate, BoxRunner), Failure> {
     let unreadable = |error: anyhow::Error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}"));
@@ -735,40 +735,18 @@ fn taken(
     layout: &Layout,
     handed: bool,
     mut received: BTreeMap<String, OwnedFd>,
-) -> Result<Option<(Inventory, Taken)>, Failure> {
-    let load = |path: &Path| {
-        inventory::load(path).map_err(|error| fail(SupervisorFailure::ChannelStateLost, format!("{error:#}")))
-    };
-    let standing = load(&layout.boxes())?;
-    if handed || !received.is_empty() {
-        let handover = load(&layout.handover())?;
-        if let Some(mut handover) = handover.filter(|handover| {
-            standing
-                .as_ref()
-                .is_none_or(|saved| handed || saved.handed_at <= handover.handed_at)
-        }) {
-            let inherited = received.is_empty();
-            for box_ in &mut handover.boxes {
-                if let Some(saved) = standing
-                    .iter()
-                    .flat_map(|inventory| &inventory.boxes)
-                    .find(|saved| saved.same_machine(box_))
-                {
-                    box_.observation.clone_from(&saved.observation);
-                }
-                if !inherited {
-                    fd_store::restore_box(&mut box_.record, &mut received);
-                }
+) -> Result<Option<StartupBoxes>, Failure> {
+    let has_descriptors = !received.is_empty();
+    let mut saved = StartupBoxes::select(layout, handed, has_descriptors)
+        .map_err(|error| fail(SupervisorFailure::ChannelStateLost, format!("{error:#}")))?;
+    if let Some(saved) = &mut saved {
+        for (index, box_) in saved.inventory.boxes.iter_mut().enumerate() {
+            if !(saved.inherited && index < saved.handed_count) {
+                fd_store::restore_box(&mut box_.record, &mut received);
             }
-            return Ok(Some((handover, Taken::Handed)));
         }
     }
-    Ok(standing.map(|mut inventory| {
-        for box_ in &mut inventory.boxes {
-            fd_store::restore_box(&mut box_.record, &mut received);
-        }
-        (inventory, Taken::Crashed)
-    }))
+    Ok(saved)
 }
 
 async fn start_update(
@@ -812,6 +790,7 @@ pub async fn run(
         .is_some()
         .then(|| tokio::time::Instant::now() + Limits::HOST.online);
     let taken = taken(&started.layout, handed, received)?;
+    let preserve_handover = taken.as_ref().is_some_and(|saved| saved.preserve_handover);
 
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
@@ -828,7 +807,9 @@ pub async fn run(
         taken,
         started.layout.boxes(),
     )?;
-    update::forget_handover(&started.layout).map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
+    if !preserve_handover {
+        update::forget_handover(&started.layout).map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
+    }
     started_daemon();
     let url = started.url;
     let config = started.config;

@@ -33,7 +33,10 @@ pub unsafe fn take_notify_socket(handed: bool) -> Result<(), String> {
         })?;
         Some(Path::new(&runtime).join("systemd").join("notify"))
     } else {
-        std::env::var_os("NOTIFY_SOCKET").map(PathBuf::from)
+        Some(std::env::var_os("NOTIFY_SOCKET")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or("the systemd descriptor store is unavailable; start the supervisor with systemctl --user start tumpel-supervisor")?)
     };
     std::env::remove_var("NOTIFY_SOCKET");
     *notify_socket() = socket;

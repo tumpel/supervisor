@@ -104,11 +104,11 @@ impl Checks {
     }
 }
 
-fn read_inventory(path: &Path) -> Result<Vec<RecordedBox>, String> {
+fn read_inventory(path: &Path, inspect_boxes: bool) -> Result<Vec<RecordedBox>, String> {
     let boxes = inventory::load(path)
         .map_err(|error| format!("{error:#}"))?
         .map_or_else(Vec::new, |inventory| inventory.boxes);
-    for box_ in &boxes {
+    for box_ in boxes.iter().filter(|_| inspect_boxes) {
         lifecycle::decode_box(&box_.record).map_err(|error| {
             format!(
                 "box {} has an invalid image or turn record: {error}",
@@ -163,14 +163,14 @@ fn collect(manifest: Option<&Path>, checks: &Checks, legacy: bool) {
     let boxes = checks.check(
         "inventory",
         "box inventory, images and turns decoded",
-        read_inventory(&layout.boxes()),
+        read_inventory(&layout.boxes(), !legacy),
     );
     if !legacy {
         inspect_host(checks, runtime.as_ref(), boxes.as_deref());
         checks.check(
             "handover",
             "legacy handover record decoded",
-            read_inventory(&layout.handover()),
+            read_inventory(&layout.handover(), true),
         );
     }
     checks.check(
