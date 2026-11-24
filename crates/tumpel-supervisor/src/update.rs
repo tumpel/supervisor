@@ -20,7 +20,7 @@ use tumpel_api::types::{
     ChannelHostMessage, ChannelSupervisorUpdateFailed, ChannelSupervisorUpdateFailedType, ChannelSupervisorUpdateStep,
     ChannelSupervisorUpdateStepReleaseVersion, ChannelSupervisorUpdateStepType, HostArchitecture,
     ReleaseManifestReleaseVersion, ReleaseSupervisorSupervisorVersion, Sha256Digest, SupervisorUpdateFailureReason,
-    SupervisorUpdatePhase, SupervisorUpdateRefusal,
+    SupervisorUpdatePending, SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
 use tumpel_channel::Outgoing;
 use tumpel_guest::setup_output::{redacted, strip_ansi};
@@ -32,6 +32,7 @@ use crate::report::CHANNEL_PROTOCOL_LINE;
 use crate::snapshot::hex;
 
 pub const REFUSAL_FILE: &str = "update-refusal.json";
+const PENDING_FILE: &str = "update-pending.json";
 pub const HANDOVER_FILE: &str = "handover.json";
 pub const BOXES_FILE: &str = "boxes.json";
 const TAIL_LINES: usize = 20;
@@ -83,6 +84,10 @@ impl Layout {
 
     pub(crate) fn clear_candidate(&self) -> Result<(), String> {
         remove(&self.candidate)
+    }
+
+    fn pending(&self) -> PathBuf {
+        self.state.join(PENDING_FILE)
     }
 
     fn refusal(&self) -> PathBuf {
@@ -705,22 +710,51 @@ impl<S: Source, I: Idle> Updater<S, I> {
         Ok(())
     }
 
-    pub(crate) fn swap(&self, release: &Release) -> Result<(), String> {
+    pub(crate) fn swap(&self, release: &Release, boxes: usize, parked_turns: usize) -> Result<(), String> {
+        let pending = SupervisorUpdatePending {
+            from_sha256: self.running.clone(),
+            to_sha256: release.sha256.clone(),
+            swapped_at: Utc::now().fixed_offset(),
+        };
+        dir::write_json(&self.layout.pending(), &pending).map_err(|error| format!("{error:#}"))?;
         let candidate = &self.layout.candidate;
         let binary = &self.layout.binary;
-        eprintln!(
-            "tumpel-supervisor: swapping supervisor {} ({}) for {}",
-            self.version,
-            short(&self.running),
-            named(release)
-        );
         std::fs::rename(candidate, binary).map_err(|error| {
             format!(
                 "moving {} over {} failed: {error}",
                 candidate.display(),
                 binary.display()
             )
-        })
+        })?;
+        eprintln!(
+            "tumpel-supervisor: handing {boxes} boxes ({parked_turns} parked turns) from {} {} to {} {}",
+            self.version, self.running, release.supervisor_version, release.sha256,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn confirm(&self, send: impl FnOnce(ChannelHostMessage) -> Result<(), String>) -> Result<(), String> {
+        let path = self.layout.pending();
+        let Some(pending) = read::<SupervisorUpdatePending>(&path, "SupervisorUpdatePending")? else {
+            return Ok(());
+        };
+        if pending.to_sha256 != self.running {
+            return Ok(());
+        }
+        let release_version = self
+            .version
+            .parse()
+            .map_err(|error| format!("the supervisor version is empty: {error}"))?;
+        send(ChannelHostMessage::SupervisorUpdateStep(ChannelSupervisorUpdateStep {
+            type_: ChannelSupervisorUpdateStepType::SupervisorUpdateStep,
+            from_sha256: pending.from_sha256,
+            to_sha256: pending.to_sha256,
+            release_version,
+            boxes_running: i32::try_from(self.idle.boxes()).unwrap_or(i32::MAX),
+            phase: SupervisorUpdatePhase::Online,
+            at: Utc::now().fixed_offset(),
+        }))?;
+        remove(&path)
     }
 }
 

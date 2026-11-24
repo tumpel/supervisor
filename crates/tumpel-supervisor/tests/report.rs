@@ -245,3 +245,80 @@ async fn startup_io_failures_exit_for_systemd_restart_before_consuming_a_handove
         assert_eq!(fs::read(handover).expect("handover remains for restart"), before);
     }
 }
+
+#[tokio::test]
+async fn the_restarted_supervisor_confirms_online_after_welcome_and_removes_the_pending_marker() {
+    use ring::digest::{digest, SHA256};
+
+    let plane = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("control plane");
+    let host = Host::new("updated", &format!("http://{}", plane.local_addr().expect("address"))).expect("fixture host");
+    let binary = host.root.join("supervisor");
+    fs::copy(BINARY, &binary).expect("installed updated supervisor");
+    let bytes = fs::read(&binary).expect("installed binary bytes");
+    let digits = b"0123456789abcdef";
+    let running: String = digest(&SHA256, &bytes)
+        .as_ref()
+        .iter()
+        .flat_map(|byte| [digits[usize::from(byte >> 4)], digits[usize::from(byte & 15)]])
+        .map(char::from)
+        .collect();
+    let previous = "a".repeat(64);
+    let pending = host.root.join("state/update-pending.json");
+    host.state(
+        "update-pending.json",
+        &json!({
+            "fromSha256":previous, "toSha256":running,"swappedAt":"2026-11-24T15:00:00Z"
+        }),
+    )
+    .expect("pending update from the predecessor");
+    for name in ["handover.json", "boxes.json"] {
+        fs::remove_file(host.root.join("state").join(name)).expect("no boxes to adopt in this test");
+    }
+    fs::create_dir_all(host.root.join("config/systemd/user")).expect("unit directory");
+    let manager = host.root.join("systemctl");
+    fs::write(&manager, b"#!/bin/sh\nexit 0\n").expect("fixture user manager");
+    fs::set_permissions(manager, fs::Permissions::from_mode(0o755)).expect("manager executable");
+    let mut command = tokio::process::Command::from(host.command(&binary));
+    let mut child = command
+        .arg("run")
+        .env("PATH", &host.root)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("systemd starts the updated supervisor");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (stream, _) = plane.accept().await.expect("supervisor connection");
+        let mut wire = tokio_tungstenite::accept_async(stream).await.expect("WebSocket");
+        wire.send(Message::text(
+            json!({"type":"Challenge","nonce":"n".repeat(43)}).to_string(),
+        ))
+        .await
+        .expect("challenge");
+        let hello = wire.next().await.expect("hello").expect("hello frame");
+        let hello: Value = serde_json::from_str(hello.to_text().expect("hello text")).expect("hello JSON");
+        assert_eq!(hello["type"], "Hello");
+        assert!(pending.exists());
+        assert!(tokio::time::timeout(Duration::from_millis(75), wire.next())
+            .await
+            .is_err());
+        wire.send(Message::text(
+            json!({"type":"Welcome","hostId":"host-1","protocolVersion":ChannelProtocol::VERSION}).to_string(),
+        ))
+        .await
+        .expect("welcome");
+        let frame = wire.next().await.expect("online").expect("online frame");
+        let frame: Value = serde_json::from_str(frame.to_text().expect("online text")).expect("online JSON");
+        assert_eq!(frame["message"]["type"], "SupervisorUpdateStep");
+        assert_eq!(frame["message"]["phase"], "Online");
+        assert_eq!(frame["message"]["fromSha256"], previous);
+        assert_eq!(frame["message"]["toSha256"], running);
+        assert_eq!(frame["message"]["releaseVersion"], env!("TUMPEL_RELEASE_VERSION"));
+        assert!(!pending.exists());
+        let pid = i32::try_from(child.id().expect("supervisor PID")).expect("PID fits");
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert!(child.wait().await.expect("supervisor exits").success());
+    })
+    .await
+    .expect("restarted supervisor confirms after Welcome");
+}

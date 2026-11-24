@@ -355,7 +355,14 @@ async fn an_unreadable_refusal_file_is_reported_and_not_skipped_silently() {
 fn refresh_unit_replaces_an_installed_unit_with_a_rollback_line() {
     let layout = layout("old-unit");
     let current = supervisor_unit_text(&layout.binary);
-    let old = current.replacen("[Service]\n", "[Service]\nExecStartPre=/bin/sh -c 'exit 0'\n", 1);
+    assert!(!current.contains("RestartSteps="));
+    assert!(!current.contains("RestartMaxDelaySec="));
+    assert!(current.contains("RestartSec=5"));
+    let old = current.replacen(
+        "[Service]\n",
+        "[Service]\nExecStartPre=/bin/sh -c 'exit 0'\nRestartSteps=10\nRestartMaxDelaySec=30min\n",
+        1,
+    );
     std::fs::write(&layout.unit, old).expect("the old unit is written");
 
     assert_eq!(refresh_unit(&layout), Ok(true));
@@ -394,10 +401,14 @@ async fn a_release_notice_replaces_the_binary_on_an_idle_host() {
         panic!("candidate prepared");
     };
     assert_eq!(text(&layout.binary), OLD_BINARY);
-    run.updater.swap(&release).expect("the settled update installs");
+    run.updater.swap(&release, 0, 0).expect("the settled update installs");
     assert!(!seen(&mut run.events).contains(&Seen::Step(SupervisorUpdatePhase::WaitingForIdle)));
     assert_eq!(text(&layout.binary), good_script());
     assert!(!layout.candidate.exists());
+    let pending: tumpel_api::types::SupervisorUpdatePending =
+        serde_json::from_str(&text(&layout.pending())).expect("the swap records its pending confirmation");
+    assert_eq!(*pending.from_sha256, sha256_hex(OLD_BINARY.as_bytes()));
+    assert_eq!(pending.to_sha256, release.sha256);
 }
 
 #[tokio::test]
@@ -416,7 +427,7 @@ async fn an_announced_rollback_installs_an_older_supervisor_version() {
     let Outcome::Restart(release) = run.updater.announced(Duration::ZERO).await else {
         panic!("rollback prepared");
     };
-    run.updater.swap(&release).expect("the settled rollback installs");
+    run.updater.swap(&release, 0, 0).expect("the settled rollback installs");
     assert_eq!(text(&layout.binary), good_script());
 }
 

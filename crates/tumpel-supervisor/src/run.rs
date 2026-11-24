@@ -462,29 +462,9 @@ async fn hand_over(
     answer.await.map_err(|_| stopped())
 }
 
-fn terminate(handover: &SupervisorHandover, layout: &Layout, out: &UnboundedSender<Outgoing>) -> Result<(), Failure> {
-    if let Err(error) = dir::write_json(&layout.handover(), handover) {
-        for turn_id in handed_turns(handover) {
-            turn_failed(
-                out,
-                &turn_id,
-                TurnFailureReason::HarnessExited,
-                format!(
-                    "the box of turn {} could not be handed to the next supervisor: {error:#}; send the turn again",
-                    *turn_id
-                ),
-            );
-        }
-        return Err(fail(
-            SupervisorFailure::ChannelStateLost,
-            format!("{error:#}; the next start takes the running boxes over from the record of running boxes"),
-        ));
-    }
-    eprintln!(
-        "tumpel-supervisor: stopped and left {} boxes running; the next start of the unit takes them over",
-        handover.boxes.len()
-    );
-    Ok(())
+fn terminate(handover: &SupervisorHandover, layout: &Layout) -> Result<(), Failure> {
+    dir::write_json(&layout.handover(), handover)
+        .map_err(|error| fail(SupervisorFailure::ChannelStateLost, format!("{error:#}")))
 }
 
 fn restarts(kind: &SupervisorFailure) -> bool {
@@ -809,14 +789,14 @@ pub async fn run(
     };
     let (stopped, update) = match served {
         Ok(Served::Revoked) => (Ok(Stopped::Revoked), None),
-        Ok(Served::Handed(stopped, record)) => (terminate(&record, &started.layout, &out).and(stopped), None),
+        Ok(Served::Handed(stopped, record)) => (terminate(&record, &started.layout).and(stopped), None),
         Ok(Served::Updated(release, record)) => (
-            terminate(&record, &started.layout, &out).map(|()| Stopped::Updated),
-            Some(release),
+            terminate(&record, &started.layout).map(|()| Stopped::Updated),
+            Some((release, record)),
         ),
         Err(failure) if restarts(&failure.kind) => {
             let stopped = match hand_over(&commands, HandoverFor::Stop).await.and_then(handover_record) {
-                Ok(record) => terminate(&record, &started.layout, &out).and(Err(failure)),
+                Ok(record) => terminate(&record, &started.layout).and(Err(failure)),
                 Err(lost) => Err(lost),
             };
             (stopped, None)
@@ -824,10 +804,10 @@ pub async fn run(
         Ok(Served::BoxesStopped(failure) | Served::HandoverFailed(failure)) | Err(failure) => (Err(failure), None),
     };
     let stopped = exit_after_store(stopped, &mut channel, &mut from_box)?;
-    if let Some(release) = update {
+    if let Some((release, record)) = update {
         updates
             .updater
-            .swap(&release)
+            .swap(&release, record.boxes.len(), handed_turns(&record).len())
             .map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
     }
     Ok(stopped)
@@ -930,6 +910,11 @@ async fn serve(
             commands,
             from_box,
             &|| updates.announced(),
+            &|channel, outbox| {
+                updates
+                    .updater
+                    .confirm(|message| channel.send(message, outbox).map_err(|error| error.to_string()))
+            },
             &mut limit,
         )
         .await?;
@@ -1100,6 +1085,7 @@ async fn session(
     commands: &UnboundedSender<BoxCommand>,
     from_box: &mut UnboundedReceiver<Outgoing>,
     announced: &(impl Fn() + Sync),
+    confirm: &(impl Fn(&mut Channel, &mut Outbox) -> Result<(), String> + Sync),
     limit: &mut RateLimit,
 ) -> Result<Ended, Failure> {
     let stream = match tokio::time::timeout(CONNECT_DEADLINE, tokio_tungstenite::connect_async(url)).await {
@@ -1136,6 +1122,8 @@ async fn session(
                                 last_beat = Instant::now();
                                 if commands.send(BoxCommand::Welcomed(channel.version())).is_err() {
                                     Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
+                                } else if let Err(error) = confirm(channel, &mut outbox) {
+                                    Some(Err(fail(SupervisorFailure::ChannelStateLost, error)))
                                 } else {
                                     announced();
                                     None
@@ -1313,6 +1301,7 @@ mod tests {
                 &commands,
                 &mut unbounded_channel().1,
                 &|| {},
+                &|_, _| Ok(()),
                 &mut RateLimit::default(),
             )
             .await

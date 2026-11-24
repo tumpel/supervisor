@@ -132,10 +132,7 @@ fn main() -> ExitCode {
             };
             match runtime.block_on(run(telemetry, handover, received)) {
                 Ok(Stopped::Revoked | Stopped::Terminated) => ExitCode::SUCCESS,
-                Ok(Stopped::Updated) => {
-                    eprintln!("tumpel-supervisor: exiting so systemd starts the new binary, which takes the running boxes over");
-                    ExitCode::from(RESTART_INTO_UPDATE)
-                }
+                Ok(Stopped::Updated) => ExitCode::from(RESTART_INTO_UPDATE),
                 Err(RunFailure::Startup(detail)) => {
                     eprintln!("tumpel-supervisor: startup failed. {detail}. On failure, systemd restarts the supervisor and it takes over the running boxes.");
                     ExitCode::FAILURE

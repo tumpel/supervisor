@@ -1791,6 +1791,8 @@ async fn a_box_handed_to_a_new_supervisor_is_charged_the_memory_it_booted_with()
 
 #[tokio::test(start_paused = true)]
 async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
     let mut old = host("handover-turn", 2, Harness::SlowClone, Boot::Works);
     old.turn("turn-1", "session-1", "one", Vec::new());
     assert_eq!(old.settle_until("claim turn-1").await, ["claim turn-1"]);
@@ -1798,7 +1800,7 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
     old.log();
     let answer = old.ask_handover();
     old.turn("turn-2", "session-2", "two", Vec::new());
-    let handover = answer
+    let mut handover = answer
         .await
         .expect("the boxes are handed over")
         .expect("export succeeds");
@@ -1807,6 +1809,34 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
         TurnFailureReason::HostUpdating
     );
     assert_eq!(old.settle_until(&refused).await, [refused]);
+    let machine = &mut handover.boxes[0].machine;
+    let old_guest = machine.guest_fd;
+    machine.guest_fd = -1;
+    machine.stdout_fd = -1;
+    machine.stderr_fd = -1;
+    let path = old.vmm.staging.join("handover.json");
+    crate::dir::write_json(&path, &handover).expect("write the handover record");
+    let record = crate::dir::read_json(&path, "SupervisorHandover")
+        .expect("read the durable record")
+        .expect("handover is present");
+    let (guest, _peer) = std::os::unix::net::UnixStream::pair().expect("guest socket");
+    let (stdout, _stdout_writer) = std::io::pipe().expect("console stdout");
+    let (stderr, _stderr_writer) = std::io::pipe().expect("console stderr");
+    let descriptors = [guest.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()];
+    let mut received = std::collections::BTreeMap::from([
+        ("box0-guest".to_string(), guest.into()),
+        ("box0-stdout".to_string(), stdout.into()),
+        ("box0-stderr".to_string(), stderr.into()),
+    ]);
+    {
+        let mut hands = old.vmm.hands.lock().expect("virtual guest streams");
+        let guest = hands.remove(&old_guest).expect("the original live stream");
+        hands.insert(descriptors[0], guest);
+    }
+    let handover = crate::fd_store::restored(record, &mut received);
+    let machine = &handover.boxes[0].machine;
+    assert_eq!([machine.guest_fd, machine.stdout_fd, machine.stderr_fd], descriptors);
+    let _owners = descriptors.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
     let mut new = old.successor(&handover);
     assert_eq!(new.settle_until("complete 1").await, ["line 1 one", "complete 1"]);
     assert_eq!(
