@@ -216,7 +216,6 @@ fn read_manifest(order: &ImageOrder, staged: &Staged) -> Result<GuestImageManife
 struct Manifests {
     images: Vec<GuestImageManifest>,
     bases: Vec<BaseImageManifest>,
-    invalid: Vec<PathBuf>,
 }
 
 fn manifests(cache: &Path) -> Result<Manifests, String> {
@@ -235,21 +234,9 @@ fn manifests(cache: &Path) -> Result<Manifests, String> {
         } else if let Ok(manifest) = serde_json::from_str::<BaseImageManifest>(&text) {
             manifests.bases.push(manifest);
         } else {
-            manifests.invalid.push(path);
+            remove(&path.with_extension("ext4"))?;
+            remove(&path)?;
         }
-    }
-    Ok(manifests)
-}
-
-pub(crate) fn check_cache(cache: &Path) -> Result<(), String> {
-    manifests(cache).map(drop)
-}
-
-fn prune_invalid(cache: &Path) -> Result<Manifests, String> {
-    let mut manifests = manifests(cache)?;
-    for path in manifests.invalid.drain(..) {
-        remove(&path.with_extension("ext4"))?;
-        remove(&path)?;
     }
     Ok(manifests)
 }
@@ -288,7 +275,7 @@ fn drop_image(cache: &Path, image_digest: &str) -> Result<(), String> {
 }
 
 pub(crate) fn supersede(cache: &Path, harness: &str, held: &BTreeSet<String>) -> Result<(), String> {
-    let others = prune_invalid(cache)?;
+    let others = manifests(cache)?;
     let (replaced, kept): (Vec<_>, Vec<_>) = others
         .images
         .into_iter()
@@ -533,7 +520,7 @@ fn place_base(cache: &Path, order: &BaseOrder, staged: &Staged, holds: &Holds) -
     }
     verify(&staged.manifest, "base manifest", &download.manifest_digest)?;
     let manifest = read_base_manifest(order, staged)?;
-    let others = prune_invalid(cache)?;
+    let others = manifests(cache)?;
     let digest = order.digest();
     rename(&staged.image, &cache.join(format!("{digest}.ext4")))?;
     if let Some(kernel) = &staged.kernel {
