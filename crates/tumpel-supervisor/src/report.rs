@@ -42,7 +42,7 @@ fn write_report(mut out: impl Write) -> io::Result<bool> {
         (
             "image cache",
             runtime.map_err(unavailable).and_then(|runtime| {
-                images::check_cache(Path::new(&*runtime.image_cache_dir)).map(|()| "cached image manifests decoded")
+                images::check_cache(Path::new(&*runtime.image_cache_dir)).map(|()| "cache files scanned")
             }),
         ),
         (

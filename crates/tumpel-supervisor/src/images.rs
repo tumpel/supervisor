@@ -242,11 +242,7 @@ fn manifests(cache: &Path) -> Result<Manifests, String> {
 }
 
 pub(crate) fn check_cache(cache: &Path) -> Result<(), String> {
-    let manifests = manifests(cache)?;
-    if let Some(path) = manifests.invalid.first() {
-        return Err(format!("{} is not a valid image manifest; replace it", path.display()));
-    }
-    Ok(())
+    manifests(cache).map(drop)
 }
 
 fn prune_invalid(cache: &Path) -> Result<Manifests, String> {
