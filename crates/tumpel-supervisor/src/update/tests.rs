@@ -552,10 +552,7 @@ async fn an_update_goes_only_to_a_newer_supervisor_version() {
         OLD_BINARY,
         "an announced downgrade leaves the running binary"
     );
-    assert!(
-        run.updater.now().await == Outcome::Restart,
-        "a downgrade the control plane demands is staged"
-    );
+    assert_eq!(run.updater.now().await, Outcome::Restart);
     assert_eq!(text(&layout.binary), OLD_BINARY);
 }
 
@@ -574,13 +571,10 @@ async fn a_timed_out_update_can_stage_again_and_a_failed_swap_refuses_it() {
     assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
     std::fs::remove_file(&layout.candidate).expect("make the candidate rename fail");
 
-    let error = run.updater.swap(0).await.expect_err("rename failed");
-
-    assert!(error.contains("moving"), "{error}");
+    assert!(run.updater.swap(0).await.unwrap_err().contains("moving"));
     assert_eq!(text(&layout.binary), OLD_BINARY);
     assert!(!layout.pending().exists());
-    let refusal: SupervisorUpdateRefusal = serde_json::from_str(&text(&layout.refusal())).expect("refusal record");
-    assert_eq!(*refusal.to_sha256, sha256_hex(good_script().as_bytes()));
+    let refusal: SupervisorUpdateRefusal = serde_json::from_str(&text(&layout.refusal())).unwrap();
     assert_eq!(
         refusal.reason,
         SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed

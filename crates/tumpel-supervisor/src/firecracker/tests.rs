@@ -128,6 +128,7 @@ fn firecracker(name: &str) -> Firecracker {
         images: data.join("images"),
         data,
         vcpus: 1,
+        processes: std::sync::Mutex::default(),
     }
 }
 
@@ -209,8 +210,8 @@ async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_bin
     };
     assert_eq!(line.text.as_str(), "one");
     assert!(machine.console_tail().contains("booted"));
-    let _ = machine.stop().await;
-    assert!(reaped(pid), "stopping an adopted box kills and reaps its process");
+    drop(machine);
+    assert!(reaped(pid), "dropping an adopted box kills and reaps its process");
 }
 
 #[tokio::test]

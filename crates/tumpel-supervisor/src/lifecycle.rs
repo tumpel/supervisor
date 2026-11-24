@@ -195,6 +195,7 @@ pub trait Vmm: Send + Sync + 'static {
     fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String>;
     fn disk(&self, drives: &[String]) -> Result<Disk, String>;
     fn discard(&self, handed: &SupervisorHandoverMachine);
+    fn keep_boxes(&self);
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String>;
     fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
@@ -2241,6 +2242,7 @@ pub type HandoverReply = oneshot::Sender<Result<SupervisorHandover, String>>;
 pub enum Input {
     Command(Command),
     HandOver(SettleFor, HandoverReply),
+    Leave(oneshot::Sender<()>),
     SnapshotAccepted(EntityId),
     SnapshotFailed(EntityId),
     Welcomed(u16),
@@ -2471,6 +2473,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 input = inputs.recv() => match input {
                     Some(Input::Command(command)) => self.command(command).await?,
                     Some(Input::HandOver(reason, reply)) => self.start_handover(reason, reply),
+                    Some(Input::Leave(reply)) => return self.leave(reply),
                     Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id).await?,
                     Some(Input::SnapshotFailed(snapshot_id)) => self.snapshot_failed(snapshot_id),
                     Some(Input::Welcomed(protocol)) => self.welcomed(protocol).await?,
@@ -2593,36 +2596,45 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             self.setups.len(),
             self.handover_report_interval().as_secs()
         );
-        if reason == SettleFor::Stop {
-            let recorded = self
-                .runner
-                .standing
-                .boxes
-                .lock()
-                .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?;
-            for (running, _) in self.slots.values().filter_map(|slot| slot.task.as_ref()) {
-                if let Running::Turn(turn_id, box_id) = running {
-                    if !recorded.values().any(|box_| {
-                        &box_.box_id == box_id
-                            && matches!(&box_.state, SupervisorHandoverBoxState::Turn(turn) if &turn.turn_id == turn_id)
-                    }) {
-                        turn_failed(&self.runner.out, turn_id, TurnFailureReason::HarnessExited,
-                            format!("the supervisor stopped before recording the box for turn {turn_id}. Send the turn again"));
-                    }
-                }
+        if reason == SettleFor::Update {
+            self.mode = Mode::TakingTurns;
+            self.parking.send_replace(false);
+            let sessions: Vec<_> = self.slots.keys().cloned().collect();
+            for session in sessions {
+                self.resume(session.clone());
+                self.drain(session).await?;
             }
-            drop(reply.send(Err(error)));
-            return Ok(());
-        }
-        self.mode = Mode::TakingTurns;
-        self.parking.send_replace(false);
-        let sessions: Vec<_> = self.slots.keys().cloned().collect();
-        for session in sessions {
-            self.resume(session.clone());
-            self.drain(session).await?;
         }
         drop(reply.send(Err(error)));
         Ok(())
+    }
+
+    fn leave(&self, reply: oneshot::Sender<()>) -> Result<(), String> {
+        let recorded = self
+            .runner
+            .standing
+            .boxes
+            .lock()
+            .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?;
+        for (running, _) in self.slots.values().filter_map(|slot| slot.task.as_ref()) {
+            let Running::Turn(turn_id, box_id) = running else {
+                continue;
+            };
+            if self.runner.answers.claimed(turn_id)
+                && !recorded.values().any(|box_| {
+                    &box_.box_id == box_id
+                        && matches!(&box_.state, SupervisorHandoverBoxState::Turn(turn) if &turn.turn_id == turn_id)
+                })
+            {
+                let detail =
+                    format!("the supervisor stopped before recording the box for turn {turn_id}. Send the turn again");
+                turn_failed(&self.runner.out, turn_id, TurnFailureReason::HarnessExited, detail);
+            }
+        }
+        self.runner.vmm.keep_boxes();
+        reply
+            .send(())
+            .map_err(|()| "the supervisor left before the box runner replied".to_string())
     }
 
     fn answer_lost(&self, session: &str, queue: VecDeque<Command>) {
@@ -3404,7 +3416,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     async fn finished(&mut self, session: String, work: Work, outcome: Outcome<V::Machine>) -> Result<(), String> {
         let slot = self.slots.entry(session.clone()).or_default();
         slot.busy = false;
-        slot.task = None;
+        if let Some((Running::Turn(turn_id, _), _)) = slot.task.take() {
+            self.runner.answers.forget(&Key::claim(&turn_id));
+        }
         if matches!(work, Work::Snapshot) && !matches!(outcome, Outcome::SnapshotDone(_)) {
             slot.snapshot = None;
         }

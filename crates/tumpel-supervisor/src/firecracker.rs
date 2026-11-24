@@ -1,11 +1,13 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::task::Poll;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
@@ -356,6 +358,26 @@ impl Adopted {
     }
 }
 
+impl Drop for Adopted {
+    fn drop(&mut self) {
+        if self.owner.is_some() {
+            let ended = self.end();
+            eprintln!(
+                "tumpel-supervisor: ending a box: Firecracker process {} {ended}",
+                self.pid
+            );
+        }
+    }
+}
+
+type BoxProcess = Mutex<Option<Process>>;
+
+fn keep_process(process: &BoxProcess) {
+    if let Some(process) = process.lock().unwrap_or_else(PoisonError::into_inner).take() {
+        process.keep();
+    }
+}
+
 enum Process {
     Spawned(Child),
     Adopted(Adopted),
@@ -580,6 +602,7 @@ pub struct Firecracker {
     images: PathBuf,
     data: PathBuf,
     vcpus: u32,
+    processes: Mutex<BTreeMap<u8, Weak<BoxProcess>>>,
 }
 
 impl Firecracker {
@@ -590,6 +613,7 @@ impl Firecracker {
             images: PathBuf::from(&*runtime.image_cache_dir),
             data: PathBuf::from(&*runtime.data_dir),
             vcpus: runtime.vcpu_count.get(),
+            processes: Mutex::default(),
         }
     }
 }
@@ -637,7 +661,7 @@ impl Firecracker {
         machine.stdout = Some(stdout);
         machine.stderr = Some(stderr);
         let scoped = matches!(owner, Owner::Scope(_));
-        machine.process = Some(Process::Adopted(Adopted {
+        *machine.process() = Some(Process::Adopted(Adopted {
             pid,
             owner: Some(owner),
         }));
@@ -657,24 +681,42 @@ impl Vmm for Firecracker {
     type Upper = Ext4Upper;
 
     fn machine(&self, session_id: &EntityId, tap: &Tap) -> Result<FirecrackerBox, String> {
+        let session = session_dir(&self.data, session_id)?;
+        let process = Arc::new(Mutex::new(None));
+        self.processes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tap.index(), Arc::downgrade(&process));
         Ok(FirecrackerBox {
             binary: self.binary.clone(),
             images: self.images.clone(),
             dir: self.data.join(format!("box{}", tap.index())),
             index: tap.index(),
-            session: session_dir(&self.data, session_id)?,
+            session,
             device: tap.device(),
             mac: tap.guest_mac(),
             boot_args: format!("{BOOT_ARGS} {}", tap.kernel_ip()),
             vcpus: self.vcpus,
             memory_mib: tap.memory_mib(),
             overlay_bytes: u64::from(tap.disk_mib().get()) * 1024 * 1024,
-            process: None,
+            process,
             watcher: None,
             stdout: None,
             stderr: None,
             console: Arc::new(Mutex::new(VecDeque::with_capacity(CONSOLE_TAIL))),
         })
+    }
+
+    fn keep_boxes(&self) {
+        for process in self
+            .processes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter_map(Weak::upgrade)
+        {
+            keep_process(&process);
+        }
     }
 
     fn reattach(
@@ -794,7 +836,7 @@ pub struct FirecrackerBox {
     vcpus: u32,
     memory_mib: NonZeroU32,
     overlay_bytes: u64,
-    process: Option<Process>,
+    process: Arc<BoxProcess>,
     watcher: Option<AbortHandle>,
     stdout: Option<OwnedFd>,
     stderr: Option<OwnedFd>,
@@ -808,6 +850,14 @@ impl Drop for FirecrackerBox {
 }
 
 impl FirecrackerBox {
+    fn process(&self) -> MutexGuard<'_, Option<Process>> {
+        self.process.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.process().as_ref().and_then(Process::id)
+    }
+
     fn session_name(&self) -> String {
         self.session
             .file_name()
@@ -822,9 +872,7 @@ impl FirecrackerBox {
 
     fn home(&self, guest: &VsockGuest) -> Result<(), String> {
         let pid = self
-            .process
-            .as_ref()
-            .and_then(Process::id)
+            .pid()
             .and_then(|pid| libc::pid_t::try_from(pid).ok())
             .ok_or_else(|| "the box has no running Firecracker process".to_string())?;
         let scope = scope_of(self.index);
@@ -866,8 +914,7 @@ impl FirecrackerBox {
     async fn spawn(&mut self) -> Result<(), String> {
         create_private_dir(&self.dir)?;
         self.clear_sockets()?;
-        let socket = self.api_socket();
-        let child = Command::new("systemd-run")
+        let mut child = Command::new("systemd-run")
             .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
             .arg(scope_of(self.index))
             .arg("--")
@@ -878,6 +925,7 @@ impl FirecrackerBox {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|error| {
                 format!(
@@ -885,9 +933,6 @@ impl FirecrackerBox {
                     self.binary.display()
                 )
             })?;
-        let Process::Spawned(child) = self.process.insert(Process::Spawned(child)) else {
-            return Err("the new box has no Firecracker child".to_string());
-        };
         if let Some(stdout) = child.stdout.take() {
             let stdout = stdout
                 .into_owned_fd()
@@ -904,16 +949,22 @@ impl FirecrackerBox {
             fd_store::keep(self.index, fd_store::STDERR, stderr.as_fd())?;
             self.stderr = Some(stderr);
         }
+        *self.process() = Some(Process::Spawned(child));
+        let socket = self.api_socket();
         while UnixStream::connect(&socket).await.is_err() {
-            if let Ok(Some(status)) = child.try_wait() {
+            let status = match self.process().as_mut() {
+                Some(Process::Spawned(child)) => child.try_wait(),
+                _ => return Err("the box is not running".to_string()),
+            };
+            if let Ok(Some(status)) = status {
                 return Err(format!(
                     "Firecracker exited with {status} before opening its API socket; check that firecrackerPath in runtime.json names it"
                 ));
             }
             tokio::time::sleep(API_WAIT_STEP).await;
         }
-        let pid = child
-            .id()
+        let pid = self
+            .pid()
             .and_then(|pid| libc::pid_t::try_from(pid).ok())
             .ok_or_else(|| "Firecracker ended right after opening its API socket".to_string())?;
         self.unwatch();
@@ -1068,12 +1119,12 @@ impl Machine for FirecrackerBox {
         .await?;
         self.call("PUT", "/actions", &json!({ "action_type": "InstanceStart" }))
             .await?;
-        let Some(Process::Spawned(process)) = self.process.as_mut() else {
-            return Err("the box is not running".to_string());
-        };
         let announcement = tokio::select! {
             accepted = ready.accept() => accepted.map_err(|error| format!("accepting the guest's ready call: {error}"))?.0,
-            status = process.wait() => {
+            status = std::future::poll_fn(|cx| match self.process().as_mut() {
+                Some(Process::Spawned(child)) => std::pin::pin!(child.wait()).poll(cx),
+                _ => Poll::Ready(Err(std::io::Error::other("the box is not running"))),
+            }) => {
                 return Err(format!("the box shut down while booting ({})", status.map_or_else(|error| error.to_string(), |status| status.to_string())));
             }
         };
@@ -1104,7 +1155,8 @@ impl Machine for FirecrackerBox {
 
     async fn stop(mut self) -> Stopped {
         self.unwatch();
-        let exit = match self.process.take() {
+        let process = self.process().take();
+        let exit = match process {
             Some(process) => process.kill().await,
             None => "was not running".to_string(),
         };
@@ -1127,9 +1179,7 @@ impl Machine for FirecrackerBox {
 
     fn record(&self) -> Result<SupervisorHandoverMachine, String> {
         let process_id = self
-            .process
-            .as_ref()
-            .and_then(Process::id)
+            .pid()
             .and_then(std::num::NonZeroU32::new)
             .ok_or_else(|| "the box has no running Firecracker process".to_string())?;
         Ok(SupervisorHandoverMachine {
@@ -1171,9 +1221,7 @@ impl Machine for FirecrackerBox {
             ..self.record()?
         };
         self.unwatch();
-        if let Some(process) = self.process.take() {
-            process.keep();
-        }
+        keep_process(&self.process);
         Ok(machine)
     }
 }

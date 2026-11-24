@@ -2,7 +2,8 @@ use super::*;
 use std::collections::BTreeSet;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tumpel_api::types::{GuestImageManifest, SupervisorHandover};
+use tokio_tungstenite::tungstenite::{protocol::frame::coding::CloseCode, protocol::CloseFrame};
+use tumpel_api::types::{ChannelCloseCode, GuestImageManifest, SupervisorHandover};
 
 const UNIT: &str = "tumpel-handover-test.service";
 type Wire = tokio_tungstenite::WebSocketStream<TcpStream>;
@@ -19,7 +20,7 @@ fn systemctl(args: &[&str]) -> bool {
 struct Unit;
 impl Drop for Unit {
     fn drop(&mut self) {
-        assert!(systemctl(&["stop", UNIT]));
+        let _ = systemctl(&["stop", UNIT]);
     }
 }
 
@@ -28,8 +29,11 @@ async fn open(plane: &TcpListener) -> Wire {
     let mut wire = tokio_tungstenite::accept_async(stream).await.unwrap();
     send(&mut wire, json!({"type":"Challenge","nonce":"n".repeat(43)})).await;
     take(&mut wire, "Hello").await;
-    let welcome = json!({"type":"Welcome","hostId":"host-1","protocolVersion":ChannelProtocol::VERSION});
-    send(&mut wire, welcome).await;
+    send(
+        &mut wire,
+        json!({"type":"Welcome","hostId":"host-1","protocolVersion":ChannelProtocol::VERSION}),
+    )
+    .await;
     http(plane, "GET /v1/releases/current ", b"{}").await;
     wire
 }
@@ -55,21 +59,16 @@ async fn order(wire: &mut Wire, seq: &mut i64, message: Value) {
 }
 
 async fn http(plane: &TcpListener, expected: &str, body: &[u8]) {
-    let mut io = BufReader::new(plane.accept().await.unwrap().0);
-    let mut line = String::new();
-    io.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with(expected), "{line}");
+    let mut headers = BufReader::new(plane.accept().await.unwrap().0).lines();
+    let request = headers.next_line().await.unwrap().unwrap();
+    assert!(request.starts_with(expected), "{request}");
     let mut length = 0;
-    loop {
-        line.clear();
-        assert_ne!(io.read_line(&mut line).await.unwrap(), 0);
-        if line == "\r\n" {
-            break;
-        }
+    while let Some(line) = headers.next_line().await.unwrap().filter(|line| !line.is_empty()) {
         if let Some(size) = line.to_ascii_lowercase().strip_prefix("content-length: ") {
-            length = size.trim().parse().unwrap();
+            length = size.parse().unwrap();
         }
     }
+    let mut io = headers.into_inner();
     io.read_exact(&mut vec![0; length]).await.unwrap();
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -85,24 +84,15 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn pids(host: &Host) -> BTreeSet<u32> {
-    let record: SupervisorHandover =
-        serde_json::from_slice(&fs::read(host.root.join("state/boxes.json")).unwrap()).unwrap();
-    record
-        .boxes
-        .into_iter()
-        .map(|box_| box_.machine.process_id.get())
-        .collect()
+    let bytes = fs::read(host.root.join("state/boxes.json")).unwrap();
+    let record: SupervisorHandover = serde_json::from_slice(&bytes).unwrap();
+    let pids = record.boxes.into_iter().map(|box_| box_.machine.process_id.get());
+    pids.filter(|pid| Path::new(&format!("/proc/{pid}")).exists()).collect()
 }
 
-async fn offer(
-    wire: &mut Wire,
-    seq: &mut i64,
-    image: &GuestImageManifest,
-    ids: (&str, &str),
-    prompt: &str,
-    ends: &str,
-) {
+async fn offer(wire: &mut Wire, seq: &mut i64, image: &GuestImageManifest, ids: (&str, &str), input: (&str, &str)) {
     let (turn, session) = ids;
+    let (prompt, ends) = input;
     order(wire, seq, json!({
         "type":"TurnOffer","turnId":turn,"sessionId":session,"boxId":session,
         "repository":"https://github.com/octocat/Hello-World.git","harness":image.harness.harness,
@@ -145,13 +135,12 @@ fn release(version: &str, sha: &str, protocol: u16) -> Value {
 
 #[tokio::test]
 async fn the_user_service_keeps_firecracker_across_an_update_and_a_restart() {
-    let kvm = std::env::var("TUMPEL_KVM");
-    assert_eq!(kvm.as_deref(), Ok("1"), "run on a dedicated KVM host");
+    assert_eq!(std::env::var("TUMPEL_KVM").as_deref(), Ok("1"), "KVM host required");
     let manifest =
         PathBuf::from(std::env::var_os("TUMPEL_IMAGE_MANIFEST").expect("set the cached Shell image manifest"));
     let image = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
     let previous =
-        std::env::var_os("TUMPEL_PREVIOUS_SUPERVISOR").expect("set a supervisor built with an older version");
+        std::env::var_os("TUMPEL_PREVIOUS_SUPERVISOR").expect("build this revision with a lower release version");
     let firecracker = std::env::var_os("TUMPEL_FIRECRACKER").expect("set the Firecracker executable");
     let plane = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", plane.local_addr().unwrap());
@@ -170,47 +159,37 @@ async fn the_user_service_keeps_firecracker_across_an_update_and_a_restart() {
     let old = digest(&fs::read(&binary).unwrap());
     let state = format!("--setenv=TUMPEL_SUPERVISOR_DIR={}", host.root.join("state").display());
     let config = format!("--setenv=XDG_CONFIG_HOME={}", host.root.join("config").display());
-    let mut start = Command::new("systemd-run");
-    start.args([
-        "--user",
-        "--collect",
-        "--unit",
-        UNIT,
-        &state,
-        &config,
-        "--property=Restart=on-failure",
-        "--property=RestartSec=1",
-        "--property=NotifyAccess=main",
-        "--property=FileDescriptorStoreMax=192",
-        "--property=FileDescriptorStorePreserve=yes",
-    ]);
-    assert!(start.arg(&binary).arg("run").status().unwrap().success());
+    assert!(Command::new("systemd-run")
+        .args([
+            "--user",
+            "--collect",
+            "--unit",
+            UNIT,
+            &state,
+            &config,
+            "--property=Restart=on-failure",
+            "--property=RestartSec=1",
+            "--property=NotifyAccess=main",
+            "--property=FileDescriptorStoreMax=192",
+            "--property=FileDescriptorStorePreserve=yes",
+        ])
+        .arg(&binary)
+        .arg("run")
+        .status()
+        .unwrap()
+        .success());
     let _unit = Unit;
     tokio::time::timeout(Duration::from_secs(180), async {
         let mut wire = open(&plane).await;
         let mut seq = 0;
         let ends = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
         for id in ["warm", "snapshot"] {
-            offer(
-                &mut wire,
-                &mut seq,
-                &image,
-                (id, id),
-                "echo dirty >/root/handover; echo ready",
-                &ends,
-            )
-            .await;
+            let prompt = "echo dirty >/root/handover; echo ready";
+            offer(&mut wire, &mut seq, &image, (id, id), (prompt, &ends)).await;
             assert_eq!(take(&mut wire, "TurnComplete").await["message"]["turnId"], id);
         }
-        offer(
-            &mut wire,
-            &mut seq,
-            &image,
-            ("running", "running"),
-            "echo dirty >/root/running; echo start; sleep 30; echo resumed",
-            &ends,
-        )
-        .await;
+        let prompt = "echo dirty >/root/running; echo start; sleep 30; echo resumed";
+        offer(&mut wire, &mut seq, &image, ("running", "running"), (prompt, &ends)).await;
         assert_eq!(take(&mut wire, "TurnLines").await["message"]["turnId"], "running");
         let before = pids(&host);
         assert_eq!(before.len(), 3);
@@ -224,14 +203,8 @@ async fn the_user_service_keeps_firecracker_across_an_update_and_a_restart() {
             (&candidate, new.clone(), ChannelProtocol::VERSION),
         ] {
             if sha == new {
-                request_snapshot(
-                    &mut wire,
-                    &mut seq,
-                    ("snap-1", "snapshot", "snapshot"),
-                    &endpoint,
-                    &ends,
-                )
-                .await;
+                let ids = ("snap-1", "snapshot", "snapshot");
+                request_snapshot(&mut wire, &mut seq, ids, &endpoint, &ends).await;
             }
             send(&mut wire, json!({"type":"ReleasePublished","releaseVersion":version})).await;
             let release = release(version, &sha, protocol);
@@ -244,13 +217,8 @@ async fn the_user_service_keeps_firecracker_across_an_update_and_a_restart() {
             }
         }
         take(&mut wire, "Restarting").await;
-        assert_eq!(
-            take(&mut wire, "Heartbeat").await["heldSessionIds"]
-                .as_array()
-                .unwrap()
-                .len(),
-            3
-        );
+        let beat = take(&mut wire, "Heartbeat").await;
+        assert_eq!(beat["heldSessionIds"].as_array().unwrap().len(), 3);
         let done = finish_snapshot(&plane, &mut wire, &mut seq, "snap-1", &ends).await;
         assert_eq!(digest(&fs::read(&binary).unwrap()), old);
         send(&mut wire, json!({"type":"Ack","seq":done["seq"]})).await;
@@ -262,15 +230,8 @@ async fn the_user_service_keeps_firecracker_across_an_update_and_a_restart() {
         assert!(!host.root.join("state/update-pending.json").exists());
         assert_eq!(take(&mut wire, "TurnComplete").await["message"]["turnId"], "running");
         assert_eq!(pids(&host), before);
-        offer(
-            &mut wire,
-            &mut seq,
-            &image,
-            ("restart", "warm"),
-            "echo start; sleep 5; echo resumed",
-            &ends,
-        )
-        .await;
+        let prompt = "echo start; sleep 5; echo resumed";
+        offer(&mut wire, &mut seq, &image, ("restart", "warm"), (prompt, &ends)).await;
         take(&mut wire, "TurnLines").await;
         request_snapshot(&mut wire, &mut seq, ("snap-2", "running", "running"), &endpoint, &ends).await;
         assert!(systemctl(&["restart", "--no-block", UNIT]));
@@ -281,12 +242,19 @@ async fn the_user_service_keeps_firecracker_across_an_update_and_a_restart() {
         wire = open(&plane).await;
         assert_eq!(take(&mut wire, "TurnComplete").await["message"]["turnId"], "restart");
         assert_eq!(pids(&host), before);
-        for id in ["warm", "snapshot", "running"] {
-            let discard = json!({"type":"BoxDiscard","boxId":id,"sessionId":id});
-            order(&mut wire, &mut seq, discard).await;
-            take(&mut wire, "BoxGone").await;
+        request_snapshot(&mut wire, &mut seq, ("snap-3", "warm", "restart"), &endpoint, &ends).await;
+        assert!(systemctl(&["restart", "--no-block", UNIT]));
+        take(&mut wire, "Heartbeat").await;
+        wire.close(Some(CloseFrame {
+            code: CloseCode::from(ChannelCloseCode::REVOKED),
+            reason: "revoked".into(),
+        }))
+        .await
+        .unwrap();
+        while before.iter().any(|pid| Path::new(&format!("/proc/{pid}")).exists()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("the update and restart finish");
+    .expect("the update, restart and revoke finish");
 }

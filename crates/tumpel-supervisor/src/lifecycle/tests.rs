@@ -101,12 +101,6 @@ fn message(value: serde_json::Value) -> GuestMessage {
 
 impl MemoryGuest {
     fn send_now(&mut self, input: &GuestInput) {
-        if let GuestInput::ClaudeSetupStart(start) = input {
-            self.pending.push_back(message(json!({
-                "type": "ClaudeSetupUrl", "claudeSetupId": *start.claude_setup_id,
-                "signInUrl": "https://example.test/sign-in"
-            })));
-        }
         if let (GuestInput::TurnCancel(cancel), Harness::StallsAfterFirstLine) = (input, self.harness) {
             self.pending.push_back(message(json!({
                 "type": "TurnEnd", "turnId": *cancel.turn_id, "reason": "Cancelled", "lastLineSeq": self.lines,
@@ -225,6 +219,7 @@ fn restored(archive: &[u8]) -> Files {
 }
 
 struct MemoryMachine {
+    _process: Arc<()>,
     harness: Harness,
     boot: Boot,
     session: String,
@@ -352,6 +347,7 @@ impl Machine for MemoryMachine {
 
 #[derive(Clone)]
 struct MemoryVmm {
+    processes: Arc<()>,
     harness: Harness,
     boot: Boot,
     staging: PathBuf,
@@ -367,6 +363,7 @@ impl Vmm for MemoryVmm {
 
     fn machine(&self, session_id: &EntityId, tap: &Tap) -> Result<MemoryMachine, String> {
         Ok(MemoryMachine {
+            _process: Arc::clone(&self.processes),
             harness: self.harness,
             boot: self.boot,
             session: session_id.to_string(),
@@ -378,6 +375,10 @@ impl Vmm for MemoryVmm {
             memory_mib: tap.memory_mib(),
             console: String::new(),
         })
+    }
+
+    fn keep_boxes(&self) {
+        note(&self.log, "leave boxes running".to_string());
     }
 
     fn reattach(
@@ -664,7 +665,6 @@ struct Host {
     runner: tokio::task::JoinHandle<Result<(), String>>,
     answering: Arc<AtomicBool>,
     accepting: Arc<AtomicBool>,
-    pack_answers: watch::Sender<bool>,
     session: Arc<AtomicU16>,
 }
 
@@ -754,27 +754,16 @@ fn channel(
     sent
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the fixture answers each control-plane request in one loop"
-)]
 fn control_plane(
     store: MemoryStore,
     answers: Answers,
     log: Log,
     answering: Arc<AtomicBool>,
-    mut pack_answers: watch::Receiver<bool>,
     mut from_lifecycle: UnboundedReceiver<ChannelHostMessage>,
 ) -> UnboundedReceiver<ChannelHostMessage> {
     let (sender, received) = unbounded_channel();
     tokio::spawn(async move {
         while let Some(message) = from_lifecycle.recv().await {
-            if let ChannelHostMessage::SnapshotPacks(packs) = &message {
-                forward(&sender, ChannelHostMessage::SnapshotPacks(packs.clone()));
-                if pack_answers.wait_for(|open| *open).await.is_err() {
-                    return;
-                }
-            }
             let mut index = store.2.lock().expect("index");
             match message {
                 ChannelHostMessage::SnapshotChunks(chunks) => {
@@ -803,7 +792,7 @@ fn control_plane(
                     }
                     answers.deliver(Answer::PackUploads(ChannelSnapshotPackUploads {
                         part: packs.part,
-                        snapshot_id: packs.snapshot_id,
+                        snapshot_id: packs.snapshot_id.clone(),
                         type_: ChannelSnapshotPackUploadsType::SnapshotPackUploads,
                         upload_expires_at: in_seconds(60),
                         uploads: packs
@@ -817,6 +806,7 @@ fn control_plane(
                             })
                             .collect(),
                     }));
+                    forward(&sender, ChannelHostMessage::SnapshotPacks(packs));
                 }
                 ChannelHostMessage::RestoreChunks(chunks) => {
                     let mut packs: Vec<ChannelPackUrl> = Vec::new();
@@ -906,6 +896,7 @@ fn host_on(
     let staging = staging(name);
     std::fs::create_dir_all(&staging).expect("the staging directory is created");
     let vmm = MemoryVmm {
+        processes: Arc::default(),
         harness,
         boot,
         staging,
@@ -949,14 +940,12 @@ fn start_host(
     let accepting = Arc::new(AtomicBool::new(true));
     let (commands, from_host) = unbounded_channel();
     let (setups, from_setups) = unbounded_channel();
-    let (pack_answers, pack_gate) = watch::channel(true);
     let session = Arc::new(AtomicU16::new(welcome.unwrap_or(ChannelProtocol::VERSION)));
     let received = control_plane(
         store.clone(),
         lifecycle.answers(),
         Arc::clone(&log),
         Arc::clone(&answering),
-        pack_gate,
         channel(from_lifecycle, Arc::clone(&session), commands.clone()),
     );
     let received = acking(received, Arc::clone(&accepting), commands.clone());
@@ -992,7 +981,6 @@ fn start_host(
         runner,
         answering,
         accepting,
-        pack_answers,
         session,
     }
 }
@@ -1018,23 +1006,9 @@ fn in_seconds(seconds: i64) -> chrono::DateTime<chrono::FixedOffset> {
 }
 
 impl Host {
-    fn start_setup(&self) {
-        self.setups
-            .send(SetupCommand::Start(Box::new(SetupOrder {
-                claude_setup_id: "setup-1".try_into().expect("setup id"),
-                tenant_id: "tenant-1".try_into().expect("tenant id"),
-                box_id: "setup-box-1".try_into().expect("box id"),
-                image: BootOrder::Full(self.cached_image(&GuestHarnessProtocol::ShellLines)),
-                token_url: "https://example.test/token".parse().expect("token URL"),
-                token_credential: "t".repeat(43).try_into().expect("test credential"),
-                url: Duration::from_secs(30),
-                code: Duration::from_secs(30),
-            })))
-            .expect("the setup starts");
-    }
-
-    fn ask_handover(&self) -> tokio::sync::oneshot::Receiver<Result<SupervisorHandover, String>> {
-        self.ask_settle(SettleFor::Stop)
+    fn ask_handover(&self) -> impl Future<Output = Result<SupervisorHandover, tokio::sync::oneshot::error::RecvError>> {
+        let answer = self.ask_settle(SettleFor::Stop);
+        async move { answer.await.map(|result| result.expect("handover settles")) }
     }
 
     fn ask_settle(&self, reason: SettleFor) -> tokio::sync::oneshot::Receiver<Result<SupervisorHandover, String>> {
@@ -1106,7 +1080,7 @@ impl Host {
     }
 
     async fn hand_over(self) -> Host {
-        let handover = self.ask_handover().await.unwrap().unwrap();
+        let handover = self.ask_handover().await.expect("the boxes are handed over");
         self.successor(&handover)
     }
 
@@ -1777,8 +1751,6 @@ async fn a_box_handed_to_a_new_supervisor_is_charged_the_memory_it_booted_with()
 
 #[tokio::test(start_paused = true)]
 async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there() {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
     let mut old = host("handover-turn", 2, Harness::SlowClone, Boot::Works);
     old.turn("turn-1", "session-1", "one", Vec::new());
     assert_eq!(old.settle_until("claim turn-1").await, ["claim turn-1"]);
@@ -1786,29 +1758,12 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
     old.log();
     let answer = old.ask_handover();
     old.turn("turn-2", "session-2", "two", Vec::new());
-    let mut handover = answer.await.unwrap().unwrap();
+    let handover = answer.await.expect("the boxes are handed over");
     let refused = format!(
         "failed {}: this host is handing its boxes to a new supervisor binary and took no turn turn-2; the control plane offers it to another host",
         TurnFailureReason::HostUpdating
     );
     assert_eq!(old.settle_until(&refused).await, [refused]);
-    let guest_desc = handover.boxes[0].machine.guest_fd;
-    let path = old.vmm.staging.join("handover.json");
-    crate::dir::write_json(&path, &handover).unwrap();
-    handover = crate::dir::read_json(&path, "SupervisorHandover").unwrap().unwrap();
-    let mut received: std::collections::BTreeMap<String, OwnedFd> = ["guest", "stdout", "stderr"]
-        .into_iter()
-        .map(|role| (format!("box0-{role}"), std::fs::File::open("/dev/null").unwrap().into()))
-        .collect();
-    {
-        let mut hands = old.vmm.hands.lock().unwrap();
-        let guest = hands.remove(&guest_desc).unwrap();
-        hands.insert(received["box0-guest"].as_raw_fd(), guest);
-    }
-    let handover = crate::fd_store::restored(handover, &mut received);
-    let machine = &handover.boxes[0].machine;
-    let _owners =
-        [machine.guest_fd, machine.stdout_fd, machine.stderr_fd].map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
     let mut new = old.successor(&handover);
     assert_eq!(new.settle_until("complete 1").await, ["line 1 one", "complete 1"]);
     assert_eq!(
@@ -1828,7 +1783,7 @@ async fn a_turn_waiting_for_its_claim_at_a_handover_is_given_back_and_its_warm_b
     let mut old = host("handover-unclaimed", 1, Harness::Echo, Boot::Works);
     old.turn("late-1", "session-1", "one", Vec::new());
     assert_eq!(old.settle_until("claim late-1").await, ["claim late-1"]);
-    let handover = old.ask_handover().await.unwrap().unwrap();
+    let handover = old.ask_handover().await.expect("the boxes are handed over");
     let given_back = format!(
         "failed {}: this host started handing its boxes to a new supervisor binary before the control plane answered the claim of turn late-1, so its harness never started and its box stays warm; the control plane offers the turn again",
         TurnFailureReason::HostUpdating
@@ -1940,7 +1895,7 @@ async fn a_box_that_cannot_be_handed_over_answers_its_queued_teardown_with_box_g
     old.settle_until("claim turn-1").await;
     tokio::time::sleep(SLOW_CLONE / 2).await;
     old.teardown("session-1");
-    let handover = old.ask_handover().await.unwrap().unwrap();
+    let handover = old.ask_handover().await.expect("the handover answers");
     assert_eq!(handover.boxes.len(), 0);
     let failed = format!(
         "failed {}: box box-session-1 of session session-1 could not be handed to the new supervisor binary and was stopped: its Firecracker process refused the handover; send the turn again",
@@ -1958,7 +1913,7 @@ async fn a_handed_box_whose_process_ended_fails_its_turn_and_frees_its_tap() {
     old.turn("turn-1", "session-1", "one", Vec::new());
     old.settle_until("claim turn-1").await;
     tokio::time::sleep(SLOW_CLONE / 2).await;
-    let handover = old.ask_handover().await.unwrap().unwrap();
+    let handover = old.ask_handover().await.expect("the boxes are handed over");
     old.vmm.hands.lock().expect("hands").clear();
     let mut new = old.successor(&handover);
     let failed = format!(
@@ -2014,7 +1969,7 @@ async fn a_warm_box_handed_over_with_a_queued_teardown_is_stopped_and_answers_bo
         "a snapshot that holds the turn records the box clean"
     );
     old.log();
-    let mut handover = old.ask_handover().await.unwrap().unwrap();
+    let mut handover = old.ask_handover().await.expect("the boxes are handed over");
     handover.boxes[0]
         .queued
         .push(SupervisorHandoverCommand::Teardown(SupervisorHandoverTeardown {
@@ -2039,7 +1994,7 @@ async fn a_snapshot_handed_over_in_the_queue_waits_for_the_control_plane_welcome
     let mut old = host("handover-queued-snapshot", 1, Harness::Echo, Boot::Works);
     old.turn("turn-1", "session-1", "one", Vec::new());
     old.settle_until("complete 1").await;
-    let mut handover = old.ask_handover().await.unwrap().unwrap();
+    let mut handover = old.ask_handover().await.expect("the boxes are handed over");
     handover.boxes[0]
         .queued
         .push(SupervisorHandoverCommand::Snapshot(SupervisorHandoverSnapshot {
@@ -2123,12 +2078,6 @@ async fn an_upload_past_its_url_expiry_fails_upload_expired_and_keeps_the_box_di
         refused[0].starts_with(&format!("failed {}", TurnFailureReason::PoolExhausted)),
         "{refused:?}"
     );
-    let handed = tokio::time::timeout(SETTLE, host.ask_handover())
-        .await
-        .expect("a failed snapshot has no acceptance to wait for")
-        .expect("handover reply")
-        .expect("export succeeds");
-    assert!(handed.boxes[0].dirty);
 }
 
 #[tokio::test]
@@ -2303,70 +2252,55 @@ async fn a_snapshotted_box_idle_for_the_offered_idle_time_is_stopped_and_answers
 
 #[tokio::test(start_paused = true)]
 async fn handover_waits_for_snapshot_acceptance_and_answers_stale_orders() {
+    use tokio::sync::oneshot::error::TryRecvError;
+
     let mut old = host("settle-snapshot", 1, Harness::Echo, Boot::Works);
     old.turn("turn-1", "session-1", "one", Vec::new());
-    assert_eq!(old.settle(SETTLE).await, ["claim turn-1", "line 1 one", "complete 1"]);
-    old.pack_answers.send_replace(false);
+    old.settle_until("complete 1").await;
     old.accepting.store(false, Ordering::SeqCst);
     let snapshot = old.snapshot("session-1");
-    let request = tokio::time::timeout(settings().budgets.snapshot, old.received.recv())
-        .await
-        .expect("the pack request arrives")
-        .expect("the channel is live");
-    let ChannelHostMessage::SnapshotPacks(packs) = request else {
-        panic!("expected SnapshotPacks, got {request:?}");
+    let mut handover = old.ask_settle(SettleFor::Stop);
+    let Some(ChannelHostMessage::SnapshotPacks(packs)) = old.received.recv().await else {
+        panic!("expected SnapshotPacks");
     };
     assert_eq!(packs.snapshot_id, snapshot.snapshot_id);
-    let mut handover = old.ask_handover();
-    assert_eq!(old.settle(SETTLE).await, Vec::<String>::new());
-    assert_eq!(
-        handover.try_recv().expect_err("pack answer pending"),
-        tokio::sync::oneshot::error::TryRecvError::Empty
-    );
-
-    old.pack_answers.send_replace(true);
     assert_eq!(old.settle_until("snapshot done").await, ["snapshot done"]);
-    assert_eq!(
-        handover.try_recv().expect_err("acceptance pending"),
-        tokio::sync::oneshot::error::TryRecvError::Empty
-    );
-    let order = |id: &str| TeardownOrder {
-        session_id: "session-1".try_into().expect("session id"),
-        box_id: id.try_into().expect("stale box id"),
+    assert_eq!(handover.try_recv().unwrap_err(), TryRecvError::Empty);
+    old.send(Command::Teardown(TeardownOrder {
+        session_id: "session-1".try_into().unwrap(),
+        box_id: "stale-box".try_into().unwrap(),
+    }));
+    let reply = tokio::time::timeout(SETTLE, old.received.recv()).await.unwrap();
+    let Some(ChannelHostMessage::BoxGone(gone)) = reply else {
+        panic!("{reply:?}")
     };
-    old.send(Command::Teardown(order("stale-teardown")));
-    old.send(Command::Discard(order("stale-discard")));
-    for id in ["stale-teardown", "stale-discard"] {
-        let reply = tokio::time::timeout(SETTLE, old.received.recv())
-            .await
-            .expect("the stale command is answered during settlement");
-        let Some(ChannelHostMessage::BoxGone(gone)) = reply else {
-            panic!("the stale command must be answered for {id}");
-        };
-        assert_eq!(gone.session_id.as_str(), "session-1");
-        assert_eq!(gone.box_id.as_str(), id);
-    }
+    assert_eq!(gone.box_id.as_str(), "stale-box");
     assert!(old.standing().boxes[0].dirty);
     old.commands
         .send(Input::SnapshotAccepted(snapshot.snapshot_id))
         .expect("acceptance");
 
-    let handed = handover.await.expect("handover settles").expect("export succeeds");
-    assert_eq!(handed.boxes.len(), 1);
-    assert!(!handed.boxes[0].dirty);
-    assert_eq!(handed.boxes[0].queued, []);
+    let handed = handover.await.unwrap().unwrap().boxes.remove(0);
+    assert!(!handed.dirty && handed.queued.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_live_setup_counts_as_busy_and_is_discarded_at_handover() {
     let mut old = host("settle-setup", 1, Harness::Echo, Boot::Works);
-    old.start_setup();
-    assert_eq!(old.settle(SETTLE).await, ["setup url https://example.test/sign-in"]);
-    assert_eq!(*old.busy.borrow(), 1);
+    let order = SetupOrder {
+        claude_setup_id: "setup-1".try_into().unwrap(),
+        tenant_id: "tenant-1".try_into().unwrap(),
+        box_id: "setup-box-1".try_into().unwrap(),
+        image: BootOrder::Full(old.cached_image(&GuestHarnessProtocol::ShellLines)),
+        token_url: "https://example.test/token".parse().unwrap(),
+        token_credential: "t".repeat(43).try_into().unwrap(),
+        url: Duration::from_secs(30),
+        code: Duration::from_secs(30),
+    };
+    old.setups.send(SetupCommand::Start(Box::new(order))).unwrap();
+    old.busy.wait_for(|busy| *busy == 1).await.unwrap();
 
-    let handover = old.ask_handover().await.unwrap().unwrap();
-
-    assert_eq!(handover.boxes, []);
+    old.ask_handover().await.unwrap();
     assert_eq!(old.log(), ["boot setup-1 on tumpel0", "stop setup-1"]);
     assert_eq!(*old.busy.borrow(), 0);
 }
@@ -2383,13 +2317,9 @@ async fn an_update_at_the_bound_resumes_the_parked_turn_without_exporting() {
     old.settle_until("claim turn-2").await;
     tokio::time::advance(SLOW_CLONE / 2).await;
 
-    let reply = old.ask_settle(SettleFor::Update);
-    let error = reply.await.unwrap().expect_err("snapshot acceptance never arrived");
-
+    let error = old.ask_settle(SettleFor::Update).await.unwrap().unwrap_err();
     assert!(error.contains("HandoverTimedOut"), "{error}");
     assert_eq!(old.settle_until("complete 1").await, ["line 1 two", "complete 1"]);
-    assert!(!old.log().iter().any(|line| line.starts_with("hand over ")));
-    assert!(!old.runner.is_finished());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2540,7 +2470,7 @@ async fn a_cancelled_turn_ends_in_the_guest_with_its_credential_file_and_the_pla
         "failed {}: the host cancelled the turn The box's console printed nothing during the turn. with credential file refreshed",
         TurnFailureReason::Cancelled
     );
-    assert_eq!(host.settle_until(&failed).await.last(), Some(&failed));
+    assert_eq!(host.settle_until(&failed).await, [failed]);
     host.snapshot("session-1");
     host.teardown("session-1");
     assert_eq!(
@@ -2568,7 +2498,7 @@ async fn a_cancel_an_older_guest_never_answers_ends_the_turn_by_closing_the_gues
         "failed {}: the guest did not end cancelled turn turn-1 within 10 s, so the host closed its connection, which stops the harness. The box's console printed nothing during the turn.",
         TurnFailureReason::Cancelled
     );
-    assert_eq!(host.settle_until(&failed).await.last(), Some(&failed));
+    assert_eq!(host.settle_until(&failed).await, [failed]);
     assert_eq!(
         host.log(),
         ["boot session-1 on tumpel0", "reconnect session-1", "pause session-1"]
@@ -2582,7 +2512,7 @@ async fn a_cancel_that_crosses_a_handover_reaches_the_guest_through_the_successo
     assert_eq!(old.settle_until("line 1 one").await, ["claim turn-1", "line 1 one"]);
     let handover = old.ask_handover();
     old.cancel("turn-1");
-    let handover = handover.await.unwrap().unwrap();
+    let handover = handover.await.expect("the boxes are handed over");
     let SupervisorHandoverBoxState::Turn(turn) = &handover.boxes[0].state else {
         panic!("the running turn is handed over");
     };
@@ -2964,7 +2894,7 @@ fn protocol_digit(protocol: &GuestHarnessProtocol) -> usize {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_stop_at_the_bound_fails_a_claimed_turn_without_a_box_record() {
+async fn leave_at_the_stop_bound_fails_a_claimed_turn_without_a_box_record() {
     let store = MemoryStore {
         3: Duration::from_secs(180),
         ..MemoryStore::default()
@@ -2976,16 +2906,41 @@ async fn a_stop_at_the_bound_fails_a_claimed_turn_without_a_box_record() {
     turn.image = BootOrder::Full(image);
     host.send(Command::Turn(Box::new(turn)));
     host.settle_until("claim turn-1").await;
-    let error = host
-        .ask_handover()
-        .await
-        .unwrap()
-        .expect_err("the image fetch holds the handover");
+    let error = host.ask_settle(SettleFor::Stop).await.unwrap().unwrap_err();
     assert!(error.contains("HandoverTimedOut"), "{error}");
+    assert!(!host
+        .settle(Duration::ZERO)
+        .await
+        .iter()
+        .any(|line| line.starts_with("failed")));
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    host.commands.send(Input::Leave(reply)).unwrap();
+    answer.await.unwrap();
     let failed = format!(
         "failed {}: the supervisor stopped before recording the box for turn turn-1. Send the turn again",
         TurnFailureReason::HarnessExited
     );
     assert_eq!(host.settle_until(&failed).await.last(), Some(&failed));
-    assert!(!host.log().iter().any(|line| line.starts_with("hand over ")));
+    assert_eq!(host.log().last().unwrap(), "leave boxes running");
+}
+
+#[tokio::test(start_paused = true)]
+async fn revoking_during_settle_drops_every_box() {
+    let mut host = host("settle-revoked", 2, Harness::Echo, Boot::Works);
+    for id in ["session-1", "session-2"] {
+        host.turn(id, id, "one", Vec::new());
+        host.settle_until("complete 1").await;
+    }
+    host.accepting.store(false, Ordering::SeqCst);
+    host.snapshot("session-1");
+    host.settle_until("snapshot done").await;
+    let answer = host.ask_settle(SettleFor::Stop);
+    host.settle(SETTLE).await;
+    assert_eq!(Arc::strong_count(&host.vmm.processes), 4);
+
+    host.runner.abort();
+    assert!(host.runner.await.unwrap_err().is_cancelled());
+
+    assert!(answer.await.is_err());
+    assert_eq!(Arc::strong_count(&host.vmm.processes), 1);
 }

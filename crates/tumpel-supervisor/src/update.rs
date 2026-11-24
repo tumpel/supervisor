@@ -393,11 +393,10 @@ impl<S: Source, I: Idle> Updater<S, I> {
         if running.is_some() {
             return Outcome::Restart;
         }
-        let release = match self.due().await {
-            Ok(release) => release,
-            Err(outcome) => return outcome,
-        };
-        self.apply(release, &mut running).await
+        match self.due().await {
+            Ok(release) => self.apply(release, &mut running).await,
+            Err(outcome) => outcome,
+        }
     }
 
     pub async fn announced(&self, grace: Duration) -> Outcome {
@@ -722,14 +721,12 @@ impl<S: Source, I: Idle> Updater<S, I> {
         };
         dir::write_json(&path, &pending).map_err(|error| format!("{error:#}"))?;
         if let Err(error) = std::fs::rename(&self.layout.candidate, &self.layout.binary) {
-            let cleanup = remove(&path)
-                .err()
-                .map_or_else(String::new, |error| format!(". {error}"));
             let detail = format!(
-                "moving {} over {} failed: {error}{cleanup}",
+                "moving {} over {} failed: {error}",
                 self.layout.candidate.display(),
                 self.layout.binary.display()
             );
+            remove(&path).map_err(|error| format!("{detail}. {error}"))?;
             return Err(self
                 .refuse(
                     &release.sha256,
@@ -744,13 +741,13 @@ impl<S: Source, I: Idle> Updater<S, I> {
         Ok(())
     }
 
-    pub(crate) fn confirm(&self, send: impl FnOnce(ChannelHostMessage) -> Result<(), String>) -> Result<bool, String> {
+    pub(crate) fn confirm(&self, send: impl FnOnce(ChannelHostMessage) -> Result<(), String>) -> Result<(), String> {
         let path = self.layout.pending();
         let Some(pending) = read::<SupervisorUpdatePending>(&path, "SupervisorUpdatePending")? else {
-            return Ok(false);
+            return Ok(());
         };
         if pending.to_sha256 != self.running {
-            return Ok(false);
+            return Ok(());
         }
         let release_version = self
             .version
@@ -765,8 +762,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
             phase: SupervisorUpdatePhase::Online,
             at: Utc::now().fixed_offset(),
         }))?;
-        remove(&path)?;
-        Ok(true)
+        remove(&path)
     }
 }
 
