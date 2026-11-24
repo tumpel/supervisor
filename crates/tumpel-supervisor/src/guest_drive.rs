@@ -1,3 +1,4 @@
+use std::ffi::CString;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -19,28 +20,28 @@ fn name(drive: &[u8]) -> String {
     format!("{}.squashfs", hex(digest(&SHA256, drive).as_ref()))
 }
 
-pub(crate) fn check(images: &Path) -> Result<&'static str, String> {
-    if DRIVE.is_some_and(|drive| !drive.starts_with(b"hsqs")) {
-        return Err("the embedded drive is not SquashFS. Install a supervisor built by the release workflow".into());
+pub(crate) fn check() -> Result<&'static str, String> {
+    match DRIVE {
+        Some(drive) if drive.starts_with(b"hsqs") => Ok("embedded SquashFS drive is present"),
+        Some(_) => Err("the embedded drive is not SquashFS; install a supervisor built by the release workflow".into()),
+        None => Ok("this development build has no embedded guest drive"),
     }
-    check_location(images).map_err(|error| {
-        format!(
-            "cannot use the guest drive directory under {}: {error}. Set imageCacheDir in runtime.json to a cache with a writable guest directory",
-            images.display()
-        )
-    })?;
-    Ok("the cache can hold the guest drive")
 }
 
-fn check_location(images: &Path) -> io::Result<()> {
+pub(crate) fn check_location(images: &Path) -> io::Result<()> {
     let guest = images.join(DIRECTORY);
-    let location = match guest.metadata() {
-        Ok(metadata) if metadata.is_dir() => &guest,
-        Ok(_) => return Err(ErrorKind::NotADirectory.into()),
-        Err(error) if error.kind() == ErrorKind::NotFound => images,
-        Err(error) => return Err(error),
-    };
-    crate::dir::check_access(location, libc::W_OK | libc::X_OK)
+    match access(&guest) {
+        Err(error) if error.kind() == ErrorKind::NotFound => access(images),
+        checked => checked,
+    }
+}
+
+fn access(dir: &Path) -> io::Result<()> {
+    let path = CString::new(dir.join(".").as_os_str().as_encoded_bytes())?;
+    if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } == 0 {
+        return Ok(());
+    }
+    Err(io::Error::last_os_error())
 }
 
 fn place(images: &Path, drive: &[u8]) -> Result<PathBuf, String> {

@@ -38,19 +38,21 @@ fn write_report(mut out: impl Write) -> io::Result<bool> {
         ),
         (BOXES_FILE, read_boxes(&state.join(BOXES_FILE))),
         (HANDOVER_FILE, read_boxes(&state.join(HANDOVER_FILE))),
-        (
-            "guest drive",
-            runtime
-                .map_err(unavailable)
-                .and_then(|runtime| guest_drive::check(Path::new(&*runtime.image_cache_dir))),
-        ),
+        ("guest drive", guest_drive::check()),
         (
             "image cache",
             runtime.map_err(unavailable).and_then(|runtime| {
                 let cache = Path::new(&*runtime.image_cache_dir);
                 std::fs::read_dir(cache)
-                    .map(|_| "cache directory is readable")
-                    .map_err(|error| format!("reading {} failed: {error}", cache.display()))
+                    .map_err(|error| format!("reading {} failed: {error}", cache.display()))?;
+                guest_drive::check_location(cache)
+                    .map(|()| "the cache can hold the guest drive")
+                    .map_err(|error| {
+                        format!(
+                            "cannot use the guest drive directory under {}: {error}. Set imageCacheDir in runtime.json to a cache with a writable guest directory",
+                            cache.display()
+                        )
+                    })
             }),
         ),
         (

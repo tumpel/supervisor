@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::ffi::CString;
-use std::io::{self, Write};
+use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tumpel_api::types::{BoxDiskLimit, BoxMemoryLimit, SupervisorChannelState, SupervisorRuntime};
@@ -13,14 +12,6 @@ pub const KEY_FILE: &str = "host-key.json";
 pub const CHANNEL_FILE: &str = "channel.json";
 pub const RUNTIME_FILE: &str = "runtime.json";
 pub const SUPERVISOR_UNIT: &str = "tumpel-supervisor.service";
-
-pub(crate) fn check_access(dir: &Path, mode: libc::c_int) -> io::Result<()> {
-    let path = CString::new(dir.as_os_str().as_encoded_bytes())?;
-    if unsafe { libc::access(path.as_ptr(), mode) } == 0 {
-        return Ok(());
-    }
-    Err(io::Error::last_os_error())
-}
 
 pub fn supervisor_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("TUMPEL_SUPERVISOR_DIR") {
