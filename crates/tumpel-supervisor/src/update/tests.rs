@@ -123,7 +123,6 @@ fn limits() -> Limits {
         verify: Duration::from_secs(5),
         place: Duration::from_secs(5),
         dry_run: Duration::from_secs(10),
-        swap: Duration::from_secs(5),
     }
 }
 
@@ -368,6 +367,39 @@ async fn a_refused_binary_is_never_downloaded_again() {
 }
 
 const GRACE: Duration = Duration::from_secs(600);
+
+#[test]
+fn the_swap_finishes_while_the_blocking_pool_is_occupied() {
+    let layout = layout("swap-with-blocking-pool-busy");
+    let script = good_script();
+    std::fs::write(&layout.candidate, &script).expect("the candidate is staged");
+    let idle = FakeIdle::default();
+    let run = updater(&layout, FakeSource::binary(&script), &idle, limits());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime with one blocking worker");
+    let (occupied, ready) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let worker = runtime.spawn_blocking(move || {
+        occupied.send(()).expect("the blocking worker is occupied");
+        wait.recv().expect("release the blocking worker");
+    });
+    ready.recv().expect("the worker is occupied before the swap");
+
+    let result = {
+        let _runtime = runtime.enter();
+        run.updater.swap(&digest(&sha256_hex(script.as_bytes())))
+    };
+    release.send(()).expect("release the blocking worker");
+    runtime.block_on(worker).expect("the worker finishes");
+
+    result.unwrap_or_else(|error| panic!("the swap failed: {}", error.detail));
+    assert_eq!(text(&layout.binary), script);
+    assert!(!layout.candidate.exists());
+    assert!(!layout.refusal().exists());
+}
 
 #[tokio::test]
 async fn a_release_notice_replaces_the_binary_on_an_idle_host() {

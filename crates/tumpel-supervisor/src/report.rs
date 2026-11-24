@@ -7,7 +7,7 @@ use tumpel_guest::setup_output::{redacted, strip_ansi};
 
 use crate::run::start;
 use crate::update::{BOXES_FILE, HANDOVER_FILE};
-use crate::{dir, guest_drive, images, lifecycle};
+use crate::{dir, guest_drive, lifecycle};
 
 pub(crate) const CHANNEL_PROTOCOL_LINE: &str = "PASS channel protocol ";
 
@@ -42,7 +42,10 @@ fn write_report(mut out: impl Write) -> io::Result<bool> {
         (
             "image cache",
             runtime.map_err(unavailable).and_then(|runtime| {
-                images::check_cache(Path::new(&*runtime.image_cache_dir)).map(|()| "cache files scanned")
+                let cache = Path::new(&*runtime.image_cache_dir);
+                std::fs::read_dir(cache)
+                    .map(|_| "cache directory is readable")
+                    .map_err(|error| format!("reading {} failed: {error}", cache.display()))
             }),
         ),
         (

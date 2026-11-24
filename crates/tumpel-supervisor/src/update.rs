@@ -44,7 +44,6 @@ pub struct Limits {
     pub verify: Duration,
     pub place: Duration,
     pub dry_run: Duration,
-    pub swap: Duration,
 }
 
 impl Limits {
@@ -54,7 +53,6 @@ impl Limits {
         verify: Duration::from_secs(30),
         place: Duration::from_secs(60),
         dry_run: Duration::from_secs(60),
-        swap: Duration::from_secs(30),
     };
 }
 
@@ -468,7 +466,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
             named(release)
         );
         self.step(release, SupervisorUpdatePhase::Restarting, self.idle.boxes());
-        match self.swap(&release.sha256).await {
+        match self.swap(&release.sha256) {
             Ok(()) => Outcome::Restart,
             Err(stopped) => {
                 let reason = stopped.reason.clone();
@@ -704,23 +702,20 @@ impl<S: Source, I: Idle> Updater<S, I> {
         Ok(())
     }
 
-    async fn swap(&self, to: &Sha256Digest) -> Result<(), Stop> {
+    fn swap(&self, to: &Sha256Digest) -> Result<(), Stop> {
         let candidate = &self.layout.candidate;
         let binary = &self.layout.binary;
-        let swapped = timeout(self.limits.swap, tokio::fs::rename(candidate, binary)).await;
-        let detail = match swapped {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(error)) => format!(
+        std::fs::rename(candidate, binary).map_err(|error| {
+            let detail = format!(
                 "moving {} over {} failed: {error}",
                 candidate.display(),
                 binary.display()
-            ),
-            Err(_) => format!("the swap ran past {} s", self.limits.swap.as_secs()),
-        };
-        Err(self.refuse(
-            to,
-            stop(SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed, detail),
-        ))
+            );
+            self.refuse(
+                to,
+                stop(SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed, detail),
+            )
+        })
     }
 }
 
