@@ -549,6 +549,11 @@ mod tests {
         let (guest, _guest_peer) = UnixStream::pair().expect("live guest sockets");
         let (stdout, _stdout_writer) = std::io::pipe().expect("stdout pipe");
         let (stderr, _stderr_writer) = std::io::pipe().expect("stderr pipe");
+        for fd in [guest.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
+        }
         let descriptor = |fd| {
             let info = fs::metadata(format!("/proc/self/fd/{fd}")).expect("descriptor metadata");
             json!({"fd":fd,"device":info.dev(),"inode":info.ino()})
