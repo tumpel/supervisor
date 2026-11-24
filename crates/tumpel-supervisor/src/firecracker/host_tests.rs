@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use tumpel_api::types::SupervisorHandoverMachine;
 
-use super::{Firecracker, Process};
+use super::Firecracker;
 use crate::lifecycle::Vmm;
 use crate::pool::{Size, TapPool};
 use crate::update::Layout;
@@ -116,6 +116,7 @@ async fn exec_handed_supervisor() {
         images: data.clone(),
         data: data.clone(),
         vcpus: 1,
+        processes: std::sync::Mutex::default(),
     };
     let mib = Size {
         memory_mib: NonZeroU32::new(512).expect("512"),
@@ -140,7 +141,7 @@ async fn exec_handed_supervisor() {
     });
     let _listener = listener.expect("the stand-in API socket");
     spawned.expect("the new box starts");
-    let new_pid = new.process.as_ref().and_then(Process::id).expect("the new box's pid");
+    let new_pid = new.pid().expect("the new box's pid");
     std::fs::write(data.join("box"), format!("{} {new_pid}", child.id())).expect("writing the box pids");
     std::future::pending::<()>().await;
 }

@@ -20,7 +20,7 @@ use tumpel_api::types::{
     ChannelHostMessage, ChannelSupervisorUpdateFailed, ChannelSupervisorUpdateFailedType, ChannelSupervisorUpdateStep,
     ChannelSupervisorUpdateStepReleaseVersion, ChannelSupervisorUpdateStepType, HostArchitecture,
     ReleaseManifestReleaseVersion, ReleaseSupervisorSupervisorVersion, Sha256Digest, SupervisorUpdateFailureReason,
-    SupervisorUpdatePhase, SupervisorUpdateRefusal,
+    SupervisorUpdatePending, SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
 use tumpel_channel::Outgoing;
 use tumpel_guest::setup_output::{redacted, strip_ansi};
@@ -32,6 +32,7 @@ use crate::report::CHANNEL_PROTOCOL_LINE;
 use crate::snapshot::hex;
 
 pub const REFUSAL_FILE: &str = "update-refusal.json";
+const PENDING_FILE: &str = "update-pending.json";
 pub const HANDOVER_FILE: &str = "handover.json";
 pub const BOXES_FILE: &str = "boxes.json";
 const TAIL_LINES: usize = 20;
@@ -83,6 +84,10 @@ impl Layout {
 
     pub(crate) fn clear_candidate(&self) -> Result<(), String> {
         remove(&self.candidate)
+    }
+
+    fn pending(&self) -> PathBuf {
+        self.state.join(PENDING_FILE)
     }
 
     fn refusal(&self) -> PathBuf {
@@ -358,7 +363,7 @@ pub struct Updater<S: Source, I: Idle> {
     version: &'static str,
     idle: I,
     out: UnboundedSender<Outgoing>,
-    running_update: Mutex<()>,
+    running_update: Mutex<Option<Release>>,
 }
 
 impl<S: Source, I: Idle> Updater<S, I> {
@@ -379,22 +384,28 @@ impl<S: Source, I: Idle> Updater<S, I> {
             version,
             idle,
             out,
-            running_update: Mutex::new(()),
+            running_update: Mutex::new(None),
         }
     }
 
     pub async fn now(&self) -> Outcome {
-        let _running = self.running_update.lock().await;
+        let mut running = self.running_update.lock().await;
+        if running.is_some() {
+            return Outcome::Restart;
+        }
         match self.due().await {
-            Ok(release) => self.apply(&release).await,
+            Ok(release) => self.apply(release, &mut running).await,
             Err(outcome) => outcome,
         }
     }
 
     pub async fn announced(&self, grace: Duration) -> Outcome {
-        let Ok(_running) = self.running_update.try_lock() else {
+        let Ok(mut running) = self.running_update.try_lock() else {
             return Outcome::Busy;
         };
+        if running.is_some() {
+            return Outcome::Busy;
+        }
         let release = match self.due().await {
             Ok(release) => release,
             Err(outcome) => return outcome,
@@ -421,7 +432,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
                 () = self.idle.settled() => {}
             }
         }
-        self.apply(&release).await
+        self.apply(release, &mut running).await
     }
 
     async fn due(&self) -> Result<Release, Outcome> {
@@ -453,27 +464,25 @@ impl<S: Source, I: Idle> Updater<S, I> {
         }
     }
 
-    async fn apply(&self, release: &Release) -> Outcome {
-        if let Err(stopped) = self.prepare(release).await {
+    async fn apply(&self, release: Release, running: &mut Option<Release>) -> Outcome {
+        if let Err(stopped) = self.prepare(&release).await {
             let reason = stopped.reason.clone();
             self.fail(&release.sha256, stopped);
             return Outcome::Failed(reason);
         }
-        eprintln!(
-            "tumpel-supervisor: swapping supervisor {} ({}) for {} and handing its boxes over",
-            self.version,
-            short(&self.running),
-            named(release)
+        self.step(&release, SupervisorUpdatePhase::Restarting, self.idle.boxes());
+        *running = Some(release);
+        Outcome::Restart
+    }
+
+    pub(crate) async fn settle_timed_out(&self, error: String) -> Result<(), String> {
+        let mut running = self.running_update.lock().await;
+        let release = running.take().ok_or("no supervisor update is staged")?;
+        self.fail(
+            &release.sha256,
+            stop(SupervisorUpdateFailureReason::SupervisorUpdateIdleTimedOut, error),
         );
-        self.step(release, SupervisorUpdatePhase::Restarting, self.idle.boxes());
-        match self.swap(&release.sha256) {
-            Ok(()) => Outcome::Restart,
-            Err(stopped) => {
-                let reason = stopped.reason.clone();
-                self.fail(&release.sha256, stopped);
-                Outcome::Failed(reason)
-            }
-        }
+        Ok(())
     }
 
     fn step(&self, release: &Release, phase: SupervisorUpdatePhase, boxes: u32) {
@@ -701,20 +710,59 @@ impl<S: Source, I: Idle> Updater<S, I> {
         Ok(())
     }
 
-    fn swap(&self, to: &Sha256Digest) -> Result<(), Stop> {
-        let candidate = &self.layout.candidate;
-        let binary = &self.layout.binary;
-        std::fs::rename(candidate, binary).map_err(|error| {
+    pub(crate) async fn swap(&self, boxes: usize) -> Result<(), String> {
+        let running = self.running_update.lock().await;
+        let release = running.as_ref().ok_or("no supervisor update is staged")?;
+        let path = self.layout.pending();
+        let pending = SupervisorUpdatePending {
+            from_sha256: self.running.clone(),
+            to_sha256: release.sha256.clone(),
+            swapped_at: Utc::now().fixed_offset(),
+        };
+        dir::write_json(&path, &pending).map_err(|error| format!("{error:#}"))?;
+        if let Err(error) = std::fs::rename(&self.layout.candidate, &self.layout.binary) {
             let detail = format!(
                 "moving {} over {} failed: {error}",
-                candidate.display(),
-                binary.display()
+                self.layout.candidate.display(),
+                self.layout.binary.display()
             );
-            self.refuse(
-                to,
-                stop(SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed, detail),
-            )
-        })
+            remove(&path).map_err(|error| format!("{detail}. {error}"))?;
+            return Err(self
+                .refuse(
+                    &release.sha256,
+                    stop(SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed, detail),
+                )
+                .detail);
+        }
+        eprintln!(
+            "tumpel-supervisor: swapping supervisor {} ({}) for {} ({}) with {boxes} boxes running",
+            self.version, self.running, release.supervisor_version, release.sha256,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn confirm(&self, send: impl FnOnce(ChannelHostMessage) -> Result<(), String>) -> Result<(), String> {
+        let path = self.layout.pending();
+        let Some(pending) = read::<SupervisorUpdatePending>(&path, "SupervisorUpdatePending")? else {
+            return Ok(());
+        };
+        if pending.to_sha256 != self.running {
+            return Ok(());
+        }
+        let release_version = self
+            .version
+            .parse()
+            .map_err(|error| format!("the supervisor version is empty: {error}"))?;
+        send(ChannelHostMessage::SupervisorUpdateStep(ChannelSupervisorUpdateStep {
+            type_: ChannelSupervisorUpdateStepType::SupervisorUpdateStep,
+            from_sha256: pending.from_sha256,
+            to_sha256: pending.to_sha256,
+            release_version,
+            boxes_running: i32::try_from(self.idle.boxes()).unwrap_or(i32::MAX),
+            phase: SupervisorUpdatePhase::Online,
+            at: Utc::now().fixed_offset(),
+        }))?;
+        remove(&path)
     }
 }
 

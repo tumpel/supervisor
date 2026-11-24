@@ -94,8 +94,10 @@ pub struct Waiting {
     pub answer: oneshot::Receiver<Answer>,
 }
 
+type Replies = HashMap<Key, Option<oneshot::Sender<Answer>>>;
+
 #[derive(Clone, Default)]
-pub struct Answers(Arc<Mutex<HashMap<Key, oneshot::Sender<Answer>>>>);
+pub struct Answers(Arc<Mutex<Replies>>);
 
 impl Answers {
     pub fn expect(&self, key: Key) -> Waiting {
@@ -103,7 +105,7 @@ impl Answers {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(key.clone(), sender);
+            .insert(key.clone(), Some(sender));
         Waiting { key, answer }
     }
 
@@ -111,13 +113,25 @@ impl Answers {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).remove(key);
     }
 
+    pub fn claimed(&self, turn_id: &EntityId) -> bool {
+        let answers = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        matches!(answers.get(&Key::claim(turn_id)), Some(None))
+    }
+
     pub fn deliver(&self, answer: Answer) {
         let key = answer.key();
-        let waiting = self.0.lock().unwrap_or_else(PoisonError::into_inner).remove(&key);
-        let delivered = waiting.is_some_and(|sender| sender.send(answer).is_ok());
-        if !delivered {
-            eprintln!("tumpel-supervisor: the answer to {key} arrived with nothing waiting for it; dropped it");
+        let claimed = matches!(answer, Answer::Claimed(_));
+        let mut answers = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(sender) = answers.get_mut(&key).and_then(Option::take) {
+            let delivered = sender.send(answer).is_ok();
+            if !claimed || !delivered {
+                answers.remove(&key);
+            }
+            if delivered {
+                return;
+            }
         }
+        eprintln!("tumpel-supervisor: the answer to {key} arrived with nothing waiting for it; dropped it");
     }
 }
 

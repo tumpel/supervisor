@@ -391,9 +391,12 @@ async fn a_release_notice_replaces_the_binary_on_an_idle_host() {
     let idle = FakeIdle::default();
     let mut run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
     assert_eq!(run.updater.announced(GRACE).await, Outcome::Restart);
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    run.updater.swap(0).await.expect("the settled update installs");
     assert!(!seen(&mut run.events).contains(&Seen::Step(SupervisorUpdatePhase::WaitingForIdle)));
     assert_eq!(text(&layout.binary), good_script());
     assert!(!layout.candidate.exists());
+    assert!(layout.pending().is_file());
 }
 
 #[tokio::test]
@@ -410,6 +413,7 @@ async fn an_announced_rollback_installs_an_older_supervisor_version() {
     };
     let run = updater(&layout, source, &idle, limits());
     assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
+    run.updater.swap(0).await.expect("the settled rollback installs");
     assert_eq!(text(&layout.binary), good_script());
 }
 
@@ -434,7 +438,7 @@ async fn a_release_notice_to_a_busy_host_waits_out_the_grace_period_then_updates
     tokio::time::resume();
     assert_eq!(notice.await, Outcome::Restart);
     assert!(started.elapsed() >= GRACE);
-    assert_eq!(text(&layout.binary), good_script());
+    assert_eq!(text(&layout.binary), OLD_BINARY);
 }
 
 #[tokio::test]
@@ -454,7 +458,7 @@ async fn a_release_notice_to_a_busy_host_updates_once_its_turns_finish_inside_th
     tokio::time::resume();
     assert_eq!(notice.await, Outcome::Restart);
     assert!(started.elapsed() < GRACE);
-    assert_eq!(text(&layout.binary), good_script());
+    assert_eq!(text(&layout.binary), OLD_BINARY);
 }
 
 #[test]
@@ -548,10 +552,31 @@ async fn an_update_goes_only_to_a_newer_supervisor_version() {
         OLD_BINARY,
         "an announced downgrade leaves the running binary"
     );
+    assert_eq!(run.updater.now().await, Outcome::Restart);
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+}
+
+#[tokio::test]
+async fn a_timed_out_update_can_stage_again_and_a_failed_swap_refuses_it() {
+    let layout = layout("swap-failed");
+    let idle = FakeIdle::default();
+    let mut run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
+    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
+    run.updater
+        .settle_timed_out("HandoverTimedOut".to_string())
+        .await
+        .unwrap();
+    assert_eq!(failure(&mut run.events).0, "HandoverTimedOut");
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
+    std::fs::remove_file(&layout.candidate).expect("make the candidate rename fail");
+
+    assert!(run.updater.swap(0).await.unwrap_err().contains("moving"));
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert!(!layout.pending().exists());
+    let refusal: SupervisorUpdateRefusal = serde_json::from_str(&text(&layout.refusal())).unwrap();
     assert_eq!(
-        run.updater.now().await,
-        Outcome::Restart,
-        "a downgrade the control plane demands installs"
+        refusal.reason,
+        SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed
     );
-    assert_eq!(text(&layout.binary), good_script());
 }

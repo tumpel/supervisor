@@ -195,6 +195,7 @@ pub trait Vmm: Send + Sync + 'static {
     fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String>;
     fn disk(&self, drives: &[String]) -> Result<Disk, String>;
     fn discard(&self, handed: &SupervisorHandoverMachine);
+    fn keep_boxes(&self);
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String>;
     fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
@@ -511,6 +512,7 @@ impl Standing {
 
 enum Outcome<M: Machine> {
     Kept(LiveBox<M>),
+    SnapshotDone(LiveBox<M>),
     Parked(LiveBox<M>, Box<Parked>),
     Gone(Tap, Result<(), String>),
 }
@@ -570,8 +572,8 @@ struct Parked {
 }
 
 enum Running {
-    Turn(EntityId),
-    Snapshot,
+    Turn(EntityId, EntityId),
+    Snapshot(EntityId),
 }
 
 fn milliseconds(duration: Duration) -> i64 {
@@ -629,10 +631,23 @@ enum Awaited {
 }
 
 impl<M: Machine> Slot<M> {
+    fn box_id(&self) -> Option<&EntityId> {
+        if let Some(live) = &self.live {
+            return Some(&live.box_id);
+        }
+        match &self.task.as_ref()?.0 {
+            Running::Turn(_, box_id) | Running::Snapshot(box_id) => Some(box_id),
+        }
+    }
+
+    fn settling(&self) -> bool {
+        self.busy || matches!(self.snapshot, Some(Awaited::Pending(_)))
+    }
+
     fn turns(&self) -> Vec<EntityId> {
         let running = self.task.iter().filter_map(|(running, _)| match running {
-            Running::Turn(turn_id) => Some(turn_id.clone()),
-            Running::Snapshot => None,
+            Running::Turn(turn_id, _) => Some(turn_id.clone()),
+            Running::Snapshot(_) => None,
         });
         let queued = self.queue.iter().filter_map(|command| match command {
             Command::Turn(turn) => Some(turn.turn_id.clone()),
@@ -1981,8 +1996,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         };
         let (Outgoing::Snapshot(message, _) | Outgoing::Message(message)) = &outgoing;
         telemetry::ended(message);
+        let done = matches!(message, ChannelHostMessage::SnapshotDone(_));
         send_out(&self.out, outgoing);
-        Outcome::Kept(live)
+        if done {
+            Outcome::SnapshotDone(live)
+        } else {
+            Outcome::Kept(live)
+        }
     }
 
     async fn store_snapshot(
@@ -2211,15 +2231,18 @@ pub enum Taken {
     Crashed,
 }
 
-pub struct Abandoned {
-    pub reason: TurnFailureReason,
-    pub cause: String,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettleFor {
+    Update,
+    Stop,
 }
+
+pub type HandoverReply = oneshot::Sender<Result<SupervisorHandover, String>>;
 
 pub enum Input {
     Command(Command),
-    HandOver(oneshot::Sender<SupervisorHandover>),
-    Abandon(oneshot::Sender<()>, Abandoned),
+    HandOver(SettleFor, HandoverReply),
+    Leave(oneshot::Sender<()>),
     SnapshotAccepted(EntityId),
     SnapshotFailed(EntityId),
     Welcomed(u16),
@@ -2287,10 +2310,9 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     turns: watch::Sender<Vec<EntityId>>,
     holdings: watch::Sender<Held>,
     setups: HashMap<String, UnboundedSender<SetupInput>>,
-    setup_tasks: HashMap<String, JoinHandle<()>>,
     mode: Mode,
     parking: watch::Sender<bool>,
-    handing: Option<(oneshot::Sender<SupervisorHandover>, AbortHandle)>,
+    handing: Option<(SettleFor, HandoverReply, AbortHandle)>,
     session_protocol: Option<u16>,
     adopted: Vec<String>,
 }
@@ -2343,7 +2365,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             turns: watch::Sender::new(Vec::new()),
             holdings,
             setups: HashMap::new(),
-            setup_tasks: HashMap::new(),
             mode: Mode::TakingTurns,
             parking,
             handing: None,
@@ -2451,8 +2472,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             tokio::select! {
                 input = inputs.recv() => match input {
                     Some(Input::Command(command)) => self.command(command).await?,
-                    Some(Input::HandOver(reply)) => self.start_handover(reply),
-                    Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
+                    Some(Input::HandOver(reason, reply)) => self.start_handover(reason, reply),
+                    Some(Input::Leave(reply)) => return self.leave(reply),
                     Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id).await?,
                     Some(Input::SnapshotFailed(snapshot_id)) => self.snapshot_failed(snapshot_id),
                     Some(Input::Welcomed(protocol)) => self.welcomed(protocol).await?,
@@ -2518,11 +2539,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
     }
 
-    fn start_handover(&mut self, reply: oneshot::Sender<SupervisorHandover>) {
+    fn start_handover(&mut self, reason: SettleFor, reply: HandoverReply) {
         self.mode = Mode::HandingOver;
         self.parking.send_replace(true);
         eprintln!(
-            "tumpel-supervisor: handing {} boxes to the new supervisor binary: this host claims no new turn, parks each running turn at its next guest message, gives back each turn still waiting for its claim and waits for the boots and snapshots in flight, logging every {} s while any runs",
+            "tumpel-supervisor: handing {} boxes to the new supervisor binary: waiting up to {} s for turns to park, boots and snapshots to settle, and setups to stop",
             self.box_count(),
             self.handover_report_interval().as_secs()
         );
@@ -2545,83 +2566,75 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         for inputs in self.setups.values() {
             let _ = inputs.send(SetupInput::Discard);
         }
-        self.handing = Some((reply, self.handover_timer()));
+        self.handing = Some((reason, reply, self.handover_timer()));
     }
 
     fn handover_timer(&self) -> AbortHandle {
         let events = self.events.clone();
-        let limit = self.handover_report_interval();
+        let deadline = Instant::now() + self.handover_report_interval();
         tokio::spawn(async move {
-            tokio::time::sleep(limit).await;
-            let _ = events.send(Event::HandoverExpired);
+            tokio::time::sleep_until(deadline).await;
+            drop(events.send(Event::HandoverExpired));
         })
         .abort_handle()
     }
 
     fn settle_handover(&mut self) -> Result<(), String> {
-        if self.handing.is_none() || !self.setups.is_empty() || self.slots.values().any(|slot| slot.busy) {
+        if self.handing.is_none() || !self.setups.is_empty() || self.slots.values().any(Slot::settling) {
             return Ok(());
         }
         self.finish_handover()
     }
 
     async fn handover_expired(&mut self) -> Result<(), String> {
-        if self.handing.is_none() {
+        let Some((reason, reply, _)) = self.handing.take() else {
             return Ok(());
-        }
-        let setups: Vec<(String, JoinHandle<()>)> = self.setup_tasks.drain().collect();
-        for (claude_setup_id, task) in setups {
-            task.abort();
-            let _ = task.await;
-            self.setups.remove(&claude_setup_id);
-            self.free_disk(&claude_setup_id)?;
-        }
-        let busy = self.slots.values().filter(|slot| slot.busy).count();
-        if busy == 0 {
-            return self.finish_handover();
-        }
-        eprintln!(
-            "tumpel-supervisor: HandoverTimedOut: {busy} boxes are still booting or snapshotting {} s into the handover; this supervisor keeps them running and hands every box over once each reaches a point it can be handed over",
+        };
+        let busy = self.slots.values().filter(|slot| slot.settling()).count();
+        let error = format!(
+            "HandoverTimedOut: {busy} boxes and {} setups did not settle within {} s",
+            self.setups.len(),
             self.handover_report_interval().as_secs()
         );
-        let timer = self.handover_timer();
-        if let Some((_, waiting)) = self.handing.as_mut() {
-            *waiting = timer;
+        if reason == SettleFor::Update {
+            self.mode = Mode::TakingTurns;
+            self.parking.send_replace(false);
+            let sessions: Vec<_> = self.slots.keys().cloned().collect();
+            for session in sessions {
+                self.resume(session.clone());
+                self.drain(session).await?;
+            }
         }
+        drop(reply.send(Err(error)));
         Ok(())
     }
 
-    async fn abandon(&mut self, reply: oneshot::Sender<()>, abandoned: Abandoned) {
-        let sessions: Vec<String> = self.slots.keys().cloned().collect();
-        for session in sessions {
-            let Some(slot) = self.slots.get_mut(&session) else {
+    fn leave(&self, reply: oneshot::Sender<()>) -> Result<(), String> {
+        let recorded = self
+            .runner
+            .standing
+            .boxes
+            .lock()
+            .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?;
+        for (running, _) in self.slots.values().filter_map(|slot| slot.task.as_ref()) {
+            let Running::Turn(turn_id, box_id) = running else {
                 continue;
             };
-            let turn_id = match (slot.task.take(), slot.parked.take()) {
-                (Some((running, task)), _) => {
-                    task.abort();
-                    let _ = task.await;
-                    match running {
-                        Running::Turn(turn_id) => Some(turn_id),
-                        Running::Snapshot => None,
-                    }
-                }
-                (None, Some(parked)) => Some(parked.turn_id),
-                (None, None) => None,
-            };
-            if let Some(turn_id) = turn_id {
-                turn_failed(
-                    &self.runner.out,
-                    &turn_id,
-                    abandoned.reason.clone(),
-                    format!(
-                        "{}, so the box of turn {} ended with it; send the turn again",
-                        abandoned.cause, *turn_id
-                    ),
-                );
+            if self.runner.answers.claimed(turn_id)
+                && !recorded.values().any(|box_| {
+                    &box_.box_id == box_id
+                        && matches!(&box_.state, SupervisorHandoverBoxState::Turn(turn) if &turn.turn_id == turn_id)
+                })
+            {
+                let detail =
+                    format!("the supervisor stopped before recording the box for turn {turn_id}. Send the turn again");
+                turn_failed(&self.runner.out, turn_id, TurnFailureReason::HarnessExited, detail);
             }
         }
-        let _ = reply.send(());
+        self.runner.vmm.keep_boxes();
+        reply
+            .send(())
+            .map_err(|()| "the supervisor left before the box runner replied".to_string())
     }
 
     fn answer_lost(&self, session: &str, queue: VecDeque<Command>) {
@@ -2649,7 +2662,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     fn finish_handover(&mut self) -> Result<(), String> {
-        let Some((reply, timer)) = self.handing.take() else {
+        let Some((_, reply, timer)) = self.handing.take() else {
             return Ok(());
         };
         let mut freed = Ok(());
@@ -2744,10 +2757,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 }
             }
         }
-        let _ = reply.send(SupervisorHandover {
+        drop(reply.send(Ok(SupervisorHandover {
             boxes,
             handed_at: now(),
-        });
+        })));
         freed
     }
 
@@ -2763,7 +2776,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         };
         slot.busy = true;
         let runner = self.runner.clone();
-        let running = Running::Turn(parked.turn_id.clone());
+        let running = Running::Turn(parked.turn_id.clone(), live.box_id.clone());
         self.spawn(session, Work::Turn, running, async move {
             runner.resume_turn(live, parked).await
         });
@@ -2880,9 +2893,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 let live = slot.live.take()?;
                 slot.busy = true;
                 let runner = self.runner.clone();
-                self.spawn(session, Work::Turn, Running::Turn(turn.turn_id), async move {
-                    runner.recover(live).await
-                });
+                self.spawn(
+                    session,
+                    Work::Turn,
+                    Running::Turn(turn.turn_id, live.box_id.clone()),
+                    async move { runner.recover(live).await },
+                );
             }
             (SupervisorHandoverBoxState::Turn(turn), Taken::Handed) => {
                 if turn.cancelled == Some(true) {
@@ -2911,7 +2927,15 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         let session = command.session();
         let slot = self.slots.entry(session.clone()).or_default();
-        if slot.busy || slot.parked.is_some() {
+        if self.mode == Mode::HandingOver || slot.busy || slot.parked.is_some() {
+            let command = match command {
+                Command::Teardown(order) | Command::Discard(order) if slot.box_id() != Some(&order.box_id) => {
+                    self.prune(&session);
+                    self.box_gone(order);
+                    return Ok(());
+                }
+                command => command,
+            };
             slot.queue.push_back(command);
             return self.record_queue(&session);
         }
@@ -3003,7 +3027,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let runner = self.runner.clone();
         let events = self.events.clone();
         let named = id.clone();
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let (tap, stopped) = runner.claude_setup(tap, order, received).await;
             let _ = events.send(Event::SetupFinished {
                 claude_setup_id: named,
@@ -3011,7 +3035,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 tap,
             });
         });
-        self.setup_tasks.insert(id, task);
     }
 
     fn spawn(
@@ -3063,7 +3086,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let runner = self.runner.clone();
         telemetry::start_kind(&root, warm.is_some());
         if let Some(live) = warm {
-            let running = Running::Turn(turn.turn_id.clone());
+            let running = Running::Turn(turn.turn_id.clone(), turn.box_id.clone());
             self.spawn(
                 session,
                 Work::Turn,
@@ -3125,8 +3148,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 return Ok(());
             }
         };
-        self.slots.entry(session.clone()).or_default().busy = true;
-        let running = Running::Turn(turn.turn_id.clone());
+        let slot = self.slots.entry(session.clone()).or_default();
+        slot.busy = true;
+        let running = Running::Turn(turn.turn_id.clone(), turn.box_id.clone());
         self.spawn(
             session,
             Work::Turn,
@@ -3186,7 +3210,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             return;
         };
         let runner = self.runner.clone();
-        let running = Running::Snapshot;
+        let running = Running::Snapshot(live.box_id.clone());
         self.spawn(session, Work::Snapshot, running, async move {
             runner.snapshot(live, &order, protocol).await
         });
@@ -3334,7 +3358,6 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 stopped,
             } => {
                 self.setups.remove(&claude_setup_id);
-                self.setup_tasks.remove(&claude_setup_id);
                 self.pool.release(tap);
                 stopped?;
                 self.free_disk(&claude_setup_id)
@@ -3393,15 +3416,23 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     async fn finished(&mut self, session: String, work: Work, outcome: Outcome<V::Machine>) -> Result<(), String> {
         let slot = self.slots.entry(session.clone()).or_default();
         slot.busy = false;
-        slot.task = None;
+        if let Some((Running::Turn(turn_id, _), _)) = slot.task.take() {
+            self.runner.answers.forget(&Key::claim(&turn_id));
+        }
+        if matches!(work, Work::Snapshot) && !matches!(outcome, Outcome::SnapshotDone(_)) {
+            slot.snapshot = None;
+        }
         let mut freed = None;
         match outcome {
             Outcome::Parked(live, parked) => {
                 slot.live = Some(live);
                 slot.parked = Some(parked);
+                if self.mode == Mode::TakingTurns {
+                    self.resume(session);
+                }
                 return Ok(());
             }
-            Outcome::Kept(live) => {
+            Outcome::Kept(live) | Outcome::SnapshotDone(live) => {
                 if matches!(work, Work::Turn) {
                     slot.paused = true;
                     slot.idle_end = Some(Instant::now() + live.idle);
@@ -3429,7 +3460,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 return None;
             }
             slot.snapshot = None;
-            Some(matches!(slot.task, Some((Running::Snapshot, _))))
+            Some(matches!(slot.task, Some((Running::Snapshot(_), _))))
         });
         if running == Some(true) {
             self.runner.cancels.cancel(snapshot_id);
@@ -3482,6 +3513,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     async fn drain(&mut self, session: String) -> Result<(), String> {
+        if self.mode == Mode::HandingOver {
+            return Ok(());
+        }
         loop {
             let next = self
                 .slots

@@ -245,3 +245,7 @@ async fn startup_io_failures_exit_for_systemd_restart_before_consuming_a_handove
         assert_eq!(fs::read(handover).expect("handover remains for restart"), before);
     }
 }
+
+#[cfg(feature = "host-tests")]
+#[path = "report/handover.rs"]
+mod handover;
