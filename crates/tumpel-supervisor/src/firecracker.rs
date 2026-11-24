@@ -356,18 +356,6 @@ impl Adopted {
     }
 }
 
-impl Drop for Adopted {
-    fn drop(&mut self) {
-        if self.owner.is_some() {
-            let ended = self.end();
-            eprintln!(
-                "tumpel-supervisor: ending a box: Firecracker process {} {ended}",
-                self.pid
-            );
-        }
-    }
-}
-
 enum Process {
     Spawned(Child),
     Adopted(Adopted),
@@ -816,15 +804,6 @@ pub struct FirecrackerBox {
 impl Drop for FirecrackerBox {
     fn drop(&mut self) {
         self.unwatch();
-        if self.process.is_some() {
-            eprintln!(
-                "tumpel-supervisor: box {} ({}) of session {} was dropped while its Firecracker process ran, which ends that process unlogged. Console: {}",
-                self.index,
-                scope_of(self.index),
-                self.session_name(),
-                self.console_tail()
-            );
-        }
     }
 }
 
@@ -887,7 +866,8 @@ impl FirecrackerBox {
     async fn spawn(&mut self) -> Result<(), String> {
         create_private_dir(&self.dir)?;
         self.clear_sockets()?;
-        let mut child = Command::new("systemd-run")
+        let socket = self.api_socket();
+        let child = Command::new("systemd-run")
             .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
             .arg(scope_of(self.index))
             .arg("--")
@@ -898,7 +878,6 @@ impl FirecrackerBox {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
             .spawn()
             .map_err(|error| {
                 format!(
@@ -906,6 +885,9 @@ impl FirecrackerBox {
                     self.binary.display()
                 )
             })?;
+        let Process::Spawned(child) = self.process.insert(Process::Spawned(child)) else {
+            return Err("the new box has no Firecracker child".to_string());
+        };
         if let Some(stdout) = child.stdout.take() {
             let stdout = stdout
                 .into_owned_fd()
@@ -922,7 +904,6 @@ impl FirecrackerBox {
             fd_store::keep(self.index, fd_store::STDERR, stderr.as_fd())?;
             self.stderr = Some(stderr);
         }
-        let socket = self.api_socket();
         while UnixStream::connect(&socket).await.is_err() {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(format!(
@@ -937,7 +918,6 @@ impl FirecrackerBox {
             .ok_or_else(|| "Firecracker ended right after opening its API socket".to_string())?;
         self.unwatch();
         self.watcher = Some(watch(self.index, pid, self.session_name(), &self.console, false)?);
-        self.process = Some(Process::Spawned(child));
         Ok(())
     }
 

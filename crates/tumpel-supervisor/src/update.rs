@@ -104,6 +104,7 @@ pub trait Idle: Send + Sync {
     fn settled(&self) -> impl Future<Output = ()> + Send;
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Release {
     pub version: ChannelSupervisorUpdateStepReleaseVersion,
     pub sha256: Sha256Digest,
@@ -312,7 +313,7 @@ pub enum Outcome {
     Refused,
     Busy,
     Failed(SupervisorUpdateFailureReason),
-    Restart,
+    Restart(Release),
 }
 
 struct Stop {
@@ -358,7 +359,7 @@ pub struct Updater<S: Source, I: Idle> {
     version: &'static str,
     idle: I,
     out: UnboundedSender<Outgoing>,
-    running_update: Mutex<()>,
+    running_update: Mutex<bool>,
 }
 
 impl<S: Source, I: Idle> Updater<S, I> {
@@ -379,22 +380,28 @@ impl<S: Source, I: Idle> Updater<S, I> {
             version,
             idle,
             out,
-            running_update: Mutex::new(()),
+            running_update: Mutex::new(false),
         }
     }
 
     pub async fn now(&self) -> Outcome {
-        let _running = self.running_update.lock().await;
+        let mut running = self.running_update.lock().await;
+        if *running {
+            return Outcome::Busy;
+        }
         match self.due().await {
-            Ok(release) => self.apply(&release).await,
+            Ok(release) => self.apply(release, &mut running).await,
             Err(outcome) => outcome,
         }
     }
 
     pub async fn announced(&self, grace: Duration) -> Outcome {
-        let Ok(_running) = self.running_update.try_lock() else {
+        let Ok(mut running) = self.running_update.try_lock() else {
             return Outcome::Busy;
         };
+        if *running {
+            return Outcome::Busy;
+        }
         let release = match self.due().await {
             Ok(release) => release,
             Err(outcome) => return outcome,
@@ -421,7 +428,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
                 () = self.idle.settled() => {}
             }
         }
-        self.apply(&release).await
+        self.apply(release, &mut running).await
     }
 
     async fn due(&self) -> Result<Release, Outcome> {
@@ -453,27 +460,24 @@ impl<S: Source, I: Idle> Updater<S, I> {
         }
     }
 
-    async fn apply(&self, release: &Release) -> Outcome {
-        if let Err(stopped) = self.prepare(release).await {
+    async fn apply(&self, release: Release, running: &mut bool) -> Outcome {
+        if let Err(stopped) = self.prepare(&release).await {
             let reason = stopped.reason.clone();
             self.fail(&release.sha256, stopped);
             return Outcome::Failed(reason);
         }
-        eprintln!(
-            "tumpel-supervisor: swapping supervisor {} ({}) for {} and handing its boxes over",
-            self.version,
-            short(&self.running),
-            named(release)
+        self.step(&release, SupervisorUpdatePhase::Restarting, self.idle.boxes());
+        *running = true;
+        Outcome::Restart(release)
+    }
+
+    pub(crate) async fn settle_timed_out(&self, release: &Release, error: String) {
+        let mut running = self.running_update.lock().await;
+        self.fail(
+            &release.sha256,
+            stop(SupervisorUpdateFailureReason::SupervisorUpdateIdleTimedOut, error),
         );
-        self.step(release, SupervisorUpdatePhase::Restarting, self.idle.boxes());
-        match self.swap(&release.sha256) {
-            Ok(()) => Outcome::Restart,
-            Err(stopped) => {
-                let reason = stopped.reason.clone();
-                self.fail(&release.sha256, stopped);
-                Outcome::Failed(reason)
-            }
-        }
+        *running = false;
     }
 
     fn step(&self, release: &Release, phase: SupervisorUpdatePhase, boxes: u32) {
@@ -701,18 +705,20 @@ impl<S: Source, I: Idle> Updater<S, I> {
         Ok(())
     }
 
-    fn swap(&self, to: &Sha256Digest) -> Result<(), Stop> {
+    pub(crate) fn swap(&self, release: &Release) -> Result<(), String> {
         let candidate = &self.layout.candidate;
         let binary = &self.layout.binary;
+        eprintln!(
+            "tumpel-supervisor: swapping supervisor {} ({}) for {}",
+            self.version,
+            short(&self.running),
+            named(release)
+        );
         std::fs::rename(candidate, binary).map_err(|error| {
-            let detail = format!(
+            format!(
                 "moving {} over {} failed: {error}",
                 candidate.display(),
                 binary.display()
-            );
-            self.refuse(
-                to,
-                stop(SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed, detail),
             )
         })
     }

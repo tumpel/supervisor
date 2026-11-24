@@ -390,7 +390,11 @@ async fn a_release_notice_replaces_the_binary_on_an_idle_host() {
     let layout = layout("notice-idle");
     let idle = FakeIdle::default();
     let mut run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
-    assert_eq!(run.updater.announced(GRACE).await, Outcome::Restart);
+    let Outcome::Restart(release) = run.updater.announced(GRACE).await else {
+        panic!("candidate prepared");
+    };
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    run.updater.swap(&release).expect("the settled update installs");
     assert!(!seen(&mut run.events).contains(&Seen::Step(SupervisorUpdatePhase::WaitingForIdle)));
     assert_eq!(text(&layout.binary), good_script());
     assert!(!layout.candidate.exists());
@@ -409,7 +413,10 @@ async fn an_announced_rollback_installs_an_older_supervisor_version() {
         ..FakeSource::binary(&good_script())
     };
     let run = updater(&layout, source, &idle, limits());
-    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
+    let Outcome::Restart(release) = run.updater.announced(Duration::ZERO).await else {
+        panic!("rollback prepared");
+    };
+    run.updater.swap(&release).expect("the settled rollback installs");
     assert_eq!(text(&layout.binary), good_script());
 }
 
@@ -432,9 +439,9 @@ async fn a_release_notice_to_a_busy_host_waits_out_the_grace_period_then_updates
     );
     assert_eq!(text(&layout.binary), OLD_BINARY);
     tokio::time::resume();
-    assert_eq!(notice.await, Outcome::Restart);
+    assert!(matches!(notice.await, Outcome::Restart(_)));
     assert!(started.elapsed() >= GRACE);
-    assert_eq!(text(&layout.binary), good_script());
+    assert_eq!(text(&layout.binary), OLD_BINARY);
 }
 
 #[tokio::test]
@@ -452,9 +459,9 @@ async fn a_release_notice_to_a_busy_host_updates_once_its_turns_finish_inside_th
     }
     busy.0.send_replace(0);
     tokio::time::resume();
-    assert_eq!(notice.await, Outcome::Restart);
+    assert!(matches!(notice.await, Outcome::Restart(_)));
     assert!(started.elapsed() < GRACE);
-    assert_eq!(text(&layout.binary), good_script());
+    assert_eq!(text(&layout.binary), OLD_BINARY);
 }
 
 #[test]
@@ -548,10 +555,32 @@ async fn an_update_goes_only_to_a_newer_supervisor_version() {
         OLD_BINARY,
         "an announced downgrade leaves the running binary"
     );
-    assert_eq!(
-        run.updater.now().await,
-        Outcome::Restart,
-        "a downgrade the control plane demands installs"
+    assert!(
+        matches!(run.updater.now().await, Outcome::Restart(_)),
+        "a downgrade the control plane demands is staged"
     );
-    assert_eq!(text(&layout.binary), good_script());
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+}
+
+#[tokio::test]
+async fn a_timed_out_settle_reports_failure_and_the_next_notice_can_prepare_again() {
+    let layout = layout("settle-timeout");
+    let idle = FakeIdle::default();
+    let source = FakeSource::binary(&good_script());
+    let mut run = updater(&layout, source, &idle, limits());
+    let Outcome::Restart(release) = run.updater.announced(Duration::ZERO).await else {
+        panic!("the report passed");
+    };
+    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Busy);
+    run.updater
+        .settle_timed_out(&release, "HandoverTimedOut: session-1 snapshot-1".to_string())
+        .await;
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert!(!layout.refusal().exists());
+    let (detail, _) = failure(&mut run.events);
+    assert_eq!(detail, "HandoverTimedOut: session-1 snapshot-1");
+    assert!(matches!(
+        run.updater.announced(Duration::ZERO).await,
+        Outcome::Restart(_)
+    ));
 }

@@ -23,8 +23,8 @@ use tumpel_api::types::{
 use tumpel_channel::Outgoing;
 
 use super::{
-    restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SetupCommand, SetupOrder,
-    SnapshotOrder, Stopped, Taken, TeardownOrder, Vmm,
+    restore_budget, BoxTurn, Budgets, Command, Guest, HandoverFor, Input, Lifecycle, Machine, Settings, SetupCommand,
+    SetupOrder, SnapshotOrder, Stopped, Taken, TeardownOrder, Vmm,
 };
 use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
@@ -1043,10 +1043,14 @@ impl Host {
             .expect("the setup starts");
     }
 
-    fn ask_handover(&self) -> tokio::sync::oneshot::Receiver<SupervisorHandover> {
+    fn ask_handover(&self) -> tokio::sync::oneshot::Receiver<Result<SupervisorHandover, String>> {
+        self.ask_settle(HandoverFor::Stop)
+    }
+
+    fn ask_settle(&self, reason: HandoverFor) -> tokio::sync::oneshot::Receiver<Result<SupervisorHandover, String>> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         self.answering.store(false, Ordering::SeqCst);
-        self.commands.send(Input::HandOver(reply)).expect("send");
+        self.commands.send(Input::HandOver(reason, reply)).expect("send");
         answer
     }
 
@@ -1112,7 +1116,11 @@ impl Host {
     }
 
     async fn hand_over(self) -> Host {
-        let handover = self.ask_handover().await.expect("the boxes are handed over");
+        let handover = self
+            .ask_handover()
+            .await
+            .expect("the boxes are handed over")
+            .expect("export succeeds");
         self.successor(&handover)
     }
 
@@ -1790,7 +1798,10 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
     old.log();
     let answer = old.ask_handover();
     old.turn("turn-2", "session-2", "two", Vec::new());
-    let handover = answer.await.expect("the boxes are handed over");
+    let handover = answer
+        .await
+        .expect("the boxes are handed over")
+        .expect("export succeeds");
     let refused = format!(
         "failed {}: this host is handing its boxes to a new supervisor binary and took no turn turn-2; the control plane offers it to another host",
         TurnFailureReason::HostUpdating
@@ -1815,7 +1826,11 @@ async fn a_turn_waiting_for_its_claim_at_a_handover_is_given_back_and_its_warm_b
     let mut old = host("handover-unclaimed", 1, Harness::Echo, Boot::Works);
     old.turn("late-1", "session-1", "one", Vec::new());
     assert_eq!(old.settle_until("claim late-1").await, ["claim late-1"]);
-    let handover = old.ask_handover().await.expect("the boxes are handed over");
+    let handover = old
+        .ask_handover()
+        .await
+        .expect("the boxes are handed over")
+        .expect("export succeeds");
     let given_back = format!(
         "failed {}: this host started handing its boxes to a new supervisor binary before the control plane answered the claim of turn late-1, so its harness never started and its box stays warm; the control plane offers the turn again",
         TurnFailureReason::HostUpdating
@@ -1927,7 +1942,11 @@ async fn a_box_that_cannot_be_handed_over_answers_its_queued_teardown_with_box_g
     old.settle_until("claim turn-1").await;
     tokio::time::sleep(SLOW_CLONE / 2).await;
     old.teardown("session-1");
-    let handover = old.ask_handover().await.expect("the handover answers");
+    let handover = old
+        .ask_handover()
+        .await
+        .expect("handover reply")
+        .expect("export succeeds");
     assert_eq!(handover.boxes.len(), 0);
     let failed = format!(
         "failed {}: box box-session-1 of session session-1 could not be handed to the new supervisor binary and was stopped: its Firecracker process refused the handover; send the turn again",
@@ -1945,7 +1964,11 @@ async fn a_handed_box_whose_process_ended_fails_its_turn_and_frees_its_tap() {
     old.turn("turn-1", "session-1", "one", Vec::new());
     old.settle_until("claim turn-1").await;
     tokio::time::sleep(SLOW_CLONE / 2).await;
-    let handover = old.ask_handover().await.expect("the boxes are handed over");
+    let handover = old
+        .ask_handover()
+        .await
+        .expect("the boxes are handed over")
+        .expect("export succeeds");
     old.vmm.hands.lock().expect("hands").clear();
     let mut new = old.successor(&handover);
     let failed = format!(
@@ -2001,7 +2024,11 @@ async fn a_warm_box_handed_over_with_a_queued_teardown_is_stopped_and_answers_bo
         "a snapshot that holds the turn records the box clean"
     );
     old.log();
-    let mut handover = old.ask_handover().await.expect("the boxes are handed over");
+    let mut handover = old
+        .ask_handover()
+        .await
+        .expect("the boxes are handed over")
+        .expect("export succeeds");
     handover.boxes[0]
         .queued
         .push(SupervisorHandoverCommand::Teardown(SupervisorHandoverTeardown {
@@ -2052,7 +2079,10 @@ async fn stale_discards_and_teardowns_are_answered_before_export() {
     old.commands
         .send(Input::SnapshotAccepted(snapshot.snapshot_id))
         .expect("snapshot accepted");
-    let handed = handover.await.expect("the box is handed over");
+    let handed = handover
+        .await
+        .expect("the box is handed over")
+        .expect("export succeeds");
     assert_eq!(handed.boxes.len(), 1);
     assert_eq!(handed.boxes[0].box_id.as_str(), "box-session-1");
     assert_eq!(handed.boxes[0].queued, []);
@@ -2081,7 +2111,11 @@ async fn a_snapshot_handed_over_in_the_queue_waits_for_the_control_plane_welcome
     let mut old = host("handover-queued-snapshot", 1, Harness::Echo, Boot::Works);
     old.turn("turn-1", "session-1", "one", Vec::new());
     old.settle_until("complete 1").await;
-    let mut handover = old.ask_handover().await.expect("the boxes are handed over");
+    let mut handover = old
+        .ask_handover()
+        .await
+        .expect("the boxes are handed over")
+        .expect("export succeeds");
     handover.boxes[0]
         .queued
         .push(SupervisorHandoverCommand::Snapshot(SupervisorHandoverSnapshot {
@@ -2168,7 +2202,8 @@ async fn an_upload_past_its_url_expiry_fails_upload_expired_and_keeps_the_box_di
     let handed = tokio::time::timeout(SETTLE, host.ask_handover())
         .await
         .expect("a failed snapshot has no acceptance to wait for")
-        .expect("handover reply");
+        .expect("handover reply")
+        .expect("export succeeds");
     assert!(handed.boxes[0].dirty);
 }
 
@@ -2377,7 +2412,7 @@ async fn handover_waits_for_snapshot_pack_answers_and_terminal_acceptance() {
         .send(Input::SnapshotAccepted(snapshot.snapshot_id))
         .expect("acceptance");
 
-    let handed = handover.await.expect("handover settles");
+    let handed = handover.await.expect("handover settles").expect("export succeeds");
     assert_eq!(handed.boxes.len(), 1);
     assert!(!handed.boxes[0].dirty);
 }
@@ -2389,11 +2424,60 @@ async fn a_live_setup_counts_as_busy_and_is_discarded_at_handover() {
     assert_eq!(old.settle(SETTLE).await, ["setup url https://example.test/sign-in"]);
     assert_eq!(*old.busy.borrow(), 1);
 
-    let handover = old.ask_handover().await.expect("handover reply");
+    let handover = old
+        .ask_handover()
+        .await
+        .expect("handover reply")
+        .expect("export succeeds");
 
     assert_eq!(handover.boxes, []);
     assert_eq!(old.log(), ["boot setup-1 on tumpel0", "stop setup-1"]);
     assert_eq!(*old.busy.borrow(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_update_at_the_bound_resumes_the_parked_turn_without_exporting() {
+    let mut old = host("settle-resume", 2, Harness::SlowClone, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    old.accepting.store(false, Ordering::SeqCst);
+    old.snapshot("session-1");
+    assert_eq!(old.settle_until("snapshot done").await, ["snapshot done"]);
+    old.turn("turn-2", "session-2", "two", Vec::new());
+    old.settle_until("claim turn-2").await;
+    tokio::time::advance(SLOW_CLONE / 2).await;
+
+    let reply = old.ask_settle(HandoverFor::Update);
+    let error = reply
+        .await
+        .expect("settle reply")
+        .expect_err("snapshot acceptance never arrived");
+
+    assert!(error.contains("HandoverTimedOut"), "{error}");
+    assert!(error.contains("session session-1 snapshot snapshot-1"), "{error}");
+    assert_eq!(old.settle_until("complete 1").await, ["line 1 two", "complete 1"]);
+    assert!(!old.log().iter().any(|line| line.starts_with("hand over ")));
+    assert!(!old.runner.is_finished());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_expired_stop_returns_the_busy_snapshot_and_ends_the_runner() {
+    let mut old = host("stop-settle-expiry", 1, Harness::Echo, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    old.accepting.store(false, Ordering::SeqCst);
+    old.snapshot("session-1");
+    assert_eq!(old.settle_until("snapshot done").await, ["snapshot done"]);
+
+    let error = old
+        .ask_handover()
+        .await
+        .expect("settle reply")
+        .expect_err("stop timed out");
+
+    assert!(error.contains("65 s limit"), "{error}");
+    assert!(error.contains("session session-1 snapshot snapshot-1"), "{error}");
+    assert_eq!(old.runner.await.expect("runner returned"), Err(error));
 }
 
 #[tokio::test(start_paused = true)]
@@ -2586,7 +2670,10 @@ async fn a_cancel_that_crosses_a_handover_reaches_the_guest_through_the_successo
     assert_eq!(old.settle_until("line 1 one").await, ["claim turn-1", "line 1 one"]);
     let handover = old.ask_handover();
     old.cancel("turn-1");
-    let handover = handover.await.expect("the boxes are handed over");
+    let handover = handover
+        .await
+        .expect("the boxes are handed over")
+        .expect("export succeeds");
     let SupervisorHandoverBoxState::Turn(turn) = &handover.boxes[0].state else {
         panic!("the running turn is handed over");
     };
