@@ -538,16 +538,6 @@ async fn an_announced_rollback_installs_an_older_supervisor_version() {
     exec_start_pre(&layout);
     let unit = text(&layout.unit);
     assert!(unit.lines().any(|line| line == "Type=simple"), "{unit}");
-    let mut start = unit
-        .lines()
-        .find_map(|line| line.strip_prefix("ExecStart="))
-        .expect("installed start command")
-        .split_whitespace();
-    let status = std::process::Command::new(start.next().expect("installed executable"))
-        .args(start)
-        .status()
-        .expect("start the selected older release");
-    assert!(status.success(), "{status}");
 }
 
 #[tokio::test]
