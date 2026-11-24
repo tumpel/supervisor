@@ -1,18 +1,8 @@
 use serde_json::json;
 
 use super::{
-    host_network, link_index, migrate_runtime, supervisor_unit_text, tap_index, tap_unit_text, HostNetwork,
-    FILTER_TEXT, NETWORK_MANAGER_TEXT,
+    host_network, link_index, migrate_runtime, tap_index, tap_unit_text, HostNetwork, FILTER_TEXT, NETWORK_MANAGER_TEXT,
 };
-
-#[test]
-fn the_supervisor_unit_starts_run_without_a_rollback_line() {
-    let unit = supervisor_unit_text(std::path::Path::new("/opt/tumpel/bin/tumpel-supervisor"));
-    assert!(unit
-        .lines()
-        .any(|line| line == "ExecStart=/opt/tumpel/bin/tumpel-supervisor run"));
-    assert!(!unit.contains("ExecStartPre="));
-}
 
 #[test]
 fn an_old_budgets_object_gets_the_missing_field_and_keeps_its_values() {

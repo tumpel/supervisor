@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use tumpel_api::types::SupervisorFailure;
 use tumpel_supervisor::{
-    check, enrol, install, install_telemetry, received_descriptors, report, run, take_notify_socket, Enrolment, Stopped,
+    check, enrol, install, install_telemetry, received_descriptors, report, run, take_notify_socket, Enrolment,
+    RunFailure, Stopped,
 };
 
 #[derive(Parser)]
@@ -62,10 +63,9 @@ fn exit_code(failure: &SupervisorFailure) -> ExitCode {
         SupervisorFailure::ProtocolError => ExitCode::from(6),
         SupervisorFailure::UsageUnreadable => ExitCode::from(7),
         SupervisorFailure::GuestDriveUnwritable => ExitCode::from(8),
-        failure => {
-            if matches!(failure, SupervisorFailure::Unrecognised(_)) {
-                eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
-            }
+        SupervisorFailure::UpdateNotOnline => ExitCode::FAILURE,
+        SupervisorFailure::Unrecognised(_) => {
+            eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
             ExitCode::FAILURE
         }
     }
@@ -135,7 +135,11 @@ fn main() -> ExitCode {
                     eprintln!("tumpel-supervisor: exiting so systemd starts the new binary, which takes the running boxes over");
                     ExitCode::from(RESTART_INTO_UPDATE)
                 }
-                Err(failure) => {
+                Err(RunFailure::Startup(detail)) => {
+                    eprintln!("tumpel-supervisor: startup failed. {detail}. On failure, systemd restarts the supervisor and it takes over the running boxes.");
+                    ExitCode::FAILURE
+                }
+                Err(RunFailure::Supervisor(failure)) => {
                     eprintln!("tumpel-supervisor: {}: {}", failure.kind, failure.detail);
                     exit_code(&failure.kind)
                 }
