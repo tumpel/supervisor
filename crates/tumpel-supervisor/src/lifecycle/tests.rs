@@ -369,6 +369,7 @@ struct MemoryVmm {
     hands: Hands,
     free_disk_mib: Arc<AtomicU64>,
     unclaimed: Vec<u8>,
+    unclaimed_disks: Vec<EntityId>,
 }
 
 impl Vmm for MemoryVmm {
@@ -420,6 +421,15 @@ impl Vmm for MemoryVmm {
         Ok(Some((self.machine(session_id, &tap)?, guest, tap)))
     }
 
+    fn recorded_process(
+        &self,
+        _: u8,
+        handed: &SupervisorHandoverMachine,
+        _: Option<&crate::firecracker::Observation>,
+    ) -> Result<bool, String> {
+        Ok(handed.guest_fd == 51 || self.hands.lock().expect("hands").contains_key(&handed.guest_fd))
+    }
+
     fn disk(&self, _: &[String]) -> Result<Disk, String> {
         Ok(Disk {
             total_mib: 100_000,
@@ -435,9 +445,23 @@ impl Vmm for MemoryVmm {
         Ok(self.unclaimed.clone())
     }
 
-    fn discard_incomplete_boot(&self, index: u8) -> Result<(), String> {
+    fn unclaimed_sessions(&self, _: &[u8]) -> Result<Vec<EntityId>, String> {
+        Ok(self.unclaimed_disks.clone())
+    }
+
+    fn discard_protected(
+        &self,
+        index: u8,
+        _: &SupervisorHandoverBox,
+        _: Option<&crate::firecracker::Observation>,
+    ) -> impl Future<Output = Result<(), String>> {
+        note(&self.log, format!("discard protected scope {index}"));
+        std::future::ready(Ok(()))
+    }
+
+    fn discard_incomplete_boot(&self, index: u8) -> impl Future<Output = Result<(), String>> {
         note(&self.log, format!("discard setup scope {index}"));
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     fn remove_leftovers(&self, _: &[u8], _: &[EntityId]) -> Result<(), String> {
@@ -661,6 +685,7 @@ struct Host {
     capacity: u32,
     settings: Settings,
     sessions: tokio::sync::watch::Receiver<Vec<EntityId>>,
+    turns: tokio::sync::watch::Receiver<Vec<EntityId>>,
     holdings: tokio::sync::watch::Receiver<Held>,
     runner: tokio::task::JoinHandle<Result<(), String>>,
     answering: Arc<AtomicBool>,
@@ -904,6 +929,7 @@ fn host_on(
         hands: Arc::default(),
         free_disk_mib: Arc::new(AtomicU64::new(1 << 30)),
         unclaimed: Vec::new(),
+        unclaimed_disks: Vec::new(),
     };
     start_host(
         vmm,
@@ -950,6 +976,7 @@ fn start_host(
     let received = acking(received, Arc::clone(&accepting), commands.clone());
     lifecycle.start(taken).expect("the lifecycle starts");
     let sessions = lifecycle.sessions();
+    let turns = lifecycle.turns();
     let holdings = lifecycle.holdings();
     let cancels = lifecycle.cancels();
     if let Some(protocol) = welcome {
@@ -973,6 +1000,7 @@ fn start_host(
         capacity,
         settings,
         sessions,
+        turns,
         holdings,
         runner,
         answering,
@@ -1756,6 +1784,11 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
     );
     assert_eq!(old.settle_until(&refused).await, [refused]);
     let mut new = old.successor(&handover);
+    assert_eq!(
+        new.turns.borrow().iter().map(EntityId::as_str).collect::<Vec<_>>(),
+        ["turn-1"]
+    );
+
     assert_eq!(new.settle_until("complete 1").await, ["line 1 one", "complete 1"]);
     assert_eq!(
         new.log(),
@@ -1849,6 +1882,8 @@ async fn a_failed_attachment_leaves_the_saved_inventory_and_skips_startup_cleanu
     old.settle_until("complete 1").await;
     let mut standing = old.standing();
     old.keep_guest(&mut standing.boxes[0], 40);
+    standing.boxes[1].machine.guest_fd = 51;
+
     let path = old.vmm.staging.join("boxes.json");
     let saved = std::fs::read(&path).expect("saved inventory");
     old.log();
@@ -1867,7 +1902,8 @@ async fn a_failed_attachment_leaves_the_saved_inventory_and_skips_startup_cleanu
     assert_eq!(old.log(), ["reattach session-1 on tumpel0", "check scopes [0]"]);
     let kept: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path).expect("saved inventory")).expect("inventory JSON");
-    let original: serde_json::Value = serde_json::from_slice(&saved).expect("original inventory");
+    let mut original: serde_json::Value = serde_json::from_slice(&saved).expect("original inventory");
+    original["boxes"][1]["machine"]["guestFd"] = json!(51);
     assert_eq!(kept["boxes"][1], original["boxes"][1]);
 }
 
@@ -1907,13 +1943,29 @@ async fn retiring_the_box_runner_leaves_its_live_boxes_and_records() {
 
 #[tokio::test(start_paused = true)]
 async fn a_failed_handover_keeps_its_record_and_hands_over_other_boxes() {
-    let mut old = host("handover-refused", 2, Harness::Echo, Boot::RefusesHandover);
-    old.turn("turn-1", "session-1", "one", Vec::new());
-    old.settle_until("complete 1").await;
+    let mut old = host("handover-refused", 2, Harness::SlowClone, Boot::RefusesHandover);
     old.turn("turn-2", "session-2", "two", Vec::new());
     old.settle_until("complete 1").await;
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("claim turn-1").await;
+    tokio::time::sleep(SLOW_CLONE / 2).await;
+    old.teardown("session-1");
 
     let handover = old.ask_handover().await.expect("the good box is handed over");
+    let frames = old.settle_until_starts("teardown failed BoxDirty:").await;
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert!(frames[0].starts_with("failed HarnessExited:"), "{frames:?}");
+    assert!(frames[1].contains("explicitly discard"), "{frames:?}");
+    let standing = old.standing();
+    assert_eq!(
+        standing
+            .boxes
+            .iter()
+            .find(|box_| box_.session_id.as_str() == "session-1")
+            .expect("failed box record")
+            .queued,
+        Vec::<SupervisorHandoverCommand>::new()
+    );
     assert_eq!(handover.boxes.len(), 1);
     assert_eq!(handover.boxes[0].session_id.as_str(), "session-2");
     assert_eq!(old.standing().boxes.len(), 2);
@@ -1968,6 +2020,87 @@ async fn a_box_that_cannot_attach_and_an_unclaimed_scope_leave_the_rest_running(
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_scope_without_a_record_keeps_its_session_disk_off_limits() {
+    let old = host("unclaimed-disk", 3, Harness::Echo, Boot::Works);
+    let mut fixture = old.vmm.clone();
+    fixture.unclaimed = vec![0];
+    fixture.unclaimed_disks = vec!["held-session".try_into().expect("session")];
+    let mut new = start_host(
+        fixture,
+        old.store.clone(),
+        old.capacity,
+        old.settings,
+        old.clone_seconds,
+        None,
+        Some(ChannelProtocol::VERSION),
+    );
+    assert_eq!(new.holdings.borrow().drives, ["held-session"]);
+    new.turn("turn-1", "held-session", "one", Vec::new());
+    let refused = new.settle_until_starts("failed HostUpdating:").await;
+    assert!(
+        refused[0].contains("disk held for an unclaimed Firecracker scope"),
+        "{refused:?}"
+    );
+    new.turn("turn-2", "another-session", "two", Vec::new());
+    new.settle_until("complete 1").await;
+    let log = new.log();
+    assert!(
+        log.iter().any(|entry| entry == "boot another-session on tumpel1"),
+        "{log:?}"
+    );
+    assert!(!log.iter().any(|entry| entry.contains("boot held-session")), "{log:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_live_box_with_an_unattachable_turn_is_reported_held_and_the_turn_fails() {
+    let mut old = host("protected-turn", 1, Harness::SlowClone, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("claim turn-1").await;
+    tokio::time::sleep(SLOW_CLONE / 2).await;
+    let mut handover = old.ask_handover().await.expect("the box is handed over");
+    assert!(matches!(handover.boxes[0].state, SupervisorHandoverBoxState::Turn(_)));
+    handover.boxes[0].machine.guest_fd = 51;
+    let mut new = old.successor(&handover);
+
+    assert_eq!(
+        new.sessions.borrow().iter().map(EntityId::as_str).collect::<Vec<_>>(),
+        ["session-1"]
+    );
+    let frames = new
+        .settle_until_starts(&format!("failed {}:", TurnFailureReason::HarnessExited))
+        .await;
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert!(
+        frames[0].contains("session-1") && frames[0].contains("send the turn again"),
+        "{frames:?}"
+    );
+    assert_eq!(new.standing().boxes[0].box_id.as_str(), "box-session-1");
+    assert!(!new.log().iter().any(|entry| entry.starts_with("stop ")));
+    assert!(new.turns.borrow().is_empty(), "the failed turn is no longer held");
+    new.teardown("session-1");
+    assert!(new.settle_until_starts("teardown failed BoxDirty:").await[0].contains("explicitly discard"));
+    new.snapshot("session-1");
+    new.settle_until_starts("snapshot failed BoxNotFound:").await;
+    new.turn("turn-2", "session-1", "two", Vec::new());
+    new.settle_until_starts("failed HostUpdating:").await;
+    new.send(Command::Discard(super::TeardownOrder {
+        session_id: "session-1".try_into().expect("session"),
+        box_id: "box-session-1".try_into().expect("box"),
+    }));
+    assert_eq!(new.settle_until("box gone session-1").await, ["box gone session-1"]);
+    assert!(new.sessions.borrow().is_empty(), "the discarded session is released");
+    assert_eq!(new.standing().boxes.len(), 0);
+    new.turn("turn-3", "session-1", "three", Vec::new());
+    new.settle_until("complete 1").await;
+    let log = new.log();
+    assert!(
+        log.windows(2)
+            .any(|entries| entries == ["discard protected scope 0", "boot session-1 on tumpel0"]),
+        "{log:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_handed_box_whose_process_ended_fails_its_turn_and_frees_its_tap() {
     let mut old = host("handover-ended", 1, Harness::SlowClone, Boot::Works);
     old.turn("turn-1", "session-1", "one", Vec::new());
@@ -1977,7 +2110,7 @@ async fn a_handed_box_whose_process_ended_fails_its_turn_and_frees_its_tap() {
     old.vmm.hands.lock().expect("hands").clear();
     let mut new = old.successor(&handover);
     let failed = format!(
-        "failed {}: the Firecracker process 103 ended during the handover; send the turn again",
+        "failed {}: box box-session-1 of session session-1: its Firecracker process 103 ended; send the turn again",
         TurnFailureReason::HarnessExited
     );
     assert_eq!(new.settle_until(&failed).await, [failed]);

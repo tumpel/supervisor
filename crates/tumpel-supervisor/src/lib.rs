@@ -40,7 +40,7 @@ pub use lifecycle::{
 };
 pub use local_handover::{receive_handover, Transfer};
 pub use pool::{Disk, PoolExhausted, Size, Tap, TapPool};
-pub use run::{run, Failure, Stopped};
+pub use run::{run, Failure, Stopped, DAEMON_START_SECONDS};
 pub use snapshot::{Entry, Ext4Upper, Kind, Manifest, Scan, Upper};
 pub use store::{DownloadError, HttpStore, Store, UploadError};
 pub use telemetry::{install as install_telemetry, Telemetry};

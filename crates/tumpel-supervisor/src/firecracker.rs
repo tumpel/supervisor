@@ -18,7 +18,9 @@ use tokio::net::unix::pipe;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::task::AbortHandle;
-use tumpel_api::types::{EntityId, GuestHello, GuestInput, GuestMessage, SupervisorHandoverMachine, SupervisorRuntime};
+use tumpel_api::types::{
+    EntityId, GuestHello, GuestInput, GuestMessage, SupervisorHandoverBox, SupervisorHandoverMachine, SupervisorRuntime,
+};
 use tumpel_guest::setup_output::{redacted, strip_ansi};
 use tumpel_guest::{encode, Decoder, GUEST_CID, GUEST_PORT, READY_PORT};
 
@@ -33,6 +35,10 @@ use crate::snapshot::Ext4Upper;
 const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/sbin/tumpel-init";
 const CONSOLE_TAIL: usize = 4096;
 pub const OVERLAY_DRIVE: &str = "overlay.ext4";
+const REPORT_INSPECTION: Duration = Duration::from_secs(1);
+pub(crate) const TAKEOVER_INSPECTION_SECONDS: u32 = 5;
+const TAKEOVER_INSPECTION: Duration = Duration::from_secs(TAKEOVER_INSPECTION_SECONDS as u64);
+const SCOPE_STOP: Duration = Duration::from_secs(30);
 const API_WAIT_STEP: Duration = Duration::from_millis(5);
 
 struct Layout {
@@ -259,17 +265,23 @@ impl std::io::Read for ApiReply {
     }
 }
 
-fn booted_memory(socket: &Path, pid: libc::pid_t) -> Result<NonZeroU32, String> {
-    use std::io::{BufRead, Read, Write};
-    const INSPECTION_LIMIT: Duration = Duration::from_secs(1);
-    let deadline = std::time::Instant::now() + INSPECTION_LIMIT;
-    let failed = |error: std::io::Error| {
-        format!(
-            "reading GET /machine-config from {} within 1 s: {error}",
-            socket.display()
-        )
-    };
-    let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(failed)?;
+fn connect_local(path: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use rustix::net::{connect, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    )?;
+    connect(&socket, &SocketAddrUnix::new(path)?)?;
+    let stream = std::os::unix::net::UnixStream::from(socket);
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+fn connect_api(socket: &Path, pid: libc::pid_t) -> Result<std::os::unix::net::UnixStream, String> {
+    let stream = connect_local(socket)
+        .map_err(|error| format!("connecting to the Firecracker API at {}: {error}", socket.display()))?;
     let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
     let mut size = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
         .map_err(|error| format!("reading Firecracker peer credentials: {error}"))?;
@@ -294,7 +306,23 @@ fn booted_memory(socket: &Path, pid: libc::pid_t) -> Result<NonZeroU32, String> 
             peer.pid
         ));
     }
-    stream.set_write_timeout(Some(INSPECTION_LIMIT)).map_err(failed)?;
+    Ok(stream)
+}
+
+fn booted_memory(socket: &Path, pid: libc::pid_t, limit: Duration) -> Result<NonZeroU32, String> {
+    use std::io::{BufRead, Read, Write};
+    let deadline = std::time::Instant::now() + limit;
+    let failed = |error: std::io::Error| {
+        format!(
+            "reading GET /machine-config from {} within {} s: {error}",
+            socket.display(),
+            limit.as_secs()
+        )
+    };
+    let mut stream = connect_api(socket, pid)?;
+    stream
+        .set_write_timeout(Some(deadline.saturating_duration_since(std::time::Instant::now())))
+        .map_err(failed)?;
     stream
         .write_all(b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n")
         .map_err(failed)?;
@@ -359,22 +387,25 @@ fn scope_of(index: u8) -> String {
     format!("tumpel-box{index}.scope")
 }
 
-fn stop_scopes(scopes: &[String]) -> Result<(), String> {
-    let stopped = std::process::Command::new("systemctl")
-        .args(["--user", "stop"])
-        .args(scopes)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("starting systemctl to stop {}: {error}", scopes.join(" ")))?;
+async fn stop_scope(scope: &str) -> Result<(), String> {
+    let stopped = tokio::time::timeout(
+        SCOPE_STOP,
+        Command::new("systemctl")
+            .args(["--user", "stop", scope])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("stopping {scope} took longer than {} s", SCOPE_STOP.as_secs()))?
+    .map_err(|error| format!("starting systemctl to stop {scope}: {error}"))?;
     if stopped.status.success() {
         return Ok(());
     }
     Err(format!(
-        "stopping {} failed with {}: {}; stop them with systemctl --user stop {}",
-        scopes.join(" "),
+        "stopping {scope} failed with {}: {}; inspect the scope with systemctl --user status {scope}",
         stopped.status,
-        String::from_utf8_lossy(&stopped.stderr).trim(),
-        scopes.join(" ")
+        String::from_utf8_lossy(&stopped.stderr).trim()
     ))
 }
 
@@ -390,15 +421,17 @@ struct Adopted {
 }
 
 impl Adopted {
-    fn end(self) -> String {
+    async fn end(self) -> Result<String, String> {
         match self.owner {
-            Owner::Child => end_child(self.pid),
-            Owner::Scope(scope) => match stop_scopes(std::slice::from_ref(&scope)) {
-                Ok(()) => format!(
+            Owner::Child => tokio::task::spawn_blocking(move || end_child(self.pid))
+                .await
+                .map_err(|error| format!("could not end Firecracker: {error}")),
+            Owner::Scope(scope) => {
+                stop_scope(&scope).await?;
+                Ok(format!(
                     "was stopped with {scope}; systemd holds its exit status, as this supervisor did not start it"
-                ),
-                Err(error) => error,
-            },
+                ))
+            }
         }
     }
 }
@@ -416,27 +449,34 @@ impl Process {
         }
     }
 
-    async fn kill(self) -> String {
+    async fn kill(self) -> Result<String, String> {
         match self {
             Self::Spawned(mut child) => kill_child(&mut child).await,
-            Self::Adopted(adopted) => tokio::task::spawn_blocking(move || adopted.end())
-                .await
-                .unwrap_or_else(|error| format!("could not be ended: {error}")),
+            Self::Adopted(adopted) => adopted.end().await,
         }
     }
 }
 
-async fn kill_child(child: &mut Child) -> String {
-    if let Ok(Some(status)) = child.try_wait() {
-        return format!("had already ended with {}", exited(status));
+async fn kill_child(child: &mut Child) -> Result<String, String> {
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|error| format!("checking Firecracker's exit status: {error}"))?
+    {
+        return Ok(format!("had already ended with {}", exited(status)));
     }
-    if let Err(error) = child.start_kill() {
-        return format!("could not be killed: {error}");
-    }
-    match child.wait().await {
-        Ok(status) => format!("was stopped and ended with {}", exited(status)),
-        Err(error) => format!("was killed and could not be waited for: {error}"),
-    }
+    child
+        .start_kill()
+        .map_err(|error| format!("stopping Firecracker: {error}"))?;
+    let status = tokio::time::timeout(SCOPE_STOP, child.wait())
+        .await
+        .map_err(|_| {
+            format!(
+                "waiting for Firecracker to stop took longer than {} s",
+                SCOPE_STOP.as_secs()
+            )
+        })?
+        .map_err(|error| format!("waiting for Firecracker after stopping it: {error}"))?;
+    Ok(format!("was stopped and ended with {}", exited(status)))
 }
 
 fn exited(status: ExitStatus) -> String {
@@ -701,6 +741,104 @@ fn tail_of(fd: &OwnedFd, console: &Arc<Mutex<VecDeque<u8>>>, named: &str) -> Res
     Ok(keep_tail(reader, Arc::clone(console)))
 }
 
+fn scope_processes() -> Result<Vec<(u8, PathBuf)>, String> {
+    let uid = unsafe { libc::geteuid() };
+    let mut scopes = Vec::new();
+    for process in entries(Path::new("/proc"))? {
+        if process
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        let path = process.path();
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.uid() == uid => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("reading process identity at {}: {error}", path.display())),
+        }
+        let cgroup = match std::fs::read_to_string(path.join("cgroup")) {
+            Ok(cgroup) => cgroup,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("reading a box scope at {}: {error}", path.display())),
+        };
+        let index = cgroup.lines().find_map(|line| {
+            line.rsplit('/')
+                .next()?
+                .strip_prefix("tumpel-box")?
+                .strip_suffix(".scope")?
+                .parse::<u8>()
+                .ok()
+        });
+        if let Some(index) = index.filter(|index| *index < crate::pool::TAP_POOL) {
+            scopes.push((index, path));
+        }
+    }
+    Ok(scopes)
+}
+
+fn opened_overlays(root: &Path, process: &Path) -> Result<Vec<EntityId>, String> {
+    let mut sessions = Vec::new();
+    for fd in entries(&process.join("fd"))? {
+        let path = match std::fs::read_link(fd.path()) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("inspecting the box disk of {}: {error}", process.display())),
+        };
+        let Some(session) = path
+            .parent()
+            .filter(|_| path.file_name().is_some_and(|name| name == OVERLAY_DRIVE))
+        else {
+            continue;
+        };
+        if session.parent() == Some(root) {
+            if let Some(id) = session
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|id| EntityId::try_from(id).ok())
+            {
+                sessions.push(id);
+            }
+        }
+    }
+    Ok(sessions)
+}
+
+fn sessions_in_scopes(root: &Path, scopes: &[u8], processes: &[(u8, PathBuf)]) -> Result<Vec<EntityId>, String> {
+    use std::collections::BTreeSet;
+    let canonical = match root.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("locating the saved box disks at {}: {error}", root.display())),
+    };
+    let mut resolved = BTreeSet::new();
+    let mut sessions = BTreeSet::new();
+    for (index, process) in processes.iter().filter(|(index, _)| scopes.contains(index)) {
+        match opened_overlays(&canonical, process) {
+            Ok(opened) if !opened.is_empty() => {
+                resolved.insert(*index);
+                sessions.extend(opened);
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("tumpel-supervisor: {error}; keeping possible box disks"),
+        }
+    }
+    if scopes.iter().any(|index| !resolved.contains(index)) {
+        eprintln!(
+            "tumpel-supervisor: an unclaimed scope has no identifiable disk; keeping existing session directories"
+        );
+        sessions.extend(
+            entries(root)?
+                .into_iter()
+                .filter_map(|entry| EntityId::try_from(entry.file_name().to_str()?).ok()),
+        );
+    }
+    Ok(sessions.into_iter().collect())
+}
+
 pub struct Firecracker {
     binary: PathBuf,
     images: PathBuf,
@@ -721,6 +859,11 @@ impl Firecracker {
 }
 
 impl Firecracker {
+    fn clear_box_files(&self, index: u8) -> Result<(), String> {
+        fd_store::forget_box(index)?;
+        remove_dir(&self.data.join(format!("box{index}")))
+    }
+
     fn attachment_pid(&self, index: u8, handed: &SupervisorHandoverMachine) -> Result<libc::pid_t, String> {
         let dir = self.data.join(format!("box{index}"));
         if Path::new(&handed.api_socket) != dir.join("api.sock") || Path::new(&handed.vsock) != dir.join("v.sock") {
@@ -817,7 +960,12 @@ impl Firecracker {
             return Err("the recorded vsock path does not name a Unix socket".to_string());
         }
         let (guest_buffer, console_tail) = recorded_buffers(handed)?;
-        let memory = booted_memory(Path::new(&handed.api_socket), pid)?;
+        let limit = if reporting {
+            REPORT_INSPECTION
+        } else {
+            TAKEOVER_INSPECTION
+        };
+        let memory = booted_memory(Path::new(&handed.api_socket), pid, limit)?;
         if process_start(pid)? != identity.start || process_start(supervisor_pid)? != supervisor_start {
             return Err(format!("box {index} changed process during inspection"));
         }
@@ -952,56 +1100,99 @@ impl Vmm for Firecracker {
         }
     }
 
+    fn recorded_process(
+        &self,
+        index: u8,
+        handed: &SupervisorHandoverMachine,
+        observation: Option<&Observation>,
+    ) -> Result<bool, String> {
+        let Some(pid) = handed_pid(handed) else {
+            return Ok(false);
+        };
+        match std::fs::metadata(format!("/proc/{pid}")) {
+            Ok(metadata) if metadata.uid() == unsafe { libc::geteuid() } => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("reading the owner of Firecracker process {pid}: {error}")),
+        }
+        let Some(identity) = process_identity(pid)? else {
+            return Ok(false);
+        };
+        if observation.is_some_and(|observed| observed.machine_start != identity.start) {
+            return Ok(false);
+        }
+        Ok(identity.parent == unsafe { libc::getpid() } || process_scope(pid, &scope_of(index))?)
+    }
+
     fn disk(&self, drives: &[String]) -> Result<Disk, String> {
         crate::usage::disk(&self.data, drives).map_err(|error| format!("{error:#}"))
     }
 
     fn unclaimed_scopes(&self, claimed: &[u8]) -> Result<Vec<u8>, String> {
-        let uid = unsafe { libc::geteuid() };
-        let mut scopes = std::collections::BTreeSet::new();
-        for process in entries(Path::new("/proc"))? {
-            if process
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-                .is_none()
-            {
-                continue;
-            }
-            let path = process.path();
-            match std::fs::metadata(&path) {
-                Ok(metadata) if metadata.uid() == uid => (),
-                Ok(_) => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("reading process identity at {}: {error}", path.display())),
-            }
-            let cgroup = match std::fs::read_to_string(path.join("cgroup")) {
-                Ok(cgroup) => cgroup,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("reading a box scope at {}: {error}", path.display())),
-            };
-            scopes.extend(
-                cgroup
-                    .lines()
-                    .filter_map(|line| {
-                        line.rsplit('/')
-                            .next()?
-                            .strip_prefix("tumpel-box")?
-                            .strip_suffix(".scope")?
-                            .parse::<u8>()
-                            .ok()
-                    })
-                    .filter(|index| *index < crate::pool::TAP_POOL && !claimed.contains(index)),
-            );
-        }
-        Ok(scopes.into_iter().collect())
+        Ok(scope_processes()?
+            .into_iter()
+            .map(|(index, _)| index)
+            .filter(|index| !claimed.contains(index))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect())
     }
 
-    fn discard_incomplete_boot(&self, index: u8) -> Result<(), String> {
+    fn unclaimed_sessions(&self, scopes: &[u8]) -> Result<Vec<EntityId>, String> {
+        sessions_in_scopes(&self.data.join("sessions"), scopes, &scope_processes()?)
+    }
+
+    async fn discard_incomplete_boot(&self, index: u8) -> Result<(), String> {
         if self.unclaimed_scopes(&[])?.contains(&index) {
-            stop_scopes(&[scope_of(index)])?;
+            stop_scope(&scope_of(index)).await?;
         }
-        Ok(())
+        self.clear_box_files(index)
+    }
+
+    async fn discard_protected(
+        &self,
+        index: u8,
+        saved: &SupervisorHandoverBox,
+        observation: Option<&Observation>,
+    ) -> Result<(), String> {
+        let scope = scope_of(index);
+        let handed = &saved.machine;
+        if self.recorded_process(index, handed, observation)? {
+            let pid = handed_pid(handed).ok_or("the recorded Firecracker PID is out of range")?;
+            if observation.is_none() {
+                let pid = self.attachment_pid(index, handed)?;
+                connect_api(Path::new(&handed.api_socket), pid)?;
+                let sessions = self
+                    .data
+                    .join("sessions")
+                    .canonicalize()
+                    .map_err(|error| format!("locating the saved sessions: {error}"))?;
+                let disks = opened_overlays(&sessions, &PathBuf::from(format!("/proc/{pid}")))?;
+                if !disks.contains(&saved.session_id) {
+                    return Err(format!(
+                        "Firecracker process {pid} does not hold the saved session disk"
+                    ));
+                }
+            }
+            if process_scope(pid, &scope)? {
+                stop_scope(&scope).await?;
+            } else {
+                let ended = Adopted {
+                    pid,
+                    owner: Owner::Child,
+                }
+                .end()
+                .await?;
+                if process_identity(pid)?.is_some() {
+                    return Err(format!("Firecracker process {pid} {ended}"));
+                }
+            }
+        } else if self.unclaimed_scopes(&[])?.contains(&index) {
+            return Err(format!(
+                "the saved box does not own {scope}; its process identity changed"
+            ));
+        }
+        self.clear_box_files(index)
     }
 
     fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String> {
@@ -1047,6 +1238,9 @@ impl Drop for FirecrackerBox {
         self.unwatch();
         for task in &self.console_tasks {
             task.abort();
+        }
+        if let Some(pid) = self.process.as_ref().and_then(Process::id) {
+            eprintln!("tumpel-supervisor: released the handle for Firecracker {pid} on TAP {}; its scope keeps any running process", self.index);
         }
     }
 }
@@ -1358,9 +1552,17 @@ impl Machine for FirecrackerBox {
         self.unwatch();
         let exit = match self.process.take() {
             Some(process) => process.kill().await,
-            None => "was not running".to_string(),
+            None => Ok("was not running".to_string()),
         };
-        let exit = format!("process in {} {exit}", scope_of(self.index));
+        let exit = match exit {
+            Ok(exit) => format!("process in {} {exit}", scope_of(self.index)),
+            Err(error) => {
+                return Stopped {
+                    exit: error.clone(),
+                    cleared: Err(error),
+                }
+            }
+        };
         let cleared = fd_store::forget_box(self.index)
             .and_then(|()| remove_dir(&self.dir))
             .map_err(|error| format!("BoxNotCleared: tearing down box {}: {error}", self.index));
@@ -1449,15 +1651,18 @@ impl Machine for FirecrackerBox {
         Ok(())
     }
 
-    fn hand_over(self, guest: VsockGuest) -> Result<SupervisorHandoverMachine, String> {
-        Ok(SupervisorHandoverMachine {
+    fn hand_over(mut self, guest: VsockGuest) -> Result<SupervisorHandoverMachine, String> {
+        let machine = SupervisorHandoverMachine {
             console_tail: bounded("the console tail", STANDARD.encode(tail_bytes(&self.console)))?,
             guest_buffer: bounded(
                 "the guest bytes buffered past the last frame",
                 STANDARD.encode(guest.decoder.buffered()),
             )?,
             ..self.record()?
-        })
+        };
+        self.unwatch();
+        self.process.take();
+        Ok(machine)
     }
 }
 

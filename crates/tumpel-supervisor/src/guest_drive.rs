@@ -6,7 +6,8 @@ use ring::digest::{digest, SHA256};
 
 use crate::snapshot::hex;
 
-const WRITE_TIME: Duration = Duration::from_secs(60);
+pub(crate) const WRITE_SECONDS: u32 = 60;
+const WRITE_TIME: Duration = Duration::from_secs(WRITE_SECONDS as u64);
 
 #[cfg(guest_drive)]
 const DRIVE: Option<&[u8]> = Some(include_bytes!(env!("TUMPEL_GUEST_DRIVE_PATH")));

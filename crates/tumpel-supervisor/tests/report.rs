@@ -3,6 +3,7 @@ mod tests {
     use std::fs;
     use std::io;
     use std::mem::offset_of;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixDatagram;
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
@@ -411,6 +412,14 @@ mod tests {
                     "boxes":[recorded_box(&recorded_image())]});
                 host.state("boxes.json", &inventory);
                 host.state("handover.json", &inventory);
+                fs::write(
+                    host.root.join("config/systemd/user/tumpel-supervisor.service"),
+                    "[Service]\n",
+                )
+                .expect("old unit");
+                let systemctl = host.root.join("systemctl");
+                fs::write(&systemctl, "#!/bin/sh\nexit 1\n").expect("failed service reload");
+                fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o700)).expect("service operation");
             }
             let mut command = tokio::process::Command::from(host.command(&argv));
             let mut daemon = command.kill_on_drop(true).spawn().expect("daemon executable");
@@ -455,7 +464,7 @@ mod tests {
             if name == "daemon" {
                 let saved = fs::read(host.root.join("state/boxes.json")).expect("preserved inventory");
                 let saved: Value = serde_json::from_slice(&saved).expect("inventory JSON");
-                assert_eq!(saved["boxes"][0]["boxId"], "box-1");
+                assert_eq!(saved["boxes"], json!([]));
                 assert!(
                     !host.root.join("state/handover.json").exists(),
                     "the skipped handover was cleared"
