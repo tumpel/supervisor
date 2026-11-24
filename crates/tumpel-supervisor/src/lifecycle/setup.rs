@@ -161,8 +161,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         };
         let failure = match (failure, &stopped) {
             (Some(failed), stopped) => Some((failed.reason, then(failed.detail, stopped.clone()))),
-            (None, Err(error)) => Some((ClaudeSetupFailureReason::ClaudeCodeExited, error.clone())),
-            (None, Ok(())) => None,
+            (None, _) => None,
         };
         if let Some((reason, detail)) = failure {
             emit(
