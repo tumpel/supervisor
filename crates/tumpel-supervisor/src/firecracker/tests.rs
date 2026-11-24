@@ -1,6 +1,6 @@
 use std::io::{ErrorKind, Read, Write};
 use std::num::NonZeroU32;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -74,7 +74,7 @@ fn inspecting_an_exited_process_leaves_its_exit_status_for_the_parent() {
     child.0.wait().expect("the parent still owns the child's exit status");
 }
 
-fn nonblocking(fd: &OwnedFd) {
+pub(super) fn nonblocking(fd: &OwnedFd) {
     let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(
@@ -197,11 +197,9 @@ async fn failed_attachment_leaves_the_vm_and_all_streams_untouched() {
             libc::fcntl(fd.as_raw_fd(), libc::F_GETFL),
         )
     });
-    let session = "session-1".try_into().expect("session id");
-    let mut pool = TapPool::new(4096, BOX);
-    let Err(error) = vmm.reattach(&session, 0, &handed.machine, None, &mut pool, true) else {
-        panic!("a socket is not a console pipe");
-    };
+    let error = vmm
+        .inspect_attachment(0, &handed.machine, InspectionSource::Daemon(None, false), &own_cgroup())
+        .expect_err("a socket is not a console pipe");
     assert!(
         error.contains("standard error") && error.contains("is no pipe"),
         "{error}"
@@ -224,6 +222,148 @@ async fn failed_attachment_leaves_the_vm_and_all_streams_untouched() {
     out.read_exact(&mut out_bytes).expect("stdout untouched");
     err.read_exact(&mut err_bytes).expect("stderr untouched");
     assert_eq!((&guest_bytes, &out_bytes, &err_bytes), (b"guest", b"stdout", b"stderr"));
+}
+
+pub(super) fn legacy_startup(machine: &SupervisorHandoverMachine, index: u8) -> crate::inventory::StartupBoxes {
+    let handover = serde_json::from_value(json!({
+        "handedAt": "2026-11-23T21:47:09Z",
+        "boxes": [{
+            "boxId": "box-1", "boxRetention": "Warm", "dirty": false, "idleMilliseconds": 0,
+            "image": {"kind": "Full", "manifest": {
+                "imageDigest": "a".repeat(64), "kernelDigest": "b".repeat(64), "baseRootfsDigest": "c".repeat(64),
+                "kernelUrl": "https://example.test/kernel", "baseRootfsUrl": "https://example.test/rootfs.squashfs",
+                "harness": {"harness": "Shell", "harnessVersion": "1", "protocol": "ShellLines",
+                    "command": ["/bin/sh", "-s"], "workingDirectory": "/root", "environment": {"HOME": "/root", "LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+                    "fixedVariables": [], "cloneSeconds": 120}, "components": []
+            }}, "machine": machine, "queued": [], "sessionId": "session-1",
+            "tapIndex": index, "state": {"kind": "Warm"}
+        }]
+    }))
+    .expect("legacy handover record");
+    let mut saved = crate::inventory::StartupBoxes::from_record(handover, crate::lifecycle::Taken::Handed);
+    saved.inherited = true;
+    saved
+}
+
+#[tokio::test]
+async fn a_live_child_outside_its_box_scope_keeps_its_record_and_disk() {
+    use crate::lifecycle::{
+        tests::{settings, MemoryStore},
+        Lifecycle,
+    };
+    let vmm = firecracker("unscoped-live");
+    let child = VmChild::new();
+    let handed = handed(&vmm, child.pid());
+    let (out, _) = tokio::sync::mpsc::unbounded_channel();
+    let path = vmm.data.join("boxes.json");
+    let kept = vmm.data.join("sessions/session-1/overlay.ext4");
+    let retired = vmm.data.join("sessions/old-session/overlay.ext4");
+    for disk in [&kept, &retired] {
+        std::fs::create_dir_all(disk.parent().expect("disk directory")).expect("session directory");
+        std::fs::write(disk, b"fixture disk").expect("a session disk");
+    }
+    let mut saved = legacy_startup(&handed.machine, 0);
+    saved.inherited = false;
+    let mut lifecycle = Lifecycle::new(
+        vmm,
+        MemoryStore::default(),
+        settings(),
+        TapPool::new(4096, BOX),
+        out,
+        path.clone(),
+    );
+    lifecycle.start_inventory(Some(saved)).expect("startup keeps reporting");
+    assert_eq!(
+        lifecycle
+            .sessions()
+            .borrow()
+            .iter()
+            .map(EntityId::as_str)
+            .collect::<Vec<_>>(),
+        ["session-1"]
+    );
+    let inventory = crate::inventory::load(&path)
+        .expect("saved inventory")
+        .expect("a record");
+    assert_eq!(inventory.boxes.len(), 1);
+    assert!(kept.exists(), "the live disk survives startup");
+    assert!(!retired.exists(), "ordinary startup still removes unrelated leftovers");
+    assert!(super::process_identity(child.pid())
+        .expect("the child is untouched")
+        .is_some());
+    std::fs::remove_dir_all(path.parent().expect("fixture directory")).expect("remove test files");
+}
+
+#[test]
+fn a_legacy_child_and_streams_are_preserved_before_failed_attachment() {
+    let vmm = firecracker("legacy-rejection");
+    let child = VmChild::new();
+    let mut record = handed(&vmm, child.pid());
+    record.machine.guest_fd = record.guest.try_clone().expect("old guest FD").into_raw_fd();
+    record.machine.stdout_fd = record.out.try_clone().expect("old stdout FD").into_raw_fd();
+    record.machine.stderr_fd = record.err.try_clone().expect("old stderr FD").into_raw_fd();
+    let guest_fd = record.machine.guest_fd;
+    let moved = std::cell::Cell::new(false);
+    let mut saved = legacy_startup(&record.machine, 0);
+    let streams = Firecracker::prepare_legacy(&mut saved, |pid, scope| {
+        assert_eq!(pid, child.pid());
+        assert_eq!(scope, "tumpel-box0.scope");
+        assert!(!vmm.data.join("box0/api.sock").exists());
+        moved.set(true);
+        Ok(())
+    });
+    assert!(moved.get());
+    assert_eq!(
+        streams.iter().map(|stream| stream.role).collect::<Vec<_>>(),
+        ["guest", "stdout", "stderr"]
+    );
+    assert_ne!(unsafe { libc::fcntl(guest_fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+    assert!(super::process_identity(child.pid()).expect("the VM survives").is_some());
+}
+
+#[test]
+fn duplicate_legacy_streams_survive_a_rejected_scope_move() {
+    let vmm = firecracker("duplicate-legacy-streams");
+    let child = VmChild::new();
+    let second = VmChild::new();
+    let first_hand = handed(&vmm, child.pid());
+    let second_hand = handed(&vmm, second.pid());
+    let duplicate = first_hand.guest.as_raw_fd();
+    let mut first = first_hand.machine;
+    let mut other = second_hand.machine;
+    other.guest_fd = duplicate;
+    first.stdout_fd = first_hand.out.try_clone().expect("inherited stdout").into_raw_fd();
+    first.stderr_fd = first_hand.err.try_clone().expect("inherited stderr").into_raw_fd();
+    other.stdout_fd = second_hand.out.try_clone().expect("inherited stdout").into_raw_fd();
+    other.stderr_fd = second_hand.err.try_clone().expect("inherited stderr").into_raw_fd();
+    let mut saved = legacy_startup(&first, 0);
+    let mut next = legacy_startup(&other, 1).inventory.boxes.remove(0);
+    next.record.session_id = "session-2".try_into().expect("another session");
+    next.record.box_id = "box-2".try_into().expect("another box");
+    saved.inventory.boxes.push(next);
+    saved.handed_count = 2;
+
+    let scopes = std::cell::RefCell::new(Vec::new());
+    let streams = Firecracker::prepare_legacy(&mut saved, |pid, scope| {
+        scopes.borrow_mut().push((pid, scope.to_string()));
+        Err("the service manager rejected the scope".to_string())
+    });
+    assert_eq!(
+        scopes.into_inner(),
+        [
+            (child.pid(), "tumpel-box0.scope".into()),
+            (second.pid(), "tumpel-box1.scope".into())
+        ]
+    );
+    assert_eq!(streams.len(), 4);
+    assert!(saved
+        .inventory
+        .boxes
+        .iter()
+        .all(|saved| saved.record.machine.guest_fd == -1));
+    assert!(unsafe { libc::fcntl(duplicate, libc::F_GETFD) } >= 0);
+    assert!(super::process_identity(child.pid()).expect("first process").is_some());
+    assert!(super::process_identity(second.pid()).expect("second process").is_some());
 }
 
 #[tokio::test]
@@ -252,45 +392,6 @@ async fn dropping_an_adopted_handle_leaves_the_vm_for_explicit_stop() {
         stopped.exit
     );
     assert!(super::process_identity(pid).expect("VM state").is_none());
-}
-
-#[tokio::test]
-async fn handing_over_an_adopted_vm_releases_only_the_daemon_copies() {
-    let vmm = firecracker("retire-adopted");
-    let tap = TapPool::new(4096, BOX).claim(BOX, ROOMY).expect("tap");
-    let child = VmChild::new();
-    let mut handed = handed(&vmm, child.pid());
-    let session = "session-1".try_into().expect("session id");
-    let mut machine = vmm.machine(&session, &tap).expect("old machine handle");
-    machine.process = Some(Process::Adopted(Adopted {
-        pid: child.pid(),
-        owner: Owner::Child,
-    }));
-    machine.stdout = Some(handed.out.try_clone().expect("old stdout"));
-    machine.stderr = Some(handed.err.try_clone().expect("old stderr"));
-    let old_guest = super::VsockGuest {
-        stream: tokio::net::UnixStream::from_std(UnixStream::from(handed.guest.try_clone().expect("old guest")))
-            .expect("the old guest stream"),
-        decoder: tumpel_guest::Decoder::default(),
-    };
-
-    let _record = machine
-        .hand_over(old_guest)
-        .expect("retire the handle and save the machine");
-    assert!(super::process_identity(child.pid()).expect("VM state").is_some());
-    handed.peer.write_all(b"guest").expect("guest stream still connected");
-    handed.stdout.write_all(b"out").expect("stdout still connected");
-    handed.stderr.write_all(b"err").expect("stderr still connected");
-    let mut guest = UnixStream::from(handed.guest);
-    let mut out = std::fs::File::from(handed.out);
-    let mut err = std::fs::File::from(handed.err);
-    let mut guest_bytes = [0; 5];
-    let mut out_bytes = [0; 3];
-    let mut err_bytes = [0; 3];
-    guest.read_exact(&mut guest_bytes).expect("guest bytes");
-    out.read_exact(&mut out_bytes).expect("stdout bytes");
-    err.read_exact(&mut err_bytes).expect("stderr bytes");
-    assert_eq!((&guest_bytes, &out_bytes, &err_bytes), (b"guest", b"out", b"err"));
 }
 
 #[test]
@@ -362,7 +463,7 @@ async fn observation_checks_live_descriptors_and_uses_only_a_separate_api_connec
     assert!(vmm
         .inspect_attachment(0, machine, InspectionSource::Report(Some(&stale)), &scope)
         .expect_err("stale PID identity")
-        .contains("different Firecracker or supervisor process"));
+        .contains("different Firecracker process"));
     stale = observed.clone();
     let wrong_guest = super::duplicate(machine.stdout_fd).expect("another descriptor for the console pipe");
     stale.guest.fd = wrong_guest.as_raw_fd();
@@ -394,9 +495,11 @@ async fn observation_checks_live_descriptors_and_uses_only_a_separate_api_connec
             .expect("live VM");
         assert_eq!(report.memory.get(), 8192);
         assert_eq!(daemon.memory, report.memory);
+        check_replaced_guest(&vmm, &daemon_machine, &observed, &scope);
         (vmm, daemon_machine, daemon, daemon_fds)
     });
     let serve = async {
+        answer_machine_config(&listener).await;
         answer_machine_config(&listener).await;
         answer_machine_config(&listener).await;
     };
@@ -408,11 +511,80 @@ async fn observation_checks_live_descriptors_and_uses_only_a_separate_api_connec
     let (vmm, daemon_machine, attachment, daemon_fds) = observed.expect("observation worker");
 
     assert_eq!(flags(handed.guest.as_raw_fd()), guest_flags);
-    let tap = TapPool::new(8192, BOX).claim(BOX, ROOMY).expect("tap");
+    verify_materialized_attachment(&vmm, &daemon_machine, attachment, daemon_fds, &mut handed).await;
+}
+
+fn check_replaced_guest(
+    vmm: &Firecracker,
+    daemon_machine: &SupervisorHandoverMachine,
+    observed: &super::Observation,
+    scope: &str,
+) {
+    let mut replaced = daemon_machine.clone();
+    let (guest, _peer) = UnixStream::pair().expect("the replaced guest connection");
+    let guest = OwnedFd::from(guest);
+    nonblocking(&guest);
+    replaced.guest_fd = guest.as_raw_fd();
+    assert!(vmm
+        .inspect_attachment(0, &replaced, InspectionSource::Daemon(Some(observed), false), scope)
+        .expect_err("a handed turn must keep its guest stream")
+        .contains("different descriptor"));
+    let recovery = vmm
+        .inspect_attachment(0, &replaced, InspectionSource::Daemon(Some(observed), true), scope)
+        .expect("crash recovery checks the stable console and VM identities")
+        .expect("the VM still owns its box");
+    assert!(
+        recovery.guest_buffer.is_empty(),
+        "a new guest stream inherits no buffered turn frame"
+    );
+}
+
+async fn verify_materialized_attachment(
+    vmm: &Firecracker,
+    daemon_machine: &SupervisorHandoverMachine,
+    attachment: super::Attachment,
+    daemon_fds: [OwnedFd; 3],
+    handed: &mut Handed,
+) {
     let session = "session-1".try_into().expect("session id");
-    let (adopted, mut attached_guest) = vmm
-        .attach_box(&session, &tap, &daemon_machine, attachment)
-        .expect("attach the checked descriptors");
+    let disk = vmm.data.join("sessions/session-1/overlay.ext4");
+    std::fs::create_dir_all(disk.parent().expect("session directory")).expect("session directory");
+    std::fs::File::create(disk)
+        .expect("create the box disk")
+        .set_len(32 * 1024 * 1024)
+        .expect("size the disk");
+    let mut pool = TapPool::new(8192, BOX);
+
+    let mut exited = VmChild::new();
+    let exited_pid = exited.pid();
+    exited.0.kill().expect("end the process during inspection");
+    exited.0.wait().expect("reap the exited process");
+    let late = super::Attachment {
+        pid: exited_pid,
+        owner: Owner::Child,
+        memory: attachment.memory,
+        guest_buffer: Vec::new(),
+        console_tail: Vec::new(),
+    };
+    let Err(error) = vmm.finish_attachment(&session, 0, daemon_machine, &mut pool, late) else {
+        panic!("the watcher rejects a PID that disappeared");
+    };
+    assert!(error.contains("watching Firecracker process"), "{error}");
+
+    let (mut adopted, mut attached_guest, tap) = vmm
+        .finish_attachment(&session, 0, daemon_machine, &mut pool, attachment)
+        .expect("the failed attachment released its TAP and left all streams available");
+    handed.stdout.write_all(b"late stdout\n").expect("write the console");
+    assert!(!adopted.console_tail().contains("late stdout"));
+    adopted.activate();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !adopted.console_tail().contains("late stdout") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the console starts at activation");
+    pool.release(tap);
     drop(daemon_fds);
     let GuestMessage::TurnLine(line) = attached_guest.receive().await.expect("the rest of the guest frame") else {
         panic!("expected a turn line");

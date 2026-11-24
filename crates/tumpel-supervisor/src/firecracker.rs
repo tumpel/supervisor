@@ -742,6 +742,14 @@ fn tail_of(fd: &OwnedFd, console: &Arc<Mutex<VecDeque<u8>>>, named: &str) -> Res
     Ok(keep_tail(reader, Arc::clone(console)))
 }
 
+fn process_owned_by_user(pid: libc::pid_t) -> Result<bool, String> {
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(metadata) => Ok(metadata.uid() == unsafe { libc::geteuid() }),
+        Err(error) if process_disappeared(&error) => Ok(false),
+        Err(error) => Err(format!("reading the owner of Firecracker process {pid}: {error}")),
+    }
+}
+
 fn process_disappeared(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
@@ -880,6 +888,137 @@ impl Firecracker {
         remove_dir(&self.data.join(format!("box{index}")))
     }
 
+    pub(crate) fn migrate_legacy(saved: &mut crate::inventory::StartupBoxes) -> Vec<fd_store::LegacyFd> {
+        Self::prepare_legacy(saved, move_into_scope)
+    }
+
+    fn prepare_legacy(
+        saved: &mut crate::inventory::StartupBoxes,
+        move_to_scope: impl Fn(libc::pid_t, &str) -> Result<(), String>,
+    ) -> Vec<fd_store::LegacyFd> {
+        let mut counts = std::collections::BTreeMap::new();
+        for saved in &saved.inventory.boxes[..saved.handed_count] {
+            let handed = &saved.record.machine;
+            for fd in [handed.guest_fd, handed.stdout_fd, handed.stderr_fd] {
+                *counts.entry(fd).or_insert(0) += 1;
+            }
+        }
+        let mut legacy_fds = Vec::new();
+        let mut scopes = Vec::new();
+        let handed_count = saved.handed_count;
+        for (position, saved) in saved.inventory.boxes.iter_mut().enumerate() {
+            let box_ = &mut saved.record;
+            let Ok(index) = u8::try_from(box_.tap_index) else {
+                continue;
+            };
+            let hand = &mut box_.machine;
+            let result = Self::legacy_owner(index, hand, saved.observation.as_ref());
+            let owner = match result {
+                Ok(identity) => identity,
+                Err(error) => {
+                    eprintln!(
+                        "tumpel-supervisor: preserving box {} on TAP {index}: {error}",
+                        box_.box_id
+                    );
+                    continue;
+                }
+            };
+            let daemon = unsafe { libc::getpid() };
+            if position < handed_count {
+                for ((role, (named, socket)), fd) in [fd_store::GUEST, fd_store::STDOUT, fd_store::STDERR]
+                    .into_iter()
+                    .zip(DESCRIPTORS)
+                    .zip([&mut hand.guest_fd, &mut hand.stdout_fd, &mut hand.stderr_fd])
+                {
+                    let result = if counts.get(fd) == Some(&1) {
+                        Descriptor::read(daemon, *fd, named, socket).and_then(|actual| {
+                            let expected = saved.observation.as_ref().map(|seen| match role {
+                                fd_store::STDOUT => &seen.stdout,
+                                fd_store::STDERR => &seen.stderr,
+                                _ => &seen.guest,
+                            });
+                            if expected.is_some_and(|seen| !actual.same_file(seen)) {
+                                return Err(format!("the inherited descriptor for {named} changed identity"));
+                            }
+                            fd_store::own_inherited(*fd)
+                        })
+                    } else {
+                        Err(format!(
+                            "the inherited descriptor for {named} is shared by multiple claims"
+                        ))
+                    };
+                    match result {
+                        Ok(fd) => legacy_fds.push(fd_store::LegacyFd {
+                            tap: owner.map(|_| index),
+                            role,
+                            fd,
+                        }),
+                        Err(error) => {
+                            *fd = -1;
+                            eprintln!(
+                                "tumpel-supervisor: preserving box {} on TAP {index}: {error}",
+                                box_.box_id
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some((pid, false)) = owner {
+                scopes.push((pid, index, box_.box_id.clone()));
+            }
+        }
+        for (pid, index, box_id) in scopes {
+            if let Err(error) = move_to_scope(pid, &scope_of(index)) {
+                eprintln!("tumpel-supervisor: preserving box {box_id} on TAP {index}: {error}");
+            }
+        }
+        legacy_fds
+    }
+
+    fn legacy_owner(
+        index: u8,
+        handed: &SupervisorHandoverMachine,
+        observation: Option<&Observation>,
+    ) -> Result<Option<(libc::pid_t, bool)>, String> {
+        let pid = handed_pid(handed).ok_or("the inherited Firecracker PID is out of range")?;
+        let Some(identity) = process_identity(pid)? else {
+            return Ok(None);
+        };
+        if observation.is_some_and(|seen| identity.start != seen.machine_start) {
+            return Ok(None);
+        }
+        let scope = scope_of(index);
+        if process_scope(pid, &scope)? {
+            return Ok(Some((pid, true)));
+        }
+        if identity.parent != unsafe { libc::getpid() } {
+            return Err(format!(
+                "live Firecracker process {pid} is outside {scope} and is not this supervisor's child"
+            ));
+        }
+        Ok(Some((pid, false)))
+    }
+
+    fn recorded_process(
+        index: u8,
+        handed: &SupervisorHandoverMachine,
+        observation: Option<&Observation>,
+    ) -> Result<bool, String> {
+        let Some(pid) = handed_pid(handed) else {
+            return Ok(false);
+        };
+        if !process_owned_by_user(pid)? {
+            return Ok(false);
+        }
+        let Some(identity) = process_identity(pid)? else {
+            return Ok(false);
+        };
+        if observation.is_some_and(|observed| observed.machine_start != identity.start) {
+            return Ok(false);
+        }
+        Ok(identity.parent == unsafe { libc::getpid() } || process_scope(pid, &scope_of(index))?)
+    }
+
     fn attachment_pid(&self, index: u8, handed: &SupervisorHandoverMachine) -> Result<libc::pid_t, String> {
         let dir = self.data.join(format!("box{index}"));
         if Path::new(&handed.api_socket) != dir.join("api.sock") || Path::new(&handed.vsock) != dir.join("v.sock") {
@@ -912,12 +1051,20 @@ impl Firecracker {
         source: InspectionSource<'_>,
         scope: &str,
     ) -> Result<Option<Attachment>, String> {
-        let pid = self.attachment_pid(index, handed)?;
+        let reporting = matches!(source, InspectionSource::Report(_));
+        let pid = if reporting {
+            self.attachment_pid(index, handed)?
+        } else {
+            handed_pid(handed).ok_or("the recorded Firecracker PID is out of range")?
+        };
+        if !process_owned_by_user(pid)? {
+            return Ok(None);
+        }
         let Some(identity) = process_identity(pid)? else {
             return Ok(None);
         };
         let own_pid = unsafe { libc::getpid() };
-        let (supervisor_pid, fds, expected, reporting, inherited) = match source {
+        let (supervisor_pid, fds, expected, reporting, reconnect) = match source {
             InspectionSource::Report(observed) => {
                 let observed = observed.ok_or("the box record has no process and descriptor identities; start the installed service to refresh the box records")?;
                 (
@@ -928,33 +1075,41 @@ impl Firecracker {
                     false,
                 )
             }
-            InspectionSource::Daemon(expected, inherited) => (
+            InspectionSource::Daemon(expected, reconnect) => (
                 own_pid,
                 [handed.guest_fd, handed.stdout_fd, handed.stderr_fd],
                 expected,
                 false,
-                inherited,
+                reconnect,
             ),
         };
-        let scoped = process_scope(pid, scope)?;
-        let child = identity.parent == own_pid;
-        if !(scoped || (inherited && child)) {
+        if expected.is_some_and(|observed| observed.machine_start != identity.start) {
             if !reporting {
                 return Ok(None);
             }
-            return Err(format!("Firecracker process {pid} is outside {scope}"));
+            return Err(format!("box {index} has a different Firecracker process"));
         }
-        let owner = if child {
+        if !process_scope(pid, scope)? {
+            if !reporting && identity.parent != own_pid && expected.is_none() {
+                let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+                    .map_err(|error| format!("reading the executable of process {pid}: {error}"))?;
+                let running = exe.to_string_lossy();
+                let running = Path::new(running.strip_suffix(" (deleted)").unwrap_or(&running));
+                if running != self.binary && running.file_name() != Some(std::ffi::OsStr::new("firecracker")) {
+                    return Ok(None);
+                }
+            }
+            return Err(format!("live Firecracker process {pid} is outside {scope}"));
+        }
+        self.attachment_pid(index, handed)?;
+        let owner = if identity.parent == own_pid {
             Owner::Child
         } else {
             Owner::Scope(scope.to_string())
         };
         let supervisor_start = process_start(supervisor_pid)?;
-        if let Some(expected) = expected {
-            if identity.start != expected.machine_start || (reporting && supervisor_start != expected.supervisor_start)
-            {
-                return Err(format!("box {index} has a different Firecracker or supervisor process"));
-            }
+        if reporting && expected.is_some_and(|observed| supervisor_start != observed.supervisor_start) {
+            return Err(format!("box {index} has a different supervisor process"));
         }
         if fds
             .iter()
@@ -966,7 +1121,7 @@ impl Firecracker {
         let expected_fds = expected.map(|observed| [&observed.guest, &observed.stdout, &observed.stderr]);
         for (role, (fd, (named, socket))) in fds.into_iter().zip(DESCRIPTORS).enumerate() {
             let actual = Descriptor::read(supervisor_pid, fd, named, socket)?;
-            if expected_fds.is_some_and(|fds| !actual.same_file(fds[role])) {
+            if !(reconnect && role == 0) && expected_fds.is_some_and(|fds| !actual.same_file(fds[role])) {
                 return Err(format!("box {index} has a different descriptor for {named}"));
             }
         }
@@ -975,7 +1130,10 @@ impl Firecracker {
         if !vsock.file_type().is_socket() {
             return Err("the recorded vsock path does not name a Unix socket".to_string());
         }
-        let (guest_buffer, console_tail) = recorded_buffers(handed)?;
+        let (mut guest_buffer, console_tail) = recorded_buffers(handed)?;
+        if reconnect {
+            guest_buffer.clear();
+        }
         let limit = if reporting {
             REPORT_INSPECTION
         } else {
@@ -1044,6 +1202,28 @@ impl Firecracker {
         Ok((machine, guest))
     }
 
+    fn finish_attachment(
+        &self,
+        session_id: &EntityId,
+        index: i32,
+        handed: &SupervisorHandoverMachine,
+        pool: &mut TapPool,
+        attachment: Attachment,
+    ) -> Result<Attached<FirecrackerBox>, String> {
+        let size = Size {
+            memory_mib: attachment.memory,
+            disk_mib: self.booted_disk(session_id)?,
+        };
+        let tap = pool.claim_device(index, size)?;
+        match self.attach_box(session_id, &tap, handed, attachment) {
+            Ok((machine, guest)) => Ok((machine, guest, tap)),
+            Err(error) => {
+                pool.release(tap);
+                Err(error)
+            }
+        }
+    }
+
     fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String> {
         let drive = session_dir(&self.data, session_id)?.join(OVERLAY_DRIVE);
         let bytes = std::fs::metadata(&drive)
@@ -1095,49 +1275,15 @@ impl Vmm for Firecracker {
         handed: &SupervisorHandoverMachine,
         observation: Option<&Observation>,
         pool: &mut TapPool,
-        inherited: bool,
+        reconnect: bool,
     ) -> Result<Option<Attached<FirecrackerBox>>, String> {
         let tap_index = u8::try_from(index).map_err(|_| "the box has an invalid TAP index")?;
-        let source = InspectionSource::Daemon(observation, inherited);
+        let source = InspectionSource::Daemon(observation, reconnect);
         let Some(attachment) = self.inspect_attachment(tap_index, handed, source, &scope_of(tap_index))? else {
             return Ok(None);
         };
-        let size = Size {
-            memory_mib: attachment.memory,
-            disk_mib: self.booted_disk(session_id)?,
-        };
-        let tap = pool.claim_device(index, size)?;
-        match self.attach_box(session_id, &tap, handed, attachment) {
-            Ok((machine, guest)) => Ok(Some((machine, guest, tap))),
-            Err(error) => {
-                pool.release(tap);
-                Err(error)
-            }
-        }
-    }
-
-    fn recorded_process(
-        &self,
-        index: u8,
-        handed: &SupervisorHandoverMachine,
-        observation: Option<&Observation>,
-    ) -> Result<bool, String> {
-        let Some(pid) = handed_pid(handed) else {
-            return Ok(false);
-        };
-        match std::fs::metadata(format!("/proc/{pid}")) {
-            Ok(metadata) if metadata.uid() == unsafe { libc::geteuid() } => {}
-            Ok(_) => return Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(format!("reading the owner of Firecracker process {pid}: {error}")),
-        }
-        let Some(identity) = process_identity(pid)? else {
-            return Ok(false);
-        };
-        if observation.is_some_and(|observed| observed.machine_start != identity.start) {
-            return Ok(false);
-        }
-        Ok(identity.parent == unsafe { libc::getpid() } || process_scope(pid, &scope_of(index))?)
+        self.finish_attachment(session_id, index, handed, pool, attachment)
+            .map(Some)
     }
 
     fn disk(&self, drives: &[String]) -> Result<Disk, String> {
@@ -1178,7 +1324,7 @@ impl Vmm for Firecracker {
     ) -> Result<(), String> {
         let scope = scope_of(index);
         let handed = &saved.machine;
-        if self.recorded_process(index, handed, observation)? {
+        if Self::recorded_process(index, handed, observation)? {
             let pid = handed_pid(handed).ok_or("the recorded Firecracker PID is out of range")?;
             if observation.is_none() {
                 let pid = self.attachment_pid(index, handed)?;
@@ -1473,26 +1619,6 @@ impl FirecrackerBox {
 
 impl Machine for FirecrackerBox {
     type Guest = VsockGuest;
-
-    fn register_inherited(&self, guest: &VsockGuest) -> Result<(), String> {
-        let pid = self
-            .process
-            .as_ref()
-            .and_then(Process::id)
-            .and_then(|pid| libc::pid_t::try_from(pid).ok())
-            .ok_or("the box has no running Firecracker process")?;
-        let scope = scope_of(self.index);
-        if process_scope(pid, &scope)? {
-            return Ok(());
-        }
-        fd_store::store(self.index, fd_store::GUEST, guest.stream.as_fd())?;
-        for (role, fd) in [(fd_store::STDOUT, &self.stdout), (fd_store::STDERR, &self.stderr)] {
-            let fd = fd.as_ref().ok_or_else(|| format!("the box has no {role} descriptor"))?;
-            fd_store::store(self.index, role, fd.as_fd())?;
-        }
-        move_into_scope(pid, &scope)?;
-        Ok(())
-    }
 
     fn activate(&mut self) {
         for reader in self.console_readers.drain(..) {

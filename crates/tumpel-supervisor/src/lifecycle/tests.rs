@@ -103,6 +103,11 @@ fn message(value: serde_json::Value) -> GuestMessage {
 
 impl MemoryGuest {
     fn send_now(&mut self, input: &GuestInput) {
+        if let GuestInput::ClaudeSetupStart(start) = input {
+            self.pending.push_back(message(json!({
+                "type": "ClaudeSetupUrl", "claudeSetupId": *start.claude_setup_id, "signInUrl": "https://example.com/setup"
+            })));
+        }
         if let (GuestInput::TurnCancel(cancel), Harness::StallsAfterFirstLine) = (input, self.harness) {
             self.pending.push_back(message(json!({
                 "type": "TurnEnd", "turnId": *cancel.turn_id, "reason": "Cancelled", "lastLineSeq": self.lines,
@@ -430,18 +435,6 @@ impl Vmm for MemoryVmm {
         Ok(Some((self.machine(session_id, &tap)?, guest, tap)))
     }
 
-    fn recorded_process(
-        &self,
-        index: u8,
-        handed: &SupervisorHandoverMachine,
-        _: Option<&crate::firecracker::Observation>,
-    ) -> Result<bool, String> {
-        Ok(
-            self.failed_attachments.contains(&index)
-                || self.hands.lock().expect("hands").contains_key(&handed.guest_fd),
-        )
-    }
-
     fn disk(&self, _: &[String]) -> Result<Disk, String> {
         Ok(Disk {
             total_mib: 100_000,
@@ -518,7 +511,7 @@ struct Index {
 }
 
 #[derive(Default, Clone)]
-struct MemoryStore(
+pub(crate) struct MemoryStore(
     Arc<Mutex<HashMap<String, Vec<u8>>>>,
     Log,
     Arc<Mutex<Index>>,
@@ -636,7 +629,7 @@ const SLOW_CUT: Duration = Duration::from_millis(300);
 const LATE_CLAIM: Duration = Duration::from_millis(150);
 const STALLED_CLAIM: Duration = Duration::from_secs(600);
 
-fn settings() -> Settings {
+pub(crate) fn settings() -> Settings {
     Settings {
         budgets: Budgets {
             boot: Duration::from_millis(300),
@@ -2005,6 +1998,49 @@ async fn a_failed_handover_keeps_its_record_and_hands_over_other_boxes() {
     assert_eq!(handover.boxes[0].session_id.as_str(), "session-2");
     assert_eq!(old.standing().boxes.len(), 2);
     assert!(!old.log().iter().any(|entry| entry.starts_with("stop ")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn handover_discards_a_setup_waiting_for_its_sign_in_code() {
+    let mut host = host("handover-setup", 1, Harness::Echo, Boot::Works);
+    host.setups
+        .send(super::SetupCommand::Start(Box::new(super::SetupOrder {
+            claude_setup_id: "setup-1".try_into().expect("setup id"),
+            tenant_id: "tenant-1".try_into().expect("tenant id"),
+            box_id: "setup-box".try_into().expect("box id"),
+            image: BootOrder::Full(host.cached_image(&GuestHarnessProtocol::ShellLines)),
+            token_url: "https://example.com/token".try_into().expect("token URL"),
+            token_credential: "t".repeat(43).try_into().expect("token credential"),
+            url: Duration::from_secs(30),
+            code: Duration::from_secs(30),
+        })))
+        .expect("send setup offer");
+    host.settle_until("setup url https://example.com/setup").await;
+    let started = tokio::time::Instant::now();
+    let handed = host.ask_handover().await.expect("handover completes");
+    assert_eq!(handed.boxes.len(), 0);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(host.log().iter().any(|event| event == "stop setup-1"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_runner_error_explicitly_discards_its_incomplete_boot() {
+    let mut host = host("retiring-incomplete", 2, Harness::Echo, Boot::Hangs);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("claim turn-1").await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(host.standing().boxes.len(), 0);
+    assert!(host.log().iter().any(|entry| entry == "boot session-1 on tumpel0"));
+    std::fs::write(host.vmm.staging.join("broken"), b"a file").expect("a teardown that fails");
+    host.teardown("broken");
+    let outcome = host.runner.await.expect("runner exit");
+    assert!(outcome.expect_err("disk cleanup fails").contains("DiskNotFreed"));
+    assert!(host
+        .log
+        .lock()
+        .expect("log")
+        .iter()
+        .any(|entry| entry == "discard setup scope 0"));
 }
 
 #[tokio::test(start_paused = true)]

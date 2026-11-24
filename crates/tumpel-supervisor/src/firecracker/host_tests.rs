@@ -1,5 +1,5 @@
 use std::num::NonZeroU32;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{IntoRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -85,30 +85,60 @@ async fn exec_handed_supervisor() {
     let stdout = OwnedFd::from(child.stdout.take().expect("its standard output"));
     let stderr = OwnedFd::from(child.stderr.take().expect("its standard error"));
     unsafe { fd_store::take_notify_socket(true) }.expect("the user manager's notify socket");
-    super::move_into_scope(i32::try_from(child.id()).expect("box PID"), "tumpel-box63.scope")
-        .expect("the old process runs in its box scope");
-    for (role, fd) in [
-        (fd_store::GUEST, guest.as_fd()),
-        (fd_store::STDOUT, stdout.as_fd()),
-        (fd_store::STDERR, stderr.as_fd()),
-    ] {
-        fd_store::keep(63, role, fd).expect("systemd keeps the box's descriptor");
-    }
     let layout = Layout::new(data.join("tumpel-supervisor"), data.clone(), unit_path());
-    if let Err(failure) = run::refresh_unit(&layout, "the restart test fails").await {
-        panic!("{}: {}", failure.kind, failure.detail);
-    }
     let vmm = Firecracker {
         binary: data.join("firecracker"),
         images: data.clone(),
         data: data.clone(),
         vcpus: 1,
     };
+    let guest = OwnedFd::from(guest);
+    for fd in [&guest, &stdout, &stderr] {
+        super::tests::nonblocking(fd);
+    }
+    let mut inherited = super::tests::legacy_startup(
+        &tumpel_api::types::SupervisorHandoverMachine {
+            api_socket: data
+                .join("box63/api.sock")
+                .display()
+                .to_string()
+                .try_into()
+                .expect("API path"),
+            vsock: data
+                .join("box63/v.sock")
+                .display()
+                .to_string()
+                .try_into()
+                .expect("vsock path"),
+            process_id: NonZeroU32::new(child.id()).expect("child PID"),
+            guest_fd: guest.into_raw_fd(),
+            stdout_fd: stdout.into_raw_fd(),
+            stderr_fd: stderr.into_raw_fd(),
+            console_tail: String::new().try_into().expect("empty console"),
+            guest_buffer: String::new().try_into().expect("empty decoder"),
+        },
+        63,
+    );
+    let streams = run::preserve_legacy(&layout, &mut inherited).await;
+    assert_eq!(streams.len(), 3);
     let mib = Size {
         memory_mib: NonZeroU32::new(512).expect("512"),
         disk_mib: NonZeroU32::new(64).expect("64"),
     };
     let mut pool = TapPool::new(1024, mib);
+    let saved = &inherited.inventory.boxes[0];
+    let Err(error) = vmm.reattach(
+        &saved.record.session_id,
+        63,
+        &saved.record.machine,
+        None,
+        &mut pool,
+        false,
+    ) else {
+        panic!("the inherited VM has no readiness socket");
+    };
+    assert!(error.contains("vsock"), "{error}");
+    drop(streams);
     let new_tap = pool.claim_device(62, mib).expect("tap 62");
     let new_session = "restart-test-new".try_into().expect("session id");
     let mut new = vmm.machine(&new_session, &new_tap).expect("a new box");

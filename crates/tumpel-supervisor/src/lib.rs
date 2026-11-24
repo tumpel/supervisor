@@ -36,7 +36,7 @@ pub use images::{ImageOrder, Refusal};
 pub use install::{install, Enrolment};
 pub use lifecycle::{
     Attached, BoxTurn, Budgets, Command, Guest, IdleGate, Input, Lifecycle, Machine, Settings, SnapshotOrder, Taken,
-    Vmm,
+    TeardownOrder, Vmm,
 };
 pub use local_handover::{receive_handover, Transfer};
 pub use pool::{Disk, PoolExhausted, Size, Tap, TapPool};
