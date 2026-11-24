@@ -2063,7 +2063,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let drive = live.machine.drive();
         let stored = self.store_snapshot(drive, &live.base, order, protocol).await;
         self.cancels.forget(&order.snapshot_id);
-        let outgoing = match stored {
+        let (message, built) = match stored {
             Ok(None) => return Outcome::Kept(live),
             Ok(Some((uploaded_bytes, chunk_count, base))) => {
                 live.base = Arc::new(base);
@@ -2073,7 +2073,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     type_: ChannelSnapshotDoneType::SnapshotDone,
                     uploaded_bytes,
                 };
-                Outgoing::Snapshot(done.into(), protocol)
+                (done.into(), Some(protocol))
             }
             Err((reason, detail)) => {
                 let failed = ChannelSnapshotFailed {
@@ -2083,14 +2083,14 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     snapshot_id: order.snapshot_id.clone(),
                     type_: ChannelSnapshotFailedType::SnapshotFailed,
                 };
-                Outgoing::Message(failed.into())
+                (failed.into(), None)
             }
         };
-        let message = match &outgoing {
-            Outgoing::Snapshot(message, _) | Outgoing::Message(message) => message,
-            Outgoing::InterruptedTurn(..) => unreachable!("this task sends only snapshot messages"),
+        telemetry::ended(&message);
+        let outgoing = match built {
+            Some(protocol) => Outgoing::Snapshot(message, protocol),
+            None => Outgoing::Message(message),
         };
-        telemetry::ended(message);
         send_out(&self.out, outgoing);
         Outcome::Kept(live)
     }
@@ -3385,19 +3385,18 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             observation,
             reconnect: saved.reconnect,
         };
-        match (handed.state, taken) {
+        match (handed.state, reconnect) {
             (SupervisorHandoverBoxState::Unrecognised(_), _) => {
                 tumpel_channel::update_required();
                 return Err(tumpel_channel::UPDATE_REQUIRED.to_string());
             }
-            (_, _) if reconnect => {}
-            (SupervisorHandoverBoxState::Warm(_), _) => {
+            (_, true) => {}
+            (SupervisorHandoverBoxState::Warm(_), false) => {
                 slot.paused = true;
                 slot.idle_end = Some(Instant::now() + duration(handed.idle_milliseconds));
                 self.runner.standing.idle_until(&session, slot.idle_end);
             }
-            (SupervisorHandoverBoxState::Turn(_), Taken::Crashed) => unreachable!("a crashed turn reconnects"),
-            (SupervisorHandoverBoxState::Turn(turn), Taken::Handed) => {
+            (SupervisorHandoverBoxState::Turn(turn), false) => {
                 if turn.cancelled == Some(true) {
                     self.runner.cancels.cancel(turn.turn_id.clone());
                 }
@@ -3577,7 +3576,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             return Some(protected_detail(i32::from(tap.index())));
         }
         self.unclaimed.values().flat_map(ScopeDisks::reserved).any(|held| held.as_str() == session).then(|| {
-            "has a disk held for an unclaimed Firecracker scope; inspect the supervisor log before stopping that scope".to_string()
+            "has a disk held for an unclaimed Firecracker scope; inspect the supervisor log, then restart the supervisor after that scope has stopped".to_string()
         })
     }
 

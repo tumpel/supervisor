@@ -52,6 +52,8 @@ enum Status {
     Fail,
     #[serde(rename = "NOT RUN")]
     NotRun,
+    #[serde(rename = "NOT RUN")]
+    LegacyObservation,
 }
 
 #[derive(Serialize)]
@@ -231,20 +233,39 @@ fn inspect_host(
                     .map(|box_| u8::try_from(box_.record.tap_index))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| error.to_string())?;
-                boxes.iter().try_for_each(|box_| {
-                    vmm.observe(box_)
-                        .map_err(|error| format!("Inspecting box {} failed. {error}", box_.record.tap_index))
-                })?;
-                vmm.unclaimed_scopes(&taps)
+                let mut missing = Vec::new();
+                for (box_, tap) in boxes.iter().zip(&taps) {
+                    let failed = |error| format!("Inspecting box {tap} failed. {error}");
+                    if box_.observation.is_some() {
+                        vmm.observe(box_).map_err(failed)?;
+                    } else {
+                        vmm.attachment_pid(*tap, &box_.record.machine).map_err(failed)?;
+                        missing.push(*tap);
+                    }
+                }
+                Ok((vmm.unclaimed_scopes(&taps)?, missing))
             })();
             match inspected {
-                Ok(taps) if taps.is_empty() => checks.send(
-                    "attachment", Status::Pass, "recorded processes, descriptors and Firecracker APIs inspected",
+                Ok((taps, missing)) if taps.is_empty() && missing.is_empty() => checks.send(
+                    "attachment",
+                    Status::Pass,
+                    "recorded processes, descriptors and Firecracker APIs inspected",
                 ),
-                Ok(taps) => checks.send(
-                    "attachment", Status::NotRun,
-                    format!("attachment ownership could not be verified for scopes on TAP devices {taps:?}; recheck after any boots or Claude setups finish"),
-                ),
+                Ok((taps, missing)) => {
+                    let detail = if missing.is_empty() {
+                        format!("attachment ownership could not be verified for scopes on TAP devices {taps:?}; recheck after any boots or Claude setups finish")
+                    } else if taps.is_empty() {
+                        format!("the saved boxes on TAP devices {missing:?} have no descriptor observations; check them again after the installed supervisor refreshes their records")
+                    } else {
+                        format!("the saved boxes on TAP devices {missing:?} have no descriptor observations, and the scopes on TAP devices {taps:?} have no saved box records")
+                    };
+                    let status = if taps.is_empty() {
+                        Status::LegacyObservation
+                    } else {
+                        Status::NotRun
+                    };
+                    checks.send("attachment", status, detail);
+                }
                 Err(error) => checks.send("attachment", Status::Fail, error),
             }
         }
@@ -303,7 +324,11 @@ fn collect_until(manifest: Option<PathBuf>, deadline: Instant, legacy: bool) -> 
             .insert(name, Check::new(Status::Fail, format!("could not {action}: {stopped}")));
         report.checks.extend(incomplete);
     }
-    report.overall = report.binary_digest.is_some() && report.checks.values().all(|check| check.status == Status::Pass);
+    report.overall = report.binary_digest.is_some()
+        && report
+            .checks
+            .values()
+            .all(|check| matches!(check.status, Status::Pass | Status::LegacyObservation));
     if !manifest_required {
         report
             .checks
@@ -347,7 +372,7 @@ fn write_human(mut out: impl Write, report: &Report) -> io::Result<()> {
         let status = match check.status {
             Status::Pass => "PASS",
             Status::Fail => "FAIL",
-            Status::NotRun => "NOT RUN",
+            Status::NotRun | Status::LegacyObservation => "NOT RUN",
         };
         writeln!(out, "{status} {name} - {}", check.reason)?;
     }

@@ -32,6 +32,61 @@ fn both_api_transports_reject_unbounded_or_ambiguous_responses() {
     assert_eq!(response.read(b"3").expect("complete body"), Some((200, &b"123"[..])));
 }
 
+#[tokio::test]
+async fn discard_protected_checks_process_identity_before_reaping_the_box() {
+    let vmm = firecracker("discard-protected-identity");
+    let dir = vmm.data.join("box0");
+    std::fs::create_dir_all(&dir).expect("box directory");
+    let api = std::os::unix::net::UnixListener::bind(dir.join("api.sock")).expect("a different process owns the API");
+    let child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("fixture VM");
+    let pid = libc::pid_t::try_from(child.id().expect("VM PID")).expect("valid PID");
+    let record = serde_json::from_value(json!({
+        "boxId": "box-1", "sessionId": "session-1", "tapIndex": 0, "boxRetention": "Warm", "dirty": true,
+        "idleMilliseconds": 100, "state": {"kind": "Warm"}, "image": {"kind": "FutureImage"}, "queued": [],
+        "machine": {"processId": pid, "apiSocket": dir.join("api.sock"), "vsock": dir.join("v.sock"),
+            "guestBuffer": "", "consoleTail": "", "guestFd": -1, "stdoutFd": -1, "stderrFd": -1}
+    }))
+    .expect("protected record");
+    let error = vmm
+        .discard_protected(0, &record, None)
+        .await
+        .expect_err("the wrong API owner must be refused");
+    assert!(error.contains("expected"), "{error}");
+
+    let supervisor_pid = std::process::id().try_into().expect("supervisor PID");
+    let descriptor = super::Descriptor {
+        fd: -1,
+        device: 0,
+        inode: 0,
+    };
+    let start = super::process_start(pid).expect("the unverified child still runs");
+    let mut observation = super::Observation {
+        supervisor_pid,
+        supervisor_start: super::process_start(supervisor_pid).expect("supervisor start"),
+        machine_start: start + 1,
+        guest: descriptor.clone(),
+        stdout: descriptor.clone(),
+        stderr: descriptor,
+    };
+    let _ = vmm.discard_protected(0, &record, Some(&observation)).await;
+    assert_eq!(
+        super::process_start(pid),
+        Ok(start),
+        "the stale identity must leave the child alive"
+    );
+
+    observation.machine_start = start;
+    let _ = vmm.discard_protected(0, &record, Some(&observation)).await;
+    assert!(super::read_process_identity(pid, true)
+        .expect("the process table can be read")
+        .is_none());
+    drop(api);
+}
+
 const BOX: Size = Size {
     memory_mib: NonZeroU32::new(4096).expect("a positive size"),
     disk_mib: NonZeroU32::new(32_768).expect("a positive size"),

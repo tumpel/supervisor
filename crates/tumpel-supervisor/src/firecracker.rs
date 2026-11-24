@@ -987,7 +987,7 @@ impl Firecracker {
         remove_dir(&self.data.join(format!("box{index}")))
     }
 
-    fn attachment_pid(&self, index: u8, handed: &SupervisorHandoverMachine) -> Result<libc::pid_t, String> {
+    pub(crate) fn attachment_pid(&self, index: u8, handed: &SupervisorHandoverMachine) -> Result<libc::pid_t, String> {
         let dir = self.data.join(format!("box{index}"));
         if Path::new(&handed.api_socket) != dir.join("api.sock") || Path::new(&handed.vsock) != dir.join("v.sock") {
             return Err(format!(
