@@ -827,6 +827,20 @@ async fn prepare_startup(
     Ok(trial)
 }
 
+async fn startup_inventory(
+    layout: &Layout,
+    handed: bool,
+    received: &BTreeMap<String, OwnedFd>,
+) -> Result<(Option<StartupBoxes>, Vec<fd_store::LegacyFd>), Failure> {
+    let mut taken = taken(layout, handed, received)?;
+    let streams = if let Some(saved) = taken.as_mut().filter(|saved| saved.inherited) {
+        preserve_legacy(layout, saved).await
+    } else {
+        Vec::new()
+    };
+    Ok((taken, streams))
+}
+
 pub async fn run(
     telemetry: Telemetry,
     handed: bool,
@@ -841,12 +855,7 @@ pub async fn run(
     })?;
     let (out, mut from_box) = unbounded_channel();
     let layout = startup_layout()?;
-    let mut taken = taken(&layout, handed, &received)?;
-    let inherited_streams = if let Some(saved) = taken.as_mut().filter(|saved| saved.inherited) {
-        preserve_legacy(&layout, saved).await
-    } else {
-        Vec::new()
-    };
+    let (taken, inherited_streams) = startup_inventory(&layout, handed, &received).await?;
     let started = start(layout)?;
     let trial = prepare_startup(&started, &out, !inherited_streams.is_empty(), handed).await?;
     let dir = dir::supervisor_dir();
