@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io::{Cursor, Read};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,7 +30,7 @@ use crate::exchange::{Answer, Answers, Cancels};
 use crate::images::ImageOrder;
 use crate::pool::{Disk, Held, Size, Tap, TapPool};
 use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Scan, Stored, Upper};
-use crate::store::{Store, UploadError};
+use crate::store::{DownloadError, Store, UploadError, DOWNLOAD_ATTEMPTS};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Harness {
@@ -460,7 +460,13 @@ struct Index {
 }
 
 #[derive(Default, Clone)]
-struct MemoryStore(Arc<Mutex<HashMap<String, Vec<u8>>>>, Log, Arc<Mutex<Index>>, Duration);
+struct MemoryStore(
+    Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    Log,
+    Arc<Mutex<Index>>,
+    Duration,
+    Arc<AtomicU32>,
+);
 
 const FETCHED_IMAGE_URL: &str = "https://r2.example.test/fetched/image";
 
@@ -499,11 +505,32 @@ impl MemoryStore {
         Ok(())
     }
 
-    fn download_range_now(&self, url: &str, file: &Path, first: u64, last: u64) -> Result<(), String> {
-        let bytes = self.get(url)?;
+    fn failing(&self, url: &str) -> Result<(), DownloadError> {
+        let failing = url.contains("/packs/")
+            && self
+                .4
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .is_ok();
+        if failing {
+            return Err(DownloadError::Transient(format!("GET {url}: error sending request")));
+        }
+        Ok(())
+    }
+
+    fn download_now(&self, url: &str, file: &Path) -> Result<(), DownloadError> {
+        self.failing(url)?;
+        let bytes = self.get(url).map_err(DownloadError::Refused)?;
+        std::fs::write(file, bytes).map_err(|error| DownloadError::Refused(error.to_string()))
+    }
+
+    fn download_range_now(&self, url: &str, file: &Path, first: u64, last: u64) -> Result<(), DownloadError> {
+        self.failing(url)?;
+        let bytes = self.get(url).map_err(DownloadError::Refused)?;
         let range = usize::try_from(first).expect("first")..=usize::try_from(last).expect("last");
-        let part = bytes.get(range).ok_or_else(|| format!("GET {url} answered 416"))?;
-        std::fs::write(file, part).map_err(|error| error.to_string())
+        let part = bytes
+            .get(range)
+            .ok_or_else(|| DownloadError::Refused(format!("GET {url} answered 416")))?;
+        std::fs::write(file, part).map_err(|error| DownloadError::Refused(error.to_string()))
     }
 }
 
@@ -521,11 +548,11 @@ impl Store for MemoryStore {
         std::future::ready(self.upload_checked_now(url, file, sha256))
     }
 
-    async fn download(&self, url: &str, file: &Path) -> Result<(), String> {
+    async fn download(&self, url: &str, file: &Path) -> Result<(), DownloadError> {
         if url == FETCHED_IMAGE_URL {
             tokio::time::sleep(self.3).await;
         }
-        std::fs::write(file, self.get(url)?).map_err(|error| error.to_string())
+        self.download_now(url, file)
     }
 
     fn download_range(
@@ -534,7 +561,7 @@ impl Store for MemoryStore {
         file: &Path,
         first: u64,
         last: u64,
-    ) -> impl Future<Output = Result<(), String>> + Send {
+    ) -> impl Future<Output = Result<(), DownloadError>> + Send {
         std::future::ready(self.download_range_now(url, file, first, last))
     }
 }
@@ -1619,6 +1646,34 @@ async fn a_restore_missing_a_chunk_fails_the_turn_snapshot_unreadable() {
         "{seen:?}"
     );
     assert!(!second.vmm.staging.join("session-1").exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restore_retries_a_pack_download_that_fails_once_and_runs_the_turn() {
+    let (mut host, snapshot) = restoring("pack-retry", settings()).await;
+    host.store.4.store(1, Ordering::SeqCst);
+    host.turn("turn-2", "session-1", "two", vec![snapshot]);
+    assert_eq!(
+        host.settle_until("complete 1").await,
+        ["claim turn-2", "line 1 two", "complete 1"]
+    );
+    assert_eq!(host.store.4.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restore_stops_retrying_a_pack_after_ten_attempts_and_fails_snapshot_unreadable() {
+    let (mut host, snapshot) = restoring("pack-retry-cap", settings()).await;
+    host.store.4.store(2 * DOWNLOAD_ATTEMPTS, Ordering::SeqCst);
+    host.turn("turn-2", "session-1", "two", vec![snapshot]);
+    let seen = host.settle(Duration::from_secs(55)).await;
+    assert!(
+        seen.len() == 2
+            && seen[0] == "claim turn-2"
+            && seen[1].starts_with(&format!("failed {}", TurnFailureReason::SnapshotUnreadable))
+            && seen[1].contains("error sending request"),
+        "{seen:?}"
+    );
+    assert_eq!(host.store.4.load(Ordering::SeqCst), DOWNLOAD_ATTEMPTS);
 }
 
 #[tokio::test(start_paused = true)]

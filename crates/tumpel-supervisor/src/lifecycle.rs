@@ -17,11 +17,11 @@ use tracing::Instrument;
 use tumpel_api::types::{
     BoxBudgets, BoxRetention, ChannelBoxGone, ChannelBoxGoneType, ChannelBoxTeardownFailed,
     ChannelBoxTeardownFailedType, ChannelBoxTeardownFailureReason, ChannelDispatchGrant, ChannelHostMessage,
-    ChannelPack, ChannelPersonaFileDownload, ChannelRestoreChunks, ChannelRestoreChunksType, ChannelSnapshotChunks,
-    ChannelSnapshotChunksType, ChannelSnapshotDone, ChannelSnapshotDoneType, ChannelSnapshotDownload,
-    ChannelSnapshotFailed, ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPacks,
-    ChannelSnapshotPacksType, ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete,
-    ChannelTurnCompleteType, ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType,
+    ChannelPack, ChannelPersonaFileDownload, ChannelRestoreChunks, ChannelRestoreChunksType, ChannelRestoreDownloads,
+    ChannelSnapshotChunks, ChannelSnapshotChunksType, ChannelSnapshotDone, ChannelSnapshotDoneType,
+    ChannelSnapshotDownload, ChannelSnapshotFailed, ChannelSnapshotFailedType, ChannelSnapshotFailureReason,
+    ChannelSnapshotPacks, ChannelSnapshotPacksType, ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType,
+    ChannelTurnComplete, ChannelTurnCompleteType, ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType,
     ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLines, ChannelTurnLinesType,
     ChannelTurnRepositoryCloneFailed, ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady,
     ChannelTurnRepositoryReadyType, CredentialText, DisplayName, EmailAddress, EntityId, GuestHello, GuestInput,
@@ -46,7 +46,7 @@ use crate::snapshot::{
     assemble, cut, decode, decode_root, draft_digests, fetches, fresh, lacking, pack_parts, restore_parts, stage,
     unpack, write_restore, Base, Births, ChunkCache, Cut, Fetch, Kind, Manifest, PackFile, Place, Places, Span,
 };
-use crate::store::{Store, UploadError};
+use crate::store::{wait, DownloadError, Store, UploadError, ATTEMPTS_PER_URL, DOWNLOAD_ATTEMPTS};
 use crate::telemetry::{self, Phase};
 use crate::update::Idle;
 
@@ -1264,7 +1264,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         deadline: Instant,
     ) -> Result<(), String> {
         let parts = restore_parts(wanted, DIGESTS_PER_PART);
-        let (jobs, queue) = unbounded_channel::<(String, Fetch)>();
+        let (jobs, queue) = unbounded_channel::<(Arc<PartUrls>, Fetch)>();
         let asking = async move {
             for (index, part) in parts.into_iter().enumerate() {
                 let key = Key {
@@ -1278,35 +1278,119 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     turn_id: turn_id.clone(),
                     type_: ChannelRestoreChunksType::RestoreChunks,
                 };
-                let Answer::Downloads(answer) = self.ask(key.clone(), message, deadline).await? else {
-                    return Err(unexpected(&key));
-                };
-                let mut urls = BTreeMap::new();
-                let mut sizes = BTreeMap::new();
-                for pack in answer.packs {
-                    let digest = pack.pack_digest.as_str().to_string();
-                    sizes.insert(digest.clone(), pack.size_bytes.get());
-                    urls.insert(digest, String::from(pack.url));
-                }
+                let answer = self.restore_urls(&key, message.clone(), deadline).await?;
+                let sizes = answer
+                    .packs
+                    .iter()
+                    .map(|pack| (pack.pack_digest.as_str().to_string(), pack.size_bytes.get()))
+                    .collect();
+                let urls = Arc::new(PartUrls {
+                    key,
+                    message,
+                    urls: Mutex::new((0, pack_urls(answer))),
+                });
                 for fetch in fetches(&part, &sizes)? {
-                    let url = urls
-                        .get(&fetch.pack)
-                        .cloned()
-                        .ok_or_else(|| format!("pack {} has no URL", fetch.pack))?;
-                    jobs.send((url, fetch))
+                    jobs.send((Arc::clone(&urls), fetch))
                         .map_err(|_| "the pack downloads stopped".to_string())?;
                 }
             }
             Ok::<(), String>(())
         };
-        let store = Arc::clone(&self.store);
+        let runner = self.clone();
         let downloading = futures_util::stream::unfold(queue, |mut queue| async move {
             queue.recv().await.map(|job| (Ok::<_, String>(job), queue))
         })
-        .try_for_each_concurrent(TRANSFERS, move |(url, fetch)| {
-            download_pack(Arc::clone(&store), url, fetch, Arc::clone(cache), dir.to_path_buf())
+        .try_for_each_concurrent(TRANSFERS, move |(urls, fetch)| {
+            let runner = runner.clone();
+            let cache = Arc::clone(cache);
+            let dir = dir.to_path_buf();
+            async move { runner.download_pack(urls, fetch, cache, dir, deadline).await }
         });
         futures_util::future::try_join(asking, downloading).await.map(|_| ())
+    }
+
+    async fn restore_urls(
+        &self,
+        key: &Key,
+        message: ChannelRestoreChunks,
+        deadline: Instant,
+    ) -> Result<ChannelRestoreDownloads, String> {
+        let Answer::Downloads(answer) = self.ask(key.clone(), message, deadline).await? else {
+            return Err(unexpected(key));
+        };
+        Ok(answer)
+    }
+
+    async fn refresh(
+        &self,
+        urls: &PartUrls,
+        seen: u32,
+        pack: &str,
+        deadline: Instant,
+    ) -> Result<(u32, String), String> {
+        let mut held = urls.urls.lock().await;
+        if held.0 == seen {
+            let answer = self.restore_urls(&urls.key, urls.message.clone(), deadline).await?;
+            *held = (seen + 1, pack_urls(answer));
+        }
+        url_of(&held, pack)
+    }
+
+    async fn download_pack(
+        &self,
+        urls: Arc<PartUrls>,
+        fetch: Fetch,
+        cache: Arc<ChunkCache>,
+        dir: PathBuf,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let named = fetch
+            .chunks
+            .first()
+            .map_or(fetch.pack.as_str(), |place| place.digest.as_str());
+        let staged = dir.join(format!("pack-{named}.part"));
+        let (mut generation, mut url) = url_of(&*urls.urls.lock().await, &fetch.pack)?;
+        let mut attempt = 1;
+        loop {
+            let fetched = match fetch.span {
+                Span::Whole => self.store.download(&url, &staged).await,
+                Span::Range { first, last } => self.store.download_range(&url, &staged, first, last).await,
+            };
+            let stale = match fetched {
+                Ok(()) => break,
+                Err(DownloadError::Refused(error)) => {
+                    return Err(format!("pack {} is unreadable: {error}", fetch.pack))
+                }
+                Err(error) if attempt >= DOWNLOAD_ATTEMPTS => {
+                    return Err(format!("pack {} is unreadable: {error}", fetch.pack))
+                }
+                Err(DownloadError::Expired(_)) => true,
+                Err(DownloadError::Transient(_)) => attempt % ATTEMPTS_PER_URL == 0,
+            };
+            wait(attempt).await;
+            if stale {
+                (generation, url) = self.refresh(&urls, generation, &fetch.pack, deadline).await?;
+            }
+            attempt += 1;
+        }
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let bytes = std::fs::read(&staged).map_err(|error| format!("reading {}: {error}", staged.display()))?;
+            remove_file(&staged)?;
+            unpack(&fetch, &bytes, &cache)
+        })
+        .await
+        .map_err(|error| format!("unpacking a pack stopped: {error}"))?
+    }
+
+    async fn download_root(&self, url: &str, file: &Path) -> Result<(), DownloadError> {
+        let mut attempt = 1;
+        loop {
+            match self.store.download(url, file).await {
+                Err(DownloadError::Transient(_)) if attempt < DOWNLOAD_ATTEMPTS => wait(attempt).await,
+                done => return done,
+            }
+            attempt += 1;
+        }
     }
 
     async fn fetch_within(
@@ -1356,9 +1440,9 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
-    async fn download_root(&self, snapshot: &ChannelSnapshotDownload, file: &Path, named: &str) -> Result<(), String> {
+    async fn restore_root(&self, snapshot: &ChannelSnapshotDownload, file: &Path, named: &str) -> Result<(), String> {
         let expires = snapshot.download_expires_at;
-        match timeout_at(instant_at(expires), self.store.download(&snapshot.download_url, file)).await {
+        match timeout_at(instant_at(expires), self.download_root(&snapshot.download_url, file)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
                 Err(format!(
@@ -1415,7 +1499,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         std::fs::create_dir_all(&dir).map_err(|error| unreadable(format!("creating {}: {error}", dir.display())))?;
         let expires = snapshot.download_expires_at;
         let file = dir.join("restore-root.json");
-        self.download_root(snapshot, &file, &named).await.map_err(unreadable)?;
+        self.restore_root(snapshot, &file, &named).await.map_err(unreadable)?;
         let damaged = |error: String| {
             unreadable(format!(
                 "{named} is unreadable: {error}; the stored snapshot is damaged, so start a new session"
@@ -2041,30 +2125,25 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 }
 
-async fn download_pack<S: Store>(
-    store: Arc<S>,
-    url: String,
-    fetch: Fetch,
-    cache: Arc<ChunkCache>,
-    dir: PathBuf,
-) -> Result<(), String> {
-    let named = fetch
-        .chunks
-        .first()
-        .map_or(fetch.pack.as_str(), |place| place.digest.as_str());
-    let staged = dir.join(format!("pack-{named}.part"));
-    let fetched = match fetch.span {
-        Span::Whole => store.download(&url, &staged).await,
-        Span::Range { first, last } => store.download_range(&url, &staged, first, last).await,
-    };
-    fetched.map_err(|error| format!("pack {} is unreadable: {error}", fetch.pack))?;
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let bytes = std::fs::read(&staged).map_err(|error| format!("reading {}: {error}", staged.display()))?;
-        remove_file(&staged)?;
-        unpack(&fetch, &bytes, &cache)
-    })
-    .await
-    .map_err(|error| format!("unpacking a pack stopped: {error}"))?
+struct PartUrls {
+    key: Key,
+    message: ChannelRestoreChunks,
+    urls: Mutex<(u32, BTreeMap<String, String>)>,
+}
+
+fn pack_urls(answer: ChannelRestoreDownloads) -> BTreeMap<String, String> {
+    answer
+        .packs
+        .into_iter()
+        .map(|pack| (pack.pack_digest.as_str().to_string(), String::from(pack.url)))
+        .collect()
+}
+
+fn url_of(held: &(u32, BTreeMap<String, String>), pack: &str) -> Result<(u32, String), String> {
+    held.1
+        .get(pack)
+        .map(|url| (held.0, url.clone()))
+        .ok_or_else(|| format!("pack {pack} has no URL"))
 }
 
 fn sha256_digest(digest: &str) -> Result<Sha256Digest, String> {
