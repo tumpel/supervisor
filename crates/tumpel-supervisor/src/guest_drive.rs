@@ -10,6 +10,7 @@ use crate::snapshot::hex;
 
 const WRITE_TIME: Duration = Duration::from_secs(60);
 const DIRECTORY: &str = "guest";
+const CACHE_FIX: &str = "make imageCacheDir in runtime.json a writable directory with room for the drive";
 
 #[cfg(guest_drive)]
 const DRIVE: Option<&[u8]> = Some(include_bytes!(env!("TUMPEL_GUEST_DRIVE_PATH")));
@@ -34,7 +35,12 @@ pub(crate) fn access(images: &Path) -> Result<(), String> {
         Err(error) if error.kind() == ErrorKind::NotFound => (images, check_permissions(images)),
         checked => (guest.as_path(), checked),
     };
-    result.map_err(|error| format!("{} needs read, write and search access: {error}", dir.display()))
+    result.map_err(|error| {
+        format!(
+            "{} needs read, write and search access: {error}; {CACHE_FIX}",
+            dir.display()
+        )
+    })
 }
 
 fn check_permissions(dir: &Path) -> io::Result<()> {
@@ -71,12 +77,11 @@ pub async fn write(images: &Path) -> Result<(), String> {
         return Ok(());
     };
     let images = images.to_path_buf();
-    let fix = "make imageCacheDir in runtime.json a writable directory with room for the drive";
     match tokio::time::timeout(WRITE_TIME, tokio::task::spawn_blocking(move || place(&images, drive))).await {
-        Ok(Ok(placed)) => placed.map(|_| ()).map_err(|error| format!("{error}; {fix}")),
+        Ok(Ok(placed)) => placed.map(|_| ()).map_err(|error| format!("{error}; {CACHE_FIX}")),
         Ok(Err(error)) => Err(format!("the guest drive writer stopped: {error}")),
         Err(_) => Err(format!(
-            "writing the guest drive took longer than {}s; {fix}",
+            "writing the guest drive took longer than {}s; {CACHE_FIX}",
             WRITE_TIME.as_secs()
         )),
     }

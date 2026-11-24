@@ -140,14 +140,28 @@ fn a_bare_report_checks_guest_drive_access_as_an_unprivileged_user() {
     fs::copy(BINARY, &binary).expect("fixture binary");
     let images = host.root.join("images");
     let guest = images.join("guest");
+    let denied = io::Error::from_raw_os_error(libc::EACCES);
+    let fix = "make imageCacheDir in runtime.json a writable directory with room for the drive";
+    let cache_failure = |dir: &Path| {
+        format!(
+            "FAIL image cache: {} needs read, write and search access: {denied}; {fix}",
+            dir.display()
+        )
+    };
 
-    for (dir, mode, exit_status) in [
-        (&images, 0o555, 1),
-        (&guest, 0o777, 0),
-        (&guest, 0o555, 1),
-        (&guest, 0o333, 1),
+    for (dir, mode, exit_status, expected) in [
+        (&images, 0o555, 1, cache_failure(&images)),
+        (
+            &guest,
+            0o777,
+            0,
+            "PASS image cache: the cache can hold the guest drive".into(),
+        ),
+        (&guest, 0o555, 1, cache_failure(&guest)),
+        (&guest, 0o333, 1, cache_failure(&guest)),
     ] {
         fs::create_dir_all(dir).expect("cache or guest directory");
+        let permissions = fs::metadata(dir).expect("directory metadata").permissions();
         fs::set_permissions(dir, fs::Permissions::from_mode(mode)).expect("set directory access");
         let mut candidate = host.command(&binary);
         if unsafe { libc::geteuid() } == 0 {
@@ -155,22 +169,15 @@ fn a_bare_report_checks_guest_drive_access_as_an_unprivileged_user() {
         }
 
         let output = candidate.output();
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o777)).expect("restore directory access");
+        fs::set_permissions(dir, permissions).expect("restore directory access");
+        if dir == &guest {
+            fs::remove_dir(&guest).expect("remove guest directory");
+        }
         let output = output.expect("report exits");
         let report = String::from_utf8(output.stdout).expect("report text");
 
         assert_eq!(output.status.code(), Some(exit_status), "{report}");
-        if exit_status == 0 {
-            assert!(report.contains("PASS image cache: "), "{report}");
-        } else {
-            assert!(
-                report.contains(&format!(
-                    "FAIL image cache: {} needs read, write and search access",
-                    dir.display()
-                )),
-                "{report}"
-            );
-        }
+        assert!(report.lines().any(|line| line == expected), "{report}");
     }
 }
 
