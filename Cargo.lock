@@ -1874,6 +1874,7 @@ dependencies = [
  "fastcdc",
  "futures-util",
  "hostname",
+ "httparse",
  "libc",
  "reqwest",
  "ring",

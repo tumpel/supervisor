@@ -140,7 +140,7 @@ pub trait Machine: Send + 'static {
     fn pause(&mut self) -> impl Future<Output = Result<(), String>> + Send;
     fn resume(&mut self) -> impl Future<Output = Result<(), String>> + Send;
     fn drive(&self) -> PathBuf;
-    fn stop(self) -> impl Future<Output = Stopped> + Send;
+    fn stop(&mut self) -> impl Future<Output = Stopped> + Send;
     fn console_tail(&self) -> String;
     fn clear_console(&mut self);
     fn hand_over(self, guest: Self::Guest) -> Result<SupervisorHandoverMachine, String>;
@@ -176,19 +176,41 @@ pub(crate) enum BoxEnd {
     SetupEnded,
 }
 
+const STOP_ATTEMPTS: u32 = 10;
+
+async fn stop_backoff(retry: u32) {
+    tokio::time::sleep(Duration::from_secs(1 << retry.min(3))).await;
+}
+
+fn stop_failed(session_id: &EntityId, box_id: &EntityId, error: &str) -> String {
+    format!(
+        "BoxStopFailed: stopping box {box_id} of session {session_id} failed after {STOP_ATTEMPTS} attempts: {error}"
+    )
+}
+
 pub(crate) async fn end_box<M: Machine>(
-    machine: M,
+    mut machine: M,
     index: u8,
     session_id: &EntityId,
     box_id: &EntityId,
     end: BoxEnd,
 ) -> Result<(), String> {
-    let Stopped { exit, cleared } = machine.stop().await;
+    let mut stopped = machine.stop().await;
+    for retry in 0..STOP_ATTEMPTS - 1 {
+        if stopped.cleared.is_ok() {
+            break;
+        }
+        stop_backoff(retry).await;
+        stopped = machine.stop().await;
+    }
+    stopped
+        .cleared
+        .map_err(|error| stop_failed(session_id, box_id, &error))?;
+    let exit = stopped.exit;
     eprintln!(
-        "tumpel-supervisor: box {index} of session {}, box id {}, ended on {end:?}: Firecracker {exit}",
-        **session_id, **box_id
+        "tumpel-supervisor: box {index} of session {session_id}, box id {box_id}, ended on {end:?}: Firecracker {exit}"
     );
-    cleared
+    Ok(())
 }
 
 #[derive(Default)]
@@ -670,6 +692,7 @@ struct Parked {
 
 enum Running {
     Recovering,
+    Stopping,
     Turn(EntityId),
     Snapshot,
 }
@@ -685,6 +708,7 @@ fn duration(milliseconds: i64) -> Duration {
 enum Work {
     Turn,
     Snapshot,
+    Stop(Option<TeardownOrder>),
 }
 
 enum Event<M: Machine> {
@@ -738,7 +762,7 @@ impl<M: Machine> Slot<M> {
     fn turns(&self) -> Vec<EntityId> {
         let running = self.task.iter().filter_map(|(running, _)| match running {
             Running::Turn(turn_id) => Some(turn_id.clone()),
-            Running::Snapshot | Running::Recovering => None,
+            Running::Snapshot | Running::Recovering | Running::Stopping => None,
         });
         let queued = self.queue.iter().filter_map(|command| match command {
             Command::Turn(turn) => Some(turn.turn_id.clone()),
@@ -823,6 +847,13 @@ pub(crate) fn turn_failed(
             type_: ChannelTurnFailedType::TurnFailed,
         },
     );
+}
+
+struct InterruptedTurn {
+    tap: i32,
+    turn: EntityId,
+    detail: String,
+    ended: bool,
 }
 
 fn report_failure(out: &UnboundedSender<Outgoing>, turn_id: &EntityId, report: Report, detail: String) {
@@ -930,7 +961,7 @@ async fn cancel<M: Machine>(live: &mut LiveBox<M>, turn_id: &EntityId, state: &m
     })
 }
 
-async fn stop_box<M: Machine>(standing: &Standing, live: LiveBox<M>, end: BoxEnd) -> (Tap, String, Result<(), String>) {
+async fn stop_box<M: Machine>(live: LiveBox<M>, end: BoxEnd) -> (Tap, String, Result<(), String>) {
     let tail = live.machine.console_tail();
     let LiveBox {
         machine,
@@ -940,16 +971,6 @@ async fn stop_box<M: Machine>(standing: &Standing, live: LiveBox<M>, end: BoxEnd
         ..
     } = live;
     let stopped = end_box(machine, tap.index(), &session_id, &box_id, end).await;
-    let index = i32::from(tap.index());
-    if stopped.is_ok() {
-        if let Err(error) = standing.write(|boxes| {
-            boxes.remove(&index);
-        }) {
-            eprintln!(
-                "tumpel-supervisor: forgetting stopped box {index} in the record of running boxes failed: {error}; the next start finds it gone"
-            );
-        }
-    }
     (tap, tail, stopped)
 }
 
@@ -1133,7 +1154,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 ),
             },
         };
-        let (tap, tail, stopped) = stop_box(&self.standing, live, BoxEnd::ResumeFailed).await;
+        let (tap, tail, stopped) = stop_box(live, BoxEnd::ResumeFailed).await;
         turn_failed(
             &self.out,
             &turn.turn_id,
@@ -1246,7 +1267,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let Err(error) = self.standing.put(&live, Some(&turn.turn_id)) else {
             return self.run_turn(live, turn, files, claiming).await;
         };
-        let (tap, tail, stopped) = stop_box(&self.standing, live, BoxEnd::NotRecorded).await;
+        let (tap, tail, stopped) = stop_box(live, BoxEnd::NotRecorded).await;
         turn_failed(
             &self.out,
             &turn.turn_id,
@@ -1885,7 +1906,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             ),
         };
         let session = live.session_id.to_string();
-        let (tap, tail, stopped) = stop_box(&self.standing, live, BoxEnd::RecoverFailed).await;
+        let (tap, tail, stopped) = stop_box(live, BoxEnd::RecoverFailed).await;
         eprintln!(
             "tumpel-supervisor: the box of session {session} did not take a new guest connection and was stopped: {failed}. Console: {tail}"
         );
@@ -1922,7 +1943,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 self.settings.budgets.boot.as_secs()
             ),
         };
-        let (tap, tail, stopped) = stop_box(&self.standing, live, BoxEnd::PauseFailed).await;
+        let (tap, tail, stopped) = stop_box(live, BoxEnd::PauseFailed).await;
         eprintln!(
             "tumpel-supervisor: a box could not be paused after its turn and was stopped: {failed}. Console: {tail}"
         );
@@ -2106,7 +2127,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 Outgoing::Message(failed.into())
             }
         };
-        let (Outgoing::Snapshot(message, _) | Outgoing::Message(message)) = &outgoing;
+        let message = match &outgoing {
+            Outgoing::Snapshot(message, _) | Outgoing::Message(message) => message,
+            Outgoing::InterruptedTurn(..) => unreachable!("this task sends only snapshot messages"),
+        };
         telemetry::ended(message);
         send_out(&self.out, outgoing);
         Outcome::Kept(live)
@@ -2341,7 +2365,7 @@ pub enum Taken {
 enum StartupAction {
     Warm,
     Resume(Box<SupervisorHandoverTurn>),
-    Reconnect(Option<EntityId>),
+    Reconnect(Option<InterruptedTurn>),
 }
 
 pub struct Abandoned {
@@ -2602,7 +2626,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     /// # Errors
-    /// Fails when a box ends and its files cannot be deleted.
+    /// Fails when a host-wide lifecycle operation cannot be completed.
     pub async fn run(
         mut self,
         mut inputs: UnboundedReceiver<Input>,
@@ -2639,7 +2663,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             if snapshot {
                 self.adopted.push(session);
             } else {
-                self.drain(session).await?;
+                self.drain(&session)?;
             }
         }
         let held: Vec<String> = self.slots.keys().cloned().collect();
@@ -2650,12 +2674,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         loop {
             tokio::select! {
                 input = inputs.recv() => match input {
-                    Some(Input::Command(command)) => self.command(command).await?,
+                    Some(Input::Command(command)) => self.command(command)?,
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
                     Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
-                    Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id).await?,
+                    Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id),
                     Some(Input::SnapshotFailed(snapshot_id)) => self.snapshot_failed(snapshot_id),
-                    Some(Input::Welcomed(protocol)) => self.welcomed(protocol).await?,
+                    Some(Input::Welcomed(protocol)) => self.welcomed(protocol)?,
                     None => break,
                 },
                 Some(setup) = setups.recv() => self.setup_command(setup),
@@ -2862,7 +2886,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     }
                     match running {
                         Running::Turn(turn_id) => Some(turn_id),
-                        Running::Snapshot | Running::Recovering => None,
+                        Running::Snapshot | Running::Recovering | Running::Stopping => None,
                     }
                 }
                 (None, Some(parked)) => Some(parked.turn_id),
@@ -3005,19 +3029,19 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         eprintln!("tumpel-supervisor: handing over box {box_id} of session {session} failed: {error}; kept its saved box record");
         let kept = self.runner.standing.write(|boxes| {
             if let Some(saved) = boxes.get_mut(&tap_index) {
-                Self::interrupt(&mut saved.saved);
                 saved.saved.record.queued.clear();
             }
         });
         if let Err(error) = kept {
             eprintln!("tumpel-supervisor: recording the interrupted box of session {session} failed: {error}");
-        } else if let SupervisorHandoverBoxState::Turn(turn) = state {
-            turn_failed(
-                &self.runner.out,
-                &turn.turn_id,
-                TurnFailureReason::HarnessExited,
-                format!("handing over box {box_id} failed: {error}; send the turn again"),
-            );
+        }
+        if let SupervisorHandoverBoxState::Turn(turn) = state {
+            self.record_interruption(InterruptedTurn {
+                tap: tap_index,
+                turn: turn.turn_id,
+                detail: format!("handing over box {box_id} failed: {error}; send the turn again"),
+                ended: false,
+            });
         }
         for command in queue {
             self.answer_protected(command, &protected_detail(tap_index));
@@ -3096,12 +3120,17 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 handed.dirty = record.dirty;
                 let mut standing_box = StandingBox::capture(record, &machine, &guest);
                 standing_box.saved.reconnect = saved.reconnect;
-                if matches!(taken, Taken::Crashed) {
-                    Self::interrupt(&mut standing_box.saved);
-                }
-                let action = match (&handed.state, standing_box.saved.reconnect) {
-                    (SupervisorHandoverBoxState::Turn(turn), true) => {
-                        StartupAction::Reconnect(Some(turn.turn_id.clone()))
+                let action = match (&handed.state, reconnect) {
+                    (SupervisorHandoverBoxState::Turn(turn), true) if !saved.reconnect => {
+                        StartupAction::Reconnect(Some(InterruptedTurn {
+                            tap: handed.tap_index,
+                            turn: turn.turn_id.clone(),
+                            detail: format!(
+                                "the supervisor stopped unexpectedly during turn {}, so the turn ended; its box is kept, so send the turn again",
+                                turn.turn_id
+                            ),
+                            ended: false,
+                        }))
                     }
                     (_, true) => StartupAction::Reconnect(None),
                     (SupervisorHandoverBoxState::Turn(turn), false) => StartupAction::Resume(Box::new(turn.clone())),
@@ -3114,8 +3143,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let claimed: Vec<u8> = prepared.iter().map(|(_, _, _, _, (_, _, tap))| tap.index()).collect();
         self.finish_startup(&mut standing, ended, &claimed, recorded, &mut failed_turns)?;
         self.runner.standing.write(|boxes| *boxes = standing)?;
-        for (turn_id, detail) in failed_turns {
-            turn_failed(&self.runner.out, &turn_id, TurnFailureReason::HarnessExited, detail);
+        for failed in failed_turns {
+            self.record_interruption(failed);
         }
         for (handed, action, image, queue, attached) in prepared {
             self.adopt(handed, action, image, queue, attached);
@@ -3150,9 +3179,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         ended: Vec<RecordedBox>,
         claimed: &[u8],
         recorded: bool,
-        failed_turns: &mut Vec<(EntityId, String)>,
+        failed_turns: &mut Vec<InterruptedTurn>,
     ) -> Result<(), String> {
         self.unclaimed = self.runner.vmm.unclaimed_reservations(claimed)?;
+        let mut interrupted_ended = Vec::new();
         for mut saved in ended {
             let tap = u8::try_from(saved.record.tap_index).map_err(|error| error.to_string())?;
             if self.unclaimed.contains_key(&tap) {
@@ -3170,19 +3200,25 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     },
                 );
             } else {
-                let record = saved.record;
-                if let Some(failed) = Self::failed_saved_turn(
-                    &record,
-                    &format!("its Firecracker process {} ended", record.machine.process_id),
-                ) {
-                    failed_turns.push(failed);
-                }
-                let queue = record
-                    .queued
+                let record = &mut saved.record;
+                let interrupted = if saved.reconnect {
+                    None
+                } else {
+                    Self::failed_saved_turn(
+                        record,
+                        &format!("its Firecracker process {} ended", record.machine.process_id),
+                        true,
+                    )
+                };
+                let queue = std::mem::take(&mut record.queued)
                     .into_iter()
                     .filter_map(|queued| Command::from_record(queued, &record.session_id, &record.box_id))
                     .collect();
                 self.answer_lost(record.session_id.as_str(), queue);
+                if let Some(failed) = interrupted {
+                    failed_turns.push(failed);
+                    interrupted_ended.push(saved);
+                }
             }
         }
         for disks in self.unclaimed.values_mut() {
@@ -3213,31 +3249,74 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 .collect::<Vec<_>>();
             self.runner.vmm.remove_leftovers(&kept, &sessions)?;
         }
+        standing.extend(interrupted_ended.into_iter().map(|saved| {
+            (
+                saved.record.tap_index,
+                StandingBox {
+                    saved,
+                    descriptors: Err("the recorded Firecracker process ended".to_string()),
+                },
+            )
+        }));
         Ok(())
     }
 
-    fn failed_saved_turn(record: &SupervisorHandoverBox, detail: &str) -> Option<(EntityId, String)> {
+    fn failed_saved_turn(record: &SupervisorHandoverBox, detail: &str, ended: bool) -> Option<InterruptedTurn> {
         let SupervisorHandoverBoxState::Turn(turn) = &record.state else {
             return None;
         };
-        Some((
-            turn.turn_id.clone(),
-            format!(
+        Some(InterruptedTurn {
+            tap: record.tap_index,
+            turn: turn.turn_id.clone(),
+            detail: format!(
                 "box {} of session {}: {detail}; send the turn again",
                 record.box_id, record.session_id
             ),
-        ))
+            ended,
+        })
     }
 
-    fn interrupt(saved: &mut RecordedBox) {
-        if matches!(saved.record.state, SupervisorHandoverBoxState::Turn(_)) {
-            saved.record.state = standing_state(None);
-            saved.record.dirty = true;
-            saved.reconnect = true;
-        }
+    fn record_interruption(&self, interruption: InterruptedTurn) -> oneshot::Receiver<()> {
+        let InterruptedTurn {
+            tap,
+            turn,
+            detail,
+            ended,
+        } = interruption;
+        let (saved, persisted) = oneshot::channel();
+        let failure = ChannelTurnFailed {
+            credential_file: None,
+            detail: reported("the turn failure detail", &detail),
+            failed_at: now(),
+            reason: TurnFailureReason::HarnessExited,
+            turn_id: turn.clone(),
+            type_: ChannelTurnFailedType::TurnFailed,
+        };
+        let standing = self.runner.standing.clone();
+        let after_save = tumpel_channel::AfterSave::new(move || {
+            let updated = standing.write(|boxes| {
+                let Some(box_) = boxes.get_mut(&tap).filter(|box_| {
+                    matches!(&box_.saved.record.state, SupervisorHandoverBoxState::Turn(active) if active.turn_id == turn)
+                }) else {
+                    return;
+                };
+                if ended {
+                    boxes.remove(&tap);
+                } else {
+                    box_.saved.record.dirty = true;
+                    box_.saved.reconnect = true;
+                }
+            });
+            if let Err(error) = updated {
+                eprintln!("tumpel-supervisor: recording the interruption of turn {turn} failed: {error}");
+            }
+            let _ = saved.send(());
+        });
+        send_out(&self.runner.out, Outgoing::InterruptedTurn(failure, after_save));
+        persisted
     }
 
-    fn protect_box(&mut self, saved: &mut RecordedBox, error: &str) -> Result<Option<(EntityId, String)>, String> {
+    fn protect_box(&mut self, saved: &mut RecordedBox, error: &str) -> Result<Option<InterruptedTurn>, String> {
         let record = &mut saved.record;
         eprintln!(
             "tumpel-supervisor: box {} of session {} is kept after attachment failed: {error}",
@@ -3245,14 +3324,17 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
         let tap = self.pool.claim_device(record.tap_index, self.pool.size(None, None))?;
         let detail = protected_detail(record.tap_index);
-        let failed = Self::failed_saved_turn(record, error);
+        let failed = if saved.reconnect {
+            None
+        } else {
+            Self::failed_saved_turn(record, error, false)
+        };
         for queued in std::mem::take(&mut record.queued) {
             if let Some(command) = Command::from_record(queued, &record.session_id, &record.box_id) {
                 self.answer_protected(command, &detail);
             }
         }
         self.protected_sessions.insert(record.session_id.to_string(), tap);
-        Self::interrupt(saved);
         Ok(failed)
     }
 
@@ -3284,16 +3366,16 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             idle: duration(handed.idle_milliseconds),
         };
         match action {
-            StartupAction::Reconnect(turn_id) => {
-                if let Some(turn_id) = turn_id {
-                    turn_failed(
-                        &self.runner.out, &turn_id, TurnFailureReason::HarnessExited,
-                        format!("the supervisor stopped unexpectedly during turn {turn_id}, so the turn ended; its box is kept, so send the turn again"),
-                    );
-                }
+            StartupAction::Reconnect(interrupted) => {
                 slot.busy = true;
+                let pending = interrupted.map(|interrupted| self.record_interruption(interrupted));
                 let runner = self.runner.clone();
                 self.spawn(session, Work::Turn, Running::Recovering, async move {
+                    if let Some(persisted) = pending {
+                        if persisted.await.is_err() {
+                            return Outcome::Protected(live.tap);
+                        }
+                    }
                     runner.recover_adopted(live).await
                 });
             }
@@ -3323,7 +3405,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    async fn command(&mut self, command: Command) -> Result<(), String> {
+    fn command(&mut self, command: Command) -> Result<(), String> {
         if let (Some(why), Command::Turn(turn)) = (self.refusal(), &command) {
             self.refuse_turn(&turn.turn_id, why);
             return Ok(());
@@ -3331,7 +3413,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let session = command.session();
         if let Some(index) = self.protected_sessions.get(&session).map(Tap::index) {
             if let Command::Discard(order) = command {
-                return self.discard_protected(&session, index, order).await;
+                return self.discard_protected(&session, index, order);
             }
         }
         if let Some(detail) = self.reserved_disk(&session) {
@@ -3343,7 +3425,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             slot.queue.push_back(command);
             return self.record_queue(&session);
         }
-        self.dispatch(session, command).await
+        self.dispatch(session, command)
     }
 
     fn answer_protected(&self, command: Command, detail: &str) {
@@ -3377,8 +3459,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
     }
 
-    async fn discard_protected(&mut self, session: &str, index: u8, order: TeardownOrder) -> Result<(), String> {
-        let saved = self
+    fn discard_protected(&mut self, session: &str, index: u8, order: TeardownOrder) -> Result<(), String> {
+        let Some(saved) = self
             .runner
             .standing
             .boxes
@@ -3386,40 +3468,51 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .map_err(|_| "the box inventory is unavailable")?
             .get(&i32::from(index))
             .map(|box_| box_.saved.clone())
-            .ok_or("the retained box record is missing")?;
+        else {
+            self.refuse_teardown(order, &protected_detail(i32::from(index)));
+            return Ok(());
+        };
         if saved.record.box_id != order.box_id {
             self.box_gone(order);
             return Ok(());
         }
-        if let Err(error) = self
-            .runner
-            .vmm
-            .discard_protected(index, &saved.record, saved.observation.as_ref())
-            .await
-        {
-            self.refuse_teardown(
-                order,
-                &format!("{error}; inspect tumpel-box{index}.scope before stopping it"),
-            );
+        let Some(tap) = self.protected_sessions.remove(session) else {
             return Ok(());
-        }
-        self.free_disk(session)?;
-        self.runner.standing.write(|boxes| {
-            boxes.remove(&i32::from(index));
-        })?;
-        self.unclaimed.remove(&index);
-        if let Some(tap) = self.protected_sessions.remove(session) {
-            self.pool.release(tap);
-        }
-        self.box_gone(order);
+        };
+        let runner = self.runner.clone();
+        let session_id = order.session_id.clone();
+        let box_id = order.box_id.clone();
+        self.slots.entry(session.to_string()).or_default().busy = true;
+        self.spawn(
+            session.to_string(),
+            Work::Stop(Some(order)),
+            Running::Stopping,
+            async move {
+                let stop = || {
+                    runner
+                        .vmm
+                        .discard_protected(index, &saved.record, saved.observation.as_ref())
+                };
+                let mut stopped = stop().await;
+                for retry in 0..STOP_ATTEMPTS - 1 {
+                    if stopped.is_ok() {
+                        break;
+                    }
+                    stop_backoff(retry).await;
+                    stopped = stop().await;
+                }
+                let stopped = stopped.map_err(|error| stop_failed(&session_id, &box_id, &error));
+                Outcome::Gone(tap, stopped)
+            },
+        );
         Ok(())
     }
 
-    async fn dispatch(&mut self, session: String, command: Command) -> Result<(), String> {
+    fn dispatch(&mut self, session: String, command: Command) -> Result<(), String> {
         match command {
             Command::Turn(turn) => {
                 let turn_id = turn.turn_id.clone();
-                self.start_turn(session, *turn).await.inspect_err(|error| {
+                self.start_turn(session, *turn).inspect_err(|error| {
                     turn_failed(
                         &self.runner.out,
                         &turn_id,
@@ -3432,8 +3525,14 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 self.start_snapshot(session, order);
                 Ok(())
             }
-            Command::Teardown(order) => self.start_teardown(session, order).await,
-            Command::Discard(order) => self.start_discard(session, order).await,
+            Command::Teardown(order) => {
+                self.start_teardown(&session, order);
+                Ok(())
+            }
+            Command::Discard(order) => {
+                self.start_discard(&session, order);
+                Ok(())
+            }
         }
     }
 
@@ -3547,19 +3646,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.slots.entry(session).or_default().task = Some((running, handle));
     }
 
-    async fn start_turn(&mut self, session: String, turn: BoxTurn) -> Result<(), String> {
-        let (harness, harness_version) = turn.image.harness();
-        let root = telemetry::turn(&turn.turn_id, &turn.session_id, harness, harness_version, &turn.model);
-        let out = &self.runner.out;
-        if let Some(detail) = expired(&turn.credential, "before the turn reached a box") {
-            root.in_scope(|| turn_failed(out, &turn.turn_id, TurnFailureReason::DispatchCredentialExpired, detail));
-            self.prune(&session);
-            return Ok(());
-        }
-        if self.live_box(&session).is_some_and(|live| live.box_id != turn.box_id) {
-            self.teardown(&session, BoxEnd::NewBox).await?;
-        }
-        let warm = self.slots.get_mut(&session).and_then(|slot| {
+    fn take_warm(&mut self, session: &str) -> Option<LiveBox<V::Machine>> {
+        let warm = self.slots.get_mut(session).and_then(|slot| {
             if let Some(armed) = slot.idle.take() {
                 armed.abort();
             }
@@ -3570,7 +3658,36 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             slot.busy = true;
             Some(live)
         });
-        self.runner.standing.idle_until(&session, None);
+        self.runner.standing.idle_until(session, None);
+        warm
+    }
+
+    fn start_turn(&mut self, session: String, turn: BoxTurn) -> Result<(), String> {
+        let (harness, harness_version) = turn.image.harness();
+        let root = telemetry::turn(&turn.turn_id, &turn.session_id, harness, harness_version, &turn.model);
+        if let Some(detail) = expired(&turn.credential, "before the turn reached a box") {
+            root.in_scope(|| {
+                turn_failed(
+                    &self.runner.out,
+                    &turn.turn_id,
+                    TurnFailureReason::DispatchCredentialExpired,
+                    detail,
+                );
+            });
+            self.prune(&session);
+            return Ok(());
+        }
+        if let Some(slot) = self
+            .slots
+            .get_mut(&session)
+            .filter(|slot| slot.live.as_ref().is_some_and(|live| live.box_id != turn.box_id))
+        {
+            slot.queue.push_front(Command::Turn(Box::new(turn)));
+            self.record_queue(&session)?;
+            self.start_stop(&session, BoxEnd::NewBox, None);
+            return Ok(());
+        }
+        let warm = self.take_warm(&session);
         let runner = self.runner.clone();
         telemetry::start_kind(&root, warm.is_some());
         if let Some(live) = warm {
@@ -3647,10 +3764,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         Ok(())
     }
 
-    async fn welcomed(&mut self, protocol: u16) -> Result<(), String> {
+    fn welcomed(&mut self, protocol: u16) -> Result<(), String> {
         self.session_protocol = Some(protocol);
         for session in std::mem::take(&mut self.adopted) {
-            self.drain(session).await?;
+            self.drain(&session)?;
         }
         Ok(())
     }
@@ -3718,36 +3835,47 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
     }
 
-    async fn start_discard(&mut self, session: String, order: TeardownOrder) -> Result<(), String> {
-        match self.live_box(&session) {
-            Some(live) if live.box_id == order.box_id => self.teardown(&session, BoxEnd::Discard).await?,
-            Some(_) => {}
-            None => self.free_disk(&session)?,
+    fn start_discard(&mut self, session: &str, order: TeardownOrder) {
+        match self.live_box(session) {
+            Some(live) if live.box_id == order.box_id => self.start_stop(session, BoxEnd::Discard, Some(order)),
+            Some(_) => self.box_gone(order),
+            None => self.acknowledge_absent(session, order),
         }
-        self.prune(&session);
-        self.box_gone(order);
-        Ok(())
     }
 
-    async fn start_teardown(&mut self, session: String, order: TeardownOrder) -> Result<(), String> {
-        if let Some(slot) = self.slots.get_mut(&session).filter(|slot| {
+    fn acknowledge_absent(&mut self, session: &str, order: TeardownOrder) {
+        match self.free_disk(session) {
+            Ok(()) => {
+                self.prune(session);
+                self.box_gone(order);
+            }
+            Err(error) => self.refuse_teardown(order, &error),
+        }
+    }
+
+    fn start_teardown(&mut self, session: &str, order: TeardownOrder) {
+        if let Some(slot) = self.slots.get_mut(session).filter(|slot| {
             matches!(slot.snapshot, Some(Awaited::Pending(_)))
                 && slot.live.as_ref().is_some_and(|live| live.box_id == order.box_id)
         }) {
             slot.snapshot = Some(Awaited::Accepted);
-            self.clean(&session).await?;
+            self.clean(session);
+            if let Some(slot) = self.slots.get_mut(session).filter(|slot| slot.busy) {
+                slot.queue.push_front(Command::Teardown(order));
+                return;
+            }
         }
         let Some(dirty) = self
-            .live_box(&session)
+            .live_box(session)
             .filter(|live| live.box_id == order.box_id)
             .map(|live| live.dirty)
         else {
-            if self.live_box(&session).is_none() {
-                self.free_disk(&session)?;
+            if self.live_box(session).is_none() {
+                self.acknowledge_absent(session, order);
+            } else {
+                self.box_gone(order);
             }
-            self.prune(&session);
-            self.box_gone(order);
-            return Ok(());
+            return;
         };
         if dirty {
             emit(
@@ -3767,12 +3895,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     type_: ChannelBoxTeardownFailedType::BoxTeardownFailed,
                 },
             );
-            return Ok(());
+            return;
         }
-        self.teardown(&session, BoxEnd::Teardown).await?;
-        self.prune(&session);
-        self.box_gone(order);
-        Ok(())
+        self.start_stop(session, BoxEnd::Teardown, Some(order));
     }
 
     fn claim(&mut self, memory_mib: Option<NonZeroU32>, disk_mib: Option<NonZeroU32>) -> Result<Tap, String> {
@@ -3824,20 +3949,65 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .map_err(|error| format!("DiskNotFreed: the box of session {session} ended, then {error}"))
     }
 
-    async fn teardown(&mut self, session: &str, end: BoxEnd) -> Result<(), String> {
-        let Some(slot) = self.slots.get_mut(session) else {
-            return Ok(());
-        };
-        slot.paused = false;
-        let Some(live) = slot.live.take() else {
-            return Ok(());
-        };
-        let (tap, _, stopped) = stop_box(&self.runner.standing, live, end).await;
-        stopped?;
-        self.pool.release(tap);
+    fn clear_stopped_box(&mut self, session: &str, tap: &Tap) -> Result<(), String> {
         self.free_disk(session)?;
-        self.prune(session);
+        self.runner.standing.write(|boxes| {
+            boxes.remove(&i32::from(tap.index()));
+        })?;
+        self.unclaimed.remove(&tap.index());
         Ok(())
+    }
+
+    fn start_stop(&mut self, session: &str, end: BoxEnd, order: Option<TeardownOrder>) {
+        let Some(slot) = self.slots.get_mut(session) else {
+            return;
+        };
+        let Some(live) = slot.live.take() else {
+            return;
+        };
+        slot.busy = true;
+        slot.paused = false;
+        if let Some(idle) = slot.idle.take() {
+            idle.abort();
+        }
+        self.spawn(session.to_string(), Work::Stop(order), Running::Stopping, async move {
+            let (tap, _, stopped) = stop_box(live, end).await;
+            Outcome::Gone(tap, stopped)
+        });
+    }
+
+    fn retain_failed_stop(&mut self, session: &str, tap: Tap, error: &str) {
+        eprintln!(
+            "tumpel-supervisor: keeping the box of session {session} on TAP {}: {error}",
+            tap.index()
+        );
+        if let Some(slot) = self.slots.remove(session) {
+            for command in slot.queue {
+                self.answer_protected(command, error);
+            }
+        }
+        if let Err(error) = self.runner.standing.queue(session, &[]) {
+            eprintln!("tumpel-supervisor: clearing failed commands for session {session}: {error}");
+        }
+        self.protected_sessions.insert(session.to_string(), tap);
+    }
+
+    fn settle_setup_stop(&mut self, setup: &str, tap: Tap, stopped: Result<(), String>) {
+        self.setup_tasks.remove(setup);
+        self.setups.remove(setup);
+        if let Err(error) = stopped.and_then(|()| self.free_disk(setup)) {
+            eprintln!(
+                "tumpel-supervisor: keeping setup {setup} on TAP {}: {error}",
+                tap.index()
+            );
+            self.unclaimed
+                .entry(tap.index())
+                .or_default()
+                .possible
+                .push(held_session(setup));
+            return;
+        }
+        self.pool.release(tap);
     }
 
     fn prune(&mut self, session: &str) {
@@ -3852,23 +4022,23 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
 
     async fn event(&mut self, event: Event<V::Machine>) -> Result<(), String> {
         match event {
-            Event::Finished { session, work, outcome } => self.finished(session, work, outcome).await,
+            Event::Finished { session, work, outcome } => self.finished(session, work, outcome),
             Event::SetupFinished {
                 claude_setup_id,
                 tap,
                 stopped,
             } => {
-                self.setups.remove(&claude_setup_id);
-                self.setup_tasks.remove(&claude_setup_id);
-                stopped?;
-                self.pool.release(tap);
-                self.free_disk(&claude_setup_id)
+                self.settle_setup_stop(&claude_setup_id, tap, stopped);
+                Ok(())
             }
             Event::HandoverExpired => {
                 self.handover_expired().await;
                 Ok(())
             }
-            Event::IdleExpired { session, box_id } => self.idle_expired(&session, box_id).await,
+            Event::IdleExpired { session, box_id } => {
+                self.idle_expired(&session, &box_id);
+                Ok(())
+            }
         }
     }
 
@@ -3906,19 +4076,21 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
     }
 
-    async fn idle_expired(&mut self, session: &str, box_id: EntityId) -> Result<(), String> {
-        if self.idle_box(session).map(|(idle, _)| idle) != Some(&box_id) {
-            return Ok(());
+    fn idle_expired(&mut self, session: &str, box_id: &EntityId) {
+        if self.idle_box(session).map(|(idle, _)| idle) != Some(box_id) {
+            return;
         }
-        self.teardown(session, BoxEnd::Idle).await?;
-        self.box_gone(TeardownOrder {
-            session_id: held_session(session),
-            box_id,
-        });
-        Ok(())
+        self.start_stop(
+            session,
+            BoxEnd::Idle,
+            Some(TeardownOrder {
+                session_id: held_session(session),
+                box_id: box_id.clone(),
+            }),
+        );
     }
 
-    async fn finished(&mut self, session: String, work: Work, outcome: Outcome<V::Machine>) -> Result<(), String> {
+    fn finished(&mut self, session: String, work: Work, outcome: Outcome<V::Machine>) -> Result<(), String> {
         let slot = self.slots.entry(session.clone()).or_default();
         slot.busy = false;
         slot.task = None;
@@ -3954,12 +4126,25 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             }
         }
         if let Some((tap, stopped)) = freed {
-            stopped?;
-            self.pool.release(tap);
-            self.free_disk(&session)?;
+            let order = if let Work::Stop(order) = work { order } else { None };
+            match stopped.and_then(|()| self.clear_stopped_box(&session, &tap)) {
+                Ok(()) => {
+                    self.pool.release(tap);
+                    if let Some(order) = order {
+                        self.box_gone(order);
+                    }
+                }
+                Err(error) => {
+                    self.retain_failed_stop(&session, tap, &error);
+                    if let Some(order) = order {
+                        self.refuse_teardown(order, &error);
+                    }
+                    return Ok(());
+                }
+            }
         }
-        self.clean(&session).await?;
-        self.drain(session).await
+        self.clean(&session);
+        self.drain(&session)
     }
 
     fn snapshot_failed(&mut self, snapshot_id: EntityId) {
@@ -3975,7 +4160,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
     }
 
-    async fn snapshot_accepted(&mut self, snapshot_id: &EntityId) -> Result<(), String> {
+    fn snapshot_accepted(&mut self, snapshot_id: &EntityId) {
         let waiting = self.slots.iter_mut().find_map(|(session, slot)| {
             if !matches!(&slot.snapshot, Some(Awaited::Pending(pending)) if pending == snapshot_id) {
                 return None;
@@ -3988,53 +4173,50 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 "tumpel-supervisor: the control plane accepted SnapshotDone {}, but no box here waits on that snapshot; a later turn ran or the box is gone, so nothing is marked clean",
                 **snapshot_id
             );
-            return Ok(());
+            return;
         };
-        self.clean(&session).await?;
+        self.clean(&session);
         self.arm_idle(&session);
-        Ok(())
     }
 
-    async fn clean(&mut self, session: &str) -> Result<(), String> {
+    fn clean(&mut self, session: &str) {
         let Some(slot) = self
             .slots
             .get_mut(session)
             .filter(|slot| matches!(slot.snapshot, Some(Awaited::Accepted)) && !slot.busy)
         else {
-            return Ok(());
+            return;
         };
         let Some(live) = slot.live.as_mut() else {
-            return Ok(());
+            return;
         };
         slot.snapshot = None;
         live.dirty = false;
         let Err(error) = self.runner.standing.put(live, None) else {
-            return Ok(());
+            return;
         };
         let box_id = live.box_id.clone();
-        self.teardown(session, BoxEnd::SnapshotNotRecorded).await?;
+        self.start_stop(session, BoxEnd::SnapshotNotRecorded, None);
         eprintln!(
-            "tumpel-supervisor: recording session {session} box {} as clean for a supervisor restart failed and the box was stopped: {error}",
-            *box_id
+            "tumpel-supervisor: recording session {session} box {box_id} as clean for a supervisor restart failed; stopping the box: {error}"
         );
-        Ok(())
     }
 
-    async fn drain(&mut self, session: String) -> Result<(), String> {
+    fn drain(&mut self, session: &str) -> Result<(), String> {
         loop {
             let next = self
                 .slots
-                .get_mut(&session)
+                .get_mut(session)
                 .filter(|slot| !slot.busy && slot.parked.is_none())
                 .and_then(|slot| slot.queue.pop_front());
             let Some(command) = next else {
                 break;
             };
-            self.record_queue(&session)?;
-            self.dispatch(session.clone(), command).await?;
+            self.record_queue(session)?;
+            self.dispatch(session.to_string(), command)?;
         }
-        self.prune(&session);
-        self.arm_idle(&session);
+        self.prune(session);
+        self.arm_idle(session);
         Ok(())
     }
 

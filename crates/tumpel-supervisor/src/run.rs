@@ -761,20 +761,6 @@ fn taken(layout: &Layout, handed: bool, received: &BTreeMap<String, OwnedFd>) ->
     Ok(saved)
 }
 
-fn refresh_steady_unit(layout: Layout) {
-    tokio::spawn(async move {
-        let fix = "check the systemd user manager and run systemctl --user daemon-reload";
-        let refreshed = match layout.unit.try_exists() {
-            Ok(true) => refresh_unit(&layout, fix).await.map_err(|failure| failure.detail),
-            Ok(false) => Ok(()),
-            Err(error) => Err(format!("reading the installed unit failed: {error}; {fix}")),
-        };
-        if let Err(error) = refreshed {
-            eprintln!("tumpel-supervisor: {error}");
-        }
-    });
-}
-
 pub(crate) async fn preserve_legacy(layout: &Layout, saved: &mut StartupBoxes) -> Vec<fd_store::LegacyFd> {
     let streams = Firecracker::migrate_legacy(saved);
     if let Err(error) = refresh_unit(layout, "check the installed supervisor service and restart it").await {
@@ -795,6 +781,7 @@ pub(crate) async fn preserve_legacy(layout: &Layout, saved: &mut StartupBoxes) -
 async fn prepare_startup(
     started: &Started,
     out: &UnboundedSender<Outgoing>,
+    inherited_streams: bool,
 ) -> Result<Option<SupervisorUpdatePending>, Failure> {
     let trial = match update::startup(&started.layout, &started.running, out)
         .map_err(|detail| fail(SupervisorFailure::ChannelStateLost, detail))?
@@ -802,6 +789,18 @@ async fn prepare_startup(
         Startup::Steady => None,
         Startup::Trial(pending) => Some(pending),
     };
+    if !inherited_streams {
+        let fix = "check the systemd user manager and run systemctl --user daemon-reload";
+        let unit_exists = started.layout.unit.try_exists().map_err(|error| {
+            fail(
+                SupervisorFailure::UpdateNotOnline,
+                format!("reading the installed unit failed: {error}; {fix}"),
+            )
+        })?;
+        if unit_exists {
+            refresh_unit(&started.layout, fix).await?;
+        }
+    }
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
         .await
         .map_err(|error| fail(SupervisorFailure::GuestDriveUnwritable, error))?;
@@ -836,11 +835,11 @@ pub async fn run(
     })?;
     let (out, mut from_box) = unbounded_channel();
     let layout = startup_layout()?;
-    let (taken, _inherited_streams) = startup_inventory(&layout, handed, &received).await?;
+    let (taken, inherited_streams) = startup_inventory(&layout, handed, &received).await?;
     let started = start(layout)?;
     let endpoint = Endpoint::bind(&started.layout.state, &started.layout.candidate)
         .map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")))?;
-    let trial = prepare_startup(&started, &out).await?;
+    let trial = prepare_startup(&started, &out, !inherited_streams.is_empty()).await?;
     let dir = dir::supervisor_dir();
     let (commands, from_channel) = unbounded_channel();
     let (usage, idle, mut runner, handover) = start_boxes(
@@ -855,9 +854,6 @@ pub async fn run(
     )?;
     drop(received);
     started_daemon();
-    if trial.is_none() {
-        refresh_steady_unit(started.layout.clone());
-    }
     let deadline = trial
         .as_ref()
         .map(|_| tokio::time::Instant::now() + Limits::HOST.online);
@@ -872,6 +868,7 @@ pub async fn run(
         config.host_id.clone(),
         env!("TUMPEL_RELEASE_VERSION").to_string(),
     );
+    store_unsent(&mut channel, &mut from_box)?;
     let (restart, mut restarted) = unbounded_channel();
     let (confirmed, online) = watch::channel(false);
     let mut updates = Updates {

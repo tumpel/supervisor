@@ -201,47 +201,90 @@ async fn api(socket: &Path, method: &str, path: &str, body: &Value) -> Result<()
         .write_all(request.as_bytes())
         .await
         .map_err(|error| format!("{method} {path}: {error}"))?;
-    let mut reader = BufReader::new(stream);
-    let mut status = String::new();
-    reader
-        .read_line(&mut status)
-        .await
-        .map_err(|error| format!("{method} {path}: {error}"))?;
-    let mut length = 0usize;
+    let failed = |error| format!("{method} {path}: {error}");
+    let mut response = Response::default();
+    let mut buffer = [0; 4096];
     loop {
-        let mut header = String::new();
-        reader
-            .read_line(&mut header)
-            .await
-            .map_err(|error| format!("{method} {path}: {error}"))?;
-        if header == "\r\n" || header.is_empty() {
-            break;
-        }
-        if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
-            length = value.trim().parse().unwrap_or(0);
+        let read = stream.read(&mut buffer).await.map_err(failed)?;
+        if let Some((status, answer)) = response.read(&buffer[..read]).map_err(failed)? {
+            if (200..300).contains(&status) {
+                return Ok(());
+            }
+            return Err(format!(
+                "Firecracker refused {method} {path}: HTTP {status} {}",
+                String::from_utf8_lossy(answer)
+            ));
         }
     }
-    let mut answer = vec![0u8; length];
-    reader
-        .read_exact(&mut answer)
-        .await
-        .map_err(|error| format!("{method} {path}: {error}"))?;
-    answered(method, path, &status, &answer)
 }
 
-fn answered(method: &str, path: &str, status: &str, answer: &[u8]) -> Result<(), String> {
-    if status
-        .split_whitespace()
-        .nth(1)
-        .is_some_and(|code| code.starts_with('2'))
-    {
-        return Ok(());
+const MAX_API_HEADERS: usize = 16 * 1024;
+const MAX_API_BODY: usize = 64 * 1024;
+
+#[derive(Default)]
+struct Response {
+    bytes: Vec<u8>,
+    head: Option<(u16, usize, usize)>,
+}
+
+fn invalid_response(reason: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, reason.into())
+}
+
+impl Response {
+    fn read(&mut self, chunk: &[u8]) -> std::io::Result<Option<(u16, &[u8])>> {
+        if chunk.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Firecracker closed an incomplete HTTP response",
+            ));
+        }
+        self.bytes.extend_from_slice(chunk);
+        if self.head.is_none() {
+            self.head = Self::parse_head(&self.bytes)?;
+        }
+        let Some((status, headers, body)) = self.head else {
+            return Ok(None);
+        };
+        Ok(self.bytes.get(headers..headers + body).map(|answer| (status, answer)))
     }
-    Err(format!(
-        "Firecracker refused {method} {path}: {} {}",
-        status.trim(),
-        String::from_utf8_lossy(answer)
-    ))
+
+    fn parse_head(bytes: &[u8]) -> std::io::Result<Option<(u16, usize, usize)>> {
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut response = httparse::Response::new(&mut headers);
+        let head = &bytes[..bytes.len().min(MAX_API_HEADERS)];
+        let length = match response
+            .parse(head)
+            .map_err(|error| invalid_response(error.to_string()))?
+        {
+            httparse::Status::Complete(length) => length,
+            httparse::Status::Partial if head.len() < MAX_API_HEADERS => return Ok(None),
+            httparse::Status::Partial => return Err(invalid_response("Firecracker sent oversized HTTP headers")),
+        };
+        let status = response
+            .code
+            .ok_or_else(|| invalid_response("Firecracker omitted its HTTP status"))?;
+        let mut body = None;
+        for header in response.headers {
+            if header.name.eq_ignore_ascii_case("transfer-encoding") {
+                return Err(invalid_response("Firecracker sent an unsupported Transfer-Encoding"));
+            }
+            if header.name.eq_ignore_ascii_case("content-length") {
+                let size = std::str::from_utf8(header.value)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<usize>().ok());
+                if body.is_some() || size.is_none() {
+                    return Err(invalid_response("Firecracker sent an invalid Content-Length"));
+                }
+                body = size;
+            }
+        }
+        let body = body.unwrap_or(0);
+        if body > MAX_API_BODY {
+            return Err(invalid_response("Firecracker sent an oversized HTTP body"));
+        }
+        Ok(Some((status, length, body)))
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -310,7 +353,7 @@ fn connect_api(socket: &Path, pid: libc::pid_t) -> Result<std::os::unix::net::Un
 }
 
 fn booted_memory(socket: &Path, pid: libc::pid_t, limit: Duration) -> Result<NonZeroU32, String> {
-    use std::io::{BufRead, Read, Write};
+    use std::io::{Read, Write};
     let deadline = std::time::Instant::now() + limit;
     let failed = |error: std::io::Error| {
         format!(
@@ -326,32 +369,19 @@ fn booted_memory(socket: &Path, pid: libc::pid_t, limit: Duration) -> Result<Non
     stream
         .write_all(b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n")
         .map_err(failed)?;
-    let mut reader = std::io::BufReader::new(ApiReply { stream, deadline });
-    let mut status = String::new();
-    reader.read_line(&mut status).map_err(failed)?;
-    let mut length = 0usize;
-    loop {
-        let mut header = String::new();
-        reader.read_line(&mut header).map_err(failed)?;
-        if header == "\r\n" || header.is_empty() {
-            break;
-        }
-        if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
-            length = value
-                .trim()
-                .parse()
-                .map_err(|_| "Firecracker sent an invalid Content-Length")?;
-            if length > 64 * 1024 {
-                return Err("Firecracker sent an oversized machine configuration".to_string());
+    let mut reader = ApiReply { stream, deadline };
+    let mut response = Response::default();
+    let mut buffer = [0; 4096];
+    let answer = loop {
+        let read = reader.read(&mut buffer).map_err(failed)?;
+        if let Some((status, answer)) = response.read(&buffer[..read]).map_err(failed)? {
+            if status != 200 {
+                return Err(format!("Firecracker refused GET /machine-config: HTTP {status}"));
             }
+            break answer;
         }
-    }
-    let mut answer = vec![0u8; length];
-    reader.read_exact(&mut answer).map_err(failed)?;
-    if !status.starts_with("HTTP/1.1 200 ") && !status.starts_with("HTTP/1.0 200 ") {
-        return Err("Firecracker refused GET /machine-config".to_string());
-    }
-    serde_json::from_slice::<MachineConfig>(&answer)
+    };
+    serde_json::from_slice::<MachineConfig>(answer)
         .map(|config| config.mem_size_mib)
         .map_err(|error| {
             format!(
@@ -417,22 +447,36 @@ enum Owner {
 
 struct Adopted {
     pid: libc::pid_t,
+    start: u64,
     owner: Owner,
 }
 
 impl Adopted {
-    async fn end(self) -> Result<String, String> {
-        match self.owner {
-            Owner::Child => tokio::task::spawn_blocking(move || end_child(self.pid))
-                .await
-                .map_err(|error| format!("could not end Firecracker: {error}")),
+    async fn end(&self) -> Result<String, String> {
+        let child = self.owner == Owner::Child;
+        if read_process_identity(self.pid, child)?.is_none_or(|identity| identity.start != self.start) {
+            return Ok("had already ended".to_string());
+        }
+        match &self.owner {
+            Owner::Child => end_child(self.pid).await,
             Owner::Scope(scope) => {
-                stop_scope(&scope).await?;
+                if !process_scope(self.pid, scope)? {
+                    return Err(format!("Firecracker {} moved outside {scope}", self.pid));
+                }
+                let stopped = stop_scope(scope).await;
+                if self.is_running()? {
+                    stopped?;
+                    return Err(format!("Firecracker {} is still running in {scope}", self.pid));
+                }
                 Ok(format!(
                     "was stopped with {scope}; systemd holds its exit status, as this supervisor did not start it"
                 ))
             }
         }
+    }
+
+    fn is_running(&self) -> Result<bool, String> {
+        Ok(process_identity(self.pid)?.is_some_and(|identity| identity.start == self.start))
     }
 }
 
@@ -450,9 +494,9 @@ impl Process {
         }
     }
 
-    async fn kill(self) -> Result<String, String> {
+    async fn kill(&mut self) -> Result<String, String> {
         match self {
-            Self::Starting(mut child) | Self::Spawned(mut child) => kill_child(&mut child).await,
+            Self::Starting(child) | Self::Spawned(child) => kill_child(child).await,
             Self::Adopted(adopted) => adopted.end().await,
         }
     }
@@ -490,21 +534,43 @@ fn exited(status: ExitStatus) -> String {
     status.to_string()
 }
 
-fn end_child(pid: libc::pid_t) -> String {
+fn reap_child(pid: libc::pid_t) -> Result<Option<ExitStatus>, String> {
     let mut status = 0;
     match unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) } {
-        0 => {}
-        waited if waited == pid => return format!("had already ended with {}", exited(ExitStatus::from_raw(status))),
-        _ => return format!("could not be waited for: {}", std::io::Error::last_os_error()),
+        0 => Ok(None),
+        waited if waited == pid => Ok(Some(ExitStatus::from_raw(status))),
+        _ => Err(format!(
+            "waiting for Firecracker {pid}: {}",
+            std::io::Error::last_os_error()
+        )),
     }
-    unsafe { libc::kill(pid, libc::SIGKILL) };
-    if unsafe { libc::waitpid(pid, &raw mut status, 0) } == pid {
-        return format!("was stopped and ended with {}", exited(ExitStatus::from_raw(status)));
+}
+
+async fn end_child(pid: libc::pid_t) -> Result<String, String> {
+    if let Some(status) = reap_child(pid)? {
+        return Ok(format!("had already ended with {}", exited(status)));
     }
-    format!(
-        "was killed and could not be waited for: {}",
-        std::io::Error::last_os_error()
-    )
+    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+        return Err(format!(
+            "stopping Firecracker {pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    tokio::time::timeout(SCOPE_STOP, async {
+        loop {
+            if let Some(status) = reap_child(pid)? {
+                return Ok(format!("was stopped and ended with {}", exited(status)));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "waiting for Firecracker {pid} to stop exceeded {} s",
+            SCOPE_STOP.as_secs()
+        )
+    })?
 }
 
 fn peek_exit(pidfd: &OwnedFd) -> String {
@@ -576,6 +642,10 @@ pub(crate) struct ProcessIdentity {
 }
 
 pub(crate) fn process_identity(pid: libc::pid_t) -> Result<Option<ProcessIdentity>, String> {
+    read_process_identity(pid, false)
+}
+
+fn read_process_identity(pid: libc::pid_t, include_exited: bool) -> Result<Option<ProcessIdentity>, String> {
     let text = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -585,7 +655,8 @@ pub(crate) fn process_identity(pid: libc::pid_t) -> Result<Option<ProcessIdentit
         .rsplit_once(") ")
         .ok_or_else(|| format!("process {pid} has no readable identity"))?;
     let mut fields = fields.split_whitespace();
-    if matches!(fields.next(), Some("Z" | "X" | "x")) {
+    let state = fields.next();
+    if !include_exited && matches!(state, Some("Z" | "X" | "x")) {
         return Ok(None);
     }
     let parent = fields.next().and_then(|field| field.parse().ok());
@@ -718,6 +789,7 @@ enum InspectionSource<'a> {
 #[derive(Debug)]
 struct Attachment {
     pid: libc::pid_t,
+    start: u64,
     owner: Owner,
     memory: NonZeroU32,
     guest_buffer: Vec<u8>,
@@ -1154,6 +1226,7 @@ impl Firecracker {
         }
         Ok(Some(Attachment {
             pid,
+            start: identity.start,
             owner,
             memory,
             guest_buffer,
@@ -1206,6 +1279,7 @@ impl Firecracker {
         )?);
         machine.process = Some(Process::Adopted(Adopted {
             pid: attachment.pid,
+            start: attachment.start,
             owner: attachment.owner,
         }));
         Ok((machine, guest))
@@ -1350,19 +1424,16 @@ impl Vmm for Firecracker {
                     ));
                 }
             }
-            if process_scope(pid, &scope)? {
-                stop_scope(&scope).await?;
+            let owner = if process_scope(pid, &scope)? {
+                Owner::Scope(scope.clone())
             } else {
-                let ended = Adopted {
-                    pid,
-                    owner: Owner::Child,
-                }
-                .end()
-                .await?;
-                if process_identity(pid)?.is_some() {
-                    return Err(format!("Firecracker process {pid} {ended}"));
-                }
-            }
+                Owner::Child
+            };
+            let start = match observation {
+                Some(observation) => observation.machine_start,
+                None => process_start(pid)?,
+            };
+            Adopted { pid, start, owner }.end().await?;
         } else if self.unclaimed_scopes(&[])?.contains(&index) {
             return Err(format!(
                 "the saved box does not own {scope}; its process identity changed"
@@ -1721,14 +1792,17 @@ impl Machine for FirecrackerBox {
         self.session.join(OVERLAY_DRIVE)
     }
 
-    async fn stop(mut self) -> Stopped {
+    async fn stop(&mut self) -> Stopped {
         self.unwatch();
-        let exit = match self.process.take() {
+        let exit = match self.process.as_mut() {
             Some(process) => process.kill().await,
             None => Ok("was not running".to_string()),
         };
         let exit = match exit {
-            Ok(exit) => format!("process in {} {exit}", scope_of(self.index)),
+            Ok(exit) => {
+                self.process = None;
+                format!("process in {} {exit}", scope_of(self.index))
+            }
             Err(error) => {
                 return Stopped {
                     exit: error.clone(),

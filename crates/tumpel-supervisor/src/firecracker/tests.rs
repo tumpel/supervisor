@@ -14,6 +14,24 @@ use super::{booted_memory, Adopted, Firecracker, InspectionSource, Owner, Proces
 use crate::lifecycle::{Guest, Machine, Vmm};
 use crate::pool::{Disk, Size, TapPool};
 
+#[test]
+fn both_api_transports_reject_unbounded_or_ambiguous_responses() {
+    for reply in [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 65537\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+    ] {
+        assert!(super::Response::default().read(reply).is_err(), "{reply:?}");
+    }
+    let mut response = super::Response::default();
+    assert!(response
+        .read(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n12")
+        .expect("valid head")
+        .is_none());
+    assert_eq!(response.read(b"3").expect("complete body"), Some((200, &b"123"[..])));
+}
+
 const BOX: Size = Size {
     memory_mib: NonZeroU32::new(4096).expect("a positive size"),
     disk_mib: NonZeroU32::new(32_768).expect("a positive size"),
@@ -150,6 +168,25 @@ fn handed(vmm: &Firecracker, pid: libc::pid_t) -> Handed {
         stderr,
         rest: rest.to_vec(),
     }
+}
+
+#[tokio::test]
+async fn stopping_an_already_exited_child_reaps_it_without_signalling_another_process() {
+    let mut child = VmChild::new();
+    let pid = child.pid();
+    let start = super::process_start(pid).expect("process start");
+    child.0.kill().expect("end the fixture VM");
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let id = libc::id_t::try_from(pid).expect("a PID");
+    let waited = unsafe { libc::waitid(libc::P_PID, id, &raw mut info, libc::WEXITED | libc::WNOWAIT) };
+    assert_eq!(waited, 0);
+    let adopted = super::Adopted {
+        pid,
+        start,
+        owner: Owner::Child,
+    };
+    assert!(adopted.end().await.expect("the child is reaped").contains("signal 9"));
+    assert!(super::process_identity(pid).expect("stopped child").is_none());
 }
 
 #[tokio::test]
@@ -383,6 +420,7 @@ async fn dropping_an_adopted_handle_leaves_the_vm_for_explicit_stop() {
     let mut machine = vmm.machine(&session, &tap).expect("machine handle");
     machine.process = Some(Process::Adopted(Adopted {
         pid,
+        start: super::process_start(pid).expect("process start"),
         owner: Owner::Child,
     }));
     drop(machine);
@@ -390,6 +428,7 @@ async fn dropping_an_adopted_handle_leaves_the_vm_for_explicit_stop() {
     let mut machine = vmm.machine(&session, &tap).expect("machine handle");
     machine.process = Some(Process::Adopted(Adopted {
         pid,
+        start: super::process_start(pid).expect("process start"),
         owner: Owner::Child,
     }));
     let stopped = machine.stop().await;
@@ -564,10 +603,12 @@ async fn verify_materialized_attachment(
 
     let mut exited = VmChild::new();
     let exited_pid = exited.pid();
+    let exited_start = super::process_start(exited_pid).expect("process start");
     exited.0.kill().expect("end the process during inspection");
     exited.0.wait().expect("reap the exited process");
     let late = super::Attachment {
         pid: exited_pid,
+        start: exited_start,
         owner: Owner::Child,
         memory: attachment.memory,
         guest_buffer: Vec::new(),
