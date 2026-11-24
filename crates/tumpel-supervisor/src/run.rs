@@ -776,10 +776,41 @@ pub(crate) async fn preserve_legacy(layout: &Layout, saved: &mut StartupBoxes) -
     streams
 }
 
+async fn refresh_installed_unit(layout: &Layout) -> Result<(), Failure> {
+    let fix = "check the systemd user manager and run systemctl --user daemon-reload";
+    let unit_exists = layout.unit.try_exists().map_err(|error| {
+        fail(
+            SupervisorFailure::UpdateNotOnline,
+            format!("reading the installed unit failed: {error}; {fix}"),
+        )
+    })?;
+    if unit_exists {
+        refresh_unit(layout, fix).await?;
+    }
+    Ok(())
+}
+
+fn refresh_unit_after_recovery(layout: &Layout, steady: bool) {
+    if !steady {
+        return;
+    }
+    let layout = layout.clone();
+    tokio::spawn(async move {
+        for delay in [0, 1, 2] {
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            match refresh_installed_unit(&layout).await {
+                Ok(()) => return,
+                Err(error) => eprintln!("tumpel-supervisor: {}", error.detail),
+            }
+        }
+    });
+}
+
 async fn prepare_startup(
     started: &Started,
     out: &UnboundedSender<Outgoing>,
     inherited_streams: bool,
+    handed: bool,
 ) -> Result<Option<SupervisorUpdatePending>, Failure> {
     let trial = match update::startup(&started.layout, &started.running, out)
         .map_err(|detail| fail(SupervisorFailure::ChannelStateLost, detail))?
@@ -787,17 +818,8 @@ async fn prepare_startup(
         Startup::Steady => None,
         Startup::Trial(pending) => Some(pending),
     };
-    if !inherited_streams {
-        let fix = "check the systemd user manager and run systemctl --user daemon-reload";
-        let unit_exists = started.layout.unit.try_exists().map_err(|error| {
-            fail(
-                SupervisorFailure::UpdateNotOnline,
-                format!("reading the installed unit failed: {error}; {fix}"),
-            )
-        })?;
-        if unit_exists {
-            refresh_unit(&started.layout, fix).await?;
-        }
+    if !inherited_streams && (handed || trial.is_some()) {
+        refresh_installed_unit(&started.layout).await?;
     }
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
         .await
@@ -826,7 +848,7 @@ pub async fn run(
         Vec::new()
     };
     let started = start(layout)?;
-    let trial = prepare_startup(&started, &out, !inherited_streams.is_empty()).await?;
+    let trial = prepare_startup(&started, &out, !inherited_streams.is_empty(), handed).await?;
     let dir = dir::supervisor_dir();
     let (commands, from_channel) = unbounded_channel();
     let (usage, idle, mut runner) = start_boxes(
@@ -841,6 +863,10 @@ pub async fn run(
     )?;
     drop(received);
     started_daemon();
+    refresh_unit_after_recovery(
+        &started.layout,
+        !handed && trial.is_none() && inherited_streams.is_empty(),
+    );
     let deadline = trial
         .as_ref()
         .map(|_| tokio::time::Instant::now() + Limits::HOST.online);
@@ -1289,11 +1315,32 @@ mod tests {
         assert!(matches!(ready.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
 
         std::fs::create_dir(&root).expect("the ledger can be created");
-        let (retry, mut ready) = message(failure, ledger);
+        let (retry, mut ready) = message(failure.clone(), ledger.clone());
         channel
             .send(retry, &mut Outbox::default())
             .expect("the failure is durably queued");
         assert_eq!(ready.try_recv(), Ok(()));
+        let mut channel = HostChannel::new(
+            tumpel_channel::empty_state(),
+            ChannelFile(ledger.clone()),
+            Unsigned,
+            "host-1".try_into().expect("host id"),
+            "0.1.0".to_string(),
+        );
+        let complete: tumpel_api::types::ChannelHostMessage = serde_json::from_value(serde_json::json!({
+            "type": "TurnComplete", "turnId": "turn-1", "lastLineSeq": 0,
+            "completedAt": "2026-11-24T00:00:00Z"
+        }))
+        .expect("completed turn");
+        channel
+            .send(complete, &mut Outbox::default())
+            .expect("the completion is queued");
+        let (duplicate, mut ready) = message(failure, ledger);
+        channel
+            .send(duplicate, &mut Outbox::default())
+            .expect("the existing frame is kept");
+        assert_eq!(ready.try_recv(), Ok(()));
+        assert_eq!(channel.state().unacked[0].message["type"], "TurnComplete");
         std::fs::remove_dir_all(root).expect("remove the fixture");
     }
 

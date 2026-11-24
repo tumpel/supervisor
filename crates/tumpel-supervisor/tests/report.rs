@@ -417,7 +417,7 @@ mod tests {
                 )
                 .expect("old unit");
                 let systemctl = host.root.join("systemctl");
-                fs::write(&systemctl, "#!/bin/sh\nexit 0\n").expect("successful service reload");
+                fs::write(&systemctl, "#!/bin/sh\nexit 1\n").expect("failed service reload");
                 fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o700)).expect("service operation");
             }
             let mut command = tokio::process::Command::from(host.command(&argv));
@@ -520,6 +520,26 @@ mod tests {
         let report = host.command(&["--json"]).output().expect("report exits");
         let report: Value = serde_json::from_slice(&report.stdout).expect("JSON report");
         assert_eq!(report["checks"]["inventory"]["status"], "FAIL");
+    }
+
+    #[test]
+    fn attachment_is_incomplete_for_a_legacy_box_without_descriptor_observations() {
+        let host = Host::new("legacy-observations", "http://127.0.0.1:9");
+        let dir = host.root.join("data/box0");
+        let mut box_ = recorded_box(&recorded_image());
+        box_["machine"]["apiSocket"] = json!(dir.join("api.sock"));
+        box_["machine"]["vsock"] = json!(dir.join("v.sock"));
+        host.state("boxes.json", &json!({"handedAt":"2026-11-16T09:30:00Z","boxes":[box_]}));
+
+        let result = host.command(&["--json"]).output().expect("report exits");
+        assert!(result.status.success(), "{result:?}");
+        let report: Value = serde_json::from_slice(&result.stdout).expect("JSON report");
+        assert_eq!(report["checks"]["inventory"]["status"], "PASS");
+        assert_eq!(report["checks"]["attachment"]["status"], "NOT RUN");
+        assert!(report["checks"]["attachment"]["reason"]
+            .as_str()
+            .expect("attachment reason")
+            .contains("no descriptor observations"));
     }
 
     #[test]
