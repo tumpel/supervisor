@@ -451,7 +451,7 @@ fn start_boxes(
     let answers = lifecycle.answers();
     let cancels = lifecycle.cancels();
     let (to_lifecycle, from_boxes) = unbounded_channel();
-    let idle = IdleGate::new(lifecycle.boxes(), lifecycle.busy());
+    let idle = IdleGate::new(lifecycle.boxes(), lifecycle.busy(), to_lifecycle.clone());
     let (to_setups, from_setups) = unbounded_channel();
     let runner = tokio::spawn(lifecycle.run(from_boxes, from_setups));
     tokio::spawn(boxes(
@@ -955,10 +955,14 @@ async fn serve(
             }
             Next::Update(reason) => {
                 eprintln!("the control plane refused this supervisor's protocol ({reason}); updating now");
-                if updates.updater.now().await == Outcome::Restart {
-                    return Ok(Served::Updated);
+                match updates.updater.now().await {
+                    Outcome::Restart => return Ok(Served::Updated),
+                    Outcome::Busy => {
+                        tokio::time::sleep(tumpel_channel::FIRST_BACKOFF).await;
+                        channel.step_up();
+                    }
+                    _ => return Err(fail(SupervisorFailure::ProtocolError, reason)),
                 }
-                return Err(fail(SupervisorFailure::ProtocolError, reason));
             }
             Next::Reconnect(wait) => {
                 let wake = tokio::time::Instant::now() + wait;
@@ -1247,6 +1251,50 @@ mod tests {
         fn sign(&self, _: &[u8]) -> String {
             "c2lnbmF0dXJl".to_string()
         }
+    }
+
+    #[test]
+    fn an_interrupted_turn_updates_its_record_only_after_the_channel_file_is_saved() {
+        let root = std::env::temp_dir().join(format!("tumpel-interrupted-ledger-{}", std::process::id()));
+        let ledger = root.join("channel.json");
+        let failure: tumpel_api::types::ChannelTurnFailed = serde_json::from_value(serde_json::json!({
+            "type": "TurnFailed", "turnId": "turn-1", "reason": "HarnessExited",
+            "failedAt": "2026-11-24T00:00:00Z", "detail": "the supervisor stopped",
+        }))
+        .expect("a terminal message");
+        let message = |failure, ledger: PathBuf| {
+            let (saved, ready) = oneshot::channel();
+            let after = tumpel_channel::AfterSave::new(move || {
+                let bytes = std::fs::read(ledger).expect("the channel file is saved");
+                let state: tumpel_api::types::SupervisorChannelState =
+                    serde_json::from_slice(&bytes).expect("the channel state decodes");
+                assert_eq!(state.unacked.len(), 1);
+                assert_eq!(state.unacked[0].message["turnId"], "turn-1");
+                let _ = saved.send(());
+            });
+            (Outgoing::InterruptedTurn(failure, after), ready)
+        };
+        let mut channel = HostChannel::new(
+            tumpel_channel::empty_state(),
+            ChannelFile(ledger.clone()),
+            Unsigned,
+            "host-1".try_into().expect("host id"),
+            "0.1.0".to_string(),
+        );
+        let (first, mut ready) = message(failure.clone(), ledger.clone());
+        assert!(matches!(
+            channel.send(first, &mut Outbox::default()),
+            Err(ChannelError::Store(_))
+        ));
+        assert!(matches!(ready.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
+
+        std::fs::create_dir(&root).expect("the ledger can be created");
+        let (retry, mut ready) = message(failure, ledger);
+        channel
+            .send(retry, &mut Outbox::default())
+            .expect("the failure is durably queued");
+        assert_eq!(ready.try_recv(), Ok(()));
+        std::fs::remove_dir_all(root).expect("remove the fixture");
     }
 
     fn hello_version(channel: &mut HostChannel<Unsaved, Unsigned>) -> serde_json::Value {

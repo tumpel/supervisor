@@ -679,6 +679,7 @@ enum Event<M: Machine> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     TakingTurns,
+    PreparingUpdate,
     HandingOver,
 }
 
@@ -2323,6 +2324,8 @@ pub struct Abandoned {
 pub enum Input {
     Command(Command),
     HandOver(oneshot::Sender<SupervisorHandover>),
+    PrepareUpdate(oneshot::Sender<Result<(), String>>),
+    CancelUpdate,
     Abandon(oneshot::Sender<()>, Abandoned),
     SnapshotAccepted(EntityId),
     SnapshotFailed(EntityId),
@@ -2333,12 +2336,13 @@ pub enum Input {
 pub struct IdleGate {
     boxes: watch::Receiver<u32>,
     busy: watch::Receiver<u32>,
+    commands: UnboundedSender<Input>,
 }
 
 impl IdleGate {
     #[must_use]
-    pub fn new(boxes: watch::Receiver<u32>, busy: watch::Receiver<u32>) -> Self {
-        Self { boxes, busy }
+    pub fn new(boxes: watch::Receiver<u32>, busy: watch::Receiver<u32>, commands: UnboundedSender<Input>) -> Self {
+        Self { boxes, busy, commands }
     }
 }
 
@@ -2358,6 +2362,25 @@ impl Idle for IdleGate {
                 std::future::pending::<()>().await;
             }
         }
+    }
+    async fn prepare_update(&self, limit: Duration) -> Result<(), String> {
+        let (reply, prepared) = oneshot::channel();
+        self.commands
+            .send(Input::PrepareUpdate(reply))
+            .map_err(|_| "the box runner stopped before preparing the update")?;
+        timeout(limit, prepared)
+            .await
+            .map_err(|_| {
+                format!(
+                    "the boxes did not settle within {} s; the current supervisor keeps serving",
+                    limit.as_secs(),
+                )
+            })?
+            .map_err(|_| "the box runner stopped preparing the update")?
+    }
+
+    fn cancel_update(&self) {
+        let _ = self.commands.send(Input::CancelUpdate);
     }
 }
 
@@ -2399,6 +2422,7 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     mode: Mode,
     parking: watch::Sender<bool>,
     handing: Option<(oneshot::Sender<SupervisorHandover>, AbortHandle)>,
+    preparing: Option<oneshot::Sender<Result<(), String>>>,
     session_protocol: Option<u16>,
     adopted: Vec<String>,
     protected_sessions: HashMap<String, Tap>,
@@ -2476,6 +2500,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             mode: Mode::TakingTurns,
             parking,
             handing: None,
+            preparing: None,
             session_protocol: None,
             adopted: Vec::new(),
             protected_sessions: HashMap::new(),
@@ -2616,6 +2641,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 input = inputs.recv() => match input {
                     Some(Input::Command(command)) => self.command(command)?,
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
+                    Some(Input::PrepareUpdate(reply)) => self.prepare_update(reply),
+                    Some(Input::CancelUpdate) => self.cancel_update()?,
                     Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
                     Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id),
                     Some(Input::SnapshotFailed(snapshot_id)) => self.snapshot_failed(snapshot_id),
@@ -2625,6 +2652,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 Some(setup) = setups.recv() => self.setup_command(setup),
                 Some(event) = finished.recv() => self.event(event).await?,
             }
+            self.settle_update();
             self.settle_handover();
             self.publish();
         }
@@ -2725,6 +2753,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     fn refusal(&self) -> Option<&'static str> {
         match self.mode {
             Mode::TakingTurns => None,
+            Mode::PreparingUpdate => Some("is preparing a supervisor update"),
             Mode::HandingOver => Some("is handing its boxes to a new supervisor binary"),
         }
     }
@@ -2741,7 +2770,59 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         );
     }
 
+    fn prepare_update(&mut self, reply: oneshot::Sender<Result<(), String>>) {
+        if self.mode != Mode::TakingTurns {
+            let _ = reply.send(Err("the supervisor is already preparing a handover".to_string()));
+            return;
+        }
+        if self.has_boxes_outside_handover() {
+            let _ = reply.send(Err(
+                "the host has live boxes it cannot hand over; the current supervisor keeps serving".to_string(),
+            ));
+            return;
+        }
+        self.mode = Mode::PreparingUpdate;
+        self.parking.send_replace(true);
+        self.preparing = Some(reply);
+    }
+
+    fn has_boxes_outside_handover(&self) -> bool {
+        !self.protected_sessions.is_empty() || !self.unclaimed.is_empty()
+    }
+
+    fn settle_update(&mut self) {
+        if self.preparing.is_none() {
+            return;
+        }
+        let result = if self.has_boxes_outside_handover() {
+            Err("a box could not be prepared for handover; the current supervisor keeps serving".to_string())
+        } else if self.setups.is_empty() && !self.slots.values().any(|slot| slot.busy) {
+            Ok(())
+        } else {
+            return;
+        };
+        if let Some(reply) = self.preparing.take() {
+            let _ = reply.send(result);
+        }
+    }
+
+    fn cancel_update(&mut self) -> Result<(), String> {
+        if self.mode != Mode::PreparingUpdate {
+            return Ok(());
+        }
+        self.preparing.take();
+        self.mode = Mode::TakingTurns;
+        self.parking.send_replace(false);
+        let sessions: Vec<String> = self.slots.keys().cloned().collect();
+        for session in sessions {
+            self.resume(session.clone());
+            self.drain(&session)?;
+        }
+        Ok(())
+    }
+
     fn start_handover(&mut self, reply: oneshot::Sender<SupervisorHandover>) {
+        self.preparing.take();
         self.mode = Mode::HandingOver;
         self.parking.send_replace(true);
         self.discard_setups();
@@ -3237,6 +3318,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             });
             if let Err(error) = updated {
                 eprintln!("tumpel-supervisor: recording the interruption of turn {turn} failed: {error}");
+                return;
             }
             let _ = saved.send(());
         });
@@ -3349,7 +3431,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             return Ok(());
         }
         let slot = self.slots.entry(session.clone()).or_default();
-        if slot.busy || slot.parked.is_some() {
+        if slot.busy || slot.parked.is_some() || self.mode == Mode::PreparingUpdate {
             slot.queue.push_back(command);
             return self.record_queue(&session);
         }
@@ -4131,6 +4213,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     fn drain(&mut self, session: &str) -> Result<(), String> {
+        if self.mode == Mode::PreparingUpdate {
+            return Ok(());
+        }
         loop {
             let next = self
                 .slots
