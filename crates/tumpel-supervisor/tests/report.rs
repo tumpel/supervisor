@@ -372,6 +372,28 @@ mod tests {
         assert!(image.exists());
     }
 
+    #[test]
+    fn a_failed_unit_reload_leaves_the_saved_inventory_for_retry() {
+        let host = Host::new("failed-reload", "http://127.0.0.1:9");
+        let inventory = json!({"handedAt":"2026-11-16T09:30:00Z", "boxes":[recorded_box(&recorded_image())]});
+        host.state("boxes.json", &inventory);
+        let unit = host.root.join("config/systemd/user/tumpel-supervisor.service");
+        fs::write(&unit, "[Service]\n").expect("old unit");
+        let systemctl = host.root.join("systemctl");
+        fs::write(&systemctl, "#!/bin/sh\nexit 1\n").expect("failed service reload");
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o700)).expect("service operation");
+
+        let daemon = host.command(&["run", "--handover"]).output().expect("daemon exits");
+        assert!(!daemon.status.success(), "{daemon:?}");
+        assert!(String::from_utf8_lossy(&daemon.stderr).contains("daemon-reload exited"));
+        let saved = fs::read(host.root.join("state/boxes.json")).expect("preserved inventory");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&saved).expect("saved inventory"),
+            inventory
+        );
+        assert!(unit.with_extension("service.reload-pending").exists());
+    }
+
     #[tokio::test]
     async fn the_old_unit_arguments_and_the_daemon_flag_start_supervision() {
         let invocations = [
@@ -395,7 +417,7 @@ mod tests {
                 )
                 .expect("old unit");
                 let systemctl = host.root.join("systemctl");
-                fs::write(&systemctl, "#!/bin/sh\nexit 1\n").expect("failed service reload");
+                fs::write(&systemctl, "#!/bin/sh\nexit 0\n").expect("successful service reload");
                 fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o700)).expect("service operation");
             }
             let mut command = tokio::process::Command::from(host.command(&argv));
@@ -493,12 +515,8 @@ mod tests {
         assert_eq!(response.supervisor_version.as_str(), VERSION);
         warm["boxes"][0]["state"]["kind"] = json!("FutureState");
         host.state("boxes.json", &warm);
-        assert!(host
-            .command(&["check"])
-            .output()
-            .expect("preflight exits")
-            .status
-            .success());
+        let unsupported = host.command(&["check"]).output().expect("preflight exits");
+        assert_eq!(unsupported.status.code(), Some(1), "{unsupported:?}");
         let report = host.command(&["--json"]).output().expect("report exits");
         let report: Value = serde_json::from_slice(&report.stdout).expect("JSON report");
         assert_eq!(report["checks"]["inventory"]["status"], "FAIL");

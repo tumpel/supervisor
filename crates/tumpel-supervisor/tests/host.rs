@@ -80,7 +80,13 @@ async fn until_complete(received: &mut UnboundedReceiver<Outgoing>) -> Vec<Strin
             .await
             .expect("a message within 60 s")
             .expect("the channel stays open");
-        let (Outgoing::Message(message) | Outgoing::Snapshot(message, _)) = message;
+        let message = match message {
+            Outgoing::Message(message) | Outgoing::Snapshot(message, _) => message,
+            Outgoing::InterruptedTurn(failed, persisted) => {
+                persisted.saved();
+                failed.into()
+            }
+        };
         let done = matches!(message, ChannelHostMessage::TurnComplete(_));
         seen.push(match message {
             ChannelHostMessage::TurnClaim(claim) => format!("claim {}", *claim.turn_id),
@@ -385,10 +391,11 @@ async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_i
         .expect("the next supervisor takes the box over");
     drop(descriptors);
     let failed = received.recv().await.expect("the cut turn is reported");
-    assert!(
-        matches!(&failed, Outgoing::Message(ChannelHostMessage::TurnFailed(failed)) if *failed.turn_id == "turn-1"),
-        "{failed:?}"
-    );
+    let Outgoing::InterruptedTurn(failed, persisted) = failed else {
+        panic!("expected an interrupted turn, got {failed:?}");
+    };
+    assert_eq!(failed.turn_id.as_str(), "turn-1");
+    persisted.saved();
     let (commands, from_test) = unbounded_channel();
     let running = tokio::spawn(taker.run(from_test, unbounded_channel().1));
     let started = Instant::now();
