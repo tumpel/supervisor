@@ -1908,7 +1908,7 @@ async fn a_failed_attachment_leaves_the_saved_inventory_and_skips_startup_cleanu
     old.settle_until("complete 1").await;
     let mut standing = old.standing();
     old.keep_guest(&mut standing.boxes[0], 40);
-    standing.boxes[1].machine.guest_fd = 51;
+    old.vmm.failed_attachments.insert(1);
 
     let path = old.vmm.staging.join("boxes.json");
     let saved = std::fs::read(&path).expect("saved inventory");
@@ -1928,8 +1928,7 @@ async fn a_failed_attachment_leaves_the_saved_inventory_and_skips_startup_cleanu
     assert_eq!(old.log(), ["reattach session-1 on tumpel0", "check scopes [0]"]);
     let kept: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path).expect("saved inventory")).expect("inventory JSON");
-    let mut original: serde_json::Value = serde_json::from_slice(&saved).expect("original inventory");
-    original["boxes"][1]["machine"]["guestFd"] = json!(51);
+    let original: serde_json::Value = serde_json::from_slice(&saved).expect("original inventory");
     assert_eq!(kept["boxes"][1], original["boxes"][1]);
 }
 
@@ -2028,7 +2027,7 @@ async fn a_box_that_cannot_attach_and_an_unclaimed_scope_leave_the_rest_running(
     old.turn("turn-2", "session-2", "two", Vec::new());
     old.settle_until("complete 1").await;
     let mut standing = old.standing();
-    standing.boxes[0].machine.guest_fd = 51;
+    old.vmm.failed_attachments.insert(0);
     old.keep_guest(&mut standing.boxes[1], 52);
     old.vmm.unclaimed = vec![0, 2];
     let mut new = old.after_crash(standing);
