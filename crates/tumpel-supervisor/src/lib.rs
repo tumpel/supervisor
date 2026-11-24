@@ -14,6 +14,7 @@ pub mod layers;
 mod lifecycle;
 mod persona_files;
 mod pool;
+mod report;
 mod run;
 mod snapshot;
 mod store;
@@ -36,6 +37,7 @@ pub use lifecycle::{
     BoxTurn, Budgets, Command, Guest, IdleGate, Input, Lifecycle, Machine, Settings, SnapshotOrder, Taken, Vmm,
 };
 pub use pool::{Disk, PoolExhausted, Size, Tap, TapPool};
+pub use report::report;
 pub use run::{run, Failure, Stopped};
 pub use snapshot::{Entry, Ext4Upper, Kind, Manifest, Scan, Upper};
 pub use store::{DownloadError, HttpStore, Store, UploadError};

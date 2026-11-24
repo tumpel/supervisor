@@ -1,0 +1,194 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::ErrorKind;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use futures_util::{SinkExt, StreamExt};
+use ring::rand::SystemRandom;
+use ring::signature::{Ed25519KeyPair, KeyPair};
+use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::Message;
+use tumpel_api::types::{ChannelProtocol, GuestProtocol, SupervisorCheckReport};
+
+const BINARY: &str = env!("CARGO_BIN_EXE_tumpel-supervisor");
+const CHECKS: [&str; 6] = [
+    "startup",
+    "boxes.json",
+    "handover.json",
+    "guest drive",
+    "image cache",
+    "Firecracker",
+];
+
+struct Host {
+    root: PathBuf,
+}
+
+#[cfg(test)]
+impl Host {
+    fn new(name: &str, endpoint: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("tumpel-report-{}-{name}", std::process::id()));
+        fs::create_dir(&root).expect("new test host");
+        for dir in ["state", "data", "images"] {
+            fs::create_dir(root.join(dir)).expect("fixture directory");
+        }
+        let host = Self { root };
+        host.state(
+            "supervisor.json",
+            &json!({"endpoint": endpoint, "hostId":"host-1", "tenantId":"tenant-1"}),
+        );
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("fixture key");
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("fixture pair");
+        host.state(
+            "host-key.json",
+            &json!({
+                "privateKey": STANDARD.encode(pkcs8.as_ref()),
+                "publicKey": STANDARD.encode(key.public_key().as_ref()),
+            }),
+        );
+        host.state("channel.json", &json!({"received":0, "sent":0, "unacked":[]}));
+        for name in ["boxes.json", "handover.json"] {
+            host.state(name, &json!({"handedAt":"2026-11-16T09:30:00Z", "boxes":[]}));
+        }
+        let firecracker = host.root.join("firecracker");
+        fs::write(&firecracker, b"#!/bin/sh\nexit 1\n").expect("fixture binary");
+        fs::set_permissions(&firecracker, fs::Permissions::from_mode(0o755)).expect("fixture binary is executable");
+        host.state(
+            "runtime.json",
+            &json!({
+                "dataDir": host.root.join("data"),
+                "imageCacheDir": host.root.join("images"),
+                "firecrackerPath": firecracker,
+            }),
+        );
+        host
+    }
+
+    fn state(&self, name: &str, value: &Value) {
+        fs::write(self.root.join("state").join(name), value.to_string()).expect("fixture state");
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(BINARY);
+        command
+            .env_clear()
+            .env("TUMPEL_SUPERVISOR_DIR", self.root.join("state"))
+            .env("XDG_CONFIG_HOME", self.root.join("config"));
+        command
+    }
+}
+
+#[cfg(test)]
+impl Drop for Host {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.root).expect("remove the test host");
+    }
+}
+
+#[cfg(test)]
+fn contents(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut entries = BTreeMap::new();
+    for entry in fs::read_dir(path).expect("list fixture") {
+        let path = entry.expect("fixture entry").path();
+        if path.is_dir() {
+            entries.extend(contents(&path));
+            entries.insert(path, Vec::new());
+        } else {
+            let bytes = fs::read(&path).expect("fixture bytes");
+            entries.insert(path, bytes);
+        }
+    }
+    entries
+}
+
+#[test]
+fn a_healthy_bare_report_passes_without_writing_or_connecting() {
+    let control_plane = std::net::TcpListener::bind("127.0.0.1:0").expect("control-plane boundary");
+    control_plane.set_nonblocking(true).expect("nonblocking listener");
+    let host = Host::new(
+        "healthy",
+        &format!("http://{}", control_plane.local_addr().expect("listener address")),
+    );
+    let before = contents(&host.root);
+    let output = host.command().output().expect("report exits");
+    let report = String::from_utf8(output.stdout).expect("report text");
+    assert!(output.status.success(), "{report}");
+    assert_eq!(report.lines().count(), CHECKS.len() + 1, "{report}");
+    for check in CHECKS {
+        assert!(report.contains(&format!("PASS {check}: ")), "{report}");
+    }
+    assert!(report.ends_with(&format!("PASS channel protocol {}\n", ChannelProtocol::VERSION)));
+    assert_eq!(contents(&host.root), before);
+    assert_eq!(
+        control_plane.accept().expect_err("no connection").kind(),
+        ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn a_corrupt_record_or_missing_firecracker_fails_while_the_other_checks_run() {
+    for (file, failed) in [
+        ("state/boxes.json", "boxes.json"),
+        ("state/handover.json", "handover.json"),
+        ("images/broken.json", "image cache"),
+        ("firecracker", "Firecracker"),
+    ] {
+        let host = Host::new("broken", "http://127.0.0.1:9");
+        if file == "firecracker" {
+            fs::remove_file(host.root.join(file)).expect("remove Firecracker");
+        } else {
+            fs::write(host.root.join(file), b"{").expect("corrupt JSON");
+        }
+        let before = contents(&host.root);
+        let output = host.command().output().expect("report exits");
+        let report = String::from_utf8(output.stdout).expect("report text");
+        assert_eq!(output.status.code(), Some(1), "{report}");
+        for check in CHECKS {
+            let status = if check == failed { "FAIL" } else { "PASS" };
+            assert!(report.contains(&format!("{status} {check}: ")), "{report}");
+        }
+        assert!(report.ends_with(&format!("PASS channel protocol {}\n", ChannelProtocol::VERSION)));
+        assert_eq!(contents(&host.root), before);
+    }
+}
+
+#[tokio::test]
+async fn explicit_check_still_dials_for_a_challenge_and_prints_a_supervisor_check_report() {
+    let control_plane = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("control-plane boundary");
+    let host = Host::new(
+        "check",
+        &format!("http://{}", control_plane.local_addr().expect("listener address")),
+    );
+    let server = async {
+        let (stream, _) = control_plane.accept().await.expect("connection");
+        let mut socket = tokio_tungstenite::accept_async(stream).await.expect("websocket");
+        socket
+            .send(Message::text(
+                r#"{"type":"Challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+            ))
+            .await
+            .expect("challenge");
+        assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
+    };
+    let mut check = tokio::process::Command::from(host.command());
+    check.arg("check").kill_on_drop(true);
+    let ((), output) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(server, check.output()) })
+        .await
+        .expect("check completes after the challenge");
+    let output = output.expect("check exits");
+    assert!(output.status.success(), "{output:?}");
+    let report: SupervisorCheckReport = serde_json::from_slice(&output.stdout).expect("legacy check report");
+    assert_eq!(report.supervisor_version.as_str(), env!("TUMPEL_RELEASE_VERSION"));
+    assert_eq!(
+        report.channel_protocol_version.get(),
+        u32::from(ChannelProtocol::VERSION)
+    );
+    assert_eq!(report.guest_protocol_version.get(), u32::from(GuestProtocol::VERSION));
+}

@@ -19,8 +19,8 @@ use tokio::time::timeout;
 use tumpel_api::types::{
     ChannelHostMessage, ChannelSupervisorUpdateFailed, ChannelSupervisorUpdateFailedType, ChannelSupervisorUpdateStep,
     ChannelSupervisorUpdateStepReleaseVersion, ChannelSupervisorUpdateStepType, HostArchitecture,
-    ReleaseManifestReleaseVersion, ReleaseSupervisorSupervisorVersion, Sha256Digest, SupervisorCheckReport,
-    SupervisorUpdateFailureReason, SupervisorUpdatePending, SupervisorUpdatePhase, SupervisorUpdateRefusal,
+    ReleaseManifestReleaseVersion, ReleaseSupervisorSupervisorVersion, Sha256Digest, SupervisorUpdateFailureReason,
+    SupervisorUpdatePending, SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
 use tumpel_channel::Outgoing;
 use tumpel_guest::setup_output::{redacted, strip_ansi};
@@ -28,6 +28,7 @@ use tumpel_guest::setup_output::{redacted, strip_ansi};
 use crate::bounded::reported;
 use crate::dir;
 use crate::install::supervisor_unit_text;
+use crate::report::CHANNEL_PROTOCOL_LINE;
 use crate::snapshot::hex;
 
 pub const PENDING_FILE: &str = "update-pending.json";
@@ -665,7 +666,6 @@ impl<S: Source, I: Idle> Updater<S, I> {
         use SupervisorUpdateFailureReason::SupervisorUpdateDryRunFailed as DryRunFailed;
         let candidate = &self.layout.candidate;
         let mut child = Command::new(candidate)
-            .arg("check")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -674,7 +674,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
             .map_err(|error| {
                 stop(
                     DryRunFailed,
-                    format!("starting {} check failed: {error}", candidate.display()),
+                    format!("starting the report from {} failed: {error}", candidate.display()),
                 )
             })?;
         let stdout = tokio::spawn(drain(child.stdout.take()));
@@ -693,12 +693,25 @@ impl<S: Source, I: Idle> Updater<S, I> {
             .ok()
             .and_then(Result::ok)
             .unwrap_or_default();
-        let failed = |detail: String| Stop {
-            reason: DryRunFailed,
-            detail,
-            tail: tail_of(&stderr, &stdout),
+        let stdout_text = strip_ansi(&String::from_utf8_lossy(&stdout));
+        let stderr_text = strip_ansi(&String::from_utf8_lossy(&stderr));
+        let failures = stdout_text
+            .lines()
+            .chain(stderr_text.lines())
+            .filter(|line| line.starts_with("FAIL "))
+            .collect::<Vec<_>>();
+        let failed = |mut detail: String| {
+            for line in &failures {
+                detail.push('\n');
+                detail.push_str(line);
+            }
+            Stop {
+                reason: DryRunFailed,
+                detail,
+                tail: tail_of(&stderr, &stdout),
+            }
         };
-        let name = format!("the check of supervisor {}", named(release));
+        let name = format!("the report from supervisor {}", named(release));
         let status = match waited {
             Err(_) => return Err(failed(format!("{name} ran past {} s", self.limits.dry_run.as_secs()))),
             Ok(Err(error)) => return Err(failed(format!("waiting for {name} failed: {error}"))),
@@ -707,18 +720,19 @@ impl<S: Source, I: Idle> Updater<S, I> {
         if !status.success() {
             return Err(failed(format!("{name} exited with {status}")));
         }
-        let text = String::from_utf8_lossy(&stdout);
-        let line = text
+        if !failures.is_empty() {
+            return Err(failed(format!("{name} reported failed checks")));
+        }
+        let protocol = stdout_text
             .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or_default();
-        let report: SupervisorCheckReport = serde_json::from_str(line)
-            .map_err(|error| failed(format!("{name} printed no SupervisorCheckReport: {error}")))?;
-        if report.channel_protocol_version.get() != release.channel_protocol_version {
+            .find_map(|line| line.strip_prefix(CHANNEL_PROTOCOL_LINE))
+            .ok_or_else(|| failed(format!("{name} printed no channel protocol")))?
+            .parse::<NonZeroU32>()
+            .map_err(|error| failed(format!("{name} printed an invalid channel protocol: {error}")))?;
+        if protocol.get() != release.channel_protocol_version {
             return Err(failed(format!(
                 "{name} speaks channel protocol {}, and the release speaks {}",
-                report.channel_protocol_version, release.channel_protocol_version
+                protocol, release.channel_protocol_version
             )));
         }
         Ok(())

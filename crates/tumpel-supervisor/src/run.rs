@@ -686,7 +686,7 @@ pub(crate) struct Started {
     pub(crate) config: SupervisorConfig,
     pair: Ed25519KeyPair,
     state: SupervisorChannelState,
-    runtime: SupervisorRuntime,
+    pub(crate) runtime: SupervisorRuntime,
     pub(crate) url: String,
     layout: Layout,
     pub(crate) running: Sha256Digest,

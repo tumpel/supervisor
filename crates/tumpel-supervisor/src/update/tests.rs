@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::sync::watch;
 use tumpel_api::types::{
     ChannelHostMessage, ChannelProtocol, HostArchitecture, Sha256Digest, SupervisorUpdateFailureReason,
-    SupervisorUpdatePhase,
+    SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
 use tumpel_channel::Outgoing;
 
@@ -91,7 +91,7 @@ fn digest(hex: &str) -> Sha256Digest {
 
 fn report_script(protocol: u32) -> String {
     format!(
-        "#!/bin/sh\necho 'supervisor starts as host h' >&2\necho '{{\"supervisorVersion\":\"0.2.0\",\"channelProtocolVersion\":{protocol},\"guestProtocolVersion\":6}}'\n"
+        "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 2\necho 'PASS startup: host settings loaded'\necho 'PASS channel protocol {protocol}'\n"
     )
 }
 
@@ -237,21 +237,31 @@ async fn a_failed_dry_run_keeps_the_running_binary_and_refuses_the_candidate() {
     let layout = layout("dry-run-fails");
     let idle = FakeIdle::default();
     let token = format!("{}-{}", ["sk", "ant", "oat01"].join("-"), "Ab3d".repeat(10));
-    let script =
-        format!("#!/bin/sh\necho 'NotEnrolled: runtime.json is missing' >&2\necho 'token {token}' >&2\nexit 3\n");
+    let boxes = "FAIL boxes.json: invalid box record";
+    let firecracker = "FAIL Firecracker: binary is missing";
+    let script = format!("#!/bin/sh\necho '{boxes}'\necho '{firecracker}'\necho 'token {token}' >&2\nexit 1\n");
     let mut run = updater(&layout, FakeSource::binary(&script), &idle, limits());
     assert_eq!(
         run.updater.announced(Duration::ZERO).await,
         Outcome::Failed(SupervisorUpdateFailureReason::SupervisorUpdateDryRunFailed)
     );
     let (detail, tail) = failure(&mut run.events);
-    assert!(detail.contains("exited with exit status: 3"), "{detail}");
+    assert!(detail.contains("exited with exit status: 1"), "{detail}");
+    assert!(detail.contains(boxes), "{detail}");
+    assert!(detail.contains(firecracker), "{detail}");
     assert!(detail.contains("the running supervisor stays"), "{detail}");
-    assert_eq!(tail, vec!["NotEnrolled: runtime.json is missing", "token [token]"]);
+    assert_eq!(tail, vec!["token [token]", boxes, firecracker]);
     assert_eq!(text(&layout.binary), OLD_BINARY, "the running binary is untouched");
     assert!(!layout.previous.exists(), "nothing was swapped");
     assert!(!layout.candidate.exists());
     assert!(!layout.state.join(PENDING_FILE).exists());
+    let refusal: SupervisorUpdateRefusal =
+        serde_json::from_str(&text(&layout.refusal())).expect("the refusal is written");
+    assert_eq!(*refusal.to_sha256, sha256_hex(script.as_bytes()));
+    assert_eq!(
+        refusal.reason,
+        SupervisorUpdateFailureReason::SupervisorUpdateDryRunFailed
+    );
     assert_eq!(
         run.updater.announced(Duration::ZERO).await,
         Outcome::Refused,
@@ -278,11 +288,27 @@ async fn a_dry_run_killed_by_a_signal_names_the_version_and_the_signal() {
     let (detail, _) = failure(&mut run.events);
     assert!(
         detail.starts_with(&format!(
-            "the check of supervisor 0.3.1 ({short}) exited with signal: 8 (SIGFPE)"
+            "the report from supervisor 0.3.1 ({short}) exited with signal: 8 (SIGFPE)"
         )),
         "{detail}"
     );
     assert_eq!(text(&layout.binary), OLD_BINARY, "the running binary is untouched");
+}
+
+#[tokio::test]
+async fn a_bare_report_speaking_the_release_channel_protocol_passes() {
+    let layout = layout("dry-run-matching-protocol");
+    let idle = FakeIdle::default();
+    let run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
+    let release = run.updater.source.release().await.expect("the release");
+    run.updater
+        .place_candidate(good_script().as_bytes())
+        .await
+        .unwrap_or_else(|error| panic!("placing the candidate failed: {}", error.detail));
+    run.updater
+        .dry_run(&release)
+        .await
+        .unwrap_or_else(|error| panic!("the report failed: {}", error.detail));
 }
 
 #[tokio::test]
@@ -303,6 +329,7 @@ async fn a_dry_run_speaking_another_channel_protocol_fails() {
         "{detail}"
     );
     assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Refused);
 }
 
 #[tokio::test]

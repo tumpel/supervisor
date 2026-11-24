@@ -3,19 +3,19 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use tumpel_api::types::SupervisorFailure;
 use tumpel_supervisor::{
-    check, enrol, install, install_telemetry, on_trial, received_descriptors, run, supervisor_dir, take_notify_socket,
-    Enrolment, Stopped,
+    check, enrol, install, install_telemetry, on_trial, received_descriptors, report, run, supervisor_dir,
+    take_notify_socket, Enrolment, Stopped,
 };
 
 #[derive(Parser)]
 #[command(
     name = "tumpel-supervisor",
     version,
-    about = "Runs tumpel boxes on this host and keeps its channel to the control plane"
+    about = "Report host readiness or run tumpel boxes"
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -72,7 +72,9 @@ fn exit_code(failure: &SupervisorFailure) -> ExitCode {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let Some(command) = Cli::parse().command else {
+        return report();
+    };
     let received = match unsafe { received_descriptors() } {
         Ok(received) => received,
         Err(error) => {
@@ -80,7 +82,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let handed = matches!(cli.command, Command::Run { handover: true, .. });
+    let handed = matches!(command, Command::Run { handover: true, .. });
     if let Err(error) = unsafe { take_notify_socket(handed) } {
         eprintln!("tumpel-supervisor: {error}");
         return ExitCode::FAILURE;
@@ -92,7 +94,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match cli.command {
+    match command {
         Command::Enrol {
             endpoint,
             token_file,
@@ -177,6 +179,6 @@ mod tests {
         let exec_start =
             "/home/u/.local/bin/tumpel-supervisor run --update-binary /home/u/.local/bin/tumpel-supervisor";
         let cli = Cli::try_parse_from(exec_start.split(' ')).expect("the old ExecStart parses");
-        assert!(matches!(cli.command, Command::Run { .. }));
+        assert!(matches!(cli.command, Some(Command::Run { .. })));
     }
 }
