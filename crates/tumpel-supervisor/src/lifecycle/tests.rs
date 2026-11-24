@@ -52,6 +52,7 @@ enum Boot {
     OldImage,
     NewImage,
     RefusesHandover,
+    RefusesStop,
 }
 
 type Files = BTreeMap<Vec<u8>, (Found, Vec<u8>)>;
@@ -297,6 +298,12 @@ impl Machine for MemoryMachine {
     }
 
     fn stop(self) -> impl Future<Output = Stopped> + Send {
+        if self.boot == Boot::RefusesStop {
+            return std::future::ready(Stopped {
+                exit: "did not stop".to_string(),
+                cleared: Err("the VM stop timed out".to_string()),
+            });
+        }
         self.drives.lock().expect("drives").remove(&self.drive);
         note(&self.log, format!("stop {}", self.session));
         std::future::ready(Stopped {
@@ -362,6 +369,7 @@ struct MemoryVmm {
     free_disk_mib: Arc<AtomicU64>,
     unclaimed: Vec<u8>,
     unclaimed_disks: Vec<EntityId>,
+    failed_attachments: BTreeSet<u8>,
 }
 
 impl Vmm for MemoryVmm {
@@ -392,7 +400,7 @@ impl Vmm for MemoryVmm {
         pool: &mut TapPool,
         _: bool,
     ) -> Result<Option<Attached<MemoryMachine>>, String> {
-        if handed.guest_fd == 51 {
+        if u8::try_from(index).is_ok_and(|index| self.failed_attachments.contains(&index)) {
             return Err("the Firecracker API did not respond".to_string());
         }
 
@@ -415,11 +423,14 @@ impl Vmm for MemoryVmm {
 
     fn recorded_process(
         &self,
-        _: u8,
+        index: u8,
         handed: &SupervisorHandoverMachine,
         _: Option<&crate::firecracker::Observation>,
     ) -> Result<bool, String> {
-        Ok(handed.guest_fd == 51 || self.hands.lock().expect("hands").contains_key(&handed.guest_fd))
+        Ok(
+            self.failed_attachments.contains(&index)
+                || self.hands.lock().expect("hands").contains_key(&handed.guest_fd),
+        )
     }
 
     fn disk(&self, _: &[String]) -> Result<Disk, String> {
@@ -437,8 +448,12 @@ impl Vmm for MemoryVmm {
         Ok(self.unclaimed.clone())
     }
 
-    fn unclaimed_sessions(&self, _: &[u8]) -> Result<Vec<EntityId>, String> {
-        Ok(self.unclaimed_disks.clone())
+    fn unclaimed_reservations(&self, claimed: &[u8]) -> Result<BTreeMap<u8, Vec<EntityId>>, String> {
+        Ok(self
+            .unclaimed_scopes(claimed)?
+            .into_iter()
+            .map(|index| (index, self.unclaimed_disks.clone()))
+            .collect())
     }
 
     fn discard_protected(
@@ -664,6 +679,7 @@ fn describe(message: ChannelHostMessage) -> Option<String> {
 
 struct Host {
     commands: UnboundedSender<Input>,
+    setups: UnboundedSender<super::SetupCommand>,
     cancels: Cancels,
     received: UnboundedReceiver<ChannelHostMessage>,
     store: MemoryStore,
@@ -922,6 +938,7 @@ fn host_on(
         free_disk_mib: Arc::new(AtomicU64::new(1 << 30)),
         unclaimed: Vec::new(),
         unclaimed_disks: Vec::new(),
+        failed_attachments: BTreeSet::new(),
     };
     start_host(
         vmm,
@@ -940,7 +957,7 @@ fn start_host(
     capacity: u32,
     settings: Settings,
     clone_seconds: u32,
-    taken: Option<(SupervisorHandover, Taken)>,
+    taken: Option<crate::inventory::StartupBoxes>,
     welcome: Option<u16>,
 ) -> Host {
     let log = Arc::clone(&vmm.log);
@@ -966,7 +983,7 @@ fn start_host(
         channel(from_lifecycle, Arc::clone(&session), commands.clone()),
     );
     let received = acking(received, Arc::clone(&accepting), commands.clone());
-    lifecycle.start(taken).expect("the lifecycle starts");
+    lifecycle.start_inventory(taken).expect("the lifecycle starts");
     let sessions = lifecycle.sessions();
     let turns = lifecycle.turns();
     let holdings = lifecycle.holdings();
@@ -976,9 +993,11 @@ fn start_host(
             .send(Input::Welcomed(protocol))
             .expect("the lifecycle reads its inputs");
     }
-    let runner = tokio::spawn(lifecycle.run(from_host, unbounded_channel().1));
+    let (setups, from_setups) = unbounded_channel();
+    let runner = tokio::spawn(lifecycle.run(from_host, from_setups));
     Host {
         commands,
+        setups,
         cancels,
         received,
         store,
@@ -1035,7 +1054,8 @@ impl Host {
 
     fn successor_welcomed(self, handover: &SupervisorHandover, welcome: Option<u16>) -> Host {
         let text = serde_json::to_string(handover).expect("the handover is JSON");
-        let record = serde_json::from_str(&text).expect("the handover reads back as a SupervisorHandover");
+        let record: SupervisorHandover =
+            serde_json::from_str(&text).expect("the handover reads back as a SupervisorHandover");
         let Host {
             vmm,
             store,
@@ -1050,7 +1070,10 @@ impl Host {
             capacity,
             settings,
             clone_seconds,
-            Some((record, Taken::Handed)),
+            Some(crate::inventory::StartupBoxes::from_record(
+                crate::inventory::Inventory::from(record),
+                Taken::Handed,
+            )),
             welcome,
         )
     }
@@ -1085,7 +1108,10 @@ impl Host {
             self.capacity,
             self.settings,
             self.clone_seconds,
-            Some((standing, Taken::Crashed)),
+            Some(crate::inventory::StartupBoxes::from_record(
+                standing.into(),
+                Taken::Crashed,
+            )),
             Some(ChannelProtocol::VERSION),
         )
     }
@@ -2033,6 +2059,23 @@ async fn a_scope_without_a_record_keeps_its_session_disk_off_limits() {
         refused[0].contains("disk held for an unclaimed Firecracker scope"),
         "{refused:?}"
     );
+    new.setups
+        .send(super::SetupCommand::Start(Box::new(super::SetupOrder {
+            claude_setup_id: "held-session".try_into().expect("setup id"),
+            tenant_id: "tenant-1".try_into().expect("tenant id"),
+            box_id: "setup-box".try_into().expect("box id"),
+            image: BootOrder::Full(new.cached_image(&GuestHarnessProtocol::ShellLines)),
+            token_url: "https://example.com/token".try_into().expect("token URL"),
+            token_credential: "t".repeat(43).try_into().expect("token credential"),
+            url: Duration::from_secs(30),
+            code: Duration::from_secs(30),
+        })))
+        .expect("send setup offer");
+    let refused = new.settle_until_starts("setup failed NoHostOnline:").await;
+    assert!(
+        refused[0].contains("disk held for an unclaimed Firecracker scope"),
+        "{refused:?}"
+    );
     new.turn("turn-2", "another-session", "two", Vec::new());
     new.settle_until("complete 1").await;
     let log = new.log();
@@ -2049,9 +2092,9 @@ async fn a_live_box_with_an_unattachable_turn_is_reported_held_and_the_turn_fail
     old.turn("turn-1", "session-1", "one", Vec::new());
     old.settle_until("claim turn-1").await;
     tokio::time::sleep(SLOW_CLONE / 2).await;
-    let mut handover = old.ask_handover().await.expect("the box is handed over");
+    let handover = old.ask_handover().await.expect("the box is handed over");
     assert!(matches!(handover.boxes[0].state, SupervisorHandoverBoxState::Turn(_)));
-    handover.boxes[0].machine.guest_fd = 51;
+    old.vmm.failed_attachments.insert(0);
     let mut new = old.successor(&handover);
 
     assert_eq!(
@@ -2066,7 +2109,28 @@ async fn a_live_box_with_an_unattachable_turn_is_reported_held_and_the_turn_fail
         frames[0].contains("session-1") && frames[0].contains("send the turn again"),
         "{frames:?}"
     );
-    assert_eq!(new.standing().boxes[0].box_id.as_str(), "box-session-1");
+    let standing = crate::inventory::load(&new.vmm.staging.join("boxes.json"))
+        .expect("read the standing inventory")
+        .expect("box was recorded");
+    let kept = &standing.boxes[0];
+    assert_eq!(kept.record.box_id.as_str(), "box-session-1");
+    assert!(kept.record.dirty && kept.reconnect);
+    assert!(matches!(kept.record.state, SupervisorHandoverBoxState::Warm(_)));
+    new.runner.abort();
+    new = start_host(
+        new.vmm.clone(),
+        new.store.clone(),
+        new.capacity,
+        new.settings,
+        new.clone_seconds,
+        Some(crate::inventory::StartupBoxes::from_record(standing, Taken::Crashed)),
+        Some(ChannelProtocol::VERSION),
+    );
+    tokio::task::yield_now().await;
+    assert!(
+        new.received.try_recv().is_err(),
+        "the failed turn is not reported a second time"
+    );
     assert!(!new.log().iter().any(|entry| entry.starts_with("stop ")));
     assert!(new.turns.borrow().is_empty(), "the failed turn is no longer held");
     new.teardown("session-1");
@@ -2090,6 +2154,23 @@ async fn a_live_box_with_an_unattachable_turn_is_reported_held_and_the_turn_fail
             .any(|entries| entries == ["discard protected scope 0", "boot session-1 on tumpel0"]),
         "{log:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_stop_keeps_the_standing_box_and_disk() {
+    let mut host = host("failed-stop", 1, Harness::Echo, Boot::RefusesStop);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("complete 1").await;
+    host.discard("session-1");
+    let result = (&mut host.runner).await.expect("lifecycle task");
+    assert_eq!(result, Err("the VM stop timed out".to_string()));
+    assert_eq!(host.standing().boxes[0].box_id.as_str(), "box-session-1");
+    assert!(host
+        .vmm
+        .drives
+        .lock()
+        .expect("drives")
+        .contains_key(&host.vmm.staging.join("session-1").join("overlay"),));
 }
 
 #[tokio::test(start_paused = true)]

@@ -437,6 +437,7 @@ impl Adopted {
 }
 
 enum Process {
+    Starting(Child),
     Spawned(Child),
     Adopted(Adopted),
 }
@@ -444,14 +445,14 @@ enum Process {
 impl Process {
     fn id(&self) -> Option<u32> {
         match self {
-            Self::Spawned(child) => child.id(),
+            Self::Starting(child) | Self::Spawned(child) => child.id(),
             Self::Adopted(adopted) => u32::try_from(adopted.pid).ok(),
         }
     }
 
     async fn kill(self) -> Result<String, String> {
         match self {
-            Self::Spawned(mut child) => kill_child(&mut child).await,
+            Self::Starting(mut child) | Self::Spawned(mut child) => kill_child(&mut child).await,
             Self::Adopted(adopted) => adopted.end().await,
         }
     }
@@ -741,6 +742,10 @@ fn tail_of(fd: &OwnedFd, console: &Arc<Mutex<VecDeque<u8>>>, named: &str) -> Res
     Ok(keep_tail(reader, Arc::clone(console)))
 }
 
+fn process_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 fn scope_processes() -> Result<Vec<(u8, PathBuf)>, String> {
     let uid = unsafe { libc::geteuid() };
     let mut scopes = Vec::new();
@@ -757,12 +762,12 @@ fn scope_processes() -> Result<Vec<(u8, PathBuf)>, String> {
         match std::fs::metadata(&path) {
             Ok(metadata) if metadata.uid() == uid => {}
             Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if process_disappeared(&error) => continue,
             Err(error) => return Err(format!("reading process identity at {}: {error}", path.display())),
         }
         let cgroup = match std::fs::read_to_string(path.join("cgroup")) {
             Ok(cgroup) => cgroup,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if process_disappeared(&error) => continue,
             Err(error) => return Err(format!("reading a box scope at {}: {error}", path.display())),
         };
         let index = cgroup.lines().find_map(|line| {
@@ -785,7 +790,7 @@ fn opened_overlays(root: &Path, process: &Path) -> Result<Vec<EntityId>, String>
     for fd in entries(&process.join("fd"))? {
         let path = match std::fs::read_link(fd.path()) {
             Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if process_disappeared(&error) => continue,
             Err(error) => return Err(format!("inspecting the box disk of {}: {error}", process.display())),
         };
         let Some(session) = path
@@ -807,36 +812,43 @@ fn opened_overlays(root: &Path, process: &Path) -> Result<Vec<EntityId>, String>
     Ok(sessions)
 }
 
-fn sessions_in_scopes(root: &Path, scopes: &[u8], processes: &[(u8, PathBuf)]) -> Result<Vec<EntityId>, String> {
-    use std::collections::BTreeSet;
+fn scope_reservations(
+    root: &Path,
+    processes: &[(u8, PathBuf)],
+) -> Result<std::collections::BTreeMap<u8, Vec<EntityId>>, String> {
+    use std::collections::BTreeMap;
+    let mut reserved: BTreeMap<u8, Vec<EntityId>> = processes.iter().map(|(index, _)| (*index, Vec::new())).collect();
+    if reserved.is_empty() {
+        return Ok(reserved);
+    }
     let canonical = match root.canonicalize() {
         Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(reserved),
         Err(error) => return Err(format!("locating the saved box disks at {}: {error}", root.display())),
     };
-    let mut resolved = BTreeSet::new();
-    let mut sessions = BTreeSet::new();
-    for (index, process) in processes.iter().filter(|(index, _)| scopes.contains(index)) {
+    for (index, process) in processes {
         match opened_overlays(&canonical, process) {
-            Ok(opened) if !opened.is_empty() => {
-                resolved.insert(*index);
-                sessions.extend(opened);
-            }
-            Ok(_) => {}
+            Ok(opened) => reserved.entry(*index).or_default().extend(opened),
             Err(error) => eprintln!("tumpel-supervisor: {error}; keeping possible box disks"),
         }
     }
-    if scopes.iter().any(|index| !resolved.contains(index)) {
+    if reserved.values().any(Vec::is_empty) {
         eprintln!(
             "tumpel-supervisor: an unclaimed scope has no identifiable disk; keeping existing session directories"
         );
-        sessions.extend(
-            entries(root)?
-                .into_iter()
-                .filter_map(|entry| EntityId::try_from(entry.file_name().to_str()?).ok()),
-        );
+        let possible: Vec<_> = entries(root)?
+            .into_iter()
+            .filter_map(|entry| EntityId::try_from(entry.file_name().to_str()?).ok())
+            .collect();
+        for sessions in reserved.values_mut().filter(|sessions| sessions.is_empty()) {
+            sessions.clone_from(&possible);
+        }
     }
-    Ok(sessions.into_iter().collect())
+    for sessions in reserved.values_mut() {
+        sessions.sort();
+        sessions.dedup();
+    }
+    Ok(reserved)
 }
 
 pub struct Firecracker {
@@ -1138,8 +1150,10 @@ impl Vmm for Firecracker {
             .collect())
     }
 
-    fn unclaimed_sessions(&self, scopes: &[u8]) -> Result<Vec<EntityId>, String> {
-        sessions_in_scopes(&self.data.join("sessions"), scopes, &scope_processes()?)
+    fn unclaimed_reservations(&self, claimed: &[u8]) -> Result<std::collections::BTreeMap<u8, Vec<EntityId>>, String> {
+        let mut processes = scope_processes()?;
+        processes.retain(|(index, _)| !claimed.contains(index));
+        scope_reservations(&self.data.join("sessions"), &processes)
     }
 
     async fn discard_incomplete_boot(&self, index: u8) -> Result<(), String> {
@@ -1239,7 +1253,16 @@ impl Drop for FirecrackerBox {
         for task in &self.console_tasks {
             task.abort();
         }
-        if let Some(pid) = self.process.as_ref().and_then(Process::id) {
+        if let Some(Process::Starting(mut child)) =
+            self.process.take_if(|process| matches!(process, Process::Starting(_)))
+        {
+            if let Err(error) = child.start_kill() {
+                eprintln!(
+                    "tumpel-supervisor: stopping the unfinished launcher on TAP {} failed: {error}",
+                    self.index
+                );
+            }
+        } else if let Some(pid) = self.process.as_ref().and_then(Process::id) {
             eprintln!("tumpel-supervisor: released the handle for Firecracker {pid} on TAP {}; its scope keeps any running process", self.index);
         }
     }
@@ -1283,7 +1306,6 @@ impl FirecrackerBox {
     async fn spawn(&mut self) -> Result<(), String> {
         create_private_dir(&self.dir)?;
         self.clear_sockets()?;
-        let socket = self.api_socket();
         let child = Command::new("systemd-run")
             .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
             .arg(scope_of(self.index))
@@ -1302,8 +1324,13 @@ impl FirecrackerBox {
                     self.binary.display()
                 )
             })?;
-        self.process = Some(Process::Spawned(child));
-        let Some(Process::Spawned(child)) = self.process.as_mut() else {
+        self.follow_spawn(child).await
+    }
+
+    async fn follow_spawn(&mut self, child: Child) -> Result<(), String> {
+        let socket = self.api_socket();
+        self.process = Some(Process::Starting(child));
+        let Some(Process::Starting(child)) = self.process.as_mut() else {
             return Err("Firecracker did not start".to_string());
         };
         if let Some(stdout) = child.stdout.take() {
@@ -1338,6 +1365,10 @@ impl FirecrackerBox {
             .ok_or_else(|| "Firecracker ended right after opening its API socket".to_string())?;
         self.unwatch();
         self.watcher = Some(watch(self.index, pid, self.session_name(), &self.console, false)?);
+        let Some(Process::Starting(child)) = self.process.take() else {
+            return Err("the Firecracker launcher is missing".to_string());
+        };
+        self.process = Some(Process::Spawned(child));
         Ok(())
     }
 

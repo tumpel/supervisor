@@ -155,6 +155,32 @@ fn handed(vmm: &Firecracker, pid: libc::pid_t) -> Handed {
 }
 
 #[tokio::test]
+async fn aborting_a_boot_stops_the_launcher_before_the_api_opens() {
+    let vmm = firecracker("aborted-launch");
+    let tap = TapPool::new(4096, BOX).claim(BOX, ROOMY).expect("tap");
+    let session = "session-1".try_into().expect("session id");
+    let mut machine = vmm.machine(&session, &tap).expect("machine");
+    let launcher = tokio::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("launcher");
+    let pid = i32::try_from(launcher.id().expect("launcher PID")).expect("valid PID");
+    let mut boot = Box::pin(async move { machine.follow_spawn(launcher).await });
+    assert!(tokio::time::timeout(std::time::Duration::ZERO, &mut boot)
+        .await
+        .is_err());
+    drop(boot);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while super::process_start(pid).is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the incomplete launcher is stopped");
+}
+
+#[tokio::test]
 async fn failed_attachment_leaves_the_vm_and_all_streams_untouched() {
     let vmm = firecracker("reattach-wrong");
     let child = VmChild::new();
@@ -495,14 +521,20 @@ fn an_unclaimed_scope_keeps_its_open_box_disk_and_leaves_other_sessions_for_clea
     }
     let open = std::fs::File::open(root.join("live").join(super::OVERLAY_DRIVE)).expect("open box disk");
     let processes = [(2, std::path::PathBuf::from("/proc/self"))];
-    let held = super::sessions_in_scopes(&root, &[2], &processes).expect("the scope's open disk");
+    let held = super::scope_reservations(&root, &processes).expect("the scope's open disk");
     assert_eq!(
-        held.iter().map(tumpel_api::types::EntityId::as_str).collect::<Vec<_>>(),
+        held[&2]
+            .iter()
+            .map(tumpel_api::types::EntityId::as_str)
+            .collect::<Vec<_>>(),
         ["live"]
     );
-    let ambiguous = super::sessions_in_scopes(&root, &[2, 3], &processes).expect("keep possible disks");
+    let ambiguous_scope = (3, vmm.data.join("gone-process"));
+    let ambiguous =
+        super::scope_reservations(&root, &[processes[0].clone(), ambiguous_scope]).expect("keep possible disks");
+    assert_eq!(ambiguous[&2], held[&2]);
     assert_eq!(
-        ambiguous
+        ambiguous[&3]
             .iter()
             .map(tumpel_api::types::EntityId::as_str)
             .collect::<Vec<_>>(),

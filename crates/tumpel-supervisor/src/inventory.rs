@@ -24,6 +24,8 @@ pub(crate) struct RecordedBox {
     pub record: SupervisorHandoverBox,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation: Option<Observation>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reconnect: bool,
 }
 
 impl From<SupervisorHandover> for Inventory {
@@ -35,6 +37,7 @@ impl From<SupervisorHandover> for Inventory {
                 .map(|record| RecordedBox {
                     record,
                     observation: None,
+                    reconnect: false,
                 })
                 .collect(),
             handed_at: handover.handed_at,
@@ -106,6 +109,11 @@ impl StartupBoxes {
                         if let Some(current) = current {
                             if current.same_machine(&saved) {
                                 current.observation = saved.observation;
+                                if saved.reconnect {
+                                    current.record.state = saved.record.state;
+                                    current.record.dirty = saved.record.dirty;
+                                    current.reconnect = true;
+                                }
                             }
                         } else {
                             handover.boxes.push(saved);

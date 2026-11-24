@@ -13,7 +13,7 @@ use tumpel_supervisor::{
     args_conflicts_with_subcommands = true,
     name = "tumpel-supervisor",
     version = env!("TUMPEL_RELEASE_VERSION"),
-    about = "Report whether this host is ready to run tumpel boxes"
+    about = "Report the supervisor's local state"
 )]
 struct Cli {
     #[arg(long, conflicts_with_all = ["json", "manifest"], help = "Start host supervision")]
@@ -235,7 +235,23 @@ fn main() -> ExitCode {
 mod tests {
     use std::time::Duration;
 
-    use super::{daemon, show_report, ReportFormat};
+    use clap::Parser;
+
+    use super::{daemon, show_report, Cli, ReportFormat};
+
+    #[test]
+    fn legacy_unit_commands_parse_as_daemon_startup() {
+        let cli = Cli::try_parse_from(["/usr/local/bin/tumpel-supervisor", "run"]).expect("the legacy unit parses");
+        assert!(matches!(cli.command, Some(super::Command::Run { .. })));
+        let cli = Cli::try_parse_from([
+            "/usr/local/bin/tumpel-supervisor",
+            "run",
+            "--update-binary",
+            "/usr/local/bin/tumpel-supervisor",
+        ])
+        .expect("the pre-trial legacy unit parses");
+        assert!(matches!(cli.command, Some(super::Command::Run { .. })));
+    }
 
     #[test]
     fn deadline_child() {
