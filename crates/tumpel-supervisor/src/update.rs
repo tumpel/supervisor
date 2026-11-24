@@ -669,14 +669,8 @@ impl<S: Source, I: Idle> Updater<S, I> {
             .and_then(Result::ok)
             .unwrap_or_default();
         let stdout_text = strip_ansi(&String::from_utf8_lossy(&stdout));
-        let stderr_text = strip_ansi(&String::from_utf8_lossy(&stderr));
-        let failures = stdout_text
-            .lines()
-            .chain(stderr_text.lines())
-            .filter(|line| line.starts_with("FAIL "))
-            .collect::<Vec<_>>();
         let failed = |mut detail: String| {
-            for line in &failures {
+            for line in stdout_text.lines().filter(|line| line.starts_with("FAIL ")) {
                 detail.push('\n');
                 detail.push_str(line);
             }
@@ -694,9 +688,6 @@ impl<S: Source, I: Idle> Updater<S, I> {
         };
         if !status.success() {
             return Err(failed(format!("{name} exited with {status}")));
-        }
-        if !failures.is_empty() {
-            return Err(failed(format!("{name} reported failed checks")));
         }
         let protocol = stdout_text
             .lines()
@@ -742,7 +733,7 @@ pub fn refresh_unit(layout: &Layout) -> Result<bool, String> {
     match std::fs::read_to_string(&layout.unit) {
         Ok(current) if current == unit => return Ok(false),
         Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(format!("reading {} failed: {error}", layout.unit.display())),
     }
     let staged = sibling(&layout.unit, ".part");

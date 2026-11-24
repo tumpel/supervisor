@@ -51,6 +51,17 @@ pub struct Failure {
     pub detail: String,
 }
 
+pub enum RunFailure {
+    Startup(String),
+    Supervisor(Failure),
+}
+
+impl From<Failure> for RunFailure {
+    fn from(failure: Failure) -> Self {
+        Self::Supervisor(failure)
+    }
+}
+
 fn fail(kind: SupervisorFailure, detail: impl Into<String>) -> Failure {
     Failure {
         kind,
@@ -112,13 +123,8 @@ impl Updates {
     }
 }
 
-pub(crate) async fn refresh_unit(layout: &Layout) -> Result<(), Failure> {
-    let failed = |detail: String| {
-        fail(
-            SupervisorFailure::NotEnrolled,
-            format!("Could not refresh the supervisor service. {detail}. Check the user service and restart it."),
-        )
-    };
+pub(crate) async fn refresh_unit(layout: &Layout) -> Result<(), String> {
+    let failed = |detail: String| format!("Refreshing {} failed. {detail}", layout.unit.display());
     if !update::refresh_unit(layout).map_err(failed)? {
         return Ok(());
     }
@@ -747,7 +753,11 @@ fn taken(
     Ok(taken)
 }
 
-pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, OwnedFd>) -> Result<Stopped, Failure> {
+pub async fn run(
+    telemetry: Telemetry,
+    handed: bool,
+    received: BTreeMap<String, OwnedFd>,
+) -> Result<Stopped, RunFailure> {
     let mut terminated = signal(SignalKind::terminate()).map_err(|error| {
         fail(
             SupervisorFailure::NotEnrolled,
@@ -756,11 +766,8 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     })?;
     let (out, mut from_box) = unbounded_channel();
     let started = start()?;
-    started
-        .layout
-        .clear_candidate()
-        .map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?;
-    refresh_unit(&started.layout).await?;
+    started.layout.clear_candidate().map_err(RunFailure::Startup)?;
+    refresh_unit(&started.layout).await.map_err(RunFailure::Startup)?;
     let taken = taken(&started.layout, &out, handed, received)?;
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
@@ -819,7 +826,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         Err(failure) if restarts(&failure.kind) => {
             if let Err(lost) = terminate(&commands, &started.layout, &out).await {
                 store_unsent(&mut channel, &mut from_box)?;
-                return Err(lost);
+                return Err(lost.into());
             }
             Err(failure)
         }
@@ -829,7 +836,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         abandon(&commands, abandoned()).await;
     }
     store_unsent(&mut channel, &mut from_box)?;
-    stopped
+    stopped.map_err(Into::into)
 }
 
 fn store_unsent(channel: &mut Channel, from_box: &mut UnboundedReceiver<Outgoing>) -> Result<(), Failure> {

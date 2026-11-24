@@ -73,8 +73,8 @@ impl Host {
         fs::write(self.root.join("state").join(name), value.to_string()).expect("fixture state");
     }
 
-    fn command(&self) -> Command {
-        let mut command = Command::new(BINARY);
+    fn command(&self, binary: &Path) -> Command {
+        let mut command = Command::new(binary);
         command
             .env_clear()
             .env("TUMPEL_SUPERVISOR_DIR", self.root.join("state"))
@@ -115,7 +115,7 @@ fn a_healthy_bare_report_passes_without_writing_or_connecting() {
         &format!("http://{}", control_plane.local_addr().expect("listener address")),
     );
     let before = contents(&host.root);
-    let output = host.command().output().expect("report exits");
+    let output = host.command(Path::new(BINARY)).output().expect("report exits");
     let report = String::from_utf8(output.stdout).expect("report text");
     assert!(output.status.success(), "{report}");
     assert_eq!(report.lines().count(), CHECKS.len() + 1, "{report}");
@@ -145,7 +145,7 @@ fn a_corrupt_record_or_missing_firecracker_fails_while_the_other_checks_run() {
             fs::write(host.root.join(file), b"{").expect("corrupt JSON");
         }
         let before = contents(&host.root);
-        let output = host.command().output().expect("report exits");
+        let output = host.command(Path::new(BINARY)).output().expect("report exits");
         let report = String::from_utf8(output.stdout).expect("report text");
         assert_eq!(output.status.code(), Some(1), "{report}");
         for check in CHECKS {
@@ -177,7 +177,7 @@ async fn explicit_check_still_dials_for_a_challenge_and_prints_a_supervisor_chec
             .expect("challenge");
         assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
     };
-    let mut check = tokio::process::Command::from(host.command());
+    let mut check = tokio::process::Command::from(host.command(Path::new(BINARY)));
     check.arg("check").kill_on_drop(true);
     let ((), output) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(server, check.output()) })
         .await
@@ -191,4 +191,64 @@ async fn explicit_check_still_dials_for_a_challenge_and_prints_a_supervisor_chec
         u32::from(ChannelProtocol::VERSION)
     );
     assert_eq!(report.guest_protocol_version.get(), u32::from(GuestProtocol::VERSION));
+}
+
+#[tokio::test]
+async fn startup_io_failures_exit_for_systemd_restart_before_consuming_a_handover() {
+    let mut exits = Vec::new();
+    for (case, detail) in [
+        ("candidate", "removing"),
+        ("unit", "writing"),
+        ("reload", "systemctl --user daemon-reload exited with exit status: 23"),
+    ] {
+        let host = Host::new(case, "http://127.0.0.1:9");
+        let binary = host.root.join("supervisor");
+        fs::copy(BINARY, &binary).expect("fixture binary");
+        let unit_dir = host.root.join("config/systemd/user");
+        fs::create_dir_all(&unit_dir).expect("fixture unit directory");
+        fs::write(
+            unit_dir.join("tumpel-supervisor.service"),
+            "[Service]\nExecStartPre=/bin/true\n",
+        )
+        .expect("legacy unit");
+        let systemctl = host.root.join("systemctl");
+        fs::write(
+            &systemctl,
+            "#!/bin/sh\n[ \"$*\" = '--user daemon-reload' ] || exit 24\nexit 23\n",
+        )
+        .expect("fixture user manager");
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).expect("fixture user manager is executable");
+        match case {
+            "candidate" => fs::create_dir(host.root.join("supervisor.candidate")).expect("obstruct candidate cleanup"),
+            "unit" => fs::create_dir(unit_dir.join("tumpel-supervisor.service.part")).expect("obstruct unit write"),
+            _ => {}
+        }
+        let handover = host.root.join("state/handover.json");
+        let before = fs::read(&handover).expect("handover record");
+        let mut command = tokio::process::Command::from(host.command(&binary));
+        command
+            .args(["run", "--handover"])
+            .env("PATH", &host.root)
+            .env("XDG_RUNTIME_DIR", &host.root)
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+            .await
+            .expect("startup exits")
+            .expect("supervisor output");
+        let log = String::from_utf8(output.stderr).expect("supervisor log");
+        assert!(log.contains(detail), "{case}: {log}");
+        assert_eq!(fs::read(handover).expect("handover remains for restart"), before);
+        exits.push((case, output.status.code(), log));
+    }
+    assert_eq!(
+        exits
+            .iter()
+            .map(|(case, status, _)| (*case, *status))
+            .collect::<Vec<_>>(),
+        [("candidate", Some(1)), ("unit", Some(1)), ("reload", Some(1))],
+        "{exits:?}"
+    );
+    for (case, _, log) in exits {
+        assert!(log.contains("systemd restarts the supervisor"), "{case}: {log}");
+    }
 }

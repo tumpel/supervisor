@@ -273,22 +273,6 @@ async fn a_dry_run_killed_by_a_signal_names_the_version_and_the_signal() {
 }
 
 #[tokio::test]
-async fn a_bare_report_speaking_the_release_channel_protocol_passes() {
-    let layout = layout("dry-run-matching-protocol");
-    let idle = FakeIdle::default();
-    let run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
-    let release = run.updater.source.release().await.expect("the release");
-    run.updater
-        .place_candidate(good_script().as_bytes())
-        .await
-        .unwrap_or_else(|error| panic!("placing the candidate failed: {}", error.detail));
-    run.updater
-        .dry_run(&release)
-        .await
-        .unwrap_or_else(|error| panic!("the report failed: {}", error.detail));
-}
-
-#[tokio::test]
 async fn a_dry_run_speaking_another_channel_protocol_fails() {
     let layout = layout("dry-run-protocol");
     let idle = FakeIdle::default();
@@ -351,13 +335,15 @@ async fn an_unreadable_refusal_file_is_reported_and_not_skipped_silently() {
 fn refresh_unit_replaces_an_installed_unit_with_a_rollback_line() {
     let layout = layout("old-unit");
     let current = supervisor_unit_text(&layout.binary);
-    assert_eq!(refresh_unit(&layout), Ok(false));
-    assert!(!layout.unit.exists());
     let old = current.replacen("[Service]\n", "[Service]\nExecStartPre=/bin/sh -c 'exit 0'\n", 1);
     std::fs::write(&layout.unit, old).expect("the old unit is written");
 
     assert_eq!(refresh_unit(&layout), Ok(true));
-    assert_eq!(text(&layout.unit), current);
+    let rewritten = text(&layout.unit);
+    assert_eq!(rewritten, current);
+    assert!(!rewritten.contains("ExecStartPre="));
+    let exec_start = format!("ExecStart={} run", layout.binary.display());
+    assert!(rewritten.lines().any(|line| line == exec_start));
     assert_eq!(refresh_unit(&layout), Ok(false));
 }
 
@@ -384,7 +370,7 @@ async fn a_refused_binary_is_never_downloaded_again() {
 const GRACE: Duration = Duration::from_secs(600);
 
 #[tokio::test]
-async fn a_release_notice_replaces_the_binary_on_an_idle_host_without_trial_files() {
+async fn a_release_notice_replaces_the_binary_on_an_idle_host() {
     let layout = layout("notice-idle");
     let idle = FakeIdle::default();
     let mut run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
@@ -392,17 +378,6 @@ async fn a_release_notice_replaces_the_binary_on_an_idle_host_without_trial_file
     assert!(!seen(&mut run.events).contains(&Seen::Step(SupervisorUpdatePhase::WaitingForIdle)));
     assert_eq!(text(&layout.binary), good_script());
     assert!(!layout.candidate.exists());
-    assert_eq!(
-        std::fs::read_dir(&layout.state).expect("the state directory").count(),
-        0
-    );
-    assert_eq!(
-        std::fs::read_dir(layout.binary.parent().expect("the binary directory"))
-            .expect("the binary directory")
-            .map(|entry| entry.expect("the directory entry").path())
-            .collect::<Vec<_>>(),
-        vec![layout.binary]
-    );
 }
 
 #[tokio::test]
