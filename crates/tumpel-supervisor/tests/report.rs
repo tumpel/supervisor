@@ -3,10 +3,9 @@ mod tests {
     use std::fs;
     use std::io;
     use std::mem::offset_of;
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixDatagram;
     use std::os::unix::process::CommandExt;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::{Command, Output};
     use std::time::Duration;
 
@@ -219,7 +218,12 @@ mod tests {
 
     #[test]
     fn a_healthy_report_does_not_write_connect_or_notify_and_both_formats_agree() {
-        let host = Host::new("healthy", "http://127.0.0.1:9");
+        let control_plane = std::net::TcpListener::bind("127.0.0.1:0").expect("control-plane boundary");
+        control_plane.set_nonblocking(true).expect("nonblocking listener");
+        let host = Host::new(
+            "healthy",
+            &format!("http://{}", control_plane.local_addr().expect("listener address")),
+        );
         let human = host.audited_report(&[]);
         assert!(human.status.success(), "{human:?}");
         let human = String::from_utf8(human.stdout).expect("human report");
@@ -240,7 +244,20 @@ mod tests {
         assert_eq!(digest, expected);
         assert!(human.contains(&format!("SHA-256 {digest}\n")));
         let checks = machine["checks"].as_object().expect("named checks");
-        assert_eq!(checks.len(), 11);
+        for required in [
+            "binary",
+            "config",
+            "runtime",
+            "host_key",
+            "channel_state",
+            "inventory",
+            "image_cache",
+            "usage",
+            "attachment",
+            "update_state",
+        ] {
+            assert_eq!(checks[required]["status"], "PASS");
+        }
         assert_eq!(checks["manifest"]["status"], "NOT RUN");
         for (name, result) in checks {
             let result = format!(
@@ -260,6 +277,10 @@ mod tests {
             u32::from(ChannelProtocol::VERSION)
         );
         assert_eq!(legacy.guest_protocol_version.get(), u32::from(GuestProtocol::VERSION));
+        assert_eq!(
+            control_plane.accept().expect_err("no control-plane connection").kind(),
+            io::ErrorKind::WouldBlock
+        );
         assert!(!host.root.join("state/boxes.json").exists());
         assert_eq!(
             host.notify.recv(&mut [0; 64]).expect_err("no readiness").kind(),
@@ -272,7 +293,7 @@ mod tests {
         } else {
             "Amd64"
         };
-        let mut release = json!({"releaseVersion":"0.1.0","channelProtocolVersion":ChannelProtocol::VERSION,
+        let release = json!({"releaseVersion":"0.1.0","channelProtocolVersion":ChannelProtocol::VERSION,
         "supervisors":[{"architecture":arch,"sha256":digest,"supervisorVersion":VERSION}]});
         let manifest_args = ["--json", "--manifest", manifest.to_str().expect("manifest path")];
         fs::write(&manifest, release.to_string()).expect("manifest");
@@ -280,12 +301,23 @@ mod tests {
         assert!(verified.status.success(), "{verified:?}");
         let verified: Value = serde_json::from_slice(&verified.stdout).expect("verified report");
         assert_eq!(verified["checks"]["manifest"]["status"], "PASS");
-        release["supervisors"][0]["supervisorVersion"] = json!("999.0.0");
-        fs::write(&manifest, release.to_string()).expect("manifest with wrong version");
-        assert_eq!(host.audited_report(&manifest_args).status.code(), Some(1));
-        release["supervisors"][0]["sha256"] = json!("0".repeat(64));
-        fs::write(&manifest, release.to_string()).expect("manifest with wrong digest");
-        assert_eq!(host.audited_report(&manifest_args).status.code(), Some(1));
+        for (field, value, reason) in [
+            ("supervisorVersion", json!("999.0.0"), "the supervisor version differs"),
+            ("sha256", json!("0".repeat(64)), "the binary hashes to"),
+        ] {
+            let mut invalid = release.clone();
+            invalid["supervisors"][0][field] = value;
+            fs::write(&manifest, invalid.to_string()).expect("manifest with one mismatch");
+            let output = host.audited_report(&manifest_args);
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+            let check = &report["checks"]["manifest"];
+            assert_eq!(check["status"], "FAIL");
+            assert!(
+                check["reason"].as_str().expect("failure detail").contains(reason),
+                "{check}"
+            );
+        }
     }
 
     #[test]
@@ -301,7 +333,7 @@ mod tests {
         ] {
             assert_eq!(host.audited_report(args).status.code(), Some(2), "{args:?}");
         }
-        host.state("channel.json", &json!({"received":0, "sent":-1, "unacked":[]}));
+        fs::write(host.root.join("state/channel.json"), "{\n\"received\":").expect("broken channel ledger");
         host.state("update-trial.json", &json!({"privateKey":"fixture-credential"}));
         host.state(
             "supervisor.json",
@@ -322,6 +354,10 @@ mod tests {
         assert_eq!(parsed["checks"]["channel_state"]["status"], "FAIL");
         assert_eq!(parsed["checks"]["update_state"]["status"], "FAIL");
         assert_eq!(parsed["checks"]["config"]["status"], "FAIL");
+        assert!(parsed["checks"]["channel_state"]["reason"]
+            .as_str()
+            .expect("ledger failure detail")
+            .contains("line 2"));
         assert_eq!(parsed["checks"]["image_cache"]["status"], "FAIL");
         assert_eq!(parsed["checks"]["runtime"]["status"], "PASS");
         assert!(invalid_image.exists());
@@ -351,35 +387,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_old_and_installed_unit_and_legacy_aliases_start_supervision() {
-        let old = format!("[Service]\nExecStart={BINARY} run --update-binary {BINARY}\n");
-        let mut new = String::new();
-        for (index, alias) in ["old", "new", "run", "handover"].into_iter().enumerate() {
+    async fn the_old_unit_arguments_and_the_daemon_flag_start_supervision() {
+        let invocations = [
+            ("old-unit", vec!["run", "--update-binary", BINARY]),
+            ("current-unit", vec!["run"]),
+            ("daemon", vec!["--daemon"]),
+            ("legacy-handover", vec!["run", "--handover"]),
+        ];
+        for (name, argv) in invocations {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("control-plane boundary");
             let endpoint = format!("http://{}", listener.local_addr().expect("listener address"));
-            let host = Host::new(alias, &endpoint);
-            let systemctl = host.root.join("systemctl");
-            fs::write(&systemctl, "#!/bin/sh\ntest \"$*\" = '--user daemon-reload'\n").expect("service operation");
-            fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).expect("executable service operation");
-            let unit = host.root.join("config/systemd/user/tumpel-supervisor.service");
-            let argv: Vec<&str> = match index {
-                0 | 1 => {
-                    let installed = if index == 0 { &old } else { &new };
-                    fs::write(&unit, installed).expect("installed unit");
-                    installed
-                        .lines()
-                        .find_map(|line| line.strip_prefix("ExecStart="))
-                        .expect("ExecStart")
-                        .split_whitespace()
-                        .skip(1)
-                        .collect()
-                }
-                2 => vec!["run"],
-                _ => {
-                    fs::write(&unit, &old).expect("unit for legacy handover");
-                    vec!["run", "--handover"]
-                }
-            };
+            let host = Host::new(name, &endpoint);
             let mut command = tokio::process::Command::from(host.command(&argv));
             let mut daemon = command.kill_on_drop(true).spawn().expect("daemon executable");
             timeout(Duration::from_secs(10), async {
@@ -424,22 +442,11 @@ mod tests {
             assert_eq!(&notification[..received], b"READY=1");
             assert!(daemon.try_wait().expect("daemon status").is_none());
             daemon.kill().await.expect("stop the test daemon");
-            if index == 0 {
-                new = fs::read_to_string(&unit).expect("rewritten unit");
-                assert!(new.contains("Type=notify\n"));
-                assert!(new.contains("KillMode=control-group\n"));
-                assert!(new.contains(&format!(
-                    "ExecStart={} --daemon\n",
-                    Path::new(BINARY).canonicalize().expect("binary").display()
-                )));
-            }
         }
     }
 
-    #[tokio::test]
-    async fn the_report_and_daemon_reject_the_same_wrong_socket_paths() {
-        let host = Host::new("attachment", "http://127.0.0.1:9");
-        let image = json!({
+    fn recorded_image() -> Value {
+        json!({
             "imageDigest": "a".repeat(64),
             "kernelUrl": "https://example.test/kernel",
             "kernelDigest": "b".repeat(64),
@@ -451,7 +458,39 @@ mod tests {
                 "fixedVariables":[], "cloneSeconds":120
             },
             "components": []
-        });
+        })
+    }
+
+    fn recorded_box(image: &Value) -> Value {
+        json!({
+            "boxId":"box-1", "boxRetention":"Warm", "dirty":true, "idleMilliseconds":300_000,
+            "image":{"kind":"Full","manifest":image},
+            "machine":{
+                "apiSocket":"/wrong/api.sock","vsock":"/wrong/v.sock","guestBuffer":"",
+                "consoleTail":"","guestFd":-1,"stdoutFd":-1,"stderrFd":-1,"processId":std::process::id()
+            },
+            "queued":[], "sessionId":"session-1", "tapIndex":0, "state":{"kind":"Warm"}
+        })
+    }
+
+    #[test]
+    fn legacy_preflight_accepts_a_warm_box_without_observation_and_a_prunable_cache_entry() {
+        let host = Host::new("warm-preflight", "http://127.0.0.1:9");
+        let warm = json!({"handedAt":"2026-11-16T09:30:00Z", "boxes":[recorded_box(&recorded_image())]});
+        host.state("boxes.json", &warm);
+        fs::write(host.root.join("images/broken.json"), "{").expect("prunable manifest");
+        fs::write(host.root.join("images/broken.ext4"), "fixture drive").expect("image file");
+
+        let preflight = host.audited_report(&["check"]);
+        assert!(preflight.status.success(), "{preflight:?}");
+        let response: SupervisorCheckReport = serde_json::from_slice(&preflight.stdout).expect("legacy response");
+        assert_eq!(response.supervisor_version.as_str(), VERSION);
+    }
+
+    #[tokio::test]
+    async fn the_report_and_daemon_reject_the_same_wrong_socket_paths() {
+        let host = Host::new("attachment", "http://127.0.0.1:9");
+        let image = recorded_image();
         fs::write(
             host.root.join("images").join(format!("{}.json", "a".repeat(64))),
             image.to_string(),
@@ -459,20 +498,7 @@ mod tests {
         .expect("cached image manifest");
         host.state(
             "boxes.json",
-            &json!({
-                "handedAt":"2026-11-16T09:30:00Z",
-                "boxes":[{
-                    "boxId":"box-1", "boxRetention":"Warm", "dirty":true, "idleMilliseconds":0,
-                    "image":{"kind":"Full","manifest":image},
-                    "machine":{
-                        "apiSocket":"/wrong/api.sock","vsock":"/wrong/v.sock","guestBuffer":"",
-                        "consoleTail":"","guestFd":-1,"stdoutFd":-1,"stderrFd":-1,"processId":std::process::id()
-                    },
-                    "queued":[], "sessionId":"session-1", "tapIndex":0,
-                    "state":{"kind":"Turn","turnId":"turn-1","turnMilliseconds":1234,"firstLineMilliseconds":0,
-                        "repositoryReady":true,"seenLine":true}
-                }]
-            }),
+            &json!({"handedAt":"2026-11-16T09:30:00Z", "boxes":[recorded_box(&image)]}),
         );
         let result = host.audited_report(&["--json"]);
         assert_eq!(result.status.code(), Some(1), "{result:?}");
@@ -495,9 +521,145 @@ mod tests {
         assert!(String::from_utf8_lossy(&failed.stderr).contains("unexpected socket paths"));
         assert_eq!(fs::read(inventory).expect("the saved record is still present"), saved);
     }
+    #[cfg(feature = "host-tests")]
+    #[test]
+    fn firecracker_report_boundary() {
+        use std::io::{BufRead, Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
 
+        let Some(box_dir) = std::env::var_os("TUMPEL_TEST_FIRECRACKER_API").map(PathBuf::from) else {
+            return;
+        };
+        let reader: libc::c_ulong = std::env::var("TUMPEL_TEST_REPORT_PARENT")
+            .expect("the process launching the reporter")
+            .parse()
+            .expect("parent PID");
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_PTRACER, reader, 0, 0, 0) }, 0);
+        let api = UnixListener::bind(box_dir.join("api.sock")).expect("the Firecracker API");
+        let _vsock = UnixListener::bind(box_dir.join("v.sock")).expect("the Firecracker vsock");
+        let (guest, _guest_peer) = UnixStream::pair().expect("live guest sockets");
+        let (stdout, _stdout_writer) = std::io::pipe().expect("stdout pipe");
+        let (stderr, _stderr_writer) = std::io::pipe().expect("stderr pipe");
+        let descriptor = |fd| {
+            let info = fs::metadata(format!("/proc/self/fd/{fd}")).expect("descriptor metadata");
+            json!({"fd":fd,"device":info.dev(),"inode":info.ino()})
+        };
+        let identity = fs::read_to_string("/proc/self/stat").expect("process identity");
+        let start: u64 = identity
+            .rsplit_once(") ")
+            .expect("stat separator")
+            .1
+            .split_whitespace()
+            .nth(19)
+            .expect("start time")
+            .parse()
+            .expect("start time in ticks");
+        println!(
+            "{}",
+            json!({
+                "supervisorPid":std::process::id(), "supervisorStart":start, "machineStart":start,
+                "guest":descriptor(guest.as_raw_fd()), "stdout":descriptor(stdout.as_raw_fd()),
+                "stderr":descriptor(stderr.as_raw_fd())
+            })
+        );
+        let (mut query, _) = api.accept().expect("read-only API connection");
+        let mut request = std::io::BufReader::new(&query);
+        let mut line = String::new();
+        request.read_line(&mut line).expect("request line");
+        assert_eq!(line, "GET /machine-config HTTP/1.1\r\n");
+        loop {
+            line.clear();
+            assert_ne!(request.read_line(&mut line).expect("request header"), 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let body = r#"{"mem_size_mib":256}"#;
+        write!(query, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).expect("reply to the report");
+        assert_eq!(
+            std::io::stdin().read(&mut [0]).expect("wait for the report to finish"),
+            0
+        );
+    }
+
+    #[cfg(feature = "host-tests")]
+    #[tokio::test]
+    async fn a_live_box_passes_the_real_cli_attachment_report() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let host = Host::new("live-inspection", "http://127.0.0.1:9");
+        let dir = host.root.join("data/box63");
+        fs::create_dir(&dir).expect("box directory");
+        let session = host.root.join("data/sessions/session-1");
+        fs::create_dir_all(&session).expect("session directory");
+        fs::File::create(session.join("overlay.ext4"))
+            .expect("box disk")
+            .set_len(1024 * 1024)
+            .expect("one MiB disk");
+        let mut api = tokio::process::Command::new("systemd-run");
+        let mut fake = api
+            .args([
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--unit=tumpel-box63.scope",
+                "--",
+            ])
+            .arg(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "tests::firecracker_report_boundary", "--nocapture"])
+            .env("TUMPEL_TEST_FIRECRACKER_API", &dir)
+            .env("TUMPEL_TEST_REPORT_PARENT", std::process::id().to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("place the API fixture in the box scope");
+        let mut lines = BufReader::new(fake.stdout.take().expect("process metadata output")).lines();
+        let observation: Value = timeout(Duration::from_secs(10), async {
+            while let Some(line) = lines.next_line().await.expect("API fixture output") {
+                if let Some(at) = line.find('{') {
+                    return serde_json::from_str(&line[at..]).expect("the live observation");
+                }
+            }
+            panic!("the scoped process exited without reporting its descriptors");
+        })
+        .await
+        .expect("observe the scoped process");
+        let mut box_ = recorded_box(&recorded_image());
+        box_["tapIndex"] = json!(63);
+        box_["machine"]["apiSocket"] = json!(dir.join("api.sock"));
+        box_["machine"]["vsock"] = json!(dir.join("v.sock"));
+        box_["machine"]["processId"] = observation["supervisorPid"].clone();
+        box_["observation"] = observation;
+        host.state("boxes.json", &json!({"handedAt":"2026-11-16T09:30:00Z","boxes":[box_]}));
+        host.state(
+            "handover.json",
+            &json!({"handedAt":"2026-11-16T09:30:00Z","boxes":[recorded_box(&recorded_image())]}),
+        );
+
+        let mut cmd = tokio::process::Command::from(host.command(&["--json"]));
+        let result = timeout(Duration::from_secs(10), cmd.kill_on_drop(true).output())
+            .await
+            .expect("bounded report")
+            .expect("report executable");
+        assert!(result.status.success(), "{result:?}");
+        let report: Value = serde_json::from_slice(&result.stdout).expect("JSON report");
+        assert_eq!(report["checks"]["attachment"]["status"], "PASS");
+        drop(fake.stdin.take());
+        assert!(timeout(Duration::from_secs(5), fake.wait())
+            .await
+            .expect("API served one call")
+            .expect("exit status")
+            .success());
+    }
     #[tokio::test]
     async fn startup_keeps_unclaimed_scopes_and_their_files() {
+        use std::os::unix::fs::PermissionsExt;
+
         let host = Host::new("unclaimed", "http://127.0.0.1:9");
         let systemctl = host.root.join("systemctl");
         fs::write(

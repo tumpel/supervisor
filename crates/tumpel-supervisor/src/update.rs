@@ -395,14 +395,13 @@ fn tail_of(stderr: &[u8], stdout: &[u8]) -> Vec<String> {
         .collect()
 }
 
-async fn drain(stream: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+async fn drain(stream: impl AsyncRead + Unpin, bytes: &mut Vec<u8>) -> std::io::Result<()> {
     const LIMIT: u64 = 64 * 1024;
-    let mut bytes = Vec::new();
-    stream.take(LIMIT + 1).read_to_end(&mut bytes).await?;
+    stream.take(LIMIT + 1).read_to_end(bytes).await?;
     if bytes.len() as u64 > LIMIT {
         return Err(std::io::Error::other("the report exceeded the output limit"));
     }
-    Ok(bytes)
+    Ok(())
 }
 
 pub struct Updater<S: Source, I: Idle> {
@@ -709,49 +708,34 @@ impl<S: Source, I: Idle> Updater<S, I> {
             .stderr
             .take()
             .ok_or_else(|| failed(format!("{name} has no stderr pipe")))?;
-        let mut stdout = tokio::spawn(drain(stdout));
-        let mut stderr = tokio::spawn(drain(stderr));
-        let waited = timeout(self.limits.dry_run, child.wait()).await;
-        let cleanup = timeout(DRAIN, async {
-            tokio::join!(&mut stdout, &mut stderr, async {
-                if waited.is_err() {
-                    child.kill().await
-                } else {
-                    Ok(())
-                }
-            })
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let checked = timeout(self.limits.dry_run, async {
+            tokio::try_join!(drain(stdout, &mut out), drain(stderr, &mut err), child.wait())
         })
         .await;
-        let Ok((out, err, reaped)) = cleanup else {
-            stdout.abort();
-            stderr.abort();
-            return Err(failed(format!(
-                "{name} did not finish cleanup within {} s",
-                DRAIN.as_secs()
-            )));
-        };
-        reaped.map_err(|error| failed(format!("stopping {name} failed: {error}")))?;
-        let captured = |result: Result<std::io::Result<Vec<u8>>, tokio::task::JoinError>| {
-            result
-                .map_err(|error| failed(format!("reading output from {name} failed: {error}")))?
-                .map_err(|error| failed(format!("reading output from {name} failed: {error}")))
-        };
-        let stdout = captured(out)?;
-        let stderr = captured(err)?;
         let failed = |detail: String| Stop {
             reason: DryRunFailed,
             detail,
-            tail: tail_of(&stderr, &stdout),
+            tail: tail_of(&err, &out),
         };
-        let status = match waited {
-            Err(_) => return Err(failed(format!("{name} ran past {} s", self.limits.dry_run.as_secs()))),
-            Ok(Err(error)) => return Err(failed(format!("waiting for {name} failed: {error}"))),
-            Ok(Ok(status)) => status,
+        let status = match checked {
+            Ok(Ok(((), (), status))) => Ok(status),
+            Err(_) => Err(format!("{name} ran past {} s", self.limits.dry_run.as_secs())),
+            Ok(Err(error)) => Err(format!("{name} failed: {error}")),
+        };
+        let status = match status {
+            Ok(status) => status,
+            Err(detail) => match timeout(DRAIN, child.kill()).await {
+                Ok(Ok(())) => return Err(failed(detail)),
+                Ok(Err(error)) => return Err(failed(format!("{detail}; stopping it failed: {error}"))),
+                Err(_) => return Err(failed(format!("{detail}; cleanup exceeded {} s", DRAIN.as_secs()))),
+            },
         };
         if !status.success() {
             return Err(failed(format!("{name} exited with {status}")));
         }
-        let text = String::from_utf8_lossy(&stdout);
+        let text = String::from_utf8_lossy(&out);
         let line = text
             .lines()
             .rev()

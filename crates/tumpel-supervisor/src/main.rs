@@ -97,7 +97,14 @@ fn with_runtime(task: impl std::future::Future<Output = ExitCode>) -> ExitCode {
     runtime.block_on(task)
 }
 
-fn daemon(handover: bool) -> ExitCode {
+const DAEMON_START_SECONDS: u32 = 120;
+const REPORT_SECONDS: u32 = 60;
+
+fn daemon(handover: bool, seconds: u32) -> ExitCode {
+    if let Err(error) = arm_deadline(seconds, daemon_timed_out) {
+        eprintln!("tumpel-supervisor: setting the daemon startup deadline failed: {error}");
+        return ExitCode::FAILURE;
+    }
     let received = match unsafe { received_descriptors() } {
         Ok(received) => received,
         Err(error) => {
@@ -117,7 +124,7 @@ fn daemon(handover: bool) -> ExitCode {
         }
     };
     with_runtime(async {
-        match run(telemetry, handover, received).await {
+        match run(telemetry, handover, received, cancel_deadline).await {
             Ok(Stopped::Revoked | Stopped::Terminated) => ExitCode::SUCCESS,
             Ok(Stopped::Updated) => {
                 eprintln!(
@@ -146,19 +153,29 @@ extern "C" fn report_timed_out(_: libc::c_int) {
     unsafe { libc::_exit(1) };
 }
 
-fn show_report(format: ReportFormat, manifest: Option<PathBuf>) -> ExitCode {
-    const SECONDS: u32 = 60;
+extern "C" fn daemon_timed_out(_: libc::c_int) {
+    unsafe { libc::_exit(10) };
+}
+
+fn arm_deadline(seconds: u32, handler: extern "C" fn(libc::c_int)) -> std::io::Result<()> {
+    if unsafe { libc::signal(libc::SIGALRM, handler as *const () as libc::sighandler_t) } == libc::SIG_ERR {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe { libc::alarm(seconds) };
+    Ok(())
+}
+
+fn cancel_deadline() {
+    unsafe { libc::alarm(0) };
+}
+
+fn show_report(format: ReportFormat, manifest: Option<PathBuf>, seconds: u32) -> ExitCode {
     const OUTPUT_TIME: Duration = Duration::from_millis(100);
-    let deadline = Instant::now() + Duration::from_secs(u64::from(SECONDS)).saturating_sub(OUTPUT_TIME);
-    let handler = report_timed_out as *const () as libc::sighandler_t;
-    if unsafe { libc::signal(libc::SIGALRM, handler) } == libc::SIG_ERR {
-        eprintln!(
-            "tumpel-supervisor: setting the report deadline failed: {}",
-            std::io::Error::last_os_error()
-        );
+    let deadline = Instant::now() + Duration::from_secs(u64::from(seconds)).saturating_sub(OUTPUT_TIME);
+    if let Err(error) = arm_deadline(seconds, report_timed_out) {
+        eprintln!("tumpel-supervisor: setting the report deadline failed: {error}");
         return ExitCode::FAILURE;
     }
-    unsafe { libc::alarm(SECONDS) };
     report(format, manifest, deadline)
 }
 
@@ -206,16 +223,73 @@ fn main() -> ExitCode {
                 }
             }
         }),
-        Some(Command::Run { handover, .. }) => daemon(handover),
-        Some(Command::Check) => show_report(ReportFormat::Legacy, None),
-        None if cli.daemon => daemon(false),
+        Some(Command::Run { handover, .. }) => daemon(handover, DAEMON_START_SECONDS),
+        Some(Command::Check) => show_report(ReportFormat::Legacy, None, REPORT_SECONDS),
+        None if cli.daemon => daemon(false, DAEMON_START_SECONDS),
         None => {
             let format = if cli.json {
                 ReportFormat::Json
             } else {
                 ReportFormat::Human
             };
-            show_report(format, cli.manifest)
+            show_report(format, cli.manifest, REPORT_SECONDS)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{daemon, show_report, ReportFormat};
+
+    #[test]
+    fn deadline_child() {
+        if let Some(mode) = std::env::var_os("TUMPEL_TEST_STARTUP_MODE") {
+            let result = if mode == "daemon" {
+                daemon(false, 1)
+            } else {
+                show_report(ReportFormat::Json, None, 1)
+            };
+            std::process::exit(i32::from(result == std::process::ExitCode::FAILURE));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocked_host_loader_cannot_hang_startup_or_the_report() {
+        let dir = std::env::temp_dir().join(format!("tumpel-startup-deadline-{}", std::process::id()));
+        std::fs::create_dir(&dir).expect("test state directory");
+        let blocked = dir.join("supervisor.json");
+        let path = std::ffi::CString::new(blocked.as_os_str().as_encoded_bytes()).expect("FIFO path");
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        for (mode, code) in [("daemon", 10), ("report", 1)] {
+            let mut command = tokio::process::Command::new(std::env::current_exe().expect("test binary"));
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                command
+                    .args(["--exact", "tests::deadline_child", "--nocapture"])
+                    .env_clear()
+                    .env("TUMPEL_SUPERVISOR_DIR", &dir)
+                    .env("TUMPEL_TEST_STARTUP_MODE", mode)
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("the blocked loader is bounded")
+            .expect("the child starts");
+            assert_eq!(output.status.code(), Some(code), "{output:?}");
+            if mode == "report" {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let json = stdout.lines().find(|line| line.starts_with('{')).expect("JSON report");
+                let report: serde_json::Value = serde_json::from_str(json).expect("complete JSON report");
+                assert_eq!(report["overall"], false);
+                assert_eq!(report["checks"]["config"]["status"], "FAIL");
+                assert!(report["checks"]["config"]["reason"]
+                    .as_str()
+                    .expect("failure reason")
+                    .contains("time limit"));
+            }
+        }
+        std::fs::remove_dir_all(dir).expect("remove the FIFO fixture");
     }
 }

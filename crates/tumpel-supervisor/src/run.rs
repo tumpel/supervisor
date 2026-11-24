@@ -585,9 +585,21 @@ pub(crate) fn load_runtime(dir: &Path) -> Result<SupervisorRuntime, Failure> {
         .and_then(|current| dir::runtime_with_defaults(&path, &current).map_err(unreadable))
 }
 
+fn private_json_error(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<serde_json::Error>() {
+        Some(json) => format!(
+            "{error}: JSON {:?} error at line {}, column {}",
+            json.classify(),
+            json.line(),
+            json.column()
+        ),
+        None => format!("{error:#}"),
+    }
+}
+
 pub(crate) fn load_config(dir: &Path) -> Result<SupervisorConfig, Failure> {
     dir::read_json(&dir.join(CONFIG_FILE), "SupervisorConfig")
-        .map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")))?
+        .map_err(|error| fail(SupervisorFailure::NotEnrolled, private_json_error(&error)))?
         .ok_or_else(|| {
             fail(
                 SupervisorFailure::NotEnrolled,
@@ -601,7 +613,7 @@ pub(crate) fn load_config(dir: &Path) -> Result<SupervisorConfig, Failure> {
 
 pub(crate) fn load_key(dir: &Path) -> Result<Ed25519KeyPair, Failure> {
     let key: SupervisorHostKey = dir::read_json(&dir.join(KEY_FILE), "SupervisorHostKey")
-        .map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")))?
+        .map_err(|error| fail(SupervisorFailure::NotEnrolled, private_json_error(&error)))?
         .ok_or_else(|| {
             fail(
                 SupervisorFailure::HostRevoked,
@@ -634,7 +646,7 @@ pub(crate) fn load_key(dir: &Path) -> Result<Ed25519KeyPair, Failure> {
 
 pub(crate) fn load_channel_state(dir: &Path) -> Result<SupervisorChannelState, Failure> {
     let state: SupervisorChannelState = dir::read_json(&dir.join(CHANNEL_FILE), "SupervisorChannelState")
-        .map_err(|error| fail(SupervisorFailure::ChannelStateLost, format!("{error:#}")))?
+        .map_err(|error| fail(SupervisorFailure::ChannelStateLost, private_json_error(&error)))?
         .ok_or_else(|| fail(
             SupervisorFailure::ChannelStateLost,
             format!("{} is missing, so frames the control plane has not acked are lost; delete {} and enrol this host again",
@@ -767,7 +779,6 @@ async fn start_update(
     layout: &Layout,
     running: &Sha256Digest,
     out: &UnboundedSender<Outgoing>,
-    handed: bool,
 ) -> Result<Option<SupervisorUpdatePending>, Failure> {
     let trial =
         match update::startup(layout, running, out).map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))? {
@@ -780,13 +791,18 @@ async fn start_update(
             format!("reading the installed supervisor unit failed: {error}"),
         )
     })?;
-    if (handed || installed) && trial.is_none() {
+    if installed && trial.is_none() {
         refresh_unit(layout, RESTARTED).await?;
     }
     Ok(trial)
 }
 
-pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, OwnedFd>) -> Result<Stopped, Failure> {
+pub async fn run(
+    telemetry: Telemetry,
+    handed: bool,
+    received: BTreeMap<String, OwnedFd>,
+    started_daemon: impl FnOnce(),
+) -> Result<Stopped, Failure> {
     let mut terminated = signal(SignalKind::terminate()).map_err(|error| {
         fail(
             SupervisorFailure::NotEnrolled,
@@ -797,8 +813,10 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     let started = start()?;
     let endpoint = Endpoint::bind(&started.layout.state, &started.layout.candidate)
         .map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")))?;
-    let trial = start_update(&started.layout, &started.running, &out, handed).await?;
-    let on_trial = trial.is_some();
+    let trial = start_update(&started.layout, &started.running, &out).await?;
+    let deadline = trial
+        .is_some()
+        .then(|| tokio::time::Instant::now() + Limits::HOST.online);
     let taken = taken(&started.layout, handed, &received)?;
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
@@ -817,6 +835,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     )?;
     drop(received);
     fd_store::ready().map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?;
+    started_daemon();
     let url = started.url;
     let config = started.config;
     let heartbeat = Duration::from_secs(u64::from(started.runtime.heartbeat_interval_seconds.get()));
@@ -847,7 +866,6 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         confirmed,
         grace,
     };
-    let deadline = on_trial.then(|| tokio::time::Instant::now() + Limits::HOST.online);
     let local = endpoint.start(move || handover.descriptors());
     let served = tokio::select! {
         served = serve(&mut channel, &url, heartbeat, &usage, &commands, &mut from_box, &config, &dir, &mut updates) => served,

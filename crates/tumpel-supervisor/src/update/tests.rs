@@ -328,6 +328,23 @@ async fn a_dry_run_past_its_limit_is_killed_and_fails() {
 }
 
 #[tokio::test]
+async fn a_report_over_the_output_limit_is_stopped_before_the_check_deadline() {
+    let layout = layout("dry-run-overflow");
+    let idle = FakeIdle::default();
+    let source = FakeSource::binary("#!/bin/sh\nhead -c 65537 /dev/zero\nexec sleep 30\n");
+    let mut run = updater(&layout, source, &idle, limits());
+    let outcome = tokio::time::timeout(Duration::from_secs(3), run.updater.announced(Duration::ZERO))
+        .await
+        .expect("an overlong report fails without waiting for the process deadline");
+    assert_eq!(
+        outcome,
+        Outcome::Failed(SupervisorUpdateFailureReason::SupervisorUpdateDryRunFailed)
+    );
+    assert!(failure(&mut run.events).0.contains("exceeded the output limit"));
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+}
+
+#[tokio::test]
 async fn an_unreadable_refusal_file_is_reported_and_not_skipped_silently() {
     let layout = layout("refusal-corrupt");
     let idle = FakeIdle::default();
@@ -453,7 +470,7 @@ async fn a_binary_swapped_in_under_the_old_unit_ends_its_trial_and_rewrites_the_
     assert_eq!(refresh_unit(&layout), Ok(true));
     assert_eq!(text(&layout.unit), supervisor_unit_text(&layout.binary));
     assert!(text(&layout.unit).contains(&format!(
-        "ExecStart={} --daemon\nKillMode=control-group\n",
+        "ExecStart={} run\nKillMode=control-group\n",
         layout.binary.display()
     )));
     confirm(&layout, &trial, &out).expect("the trial ends");
@@ -505,14 +522,32 @@ async fn an_announced_rollback_installs_an_older_supervisor_version() {
 
     let layout = layout("rollback");
     let idle = FakeIdle::default();
+    let legacy = format!(
+        "#!/bin/sh\ncase \"$1\" in\ncheck) echo '{{\"supervisorVersion\":\"0.2.1-main.1\",\"channelProtocolVersion\":{},\"guestProtocolVersion\":6}}';;\nrun) test \"$#\" = 1;;\n*) exit 2;;\nesac\n",
+        ChannelProtocol::VERSION
+    );
     let source = FakeSource {
         supervisor_version: "0.2.1-main.1",
         rollback: true,
-        ..FakeSource::binary(&good_script())
+        ..FakeSource::binary(&legacy)
     };
+    assert_eq!(refresh_unit(&layout), Ok(true));
     let run = updater(&layout, source, &idle, limits());
     assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
-    assert_eq!(text(&layout.binary), good_script());
+    assert_eq!(text(&layout.binary), legacy);
+    exec_start_pre(&layout);
+    let unit = text(&layout.unit);
+    assert!(unit.lines().any(|line| line == "Type=simple"), "{unit}");
+    let mut start = unit
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .expect("installed start command")
+        .split_whitespace();
+    let status = std::process::Command::new(start.next().expect("installed executable"))
+        .args(start)
+        .status()
+        .expect("start the selected older release");
+    assert!(status.success(), "{status}");
 }
 
 #[tokio::test]

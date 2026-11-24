@@ -447,18 +447,21 @@ pub(crate) fn decode_box(
 
 struct StandingBox {
     saved: RecordedBox,
-    descriptors: Option<Arc<[OwnedFd; 3]>>,
+    descriptors: Result<Arc<[OwnedFd; 3]>, String>,
 }
 
 impl StandingBox {
-    fn capture<M: Machine>(record: SupervisorHandoverBox, machine: &M, guest: &M::Guest) -> Result<Self, String> {
-        Ok(Self {
-            saved: RecordedBox {
-                record,
-                observation: machine.observation(guest)?,
-            },
-            descriptors: machine.handover_descriptors(guest)?.map(Arc::new),
-        })
+    fn capture<M: Machine>(record: SupervisorHandoverBox, machine: &M, guest: &M::Guest) -> Self {
+        let observation = report_observation(machine, guest, record.tap_index);
+        let descriptors = machine.handover_descriptors(guest).and_then(|descriptors| {
+            descriptors
+                .map(Arc::new)
+                .ok_or_else(|| "no saved descriptors for handover".to_string())
+        });
+        Self {
+            saved: RecordedBox { record, observation },
+            descriptors,
+        }
     }
 }
 
@@ -485,11 +488,18 @@ impl HandoverSource {
                 let descriptors = box_
                     .descriptors
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("box {tap} has no saved descriptors for handover"))?;
+                    .map_err(|error| anyhow::anyhow!("box {tap}: {error}"))?;
                 Ok((tap, Arc::clone(descriptors)))
             })
             .collect()
     }
+}
+
+fn report_observation<M: Machine>(machine: &M, guest: &M::Guest, tap: i32) -> Option<Observation> {
+    machine.observation(guest).unwrap_or_else(|error| {
+        eprintln!("tumpel-supervisor: cannot inspect box {tap} for the report: {error}");
+        None
+    })
 }
 
 #[derive(Clone)]
@@ -537,7 +547,7 @@ impl Standing {
     }
 
     fn put<M: Machine>(&self, live: &LiveBox<M>, turn_id: Option<&EntityId>) -> Result<(), String> {
-        let mut box_ = StandingBox::capture(live.record(turn_id)?, &live.machine, &live.guest)?;
+        let mut box_ = StandingBox::capture(live.record(turn_id)?, &live.machine, &live.guest);
         self.write(|boxes| {
             let record = &mut box_.saved.record;
             if let Some(kept) = boxes
@@ -2896,7 +2906,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 }
             }
             let index = record.tap_index;
-            standing.insert(index, StandingBox::capture(record, &machine, &guest).map_err(context)?);
+            standing.insert(index, StandingBox::capture(record, &machine, &guest));
             prepared.push((handed, image, queue, (machine, guest, tap)));
         }
         let claimed: Vec<u8> = prepared.iter().map(|(_, _, _, (_, _, tap))| tap.index()).collect();
