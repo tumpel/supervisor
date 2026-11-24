@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,35 +29,36 @@ struct Host {
     root: PathBuf,
 }
 
-#[cfg(test)]
 impl Host {
-    fn new(name: &str, endpoint: &str) -> Self {
+    fn new(name: &str, endpoint: &str) -> io::Result<Self> {
         let root = std::env::temp_dir().join(format!("tumpel-report-{}-{name}", std::process::id()));
-        fs::create_dir(&root).expect("new test host");
-        for dir in ["state", "data", "images"] {
-            fs::create_dir(root.join(dir)).expect("fixture directory");
-        }
+        fs::create_dir(&root)?;
         let host = Self { root };
+        for dir in ["state", "data", "images"] {
+            fs::create_dir(host.root.join(dir))?;
+        }
         host.state(
             "supervisor.json",
             &json!({"endpoint": endpoint, "hostId":"host-1", "tenantId":"tenant-1"}),
-        );
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("fixture key");
-        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("fixture pair");
+        )?;
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+            .map_err(|error| io::Error::other(format!("generate fixture key: {error}")))?;
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+            .map_err(|error| io::Error::other(format!("read fixture key: {error}")))?;
         host.state(
             "host-key.json",
             &json!({
                 "privateKey": STANDARD.encode(pkcs8.as_ref()),
                 "publicKey": STANDARD.encode(key.public_key().as_ref()),
             }),
-        );
-        host.state("channel.json", &json!({"received":0, "sent":0, "unacked":[]}));
+        )?;
+        host.state("channel.json", &json!({"received":0, "sent":0, "unacked":[]}))?;
         for name in ["boxes.json", "handover.json"] {
-            host.state(name, &json!({"handedAt":"2026-11-16T09:30:00Z", "boxes":[]}));
+            host.state(name, &json!({"handedAt":"2026-11-16T09:30:00Z", "boxes":[]}))?;
         }
         let firecracker = host.root.join("firecracker");
-        fs::write(&firecracker, b"#!/bin/sh\nexit 1\n").expect("fixture binary");
-        fs::set_permissions(&firecracker, fs::Permissions::from_mode(0o755)).expect("fixture binary is executable");
+        fs::write(&firecracker, b"#!/bin/sh\nexit 1\n")?;
+        fs::set_permissions(&firecracker, fs::Permissions::from_mode(0o755))?;
         host.state(
             "runtime.json",
             &json!({
@@ -65,12 +66,12 @@ impl Host {
                 "imageCacheDir": host.root.join("images"),
                 "firecrackerPath": firecracker,
             }),
-        );
-        host
+        )?;
+        Ok(host)
     }
 
-    fn state(&self, name: &str, value: &Value) {
-        fs::write(self.root.join("state").join(name), value.to_string()).expect("fixture state");
+    fn state(&self, name: &str, value: &Value) -> io::Result<()> {
+        fs::write(self.root.join("state").join(name), value.to_string())
     }
 
     fn command(&self, binary: &Path) -> Command {
@@ -83,27 +84,26 @@ impl Host {
     }
 }
 
-#[cfg(test)]
 impl Drop for Host {
     fn drop(&mut self) {
-        fs::remove_dir_all(&self.root).expect("remove the test host");
+        let removed = fs::remove_dir_all(&self.root);
+        assert!(removed.is_ok(), "remove the test host: {removed:?}");
     }
 }
 
-#[cfg(test)]
-fn contents(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+fn contents(path: &Path) -> io::Result<BTreeMap<PathBuf, Vec<u8>>> {
     let mut entries = BTreeMap::new();
-    for entry in fs::read_dir(path).expect("list fixture") {
-        let path = entry.expect("fixture entry").path();
+    for entry in fs::read_dir(path)? {
+        let path = entry?.path();
         if path.is_dir() {
-            entries.extend(contents(&path));
+            entries.extend(contents(&path)?);
             entries.insert(path, Vec::new());
         } else {
-            let bytes = fs::read(&path).expect("fixture bytes");
+            let bytes = fs::read(&path)?;
             entries.insert(path, bytes);
         }
     }
-    entries
+    Ok(entries)
 }
 
 #[test]
@@ -113,10 +113,11 @@ fn a_healthy_bare_report_passes_without_writing_or_connecting() {
     let host = Host::new(
         "healthy",
         &format!("http://{}", control_plane.local_addr().expect("listener address")),
-    );
+    )
+    .expect("healthy test host");
     fs::write(host.root.join("images/broken.json"), b"{").expect("unfinished cache manifest");
     fs::write(host.root.join("images/broken.ext4"), b"partial image").expect("unfinished cache image");
-    let before = contents(&host.root);
+    let before = contents(&host.root).expect("read initial state");
     let output = host.command(Path::new(BINARY)).output().expect("report exits");
     let report = String::from_utf8(output.stdout).expect("report text");
     assert!(output.status.success(), "{report}");
@@ -125,7 +126,7 @@ fn a_healthy_bare_report_passes_without_writing_or_connecting() {
         assert!(report.contains(&format!("PASS {check}: ")), "{report}");
     }
     assert!(report.ends_with(&format!("PASS channel protocol {}\n", ChannelProtocol::VERSION)));
-    assert_eq!(contents(&host.root), before);
+    assert_eq!(contents(&host.root).expect("read state after report"), before);
     assert_eq!(
         control_plane.accept().expect_err("no connection").kind(),
         ErrorKind::WouldBlock
@@ -140,13 +141,13 @@ fn a_failed_local_check_still_reports_the_other_checks() {
         ("images", "image cache"),
         ("firecracker", "Firecracker"),
     ] {
-        let host = Host::new("broken", "http://127.0.0.1:9");
+        let host = Host::new("broken", "http://127.0.0.1:9").expect("test host");
         match file {
             "firecracker" => fs::remove_file(host.root.join(file)).expect("remove Firecracker"),
             "images" => fs::remove_dir(host.root.join(file)).expect("remove image cache"),
             _ => fs::write(host.root.join(file), b"{").expect("corrupt JSON"),
         }
-        let before = contents(&host.root);
+        let before = contents(&host.root).expect("read initial state");
         let output = host.command(Path::new(BINARY)).output().expect("report exits");
         let report = String::from_utf8(output.stdout).expect("report text");
         assert_eq!(output.status.code(), Some(1), "{report}");
@@ -155,7 +156,7 @@ fn a_failed_local_check_still_reports_the_other_checks() {
             assert!(report.contains(&format!("{status} {check}: ")), "{report}");
         }
         assert!(report.ends_with(&format!("PASS channel protocol {}\n", ChannelProtocol::VERSION)));
-        assert_eq!(contents(&host.root), before);
+        assert_eq!(contents(&host.root).expect("read state after report"), before);
     }
 }
 
@@ -167,7 +168,8 @@ async fn explicit_check_still_dials_for_a_challenge_and_prints_a_supervisor_chec
     let host = Host::new(
         "check",
         &format!("http://{}", control_plane.local_addr().expect("listener address")),
-    );
+    )
+    .expect("test host");
     let server = async {
         let (stream, _) = control_plane.accept().await.expect("connection");
         let mut socket = tokio_tungstenite::accept_async(stream).await.expect("websocket");
@@ -197,13 +199,12 @@ async fn explicit_check_still_dials_for_a_challenge_and_prints_a_supervisor_chec
 
 #[tokio::test]
 async fn startup_io_failures_exit_for_systemd_restart_before_consuming_a_handover() {
-    let mut exits = Vec::new();
     for (case, detail) in [
         ("candidate", "removing"),
         ("unit", "writing"),
         ("reload", "systemctl --user daemon-reload exited with exit status: 23"),
     ] {
-        let host = Host::new(case, "http://127.0.0.1:9");
+        let host = Host::new(case, "http://127.0.0.1:9").expect("test host");
         let binary = host.root.join("supervisor");
         fs::copy(BINARY, &binary).expect("fixture binary");
         let unit_dir = host.root.join("config/systemd/user");
@@ -238,19 +239,9 @@ async fn startup_io_failures_exit_for_systemd_restart_before_consuming_a_handove
             .expect("startup exits")
             .expect("supervisor output");
         let log = String::from_utf8(output.stderr).expect("supervisor log");
+        assert_eq!(output.status.code(), Some(1), "{case}: {log}");
         assert!(log.contains(detail), "{case}: {log}");
-        assert_eq!(fs::read(handover).expect("handover remains for restart"), before);
-        exits.push((case, output.status.code(), log));
-    }
-    assert_eq!(
-        exits
-            .iter()
-            .map(|(case, status, _)| (*case, *status))
-            .collect::<Vec<_>>(),
-        [("candidate", Some(1)), ("unit", Some(1)), ("reload", Some(1))],
-        "{exits:?}"
-    );
-    for (case, _, log) in exits {
         assert!(log.contains("systemd restarts the supervisor"), "{case}: {log}");
+        assert_eq!(fs::read(handover).expect("handover remains for restart"), before);
     }
 }

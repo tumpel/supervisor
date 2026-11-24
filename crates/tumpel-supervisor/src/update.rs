@@ -667,10 +667,9 @@ impl<S: Source, I: Idle> Updater<S, I> {
             .and_then(Result::ok)
             .unwrap_or_default();
         let stdout_text = strip_ansi(&String::from_utf8_lossy(&stdout));
-        let failed = |mut detail: String| {
+        let failed = |detail: String| {
             for line in stdout_text.lines().filter(|line| line.starts_with("FAIL ")) {
-                detail.push('\n');
-                detail.push_str(line);
+                eprintln!("tumpel-supervisor: {}", redacted(line));
             }
             Stop {
                 reason: DryRunFailed,
