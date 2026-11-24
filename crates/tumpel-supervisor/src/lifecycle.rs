@@ -511,6 +511,7 @@ impl Standing {
 
 enum Outcome<M: Machine> {
     Kept(LiveBox<M>),
+    SnapshotDone(LiveBox<M>),
     Parked(LiveBox<M>, Box<Parked>),
     Gone(Tap, Result<(), String>),
 }
@@ -612,6 +613,7 @@ enum Mode {
 }
 
 struct Slot<M: Machine> {
+    box_id: Option<EntityId>,
     live: Option<LiveBox<M>>,
     busy: bool,
     paused: bool,
@@ -629,6 +631,10 @@ enum Awaited {
 }
 
 impl<M: Machine> Slot<M> {
+    fn settling(&self) -> bool {
+        self.busy || matches!(self.snapshot, Some(Awaited::Pending(_)))
+    }
+
     fn turns(&self) -> Vec<EntityId> {
         let running = self.task.iter().filter_map(|(running, _)| match running {
             Running::Turn(turn_id) => Some(turn_id.clone()),
@@ -646,6 +652,7 @@ impl<M: Machine> Slot<M> {
 impl<M: Machine> Default for Slot<M> {
     fn default() -> Self {
         Self {
+            box_id: None,
             live: None,
             busy: false,
             paused: false,
@@ -1981,8 +1988,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         };
         let (Outgoing::Snapshot(message, _) | Outgoing::Message(message)) = &outgoing;
         telemetry::ended(message);
+        let done = matches!(message, ChannelHostMessage::SnapshotDone(_));
         send_out(&self.out, outgoing);
-        Outcome::Kept(live)
+        if done {
+            Outcome::SnapshotDone(live)
+        } else {
+            Outcome::Kept(live)
+        }
     }
 
     async fn store_snapshot(
@@ -2559,7 +2571,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     fn settle_handover(&mut self) -> Result<(), String> {
-        if self.handing.is_none() || !self.setups.is_empty() || self.slots.values().any(|slot| slot.busy) {
+        if self.handing.is_none() || !self.setups.is_empty() || self.slots.values().any(Slot::settling) {
             return Ok(());
         }
         self.finish_handover()
@@ -2576,7 +2588,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             self.setups.remove(&claude_setup_id);
             self.free_disk(&claude_setup_id)?;
         }
-        let busy = self.slots.values().filter(|slot| slot.busy).count();
+        let busy = self.slots.values().filter(|slot| slot.settling()).count();
         if busy == 0 {
             return self.finish_handover();
         }
@@ -2843,6 +2855,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let hold = self.runner.holds.hold_boot(&image);
         let slot = self.slots.entry(session.clone()).or_default();
         slot.queue = queue;
+        slot.box_id = Some(handed.box_id.clone());
         slot.live = Some(LiveBox {
             session_id: handed.session_id,
             box_id: handed.box_id,
@@ -2911,7 +2924,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         }
         let session = command.session();
         let slot = self.slots.entry(session.clone()).or_default();
-        if slot.busy || slot.parked.is_some() {
+        if let Command::Teardown(order) | Command::Discard(order) = &command {
+            if slot.box_id.as_ref() != Some(&order.box_id) {
+                return self.dispatch(session, command).await;
+            }
+        }
+        if self.mode == Mode::HandingOver || slot.busy || slot.parked.is_some() {
             slot.queue.push_back(command);
             return self.record_queue(&session);
         }
@@ -3036,6 +3054,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.slots.entry(session).or_default().task = Some((running, handle));
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "turn admission checks and starts the box in one place"
+    )]
     async fn start_turn(&mut self, session: String, turn: BoxTurn) -> Result<(), String> {
         let (harness, harness_version) = turn.image.harness();
         let root = telemetry::turn(&turn.turn_id, &turn.session_id, harness, harness_version, &turn.model);
@@ -3125,7 +3147,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 return Ok(());
             }
         };
-        self.slots.entry(session.clone()).or_default().busy = true;
+        let slot = self.slots.entry(session.clone()).or_default();
+        slot.box_id = Some(turn.box_id.clone());
+        slot.busy = true;
         let running = Running::Turn(turn.turn_id.clone());
         self.spawn(
             session,
@@ -3210,8 +3234,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     async fn start_discard(&mut self, session: String, order: TeardownOrder) -> Result<(), String> {
         match self.live_box(&session) {
             Some(live) if live.box_id == order.box_id => self.teardown(&session, BoxEnd::Discard).await?,
-            Some(_) => {}
-            None => self.free_disk(&session)?,
+            None if !self.slots.get(&session).is_some_and(|slot| slot.busy) => self.free_disk(&session)?,
+            Some(_) | None => {}
         }
         self.prune(&session);
         self.box_gone(order);
@@ -3231,7 +3255,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             .filter(|live| live.box_id == order.box_id)
             .map(|live| live.dirty)
         else {
-            if self.live_box(&session).is_none() {
+            if !self
+                .slots
+                .get(&session)
+                .is_some_and(|slot| slot.busy || slot.live.is_some())
+            {
                 self.free_disk(&session)?;
             }
             self.prune(&session);
@@ -3307,6 +3335,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let Some(live) = slot.live.take() else {
             return Ok(());
         };
+        slot.box_id = None;
         let (tap, _, stopped) = stop_box(&self.runner.standing, live, end).await;
         self.pool.release(tap);
         stopped?;
@@ -3394,6 +3423,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let slot = self.slots.entry(session.clone()).or_default();
         slot.busy = false;
         slot.task = None;
+        if matches!(work, Work::Snapshot) && !matches!(outcome, Outcome::SnapshotDone(_)) {
+            slot.snapshot = None;
+        }
         let mut freed = None;
         match outcome {
             Outcome::Parked(live, parked) => {
@@ -3401,7 +3433,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 slot.parked = Some(parked);
                 return Ok(());
             }
-            Outcome::Kept(live) => {
+            Outcome::Kept(live) | Outcome::SnapshotDone(live) => {
                 if matches!(work, Work::Turn) {
                     slot.paused = true;
                     slot.idle_end = Some(Instant::now() + live.idle);
@@ -3410,6 +3442,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 slot.live = Some(live);
             }
             Outcome::Gone(tap, stopped) => {
+                slot.box_id = None;
                 slot.paused = false;
                 freed = Some((tap, stopped));
             }
@@ -3482,6 +3515,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     async fn drain(&mut self, session: String) -> Result<(), String> {
+        if self.mode == Mode::HandingOver {
+            return Ok(());
+        }
         loop {
             let next = self
                 .slots
