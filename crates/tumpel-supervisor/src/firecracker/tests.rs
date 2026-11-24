@@ -117,9 +117,7 @@ struct Handed {
 }
 
 fn firecracker(name: &str) -> Firecracker {
-    let data = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/firecracker-tests")
-        .join(name);
+    let data = std::env::temp_dir().join(format!("tumpel-firecracker-{}-{name}", std::process::id()));
     if data.exists() {
         std::fs::remove_dir_all(&data).expect("clearing the last run");
     }
@@ -277,7 +275,8 @@ async fn observation_checks_live_descriptors_and_uses_only_a_separate_api_connec
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let vmm = firecracker("observe-live");
-    let box_dir = vmm.data.join("box0");
+    let data = vmm.data.clone();
+    let box_dir = data.join("box0");
     std::fs::create_dir_all(&box_dir).expect("the box directory");
     let listener = tokio::net::UnixListener::bind(box_dir.join("api.sock")).expect("the fixture Firecracker API");
     let pid = i32::try_from(std::process::id()).expect("this process owns the fixture descriptors and API");
@@ -356,6 +355,7 @@ async fn observation_checks_live_descriptors_and_uses_only_a_separate_api_connec
             .kind(),
         ErrorKind::WouldBlock
     );
+    std::fs::remove_dir_all(data).expect("removing the fixture directory");
 }
 
 #[test]
