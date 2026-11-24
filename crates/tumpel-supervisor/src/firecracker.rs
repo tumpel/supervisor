@@ -34,7 +34,6 @@ const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/
 const CONSOLE_TAIL: usize = 4096;
 pub const OVERLAY_DRIVE: &str = "overlay.ext4";
 const API_WAIT_STEP: Duration = Duration::from_millis(5);
-const API_ANSWER: Duration = Duration::from_secs(5);
 
 struct Layout {
     rootfs: PathBuf,
@@ -244,13 +243,30 @@ struct MachineConfig {
     mem_size_mib: NonZeroU32,
 }
 
+struct ApiReply {
+    stream: std::os::unix::net::UnixStream,
+    deadline: std::time::Instant,
+}
+
+impl std::io::Read for ApiReply {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buffer)
+    }
+}
+
 fn booted_memory(socket: &Path, pid: libc::pid_t) -> Result<NonZeroU32, String> {
     use std::io::{BufRead, Read, Write};
+    const INSPECTION_LIMIT: Duration = Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + INSPECTION_LIMIT;
     let failed = |error: std::io::Error| {
         format!(
-            "reading GET /machine-config from {} within {} s: {error}",
-            socket.display(),
-            API_ANSWER.as_secs()
+            "reading GET /machine-config from {} within 1 s: {error}",
+            socket.display()
         )
     };
     let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(failed)?;
@@ -278,12 +294,11 @@ fn booted_memory(socket: &Path, pid: libc::pid_t) -> Result<NonZeroU32, String> 
             peer.pid
         ));
     }
-    stream.set_write_timeout(Some(API_ANSWER)).map_err(failed)?;
-    stream.set_read_timeout(Some(API_ANSWER)).map_err(failed)?;
+    stream.set_write_timeout(Some(INSPECTION_LIMIT)).map_err(failed)?;
     stream
         .write_all(b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n")
         .map_err(failed)?;
-    let mut reader = std::io::BufReader::new(stream);
+    let mut reader = std::io::BufReader::new(ApiReply { stream, deadline });
     let mut status = String::new();
     reader.read_line(&mut status).map_err(failed)?;
     let mut length = 0usize;
@@ -765,6 +780,9 @@ impl Firecracker {
         let scoped = process_scope(pid, scope)?;
         let child = identity.parent == own_pid;
         if !(scoped || (inherited && child)) {
+            if !reporting {
+                return Ok(None);
+            }
             return Err(format!("Firecracker process {pid} is outside {scope}"));
         }
         let owner = if child {
@@ -938,40 +956,52 @@ impl Vmm for Firecracker {
         crate::usage::disk(&self.data, drives).map_err(|error| format!("{error:#}"))
     }
 
-    fn check_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
-        if claimed.is_empty()
-            && !entries(&self.data)?
-                .iter()
-                .any(|entry| box_index(&entry.file_name()).is_some())
-        {
-            return Ok(());
+    fn unclaimed_scopes(&self, claimed: &[u8]) -> Result<Vec<u8>, String> {
+        let uid = unsafe { libc::geteuid() };
+        let mut scopes = std::collections::BTreeSet::new();
+        for process in entries(Path::new("/proc"))? {
+            if process
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+                .is_none()
+            {
+                continue;
+            }
+            let path = process.path();
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.uid() == uid => (),
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("reading process identity at {}: {error}", path.display())),
+            }
+            let cgroup = match std::fs::read_to_string(path.join("cgroup")) {
+                Ok(cgroup) => cgroup,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("reading a box scope at {}: {error}", path.display())),
+            };
+            scopes.extend(
+                cgroup
+                    .lines()
+                    .filter_map(|line| {
+                        line.rsplit('/')
+                            .next()?
+                            .strip_prefix("tumpel-box")?
+                            .strip_suffix(".scope")?
+                            .parse::<u8>()
+                            .ok()
+                    })
+                    .filter(|index| *index < crate::pool::TAP_POOL && !claimed.contains(index)),
+            );
         }
-        let listed = std::process::Command::new("systemctl")
-            .args(["--user", "list-units", "--plain", "--no-legend", "tumpel-box*.scope"])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| format!("starting systemctl to list the box scopes: {error}"))?;
-        if !listed.status.success() {
-            return Err(format!(
-                "listing the box scopes failed with {}: {}; run the supervisor from its systemd user unit",
-                listed.status,
-                String::from_utf8_lossy(&listed.stderr).trim()
-            ));
+        Ok(scopes.into_iter().collect())
+    }
+
+    fn discard_incomplete_boot(&self, index: u8) -> Result<(), String> {
+        if self.unclaimed_scopes(&[])?.contains(&index) {
+            stop_scopes(&[scope_of(index)])?;
         }
-        let kept: Vec<String> = claimed.iter().copied().map(scope_of).collect();
-        let unclaimed: Vec<String> = String::from_utf8_lossy(&listed.stdout)
-            .lines()
-            .filter_map(|line| line.split_whitespace().next())
-            .filter(|scope| !kept.iter().any(|kept| kept == scope))
-            .map(str::to_string)
-            .collect();
-        if unclaimed.is_empty() {
-            return Ok(());
-        }
-        Err(format!(
-            "found running box scopes outside the inventory: {}; restore their box records or stop those scopes explicitly",
-            unclaimed.join(" ")
-        ))
+        Ok(())
     }
 
     fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String> {

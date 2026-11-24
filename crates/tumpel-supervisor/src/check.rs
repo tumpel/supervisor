@@ -1,10 +1,9 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Instant;
 
@@ -13,6 +12,7 @@ use tumpel_api::types::{ChannelProtocol, GuestProtocol, Sha256Digest, Supervisor
 
 use crate::firecracker::Firecracker;
 use crate::inventory::{self, RecordedBox};
+use crate::lifecycle::Vmm;
 use crate::pool::Held;
 use crate::run::{box_size, channel_url, load_channel_state, load_config, load_key, load_runtime};
 use crate::update::{self, Layout};
@@ -78,7 +78,12 @@ struct Report {
     checks: BTreeMap<&'static str, Check>,
 }
 
-struct Checks(Arc<Mutex<Report>>);
+enum Progress {
+    Check(&'static str, Check),
+    Digest(Sha256Digest),
+}
+
+struct Checks(mpsc::Sender<Progress>);
 
 impl Checks {
     fn check<T>(&self, name: &'static str, success: &str, result: Result<T, impl Into<String>>) -> Option<T> {
@@ -95,37 +100,23 @@ impl Checks {
     }
 
     fn send(&self, name: &'static str, status: Status, reason: impl Into<String>) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .checks
-            .insert(name, Check::new(status, reason));
+        drop(self.0.send(Progress::Check(name, Check::new(status, reason))));
     }
 }
 
-fn read_inventory(path: &Path) -> Result<Vec<RecordedBox>, String> {
+fn read_inventory(path: &Path, inspect_boxes: bool) -> Result<Vec<RecordedBox>, String> {
     let boxes = inventory::load(path)
         .map_err(|error| format!("{error:#}"))?
         .map_or_else(Vec::new, |inventory| inventory.boxes);
-    let mut taps = HashSet::new();
-    let mut sessions = HashSet::new();
-    for box_ in &boxes {
-        decode_box(box_, &mut taps, &mut sessions)?;
+    for box_ in boxes.iter().filter(|_| inspect_boxes) {
+        lifecycle::decode_box(&box_.record).map_err(|error| {
+            format!(
+                "box {} has an invalid image or turn record: {error}",
+                box_.record.tap_index
+            )
+        })?;
     }
     Ok(boxes)
-}
-
-fn decode_box(box_: &RecordedBox, taps: &mut HashSet<i32>, sessions: &mut HashSet<String>) -> Result<(), String> {
-    let record = &box_.record;
-    if !(0..i32::from(crate::pool::TAP_POOL)).contains(&record.tap_index)
-        || !taps.insert(record.tap_index)
-        || !sessions.insert(record.session_id.to_string())
-    {
-        return Err("the box inventory has an invalid or duplicate TAP index or a duplicate session".to_string());
-    }
-    lifecycle::decode_box(record)
-        .map_err(|error| format!("box {} has an invalid image or turn record: {error}", record.tap_index))?;
-    Ok(())
 }
 
 fn collect(manifest: Option<&Path>, checks: &Checks, legacy: bool) {
@@ -142,12 +133,9 @@ fn collect(manifest: Option<&Path>, checks: &Checks, legacy: bool) {
             Ok::<_, String>(digest)
         })(),
     );
-    checks
-        .0
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .binary_digest
-        .clone_from(&digest);
+    if let Some(digest) = digest.as_ref() {
+        drop(checks.0.send(Progress::Digest(digest.clone())));
+    }
     checks.check(
         "config",
         "host enrolment and control-plane address loaded",
@@ -175,14 +163,14 @@ fn collect(manifest: Option<&Path>, checks: &Checks, legacy: bool) {
     let boxes = checks.check(
         "inventory",
         "box inventory, images and turns decoded",
-        read_inventory(&layout.boxes()),
+        read_inventory(&layout.boxes(), !legacy),
     );
     if !legacy {
         inspect_host(checks, runtime.as_ref(), boxes.as_deref());
         checks.check(
             "handover",
             "legacy handover record decoded",
-            read_inventory(&layout.handover()),
+            read_inventory(&layout.handover(), true),
         );
     }
     checks.check(
@@ -235,16 +223,29 @@ fn inspect_host(
         }
     }
     match (runtime, boxes) {
-        (_, Some([])) => checks.send("attachment", Status::Pass, "no recorded boxes to inspect"),
         (Some(runtime), Some(boxes)) => {
             let vmm = Firecracker::new(runtime);
             checks.check(
                 "attachment",
                 "recorded processes, descriptors and Firecracker APIs inspected",
-                boxes.iter().try_for_each(|box_| {
-                    vmm.observe(box_)
-                        .map_err(|error| format!("Inspecting box {} failed. {error}", box_.record.tap_index))
-                }),
+                (|| {
+                    let taps = boxes
+                        .iter()
+                        .map(|box_| u8::try_from(box_.record.tap_index))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| error.to_string())?;
+                    boxes.iter().try_for_each(|box_| {
+                        vmm.observe(box_)
+                            .map_err(|error| format!("Inspecting box {} failed. {error}", box_.record.tap_index))
+                    })?;
+                    let unclaimed = vmm.unclaimed_scopes(&taps)?;
+                    if unclaimed.is_empty() {
+                        return Ok(());
+                    }
+                    Err(format!(
+                        "running box scopes outside the inventory on TAP devices {unclaimed:?}"
+                    ))
+                })(),
             );
         }
         _ => checks.send(
@@ -266,33 +267,26 @@ fn check_manifest(path: &Path, digest: &Sha256Digest) -> Result<(), String> {
 
 fn collect_until(manifest: Option<PathBuf>, deadline: Instant, legacy: bool) -> Report {
     let manifest_required = manifest.is_some();
-    let (done, wait) = mpsc::channel();
-    let shared = Arc::new(Mutex::new(Report {
+    let (out, wait) = mpsc::channel();
+    let started = thread::Builder::new().spawn(move || collect(manifest.as_deref(), &Checks(out), legacy));
+    let mut report = Report {
         version: VERSION,
         binary_digest: None,
         overall: false,
         checks: BTreeMap::new(),
-    }));
-    let checks = Checks(Arc::clone(&shared));
-    let started = thread::Builder::new().spawn(move || {
-        collect(manifest.as_deref(), &checks, legacy);
-        done.send(())
-    });
+    };
     let stopped = if started.is_err() {
         "the report worker could not start"
     } else {
-        match wait.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Err(RecvTimeoutError::Timeout) => "the report reached its time limit",
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => "the report ended before this check finished",
-        }
-    };
-    let mut report = {
-        let mut shared = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        Report {
-            version: VERSION,
-            binary_digest: shared.binary_digest.take(),
-            overall: false,
-            checks: std::mem::take(&mut shared.checks),
+        loop {
+            match wait.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Progress::Check(name, check)) => {
+                    report.checks.insert(name, check);
+                }
+                Ok(Progress::Digest(digest)) => report.binary_digest = Some(digest),
+                Err(RecvTimeoutError::Timeout) => break "the report reached its time limit",
+                Err(RecvTimeoutError::Disconnected) => break "the report ended before this check finished",
+            }
         }
     };
     let mut pending = CHECKS
