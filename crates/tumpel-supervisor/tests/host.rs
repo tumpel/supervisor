@@ -9,7 +9,7 @@ use tumpel_api::types::{BoxRetention, ChannelHostMessage, GuestImageManifest, Se
 use tumpel_channel::Outgoing;
 use tumpel_supervisor::{
     restored_descriptors, take_notify_socket, BootOrder, BoxTurn, Budgets, Command, Ext4Upper, Firecracker, HttpStore,
-    ImageOrder, Input, Lifecycle, Settings, Size, Taken, TapPool, Upper,
+    ImageOrder, Input, Lifecycle, Settings, Size, Taken, TapPool, TeardownOrder, Upper,
 };
 
 const BOX: Size = Size {
@@ -195,12 +195,32 @@ async fn a_shell_box_runs_a_turn_pauses_resumes_warm_and_its_drive_reads_back() 
         cold.as_millis(),
         warm.as_millis()
     );
+    discard_box(&commands, &mut received).await;
     drop(commands);
     running
         .await
         .expect("the lifecycle stops")
         .expect("the lifecycle ends without an error");
     std::fs::remove_dir_all(&data).expect("removing the test data");
+}
+
+async fn discard_box(commands: &tokio::sync::mpsc::UnboundedSender<Input>, received: &mut UnboundedReceiver<Outgoing>) {
+    commands
+        .send(Input::Command(Command::Discard(TeardownOrder {
+            session_id: "host-test-session".try_into().expect("session id"),
+            box_id: "host-test-box".try_into().expect("box id"),
+        })))
+        .expect("request explicit teardown");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = received.recv().await {
+            if matches!(event, Outgoing::Message(ChannelHostMessage::BoxGone(_))) {
+                return;
+            }
+        }
+        panic!("the runner stopped before its VM");
+    })
+    .await
+    .expect("the VM is stopped before the files are removed");
 }
 
 #[cfg(test)]
@@ -386,6 +406,7 @@ async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_i
         after.boxes[0].machine.process_id, pid,
         "the next turn ran on the same Firecracker"
     );
+    discard_box(&commands, &mut received).await;
     drop(commands);
     running
         .await

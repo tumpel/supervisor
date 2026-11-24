@@ -35,7 +35,7 @@ pub use images::{ImageOrder, Refusal};
 pub use install::{install, Enrolment};
 pub use lifecycle::{
     Attached, BoxTurn, Budgets, Command, Guest, IdleGate, Input, Lifecycle, Machine, Settings, SnapshotOrder, Taken,
-    Vmm,
+    TeardownOrder, Vmm,
 };
 pub use pool::{Disk, PoolExhausted, Size, Tap, TapPool};
 pub use run::{run, Failure, Stopped, DAEMON_START_SECONDS};

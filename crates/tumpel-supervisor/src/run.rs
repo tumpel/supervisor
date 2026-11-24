@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -699,13 +699,20 @@ struct Started {
     store: HttpStore,
 }
 
-fn start() -> Result<Started, Failure> {
+fn startup_layout() -> Result<Layout, Failure> {
+    let binary = std::env::current_exe().map_err(|error| {
+        fail(
+            SupervisorFailure::ChannelStateLost,
+            format!("finding this supervisor's own binary failed: {error}"),
+        )
+    })?;
+    Ok(Layout::new(binary, dir::supervisor_dir(), dir::supervisor_unit_path()))
+}
+
+fn start(layout: Layout) -> Result<Started, Failure> {
     let unusable = |detail: String| fail(SupervisorFailure::NotEnrolled, detail);
-    let dir = dir::supervisor_dir();
-    let binary = std::env::current_exe()
-        .map_err(|error| unusable(format!("finding this supervisor's own binary failed: {error}")))?;
+    let dir = layout.state.clone();
     let running = update::binary_sha256(Path::new("/proc/self/exe")).map_err(unusable)?;
-    let layout = Layout::new(binary, dir.clone(), dir::supervisor_unit_path());
     let config = load_config(&dir)?;
     let pair = load_key(&dir)?;
     let state = load_channel_state(&dir)?;
@@ -766,24 +773,37 @@ fn refresh_steady_unit(layout: Layout) {
     });
 }
 
+pub(crate) async fn preserve_legacy(layout: &Layout, saved: &mut StartupBoxes) -> Vec<fd_store::LegacyFd> {
+    let streams = Firecracker::migrate_legacy(saved);
+    if let Err(error) = refresh_unit(layout, "check the installed supervisor service and restart it").await {
+        eprintln!(
+            "tumpel-supervisor: retaining the inherited streams in this supervisor: {}",
+            error.detail
+        );
+    }
+    for stream in &streams {
+        let Some(index) = stream.tap else { continue };
+        if let Err(error) = fd_store::keep(index, stream.role, stream.fd.as_fd()) {
+            eprintln!("tumpel-supervisor: retaining an inherited stream in this supervisor: {error}");
+        }
+    }
+    streams
+}
+
 async fn prepare_startup(
     started: &Started,
-    handed: bool,
-    received: &BTreeMap<String, OwnedFd>,
     out: &UnboundedSender<Outgoing>,
-) -> Result<(Option<SupervisorUpdatePending>, Option<StartupBoxes>), Failure> {
+) -> Result<Option<SupervisorUpdatePending>, Failure> {
     let trial = match update::startup(&started.layout, &started.running, out)
-        .map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?
+        .map_err(|detail| fail(SupervisorFailure::ChannelStateLost, detail))?
     {
         Startup::Steady => None,
         Startup::Trial(pending) => Some(pending),
     };
-    let taken = taken(&started.layout, handed, received)?;
-
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
         .await
         .map_err(|error| fail(SupervisorFailure::GuestDriveUnwritable, error))?;
-    Ok((trial, taken))
+    Ok(trial)
 }
 
 pub async fn run(
@@ -799,8 +819,15 @@ pub async fn run(
         )
     })?;
     let (out, mut from_box) = unbounded_channel();
-    let started = start()?;
-    let (trial, taken) = prepare_startup(&started, handed, &received, &out).await?;
+    let layout = startup_layout()?;
+    let mut taken = taken(&layout, handed, &received)?;
+    let _inherited_streams = if let Some(saved) = taken.as_mut().filter(|saved| saved.inherited) {
+        preserve_legacy(&layout, saved).await
+    } else {
+        Vec::new()
+    };
+    let started = start(layout)?;
+    let trial = prepare_startup(&started, &out).await?;
     let dir = dir::supervisor_dir();
     let (commands, from_channel) = unbounded_channel();
     let (usage, idle, mut runner) = start_boxes(

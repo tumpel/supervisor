@@ -67,16 +67,32 @@ fn remove(name: &str) -> Result<(), String> {
 
 pub fn keep(tap: u8, role: &str, fd: BorrowedFd<'_>) -> Result<(), String> {
     remove(&name(tap, role))?;
-    store(tap, role, fd)
-}
-
-pub(crate) fn store(tap: u8, role: &str, fd: BorrowedFd<'_>) -> Result<(), String> {
     let name = name(tap, role);
     notify(
         &format!("handing {name} to systemd"),
         &format!("FDSTORE=1\nFDNAME={name}\n"),
         &[fd.as_raw_fd()],
     )
+}
+
+pub(crate) struct LegacyFd {
+    pub tap: Option<u8>,
+    pub role: &'static str,
+    pub fd: OwnedFd,
+}
+
+pub(crate) fn own_inherited(fd: RawFd) -> Result<OwnedFd, String> {
+    if fd < 3 {
+        return Err(format!("the inherited descriptor {fd} is reserved or missing"));
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(format!(
+            "keeping inherited descriptor {fd} out of child processes failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 pub fn forget(tap: u8, role: &str) -> Result<(), String> {

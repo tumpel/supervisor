@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::io::BufWriter;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -130,9 +130,6 @@ pub trait Guest: Send + 'static {
 pub trait Machine: Send + 'static {
     type Guest: Guest;
     fn activate(&mut self) {}
-    fn register_inherited(&self, _guest: &Self::Guest) -> Result<(), String> {
-        Ok(())
-    }
     fn start(
         &mut self,
         boot: &Boot,
@@ -212,14 +209,8 @@ pub trait Vmm: Send + Sync + 'static {
         handed: &SupervisorHandoverMachine,
         observation: Option<&Observation>,
         pool: &mut TapPool,
-        inherited: bool,
+        reconnect: bool,
     ) -> Result<Option<Attached<Self::Machine>>, String>;
-    fn recorded_process(
-        &self,
-        index: u8,
-        handed: &SupervisorHandoverMachine,
-        observation: Option<&Observation>,
-    ) -> Result<bool, String>;
     fn disk(&self, drives: &[String]) -> Result<Disk, String>;
     fn unclaimed_scopes(&self, claimed: &[u8]) -> Result<Vec<u8>, String>;
     fn unclaimed_reservations(&self, claimed: &[u8]) -> Result<BTreeMap<u8, ScopeDisks>, String>;
@@ -2294,14 +2285,10 @@ pub enum Taken {
     Crashed,
 }
 
-fn close_inherited_descriptor(fd: std::os::fd::RawFd) -> Result<(), String> {
-    if unsafe { libc::close(fd) } == 0 {
-        return Ok(());
-    }
-    Err(format!(
-        "releasing an inherited box descriptor failed: {}",
-        std::io::Error::last_os_error()
-    ))
+enum StartupAction {
+    Warm,
+    Resume(Box<SupervisorHandoverTurn>),
+    Reconnect(Option<EntityId>),
 }
 
 pub struct Abandoned {
@@ -2564,6 +2551,21 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let Some(mut finished) = self.finished.take() else {
             return Ok(());
         };
+        let result = self.run_loop(&mut inputs, &mut setups, &mut finished).await;
+        let retired = self.retire(&mut finished).await;
+        match (result, retired) {
+            (Ok(()), retired) => retired,
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup)) => Err(format!("{error}; retiring the box runner also failed: {cleanup}")),
+        }
+    }
+
+    async fn run_loop(
+        &mut self,
+        inputs: &mut UnboundedReceiver<Input>,
+        setups: &mut UnboundedReceiver<SetupCommand>,
+        finished: &mut UnboundedReceiver<Event<V::Machine>>,
+    ) -> Result<(), String> {
         let queued: Vec<(String, bool)> = self
             .slots
             .iter()
@@ -2605,6 +2607,88 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         Ok(())
     }
 
+    fn discard_setups(&self) {
+        for inputs in self.setups.values() {
+            let _ = inputs.send(SetupInput::Discard);
+        }
+    }
+
+    async fn retire(&mut self, finished: &mut UnboundedReceiver<Event<V::Machine>>) -> Result<(), String> {
+        self.discard_setups();
+        let limit = self.handover_report_interval();
+        let mut failures = Vec::new();
+        let mut boots = Vec::new();
+        for (session, slot) in &mut self.slots {
+            if let Some((_, task)) = slot.task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Some(index) = slot.boot_tap.take() {
+                boots.push((session.clone(), index));
+            }
+        }
+        for (session, index) in boots {
+            if let Err(error) = self.discard_unrecorded_boot(&session, index).await {
+                failures.push(error);
+            }
+        }
+        let setups = async {
+            while !self.setups.is_empty() {
+                let Some(event) = finished.recv().await else { break };
+                if matches!(event, Event::SetupFinished { .. }) {
+                    if let Err(error) = self.event(event).await {
+                        failures.push(error);
+                    }
+                }
+            }
+        };
+
+        if timeout(limit, setups).await.is_err() {
+            failures.extend(self.discard_stalled_setups().await);
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(failures.join("; "))
+    }
+
+    async fn discard_unrecorded_boot(&self, session: &str, index: u8) -> Result<(), String> {
+        let unrecorded = self
+            .runner
+            .standing
+            .boxes
+            .lock()
+            .map_err(|_| "the saved box inventory is unavailable")?
+            .get(&i32::from(index))
+            .is_none();
+        if unrecorded {
+            self.runner.vmm.discard_incomplete_boot(index).await?;
+            self.free_disk(session)?;
+        }
+        Ok(())
+    }
+
+    async fn discard_stalled_setups(&mut self) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (claude_setup_id, (index, task)) in std::mem::take(&mut self.setup_tasks) {
+            task.abort();
+            let _ = task.await;
+            self.setups.remove(&claude_setup_id);
+            if let Err(error) = self
+                .runner
+                .vmm
+                .discard_incomplete_boot(index)
+                .await
+                .and_then(|()| self.free_disk(&claude_setup_id))
+            {
+                failures.push(format!(
+                    "discarding the setup box on TAP {index} failed: {error}; kept its files"
+                ));
+            }
+        }
+        failures
+    }
+
     fn box_count(&self) -> u32 {
         u32::try_from(self.slots.len() + self.setups.len()).unwrap_or(u32::MAX)
     }
@@ -2636,6 +2720,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     fn start_handover(&mut self, reply: oneshot::Sender<SupervisorHandover>) {
         self.mode = Mode::HandingOver;
         self.parking.send_replace(true);
+        self.discard_setups();
         eprintln!(
             "tumpel-supervisor: handing {} boxes to the new supervisor binary: this host claims no new turn, parks each running turn at its next guest message, gives back each turn still waiting for its claim and waits for the boots and snapshots in flight, logging every {} s while any runs",
             self.box_count(),
@@ -2680,19 +2765,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         if self.handing.is_none() {
             return;
         }
-        for (claude_setup_id, (index, task)) in std::mem::take(&mut self.setup_tasks) {
-            task.abort();
-            let _ = task.await;
-            self.setups.remove(&claude_setup_id);
-            if let Err(error) = self
-                .runner
-                .vmm
-                .discard_incomplete_boot(index)
-                .await
-                .and_then(|()| self.free_disk(&claude_setup_id))
-            {
-                eprintln!("tumpel-supervisor: discarding the setup box on TAP {index} failed: {error}; kept its files");
-            }
+        for error in self.discard_stalled_setups().await {
+            eprintln!("tumpel-supervisor: {error}");
         }
         let busy = self.slots.values().filter(|slot| slot.busy).count();
         if busy == 0 {
@@ -2720,18 +2794,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     task.abort();
                     let _ = task.await;
                     if let Some(index) = slot.boot_tap.take() {
-                        let recorded = self
-                            .runner
-                            .standing
-                            .boxes
-                            .lock()
-                            .map_or(true, |boxes| boxes.contains_key(&i32::from(index)));
-                        if !recorded {
-                            if let Err(error) = self.runner.vmm.discard_incomplete_boot(index).await {
-                                eprintln!(
-                                    "tumpel-supervisor: discarding the incomplete boot on TAP {index} failed: {error}"
-                                );
-                            }
+                        if let Err(error) = self.discard_unrecorded_boot(&session, index).await {
+                            eprintln!(
+                                "tumpel-supervisor: discarding the incomplete boot on TAP {index} failed: {error}"
+                            );
                         }
                     }
                     match running {
@@ -2925,12 +2991,10 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let mut prepared = Vec::new();
         let mut standing = BTreeMap::new();
         let mut ended = Vec::new();
-        let mut inherited_fds = HashSet::new();
         let mut failed_turns = Vec::new();
         if let Some(StartupBoxes {
             inventory,
             handed_count,
-            inherited,
             ..
         }) = taken
         {
@@ -2942,13 +3006,13 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 } else {
                     Taken::Crashed
                 };
-                let inherited = inherited && index < handed_count;
                 let mut handed = saved.record.clone();
                 if matches!(handed.state, SupervisorHandoverBoxState::Warm(_)) {
                     handed.idle_milliseconds = handed.idle_milliseconds.saturating_sub(age).max(0);
                 }
-                let attempt =
-                    self.prepare_attachment(&handed, saved.observation.as_ref(), inherited, &mut inherited_fds);
+                let reconnect = saved.reconnect
+                    || (taken == Taken::Crashed && matches!(handed.state, SupervisorHandoverBoxState::Turn(_)));
+                let attempt = self.prepare_attachment(&handed, saved.observation.as_ref(), reconnect);
                 let (record, image, queue, (machine, guest, tap)) = match attempt {
                     Ok(Some(attached)) => attached,
                     Ok(None) => {
@@ -2973,25 +3037,26 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 if matches!(taken, Taken::Crashed) {
                     Self::interrupt(&mut record);
                 }
-                let reconnect = record.reconnect;
+                let action = match (&handed.state, record.reconnect) {
+                    (SupervisorHandoverBoxState::Turn(turn), true) => {
+                        StartupAction::Reconnect(Some(turn.turn_id.clone()))
+                    }
+                    (_, true) => StartupAction::Reconnect(None),
+                    (SupervisorHandoverBoxState::Turn(turn), false) => StartupAction::Resume(Box::new(turn.clone())),
+                    _ => StartupAction::Warm,
+                };
                 standing.insert(record.record.tap_index, record);
-                prepared.push((handed, taken, image, queue, (machine, guest, tap), reconnect));
+                prepared.push((handed, action, image, queue, (machine, guest, tap)));
             }
         }
-        let claimed: Vec<u8> = prepared
-            .iter()
-            .map(|(_, _, _, _, (_, _, tap), _)| tap.index())
-            .collect();
+        let claimed: Vec<u8> = prepared.iter().map(|(_, _, _, _, (_, _, tap))| tap.index()).collect();
         self.finish_startup(&mut standing, ended, &claimed, recorded, &mut failed_turns)?;
         self.runner.standing.write(|boxes| *boxes = standing)?;
         for (turn_id, detail) in failed_turns {
             turn_failed(&self.runner.out, &turn_id, TurnFailureReason::HarnessExited, detail);
         }
-        for fd in inherited_fds {
-            close_inherited_descriptor(fd)?;
-        }
-        for (handed, taken, image, queue, attached, reconnect) in prepared {
-            self.adopt(handed, taken, image, queue, attached, reconnect);
+        for (handed, action, image, queue, attached) in prepared {
+            self.adopt(handed, action, image, queue, attached);
         }
         self.publish();
         Ok(())
@@ -3001,41 +3066,20 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         &mut self,
         handed: &SupervisorHandoverBox,
         observation: Option<&Observation>,
-        inherited: bool,
-        inherited_fds: &mut HashSet<i32>,
+        reconnect: bool,
     ) -> Result<Option<Prepared<V::Machine>>, String> {
-        let tap = u8::try_from(handed.tap_index).map_err(|error| error.to_string())?;
-        if !self.runner.vmm.recorded_process(tap, &handed.machine, observation)? {
-            return Ok(None);
-        }
         let (record, image, queue) = decode_box(handed)?;
-        let descriptors = [
-            handed.machine.guest_fd,
-            handed.machine.stdout_fd,
-            handed.machine.stderr_fd,
-        ];
-        if inherited && descriptors.iter().any(|fd| inherited_fds.contains(fd)) {
-            return Err("an inherited descriptor belongs to more than one box".to_string());
-        }
-        let attached = self.runner.vmm.reattach(
-            &handed.session_id,
-            handed.tap_index,
-            &handed.machine,
-            observation,
-            &mut self.pool,
-            inherited,
-        )?;
-        let Some((machine, guest, tap)) = attached else {
-            return Ok(None);
-        };
-        if inherited {
-            if let Err(error) = machine.register_inherited(&guest) {
-                self.pool.release(tap);
-                return Err(error);
-            }
-            inherited_fds.extend(descriptors);
-        }
-        Ok(Some((record, image, queue, (machine, guest, tap))))
+        self.runner
+            .vmm
+            .reattach(
+                &handed.session_id,
+                handed.tap_index,
+                &handed.machine,
+                observation,
+                &mut self.pool,
+                reconnect,
+            )
+            .map(|attached| attached.map(|attached| (record, image, queue, attached)))
     }
 
     fn finish_startup(
@@ -3147,18 +3191,17 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     fn adopt(
         &mut self,
         handed: SupervisorHandoverBox,
-        taken: Taken,
+        action: StartupAction,
         image: Boot,
         queue: VecDeque<Command>,
         (mut machine, guest, tap): Attached<V::Machine>,
-        reconnect: bool,
     ) {
         let session = handed.session_id.to_string();
         machine.activate();
         let hold = self.runner.holds.hold_boot(&image);
         let slot = self.slots.entry(session.clone()).or_default();
         slot.queue = queue;
-        slot.live = Some(LiveBox {
+        let live = LiveBox {
             session_id: handed.session_id,
             box_id: handed.box_id,
             machine,
@@ -3171,37 +3214,29 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             credential_file: handed.credential_file.map(String::from),
             box_retention: handed.box_retention,
             idle: duration(handed.idle_milliseconds),
-        });
-        if reconnect {
-            if let SupervisorHandoverBoxState::Turn(turn) = handed.state {
-                turn_failed(
-                    &self.runner.out, &turn.turn_id, TurnFailureReason::HarnessExited,
-                    format!("the supervisor stopped unexpectedly during turn {}, so the turn ended; its box is kept, so send the turn again", *turn.turn_id),
-                );
+        };
+        match action {
+            StartupAction::Reconnect(turn_id) => {
+                if let Some(turn_id) = turn_id {
+                    turn_failed(
+                        &self.runner.out, &turn_id, TurnFailureReason::HarnessExited,
+                        format!("the supervisor stopped unexpectedly during turn {turn_id}, so the turn ended; its box is kept, so send the turn again"),
+                    );
+                }
+                slot.busy = true;
+                let runner = self.runner.clone();
+                self.spawn(session, Work::Turn, Running::Recovering, async move {
+                    runner.recover_adopted(live).await
+                });
             }
-            let Some(live) = slot.live.take() else {
-                return;
-            };
-            slot.busy = true;
-            let runner = self.runner.clone();
-            self.spawn(session, Work::Turn, Running::Recovering, async move {
-                runner.recover_adopted(live).await
-            });
-            return;
-        }
-        match (handed.state, taken) {
-            (SupervisorHandoverBoxState::Unrecognised(_), _) => {
-                tumpel_channel::update_required();
-            }
-            (SupervisorHandoverBoxState::Warm(_), _) => {
+            StartupAction::Warm => {
                 slot.paused = true;
-                slot.idle_end = Some(Instant::now() + duration(handed.idle_milliseconds));
+                slot.idle_end = Some(Instant::now() + live.idle);
                 self.runner.standing.idle_until(&session, slot.idle_end);
+                slot.live = Some(live);
             }
-            (SupervisorHandoverBoxState::Turn(_), Taken::Crashed) => {
-                unreachable!("crashed turns recover before matching handover state")
-            }
-            (SupervisorHandoverBoxState::Turn(turn), Taken::Handed) => {
+            StartupAction::Resume(turn) => {
+                slot.live = Some(live);
                 if turn.cancelled == Some(true) {
                     self.runner.cancels.cancel(turn.turn_id.clone());
                 }
@@ -3945,4 +3980,4 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
