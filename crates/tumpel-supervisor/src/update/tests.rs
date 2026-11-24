@@ -46,7 +46,7 @@ impl Idle for &FakeIdle {
     }
 }
 
-struct FakeSource {
+pub(crate) struct FakeSource {
     bytes: Vec<u8>,
     sha256: String,
     supervisor_version: &'static str,
@@ -56,7 +56,7 @@ struct FakeSource {
 }
 
 impl FakeSource {
-    fn binary(script: &str) -> Self {
+    pub(crate) fn binary(script: &str) -> Self {
         Self {
             bytes: script.as_bytes().to_vec(),
             sha256: sha256_hex(script.as_bytes()),
@@ -95,7 +95,7 @@ fn report_script(protocol: u32) -> String {
     )
 }
 
-fn good_script() -> String {
+pub(crate) fn good_script() -> String {
     report_script(u32::from(ChannelProtocol::VERSION))
 }
 
@@ -574,24 +574,33 @@ async fn an_update_goes_only_to_a_newer_supervisor_version() {
 }
 
 #[tokio::test]
-async fn a_timed_out_settle_reports_failure_and_the_next_notice_can_prepare_again() {
-    let layout = layout("settle-timeout");
+async fn a_timed_out_update_can_stage_again_and_a_failed_swap_refuses_it() {
+    let layout = layout("swap-failed");
     let idle = FakeIdle::default();
-    let source = FakeSource::binary(&good_script());
-    let mut run = updater(&layout, source, &idle, limits());
+    let mut run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
     let Outcome::Restart(release) = run.updater.announced(Duration::ZERO).await else {
-        panic!("the report passed");
+        panic!("the candidate report passed");
     };
-    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Busy);
-    run.updater
-        .settle_timed_out(&release, "HandoverTimedOut: session-1 snapshot-1".to_string())
-        .await;
+    run.updater.settle_timed_out(&release, "HandoverTimedOut".to_string());
+    assert_eq!(failure(&mut run.events).0, "HandoverTimedOut");
     assert_eq!(text(&layout.binary), OLD_BINARY);
-    assert!(!layout.refusal().exists());
-    let (detail, _) = failure(&mut run.events);
-    assert_eq!(detail, "HandoverTimedOut: session-1 snapshot-1");
-    assert!(matches!(
-        run.updater.announced(Duration::ZERO).await,
-        Outcome::Restart(_)
-    ));
+    let Outcome::Restart(release) = run.updater.announced(Duration::ZERO).await else {
+        panic!("a timeout doesn't refuse the release");
+    };
+    std::fs::remove_file(&layout.candidate).expect("make the candidate rename fail");
+
+    let error = run.updater.swap(&release, 0, 0).expect_err("rename failed");
+
+    assert!(error.contains("moving"), "{error}");
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert!(!layout.pending().exists());
+    let refusal: SupervisorUpdateRefusal = serde_json::from_str(&text(&layout.refusal())).expect("refusal record");
+    assert_eq!(refusal.to_sha256, release.sha256);
+    assert_eq!(
+        refusal.reason,
+        SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed
+    );
+    let restarted = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
+    assert_eq!(restarted.updater.announced(Duration::ZERO).await, Outcome::Refused);
+    assert_eq!(restarted.updater.source.downloads.load(Ordering::SeqCst), 0);
 }

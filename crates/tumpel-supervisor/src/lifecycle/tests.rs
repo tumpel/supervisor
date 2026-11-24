@@ -649,8 +649,8 @@ fn describe(message: ChannelHostMessage) -> Option<String> {
     })
 }
 
-struct Host {
-    commands: UnboundedSender<Input>,
+pub(crate) struct Host {
+    pub(crate) commands: UnboundedSender<Input>,
     setups: UnboundedSender<SetupCommand>,
     cancels: Cancels,
     received: UnboundedReceiver<ChannelHostMessage>,
@@ -664,10 +664,10 @@ struct Host {
     vmm: MemoryVmm,
     capacity: u32,
     settings: Settings,
-    sessions: tokio::sync::watch::Receiver<Vec<EntityId>>,
+    pub(crate) sessions: tokio::sync::watch::Receiver<Vec<EntityId>>,
     busy: watch::Receiver<u32>,
     holdings: tokio::sync::watch::Receiver<Held>,
-    runner: tokio::task::JoinHandle<Result<(), String>>,
+    pub(crate) runner: tokio::task::JoinHandle<Result<(), String>>,
     answering: Arc<AtomicBool>,
     accepting: Arc<AtomicBool>,
     pack_answers: watch::Sender<bool>,
@@ -2491,26 +2491,6 @@ async fn an_update_at_the_bound_resumes_the_parked_turn_without_exporting() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_expired_stop_returns_the_busy_snapshot_and_ends_the_runner() {
-    let mut old = host("stop-settle-expiry", 1, Harness::Echo, Boot::Works);
-    old.turn("turn-1", "session-1", "one", Vec::new());
-    old.settle_until("complete 1").await;
-    old.accepting.store(false, Ordering::SeqCst);
-    old.snapshot("session-1");
-    assert_eq!(old.settle_until("snapshot done").await, ["snapshot done"]);
-
-    let error = old
-        .ask_handover()
-        .await
-        .expect("settle reply")
-        .expect_err("stop timed out");
-
-    assert!(error.contains("65 s limit"), "{error}");
-    assert!(error.contains("session session-1 snapshot snapshot-1"), "{error}");
-    assert_eq!(old.runner.await.expect("runner returned"), Err(error));
-}
-
-#[tokio::test(start_paused = true)]
 async fn a_box_whose_snapshot_done_is_never_accepted_stays_dirty_past_its_idle_time() {
     let mut host = host("idle-refused", 1, Harness::Echo, Boot::Works);
     host.idle_seconds = NonZeroU32::new(300).expect("five minutes");
@@ -2658,7 +2638,7 @@ async fn a_cancelled_turn_ends_in_the_guest_with_its_credential_file_and_the_pla
         "failed {}: the host cancelled the turn The box's console printed nothing during the turn. with credential file refreshed",
         TurnFailureReason::Cancelled
     );
-    assert_eq!(host.settle_until(&failed).await, [failed]);
+    assert_eq!(host.settle_until(&failed).await.last(), Some(&failed));
     host.snapshot("session-1");
     host.teardown("session-1");
     assert_eq!(
@@ -2686,7 +2666,7 @@ async fn a_cancel_an_older_guest_never_answers_ends_the_turn_by_closing_the_gues
         "failed {}: the guest did not end cancelled turn turn-1 within 10 s, so the host closed its connection, which stops the harness. The box's console printed nothing during the turn.",
         TurnFailureReason::Cancelled
     );
-    assert_eq!(host.settle_until(&failed).await, [failed]);
+    assert_eq!(host.settle_until(&failed).await.last(), Some(&failed));
     assert_eq!(
         host.log(),
         ["boot session-1 on tumpel0", "reconnect session-1", "pause session-1"]
@@ -3082,4 +3062,53 @@ fn protocol_digit(protocol: &GuestHarnessProtocol) -> usize {
     .iter()
     .position(|known| known == protocol)
     .expect("a known harness protocol")
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_timeout_fails_a_claimed_turn_without_a_box_record() {
+    let store = MemoryStore {
+        3: Duration::from_secs(180),
+        ..MemoryStore::default()
+    };
+    let mut host = host_on("unrecorded-stop", store, 2, Harness::Echo, Boot::Works, settings(), 120);
+    host.turn("warm", "session-warm", "warm", Vec::new());
+    host.settle_until("complete 1").await;
+    host.accepting.store(false, Ordering::SeqCst);
+    host.snapshot("session-warm");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    let mut turn = host.box_turn("turn-1", "session-1", "one", Vec::new(), 300);
+    let mut image = host.uncached_image();
+    image.download.fetch_seconds = NonZeroU32::new(240).expect("fetch budget");
+    turn.image = BootOrder::Full(image);
+    host.send(Command::Turn(Box::new(turn)));
+    host.settle_until("claim turn-1").await;
+    assert_eq!(host.standing().boxes[0].session_id.as_str(), "session-warm");
+
+    let error = host
+        .ask_settle(HandoverFor::Stop)
+        .await
+        .expect("settle reply")
+        .expect_err("stop timed out");
+
+    assert!(error.contains("turn turn-1"), "{error}");
+    assert!(
+        error.contains("65 s limit") && error.contains("session-warm snapshot"),
+        "{error}"
+    );
+    let failed = format!(
+        "failed {}: the supervisor stopped before recording the box for turn turn-1. Send the turn again",
+        TurnFailureReason::HarnessExited
+    );
+    assert_eq!(host.settle_until(&failed).await.last(), Some(&failed));
+    assert_eq!(host.runner.await.expect("runner returns"), Err(error));
+}
+
+pub(crate) async fn pending_snapshot(name: &str) -> (Host, EntityId) {
+    let mut host = host(name, 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("complete 1").await;
+    host.accepting.store(false, Ordering::SeqCst);
+    let snapshot = host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    (host, snapshot.snapshot_id)
 }
