@@ -38,7 +38,12 @@ fn write_report(mut out: impl Write) -> io::Result<bool> {
         ),
         (BOXES_FILE, read_boxes(&state.join(BOXES_FILE))),
         (HANDOVER_FILE, read_boxes(&state.join(HANDOVER_FILE))),
-        ("guest drive", guest_drive::check()),
+        (
+            "guest drive",
+            runtime
+                .map_err(unavailable)
+                .and_then(|runtime| guest_drive::check(Path::new(&*runtime.image_cache_dir))),
+        ),
         (
             "image cache",
             runtime.map_err(unavailable).and_then(|runtime| {

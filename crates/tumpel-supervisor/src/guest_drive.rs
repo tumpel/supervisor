@@ -1,3 +1,4 @@
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -7,6 +8,7 @@ use ring::digest::{digest, SHA256};
 use crate::snapshot::hex;
 
 const WRITE_TIME: Duration = Duration::from_secs(60);
+const DIRECTORY: &str = "guest";
 
 #[cfg(guest_drive)]
 const DRIVE: Option<&[u8]> = Some(include_bytes!(env!("TUMPEL_GUEST_DRIVE_PATH")));
@@ -17,16 +19,32 @@ fn name(drive: &[u8]) -> String {
     format!("{}.squashfs", hex(digest(&SHA256, drive).as_ref()))
 }
 
-pub(crate) fn check() -> Result<&'static str, String> {
-    match DRIVE {
-        Some(drive) if drive.starts_with(b"hsqs") => Ok("embedded SquashFS drive is present"),
-        Some(_) => Err("the embedded drive is not SquashFS; install a supervisor built by the release workflow".into()),
-        None => Ok("this development build has no embedded guest drive"),
+pub(crate) fn check(images: &Path) -> Result<&'static str, String> {
+    if DRIVE.is_some_and(|drive| !drive.starts_with(b"hsqs")) {
+        return Err("the embedded drive is not SquashFS. Install a supervisor built by the release workflow".into());
     }
+    check_location(images).map_err(|error| {
+        format!(
+            "cannot use the guest drive directory under {}: {error}. Set imageCacheDir in runtime.json to a cache with a writable guest directory",
+            images.display()
+        )
+    })?;
+    Ok("the cache can hold the guest drive")
+}
+
+fn check_location(images: &Path) -> io::Result<()> {
+    let guest = images.join(DIRECTORY);
+    let location = match guest.metadata() {
+        Ok(metadata) if metadata.is_dir() => &guest,
+        Ok(_) => return Err(ErrorKind::NotADirectory.into()),
+        Err(error) if error.kind() == ErrorKind::NotFound => images,
+        Err(error) => return Err(error),
+    };
+    crate::dir::check_access(location, libc::W_OK | libc::X_OK)
 }
 
 fn place(images: &Path, drive: &[u8]) -> Result<PathBuf, String> {
-    let dir = images.join("guest");
+    let dir = images.join(DIRECTORY);
     let name = name(drive);
     let path = dir.join(&name);
     std::fs::create_dir_all(&dir).map_err(|error| format!("creating {}: {error}", dir.display()))?;
@@ -66,7 +84,7 @@ pub fn path(images: &Path) -> Result<PathBuf, String> {
     static NAME: OnceLock<Option<String>> = OnceLock::new();
     NAME.get_or_init(|| DRIVE.map(name))
         .as_ref()
-        .map(|name| images.join("guest").join(name))
+        .map(|name| images.join(DIRECTORY).join(name))
         .ok_or_else(|| "this supervisor was built without a guest drive, so it boots no layered box; install a supervisor the release workflow built".to_string())
 }
 
