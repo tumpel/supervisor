@@ -815,9 +815,12 @@ fn opened_overlays(root: &Path, process: &Path) -> Result<Vec<EntityId>, String>
 fn scope_reservations(
     root: &Path,
     processes: &[(u8, PathBuf)],
-) -> Result<std::collections::BTreeMap<u8, Vec<EntityId>>, String> {
+) -> Result<std::collections::BTreeMap<u8, crate::lifecycle::ScopeDisks>, String> {
     use std::collections::BTreeMap;
-    let mut reserved: BTreeMap<u8, Vec<EntityId>> = processes.iter().map(|(index, _)| (*index, Vec::new())).collect();
+    let mut reserved: BTreeMap<u8, crate::lifecycle::ScopeDisks> = processes
+        .iter()
+        .map(|(index, _)| (*index, crate::lifecycle::ScopeDisks::default()))
+        .collect();
     if reserved.is_empty() {
         return Ok(reserved);
     }
@@ -828,11 +831,11 @@ fn scope_reservations(
     };
     for (index, process) in processes {
         match opened_overlays(&canonical, process) {
-            Ok(opened) => reserved.entry(*index).or_default().extend(opened),
+            Ok(opened) => reserved.entry(*index).or_default().identified.extend(opened),
             Err(error) => eprintln!("tumpel-supervisor: {error}; keeping possible box disks"),
         }
     }
-    if reserved.values().any(Vec::is_empty) {
+    if reserved.values().any(|disks| disks.identified.is_empty()) {
         eprintln!(
             "tumpel-supervisor: an unclaimed scope has no identifiable disk; keeping existing session directories"
         );
@@ -840,13 +843,14 @@ fn scope_reservations(
             .into_iter()
             .filter_map(|entry| EntityId::try_from(entry.file_name().to_str()?).ok())
             .collect();
-        for sessions in reserved.values_mut().filter(|sessions| sessions.is_empty()) {
-            sessions.clone_from(&possible);
+        for sessions in reserved.values_mut().filter(|disks| disks.identified.is_empty()) {
+            sessions.possible.clone_from(&possible);
         }
     }
     for sessions in reserved.values_mut() {
-        sessions.sort();
-        sessions.dedup();
+        sessions.identified.sort();
+        sessions.identified.dedup();
+        sessions.possible.sort();
     }
     Ok(reserved)
 }
@@ -1150,7 +1154,10 @@ impl Vmm for Firecracker {
             .collect())
     }
 
-    fn unclaimed_reservations(&self, claimed: &[u8]) -> Result<std::collections::BTreeMap<u8, Vec<EntityId>>, String> {
+    fn unclaimed_reservations(
+        &self,
+        claimed: &[u8],
+    ) -> Result<std::collections::BTreeMap<u8, crate::lifecycle::ScopeDisks>, String> {
         let mut processes = scope_processes()?;
         processes.retain(|(index, _)| !claimed.contains(index));
         scope_reservations(&self.data.join("sessions"), &processes)

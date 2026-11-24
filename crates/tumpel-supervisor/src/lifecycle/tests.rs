@@ -369,6 +369,7 @@ struct MemoryVmm {
     free_disk_mib: Arc<AtomicU64>,
     unclaimed: Vec<u8>,
     unclaimed_disks: Vec<EntityId>,
+    possible_unclaimed_disks: Vec<EntityId>,
     failed_attachments: BTreeSet<u8>,
 }
 
@@ -448,11 +449,19 @@ impl Vmm for MemoryVmm {
         Ok(self.unclaimed.clone())
     }
 
-    fn unclaimed_reservations(&self, claimed: &[u8]) -> Result<BTreeMap<u8, Vec<EntityId>>, String> {
+    fn unclaimed_reservations(&self, claimed: &[u8]) -> Result<BTreeMap<u8, super::ScopeDisks>, String> {
         Ok(self
             .unclaimed_scopes(claimed)?
             .into_iter()
-            .map(|index| (index, self.unclaimed_disks.clone()))
+            .map(|index| {
+                (
+                    index,
+                    super::ScopeDisks {
+                        identified: self.unclaimed_disks.clone(),
+                        possible: self.possible_unclaimed_disks.clone(),
+                    },
+                )
+            })
             .collect())
     }
 
@@ -938,6 +947,7 @@ fn host_on(
         free_disk_mib: Arc::new(AtomicU64::new(1 << 30)),
         unclaimed: Vec::new(),
         unclaimed_disks: Vec::new(),
+        possible_unclaimed_disks: Vec::new(),
         failed_attachments: BTreeSet::new(),
     };
     start_host(
@@ -2022,8 +2032,13 @@ async fn a_box_that_cannot_attach_and_an_unclaimed_scope_leave_the_rest_running(
     old.vmm.failed_attachments.insert(0);
     old.keep_guest(&mut standing.boxes[1], 52);
     old.vmm.unclaimed = vec![0, 2];
+    old.vmm.possible_unclaimed_disks = vec![
+        "session-2".try_into().expect("attached session"),
+        "unknown".try_into().expect("unidentified disk"),
+    ];
     let mut new = old.after_crash(standing);
     assert_eq!(new.standing().boxes.len(), 2);
+    assert!(!new.holdings.borrow().drives.iter().any(|drive| drive == "unknown"));
     new.turn("turn-3", "session-2", "three", Vec::new());
     new.settle_until("complete 1").await;
     new.turn("turn-4", "session-3", "four", Vec::new());
