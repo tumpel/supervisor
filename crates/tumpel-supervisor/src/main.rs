@@ -1,11 +1,12 @@
 use clap::{Parser, Subcommand};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use tumpel_api::types::SupervisorFailure;
 use tumpel_supervisor::{
-    enrol, install, install_telemetry, on_trial, received_descriptors, report, run, supervisor_dir, take_notify_socket,
-    Enrolment, ReportFormat, Stopped,
+    enrol, install, install_telemetry, on_trial, receive_handover, received_descriptors, report, run, supervisor_dir,
+    take_notify_socket, Enrolment, ReportFormat, Stopped,
 };
 
 #[derive(Parser)]
@@ -18,6 +19,8 @@ use tumpel_supervisor::{
 struct Cli {
     #[arg(long, conflicts_with_all = ["json", "manifest"], help = "Start host supervision")]
     daemon: bool,
+    #[arg(long, hide = true, requires = "daemon")]
+    handover_from: Option<NonZeroU32>,
     #[arg(long, help = "Print the report as JSON")]
     json: bool,
     #[arg(
@@ -159,8 +162,24 @@ fn show_report(format: ReportFormat, manifest: Option<PathBuf>) -> ExitCode {
     report(format, manifest, deadline)
 }
 
+fn successor(parent: NonZeroU32) -> ExitCode {
+    with_runtime(async move {
+        match receive_handover(&supervisor_dir(), parent).await {
+            Ok(transfer) => eprintln!(
+                "tumpel-supervisor: received the handover listener and descriptors for {} boxes; ownership has not been committed",
+                transfer.boxes.len()
+            ),
+            Err(error) => eprintln!("tumpel-supervisor: {error:#}"),
+        }
+        ExitCode::FAILURE
+    })
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(parent) = cli.handover_from {
+        return successor(parent);
+    }
     match cli.command {
         Some(Command::Enrol {
             endpoint,

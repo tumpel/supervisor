@@ -34,9 +34,10 @@ use crate::firecracker::Firecracker;
 use crate::guest_drive;
 use crate::inventory::{self, RestoredInventory};
 use crate::lifecycle::{
-    turn_failed, Abandoned, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder,
-    Taken, TeardownOrder,
+    turn_failed, Abandoned, BoxTurn, Budgets, Command, HandoverSource, IdleGate, Input, Lifecycle, Settings,
+    SetupCommand, SetupOrder, Taken, TeardownOrder,
 };
+use crate::local_handover::Endpoint;
 use crate::pool::{memory_budget_mib, mib, Held, Size, TapPool};
 use crate::store::{jitter, HttpStore};
 use crate::telemetry::Telemetry;
@@ -411,7 +412,7 @@ fn start_boxes(
     telemetry: Telemetry,
     taken: Option<RestoredInventory>,
     layout: &Layout,
-) -> Result<(Usage, IdleGate, BoxRunner), Failure> {
+) -> Result<(Usage, IdleGate, BoxRunner, HandoverSource), Failure> {
     let unreadable = |error: anyhow::Error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}"));
     usage::prepare_data_dir(Path::new(&*runtime.data_dir)).map_err(unreadable)?;
     let total_mib = usage::memory_bytes().map_err(unreadable)?.get() / (1024 * 1024);
@@ -445,6 +446,7 @@ fn start_boxes(
     let (to_lifecycle, from_boxes) = unbounded_channel();
     let idle = IdleGate::new(lifecycle.boxes(), lifecycle.busy());
     let (to_setups, from_setups) = unbounded_channel();
+    let handover = lifecycle.handover_source();
     let runner = tokio::spawn(lifecycle.run(from_boxes, from_setups));
     tokio::spawn(boxes(
         Path::new(&*runtime.data_dir).join(crate::persona_files::DIR),
@@ -454,7 +456,7 @@ fn start_boxes(
         to_lifecycle,
         to_setups,
     ));
-    Ok((usage, idle, runner))
+    Ok((usage, idle, runner, handover))
 }
 
 fn boxes_stopped(ended: Result<Result<(), String>, JoinError>) -> Failure {
@@ -793,6 +795,8 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     })?;
     let (out, mut from_box) = unbounded_channel();
     let started = start()?;
+    let endpoint = Endpoint::bind(&started.layout.state, &started.layout.candidate)
+        .map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")))?;
     let trial = start_update(&started.layout, &started.running, &out, handed).await?;
     let on_trial = trial.is_some();
     let taken = taken(&started.layout, handed, &received)?;
@@ -801,7 +805,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         .await
         .map_err(|error| fail(SupervisorFailure::GuestDriveUnwritable, error))?;
     let (commands, from_channel) = unbounded_channel();
-    let (usage, idle, mut runner) = start_boxes(
+    let (usage, idle, mut runner, handover) = start_boxes(
         &started.runtime,
         started.box_size,
         started.store,
@@ -844,6 +848,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         grace,
     };
     let deadline = on_trial.then(|| tokio::time::Instant::now() + Limits::HOST.online);
+    let local = endpoint.start(move || handover.descriptors());
     let served = tokio::select! {
         served = serve(&mut channel, &url, heartbeat, &usage, &commands, &mut from_box, &config, &dir, &mut updates) => served,
         Some(()) = restarted.recv() => Ok(Served::Updated),
@@ -854,6 +859,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
             format!("this supervisor did not reach Welcome on {url} within {} s of its start after its swap; systemd restarts the unit, and its ExecStartPre puts the previous binary back", Limits::HOST.online.as_secs()),
         )),
     };
+    drop(local);
     let stopped = match served {
         Ok(Served::Revoked) => Ok(Stopped::Revoked),
         Ok(Served::Updated) => terminate(&commands, &updates.layout, &updates.out)

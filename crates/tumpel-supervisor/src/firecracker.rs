@@ -508,12 +508,12 @@ fn in_scope(pid: libc::pid_t, scope: &str) -> bool {
 }
 
 #[derive(PartialEq, Eq)]
-struct ProcessIdentity {
-    parent: libc::pid_t,
-    start: u64,
+pub(crate) struct ProcessIdentity {
+    pub parent: libc::pid_t,
+    pub start: u64,
 }
 
-fn process_identity(pid: libc::pid_t) -> Result<Option<ProcessIdentity>, String> {
+pub(crate) fn process_identity(pid: libc::pid_t) -> Result<Option<ProcessIdentity>, String> {
     let text = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1361,6 +1361,23 @@ impl Machine for FirecrackerBox {
             stdout_fd: -1,
             vsock: bounded("the vsock path", self.vsock().display().to_string())?,
         })
+    }
+
+    fn handover_descriptors(&self, guest: &VsockGuest) -> Result<Option<[OwnedFd; 3]>, String> {
+        let stdout = self
+            .stdout
+            .as_ref()
+            .ok_or("the box has no standard output descriptor")?;
+        let stderr = self.stderr.as_ref().ok_or("the box has no standard error descriptor")?;
+        let duplicate = |fd: std::os::fd::BorrowedFd<'_>| {
+            fd.try_clone_to_owned()
+                .map_err(|error| format!("duplicating a box descriptor for handover: {error}"))
+        };
+        Ok(Some([
+            duplicate(guest.stream.as_fd())?,
+            duplicate(stdout.as_fd())?,
+            duplicate(stderr.as_fd())?,
+        ]))
     }
 
     fn observation(&self, guest: &VsockGuest) -> Result<Option<Observation>, String> {

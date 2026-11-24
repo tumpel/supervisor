@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::BufWriter;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -43,6 +44,7 @@ use crate::harness_result::{error_result, exit_result, turn_end};
 use crate::images;
 use crate::inventory::{Inventory, RecordedBox, RestoredInventory};
 use crate::layers::LayerCache;
+use crate::local_handover::Descriptors;
 use crate::pool::{mib, restore_charge_mib, Charge, Disk, Held, Tally, Tap, TapPool};
 use crate::snapshot::{
     assemble, cut, decode, decode_root, draft_digests, fetches, fresh, lacking, pack_parts, restore_parts, stage,
@@ -146,6 +148,9 @@ pub trait Machine: Send + 'static {
     fn clear_console(&mut self);
     fn hand_over(self, guest: Self::Guest) -> Result<SupervisorHandoverMachine, String>;
     fn record(&self) -> Result<SupervisorHandoverMachine, String>;
+    fn handover_descriptors(&self, _guest: &Self::Guest) -> Result<Option<[OwnedFd; 3]>, String> {
+        Ok(None)
+    }
     fn observation(&self, _guest: &Self::Guest) -> Result<Option<Observation>, String> {
         Ok(None)
     }
@@ -440,15 +445,62 @@ pub(crate) fn decode_box(
     Ok((record, image, queue))
 }
 
+struct StandingBox {
+    saved: RecordedBox,
+    descriptors: Option<Arc<[OwnedFd; 3]>>,
+}
+
+impl StandingBox {
+    fn capture<M: Machine>(record: SupervisorHandoverBox, machine: &M, guest: &M::Guest) -> Result<Self, String> {
+        Ok(Self {
+            saved: RecordedBox {
+                record,
+                observation: machine.observation(guest)?,
+            },
+            descriptors: machine.handover_descriptors(guest)?.map(Arc::new),
+        })
+    }
+}
+
+pub(crate) struct HandoverSource {
+    standing: Standing,
+    running: watch::Receiver<u32>,
+}
+
+impl HandoverSource {
+    pub fn descriptors(&self) -> anyhow::Result<Descriptors> {
+        let boxes = self
+            .standing
+            .boxes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the box inventory is unavailable"))?;
+        anyhow::ensure!(
+            u32::try_from(boxes.len())? == *self.running.borrow(),
+            "a box has no standing record for handover"
+        );
+        boxes
+            .iter()
+            .map(|(index, box_)| {
+                let tap = u8::try_from(*index)?;
+                let descriptors = box_
+                    .descriptors
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("box {tap} has no saved descriptors for handover"))?;
+                Ok((tap, Arc::clone(descriptors)))
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 struct Standing {
     path: PathBuf,
-    boxes: Arc<std::sync::Mutex<BTreeMap<i32, RecordedBox>>>,
+    boxes: Arc<std::sync::Mutex<BTreeMap<i32, StandingBox>>>,
     idle_ends: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
 }
 
 impl Standing {
-    fn write(&self, change: impl FnOnce(&mut BTreeMap<i32, RecordedBox>)) -> Result<(), String> {
+    fn write(&self, change: impl FnOnce(&mut BTreeMap<i32, StandingBox>)) -> Result<(), String> {
         let mut boxes = self
             .boxes
             .lock()
@@ -456,7 +508,8 @@ impl Standing {
         change(&mut boxes);
         let idle_ends = self.idle_ends.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let written = Instant::now();
-        for RecordedBox { record, .. } in boxes.values_mut() {
+        for box_ in boxes.values_mut() {
+            let record = &mut box_.saved.record;
             if let (SupervisorHandoverBoxState::Warm(_), Some(end)) =
                 (&record.state, idle_ends.get(record.session_id.as_str()))
             {
@@ -465,7 +518,7 @@ impl Standing {
         }
         drop(idle_ends);
         let record = Inventory {
-            boxes: boxes.values().cloned().collect(),
+            boxes: boxes.values().map(|box_| box_.saved.clone()).collect(),
             handed_at: now(),
         };
         let text = serde_json::to_string(&record).map_err(|error| format!("encoding the running boxes: {error}"))?;
@@ -484,17 +537,17 @@ impl Standing {
     }
 
     fn put<M: Machine>(&self, live: &LiveBox<M>, turn_id: Option<&EntityId>) -> Result<(), String> {
-        let mut record = live.record(turn_id)?;
-        let observation = live.machine.observation(&live.guest)?;
+        let mut box_ = StandingBox::capture(live.record(turn_id)?, &live.machine, &live.guest)?;
         self.write(|boxes| {
+            let record = &mut box_.saved.record;
             if let Some(kept) = boxes
                 .remove(&record.tap_index)
-                .map(|kept| kept.record)
+                .map(|kept| kept.saved.record)
                 .filter(|kept| kept.session_id == record.session_id)
             {
                 record.queued = kept.queued;
             }
-            boxes.insert(record.tap_index, RecordedBox { record, observation });
+            boxes.insert(record.tap_index, box_);
         })
     }
 
@@ -504,7 +557,7 @@ impl Standing {
             .lock()
             .map_err(|_| "the record of running boxes was poisoned by a panic".to_string())?
             .values()
-            .map(|box_| &box_.record)
+            .map(|box_| &box_.saved.record)
             .filter(|record| record.session_id.as_str() == session)
             .all(|record| record.queued == queued);
         if unchanged {
@@ -513,7 +566,7 @@ impl Standing {
         self.write(|boxes| {
             for record in boxes
                 .values_mut()
-                .map(|box_| &mut box_.record)
+                .map(|box_| &mut box_.saved.record)
                 .filter(|record| record.session_id.as_str() == session)
             {
                 record.queued = queued.to_vec();
@@ -2439,6 +2492,13 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.runner.cancels.clone()
     }
 
+    pub(crate) fn handover_source(&self) -> HandoverSource {
+        HandoverSource {
+            standing: self.runner.standing.clone(),
+            running: self.boxes(),
+        }
+    }
+
     fn publish(&self) {
         let warm = self.slots.values().filter(|slot| slot.paused).count();
         self.warm.send_replace(u32::try_from(warm).unwrap_or(u32::MAX));
@@ -2835,8 +2895,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     }
                 }
             }
-            let observation = machine.observation(&guest).map_err(context)?;
-            standing.insert(record.tap_index, RecordedBox { record, observation });
+            let index = record.tap_index;
+            standing.insert(index, StandingBox::capture(record, &machine, &guest).map_err(context)?);
             prepared.push((handed, image, queue, (machine, guest, tap)));
         }
         let claimed: Vec<u8> = prepared.iter().map(|(_, _, _, (_, _, tap))| tap.index()).collect();

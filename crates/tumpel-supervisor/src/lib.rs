@@ -13,6 +13,7 @@ mod install;
 mod inventory;
 pub mod layers;
 mod lifecycle;
+mod local_handover;
 mod persona_files;
 mod pool;
 mod run;
@@ -37,6 +38,7 @@ pub use lifecycle::{
     Attached, BoxTurn, Budgets, Command, Guest, IdleGate, Input, Lifecycle, Machine, Settings, SnapshotOrder, Taken,
     Vmm,
 };
+pub use local_handover::{receive_handover, Transfer};
 pub use pool::{Disk, PoolExhausted, Size, Tap, TapPool};
 pub use run::{run, Failure, Stopped};
 pub use snapshot::{Entry, Ext4Upper, Kind, Manifest, Scan, Upper};

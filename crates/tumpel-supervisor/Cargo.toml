@@ -24,6 +24,7 @@ futures-util.workspace = true
 hostname.workspace = true
 libc.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
+rustix = { version = "1.1.6", features = ["net"] }
 ring.workspace = true
 semver.workspace = true
 serde.workspace = true

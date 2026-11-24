@@ -295,6 +295,7 @@ mod tests {
             &["--daemon", "--json"][..],
             &["--manifest"],
             &["--json", "run"],
+            &["--handover-from", "1"],
             &["run", "--update-binary", BINARY, "--handover"],
             &["--unknown"],
         ] {
@@ -325,6 +326,28 @@ mod tests {
         assert_eq!(parsed["checks"]["runtime"]["status"], "PASS");
         assert!(invalid_image.exists());
         assert!(image.exists());
+    }
+
+    #[test]
+    fn a_candidate_without_a_predecessor_exits_before_daemon_startup() {
+        let host = Host::new("no-predecessor", "http://127.0.0.1:9");
+        let parent = std::process::id().to_string();
+        let output = host
+            .command(&["--daemon", "--handover-from", &parent])
+            .output()
+            .expect("the candidate exits");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("connecting to the private supervisor handover endpoint")
+        );
+        assert!(!host.root.join("state/boxes.json").exists());
+        assert_eq!(
+            host.notify
+                .recv(&mut [0; 128])
+                .expect_err("no service notification")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[tokio::test]
