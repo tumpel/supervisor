@@ -194,6 +194,18 @@ pub(crate) async fn end_box<M: Machine>(
     cleared
 }
 
+#[derive(Default)]
+pub struct ScopeDisks {
+    pub identified: Vec<EntityId>,
+    pub possible: Vec<EntityId>,
+}
+
+impl ScopeDisks {
+    fn reserved(&self) -> impl Iterator<Item = &EntityId> {
+        self.identified.iter().chain(&self.possible)
+    }
+}
+
 pub trait Vmm: Send + Sync + 'static {
     type Machine: Machine;
     type Upper: crate::snapshot::Upper;
@@ -215,7 +227,7 @@ pub trait Vmm: Send + Sync + 'static {
     ) -> Result<bool, String>;
     fn disk(&self, drives: &[String]) -> Result<Disk, String>;
     fn unclaimed_scopes(&self, claimed: &[u8]) -> Result<Vec<u8>, String>;
-    fn unclaimed_reservations(&self, claimed: &[u8]) -> Result<BTreeMap<u8, Vec<EntityId>>, String>;
+    fn unclaimed_reservations(&self, claimed: &[u8]) -> Result<BTreeMap<u8, ScopeDisks>, String>;
     fn discard_incomplete_boot(&self, index: u8) -> impl Future<Output = Result<(), String>> + Send;
     fn discard_protected(
         &self,
@@ -2432,7 +2444,7 @@ pub struct Lifecycle<V: Vmm, S: Store> {
     session_protocol: Option<u16>,
     adopted: Vec<String>,
     protected_sessions: HashMap<String, Tap>,
-    unclaimed: BTreeMap<u8, Vec<EntityId>>,
+    unclaimed: BTreeMap<u8, ScopeDisks>,
 }
 
 impl<V: Vmm, S: Store> Drop for Lifecycle<V, S> {
@@ -2582,7 +2594,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 .keys()
                 .chain(self.protected_sessions.keys())
                 .map(|session| held_session(session))
-                .chain(self.unclaimed.values().flatten().cloned())
+                .chain(
+                    self.unclaimed
+                        .values()
+                        .flat_map(|disks| disks.identified.iter().cloned()),
+                )
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
@@ -3125,6 +3141,15 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 self.answer_lost(record.session_id.as_str(), queue);
             }
         }
+        for disks in self.unclaimed.values_mut() {
+            disks.possible.retain(|session| {
+                !claimed.iter().any(|index| {
+                    standing
+                        .get(&i32::from(*index))
+                        .is_some_and(|saved| &saved.saved.record.session_id == session)
+                })
+            });
+        }
         for &index in self.unclaimed.keys() {
             if !self.protected_sessions.values().any(|tap| tap.index() == index) {
                 self.pool.reserve_scope(index);
@@ -3140,7 +3165,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             let sessions = standing
                 .values()
                 .map(|box_| box_.saved.record.session_id.clone())
-                .chain(self.unclaimed.values().flatten().cloned())
+                .chain(self.unclaimed.values().flat_map(ScopeDisks::reserved).cloned())
                 .collect::<Vec<_>>();
             self.runner.vmm.remove_leftovers(&kept, &sessions)?;
         }
@@ -3405,7 +3430,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         if let Some(tap) = self.protected_sessions.get(session) {
             return Some(protected_detail(i32::from(tap.index())));
         }
-        self.unclaimed.values().flatten().any(|held| held.as_str() == session).then(|| {
+        self.unclaimed.values().flat_map(ScopeDisks::reserved).any(|held| held.as_str() == session).then(|| {
             "has a disk held for an unclaimed Firecracker scope; inspect the supervisor log before stopping that scope".to_string()
         })
     }
@@ -3730,7 +3755,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 .chain(self.setups.keys())
                 .chain(self.protected_sessions.keys())
                 .cloned()
-                .chain(self.unclaimed.values().flatten().map(ToString::to_string))
+                .chain(
+                    self.unclaimed
+                        .values()
+                        .flat_map(|disks| &disks.identified)
+                        .map(ToString::to_string),
+                )
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),

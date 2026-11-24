@@ -522,6 +522,7 @@ fn an_unclaimed_scope_keeps_its_open_box_disk_and_leaves_other_sessions_for_clea
     let held = super::scope_reservations(&root, &processes).expect("the scope's open disk");
     assert_eq!(
         held[&2]
+            .identified
             .iter()
             .map(tumpel_api::types::EntityId::as_str)
             .collect::<Vec<_>>(),
@@ -530,9 +531,10 @@ fn an_unclaimed_scope_keeps_its_open_box_disk_and_leaves_other_sessions_for_clea
     let ambiguous_scope = (3, vmm.data.join("gone-process"));
     let ambiguous =
         super::scope_reservations(&root, &[processes[0].clone(), ambiguous_scope]).expect("keep possible disks");
-    assert_eq!(ambiguous[&2], held[&2]);
+    assert_eq!(ambiguous[&2].identified, held[&2].identified);
     assert_eq!(
         ambiguous[&3]
+            .possible
             .iter()
             .map(tumpel_api::types::EntityId::as_str)
             .collect::<Vec<_>>(),
