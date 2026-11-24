@@ -95,9 +95,7 @@ struct Handed {
 }
 
 fn firecracker(name: &str) -> Firecracker {
-    let data = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/firecracker-tests")
-        .join(name);
+    let data = std::env::temp_dir().join(format!("tumpel-firecracker-{}-{name}", std::process::id()));
     if data.exists() {
         std::fs::remove_dir_all(&data).expect("clearing the last run");
     }
