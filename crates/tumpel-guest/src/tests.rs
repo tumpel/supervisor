@@ -49,9 +49,18 @@ fn a_length_over_the_limit_is_refused_before_the_body_arrives() {
 }
 
 #[test]
-fn a_body_that_is_no_guest_message_names_the_contract() {
+fn an_unknown_guest_message_keeps_its_value_and_leaves_the_next_message_readable() {
     let mut decoder = Decoder::default();
-    decoder.push(&encode(&json!({ "type": "Nonsense" })).expect("encodes"));
-    let error = decoder.take::<GuestMessage>().expect_err("refused");
-    assert!(error.to_string().contains("supervisor.tsp"), "{error}");
+    decoder.push(&encode(&json!({ "type": "FutureMessage", "extra": true })).expect("encodes"));
+    decoder.push(
+        &encode(&json!({ "type": "TurnLine", "turnId":"turn-1", "lineSeq":1, "text":"known", "extra": true }))
+            .expect("encodes"),
+    );
+    assert!(matches!(
+        decoder.take::<GuestMessage>().expect("unknown message"),
+        Some(GuestMessage::Unrecognised(_))
+    ));
+    assert!(
+        matches!(decoder.take::<GuestMessage>().expect("known message"), Some(GuestMessage::TurnLine(line)) if line.text.as_str() == "known")
+    );
 }

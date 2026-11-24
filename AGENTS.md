@@ -6,6 +6,7 @@ Always follow `rules/errors.md` and `rules/coding-standards.md`.
 - When writing or changing a test, follow `rules/tests.md`.
 - When committing or opening a pull request, follow `rules/commits-and-prs.md`.
 - When writing text a user reads, docs, an issue or a PR body, follow `rules/writing.md`.
+- When decoding control-plane messages or changing release handoffs, follow `rules/client-first.md`.
 - No comments in code.
 - The API types come from `tumpel-api`, pinned exactly. Change them in tumpel/protocol, release it, then bump the pin.
 - Consume a tumpel/protocol release candidate from crates.io, pinned exactly as `tumpel-api = "=X.Y.Z-rc.N"`, with the `@tumpel/schemas` tarball of the same release. Never use a git dependency: `npm run pins:check` refuses it.

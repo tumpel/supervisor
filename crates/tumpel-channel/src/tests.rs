@@ -1477,21 +1477,6 @@ fn snapshot_frames_saved_before_39_offer_38_until_the_control_plane_acks_them() 
 }
 
 #[test]
-fn a_turn_offer_with_an_image_this_supervisor_does_not_know_is_reported_and_left_unacked() {
-    let disk = Disk::default();
-    let mut channel = channel(&disk, &Recorder::default());
-    let mut wire = Wire::default();
-    open(&mut channel, &mut wire);
-    let mut frame: Value = serde_json::from_str(&offer(1, "grant-1")).expect("offer json");
-    frame["message"]["image"] = json!({"kind": "Teleported"});
-    let Ok(Event::Unrecognised(detail)) = channel.receive(&frame.to_string()) else {
-        panic!("an unknown image is reported");
-    };
-    assert!(detail.contains("frame 1"), "{detail}");
-    assert_eq!(channel.state().received.0, 0);
-}
-
-#[test]
 fn a_backlog_saved_by_an_older_supervisor_goes_out_on_37_with_each_line_its_own_frame_under_its_own_seq() {
     let saved: SupervisorChannelState = serde_json::from_value(json!({
         "received": 0,
@@ -1599,4 +1584,239 @@ fn an_ack_for_a_seq_this_host_never_sent_closes_the_channel_and_keeps_every_fram
     let Ok(Event::Message(_)) = channel.receive(&frame(1, 1, "snap-9")) else {
         panic!("the resent frame 1 is taken, not dropped as a duplicate");
     };
+}
+
+#[derive(Clone, Default)]
+struct UpdateLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::field::Visit for UpdateLogs {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0.lock().expect("logs").push(format!("{value:?}"));
+        }
+    }
+}
+
+impl tracing_subscriber::Layer<tracing_subscriber::Registry> for UpdateLogs {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _: tracing_subscriber::layer::Context<'_, tracing_subscriber::Registry>,
+    ) {
+        if event.metadata().target() == "tumpel::compatibility" {
+            event.record(&mut self.clone());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unfamiliar_envelopes_leave_the_handshake_and_known_notifications_working() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let logs = UpdateLogs::default();
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+    let mut channel = HostChannel::new(
+        empty_state(),
+        Disk::default(),
+        Recorder::default(),
+        "host-1".try_into().expect("host"),
+        "1".to_string(),
+    );
+    channel.connect();
+    assert!(matches!(
+        channel.receive(r#"{"type":"FutureChallenge","extra":true}"#),
+        Ok(Event::None)
+    ));
+    assert!(matches!(
+        channel.receive(r#"{"type":"Challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":true}"#),
+        Ok(Event::Challenged(_))
+    ));
+    channel
+        .hello(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            NonZeroU32::new(1).expect("capacity"),
+            Usage {
+                host: HostUsage {
+                    load_average: 0.0,
+                    memory_available_mib: 1,
+                    disk_budget_mib: 1,
+                    disk_held_mib: 0,
+                    memory_budget_mib: 1,
+                    memory_held_mib: 0,
+                },
+            },
+            Vec::new(),
+            &mut Wire::default(),
+        )
+        .expect("hello");
+    assert!(matches!(
+        channel.receive(r#"{"type":"FutureWelcome","extra":true}"#),
+        Ok(Event::None)
+    ));
+    assert!(matches!(
+        channel.receive(
+            &json!({"type":"Welcome","hostId":"host-1","protocolVersion":ChannelProtocol::VERSION,"extra":true})
+                .to_string()
+        ),
+        Ok(Event::Welcomed)
+    ));
+    for known in [
+        json!({"type":"Heartbeat","sentAt":"2026-11-23T12:00:00Z","extra":true}),
+        json!({"type":"ReleasePublished","releaseVersion":"1.0.0","extra":true}),
+        json!({"type":"Ack","seq":0,"extra":true}),
+        json!({"type":"FrameRefused","seq":0,"reason":"FutureFailureReason","extra":true}),
+        json!({"type":"FrameRateLimited","seq":1,"reason":"FuturePauseReason","framesPerMinute":60,"retryAfter":"2026-11-23T12:00:00Z","extra":true}),
+    ] {
+        let future = json!({"type":format!("Future{}", known["type"].as_str().expect("type")),"extra":true});
+        assert!(matches!(channel.receive(&future.to_string()), Ok(Event::None)));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let event = channel.receive(&known.to_string()).expect("known notification");
+        match known["type"].as_str().expect("type") {
+            "Heartbeat" => assert!(matches!(event, Event::Heartbeat)),
+            "ReleasePublished" => assert!(matches!(event, Event::ReleasePublished)),
+            "Ack" => assert!(matches!(event, Event::None)),
+            "FrameRefused" => {
+                assert!(matches!(event, Event::FrameRefused { reason, .. } if reason == "FutureFailureReason"));
+            }
+            "FrameRateLimited" => assert!(
+                matches!(event, Event::FrameRateLimited { reason, frames_per_minute:60, .. } if reason == "FuturePauseReason")
+            ),
+            _ => panic!("unexpected test notification"),
+        }
+        assert_eq!(channel.phase(), Phase::Open);
+    }
+    assert_eq!(*logs.0.lock().expect("logs"), vec![super::UPDATE_REQUIRED; 7]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unfamiliar_commands_advance_the_cursor_and_every_known_command_keeps_its_work() {
+    use tracing_subscriber::layer::SubscriberExt;
+    for known in [
+        json!({"type":"TurnWithdrawn","turnId":"turn-1"}),
+        json!({"type":"TurnClaimed","turnId":"turn-1"}),
+        json!({"type":"TurnCancel","turnId":"turn-1"}),
+        json!({"type":"SnapshotRequest","snapshotId":"snap-1","sessionId":"session-1","boxId":"box-1","turnId":"turn-1","snapshotSeq":1,"storageKey":"snapshots/snap-1","uploadUrl":"https://example.test/upload","uploadExpiresAt":"2026-11-23T12:00:00Z"}),
+        json!({"type":"SnapshotChunksHeld","snapshotId":"snap-1","part":1,"held":[]}),
+        json!({"type":"SnapshotPackUploads","snapshotId":"snap-1","part":1,"uploads":[],"uploadExpiresAt":"2026-11-23T12:00:00Z"}),
+        json!({"type":"RestoreDownloads","turnId":"turn-1","part":1,"packs":[],"downloadExpiresAt":"2026-11-23T12:00:00Z"}),
+        json!({"type":"BoxTeardown","sessionId":"session-1","boxId":"box-1"}),
+        json!({"type":"BoxDiscard","sessionId":"session-1","boxId":"box-1"}),
+        json!({"type":"ClaudeSetupBoxCode","claudeSetupId":"setup-1","boxId":"box-1","code":"code","mintBudgetSeconds":60}),
+        json!({"type":"ClaudeSetupBoxDiscard","claudeSetupId":"setup-1","boxId":"box-1"}),
+    ] {
+        let logs = UpdateLogs::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let disk = Disk::default();
+        let mut channel = HostChannel::new(
+            empty_state(),
+            disk.clone(),
+            Recorder::default(),
+            "host-1".try_into().expect("host"),
+            "1".to_string(),
+        );
+        channel.phase = Phase::Open;
+        let future = json!({"type":"Frame","seq":1,"ack":0,"extra":true,"message":{"type":format!("Future{}",known["type"].as_str().expect("type")),"extra":true}});
+        assert!(matches!(channel.receive(&future.to_string()), Ok(Event::None)));
+        assert_eq!(channel.state().received.0, 1);
+        assert_eq!(disk.0.borrow().as_ref().expect("persisted cursor").received.0, 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut extended = known.clone();
+        extended["extra"] = json!(true);
+        let frame = json!({"type":"Frame","seq":2,"ack":0,"extra":true,"message":extended});
+        let Event::Message(message) = channel.receive(&frame.to_string()).expect("known command") else {
+            panic!("known work is delivered");
+        };
+        assert_eq!(serde_json::to_value(message).expect("message"), known);
+        assert_eq!(channel.state().received.0, 2);
+        assert_eq!(disk.0.borrow().as_ref().expect("persisted cursor").received.0, 2);
+        assert_eq!(channel.phase(), Phase::Open);
+        assert_eq!(*logs.0.lock().expect("logs"), [super::UPDATE_REQUIRED]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unfamiliar_turn_values_are_acked_without_starting_them_and_known_offers_still_arrive() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let known = json!({
+        "type":"TurnOffer","turnId":"turn-1","sessionId":"session-1","boxId":"box-1",
+        "repository":"https://example.test/repo.git","harness":"ClaudeCode","harnessVersion":"1","model":"model","prompt":"hello",
+        "credential":{"credentialHandoverId":"grant-1","expiresAt":"2026-11-23T12:00:00Z","variables":[],"connectors":[]},
+        "lastLineSeq":0,"snapshots":[],"personaFiles":[],
+        "image":{"kind":"Full","imageDigest":"b".repeat(64),"kernelDigest":"c".repeat(64),"manifestDigest":"d".repeat(64),"imageUrl":"https://example.test/image","kernelUrl":"https://example.test/kernel","manifestUrl":"https://example.test/manifest","downloadExpiresAt":"2026-11-23T12:00:00Z","fetchSeconds":60},
+        "gitAuthorName":"Agent","gitAuthorEmail":"agent@example.test","boxRetention":"Auto","turnSeconds":60,"idleSeconds":60
+    });
+    for (field, future) in [
+        ("type", json!("FutureTurnOffer")),
+        ("harness", json!("FutureHarness")),
+        ("boxRetention", json!("FutureRetention")),
+        ("image", json!({"kind":"FutureImage"})),
+    ] {
+        let logs = UpdateLogs::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let mut channel = HostChannel::new(
+            empty_state(),
+            Disk::default(),
+            Recorder::default(),
+            "host-1".try_into().expect("host"),
+            "1".to_string(),
+        );
+        channel.phase = Phase::Open;
+        let mut unfamiliar = known.clone();
+        unfamiliar[field] = future;
+        unfamiliar["extra"] = json!(true);
+        assert!(matches!(
+            channel.receive(&json!({"type":"Frame","seq":1,"ack":0,"message":unfamiliar}).to_string()),
+            Ok(Event::None)
+        ));
+        assert_eq!(channel.state().received.0, 1);
+        assert_eq!(channel.offered, []);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut extended = known.clone();
+        extended["extra"] = json!(true);
+        assert!(
+            matches!(channel.receive(&json!({"type":"Frame","seq":2,"ack":0,"message":extended}).to_string()), Ok(Event::Message(message)) if matches!(*message, ChannelControlMessage::TurnOffer(_)))
+        );
+        assert_eq!(channel.offered.len(), 1);
+        assert_eq!(*logs.0.lock().expect("logs"), [super::UPDATE_REQUIRED]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unfamiliar_setup_values_leave_known_setup_work_available() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let known = json!({
+        "type":"ClaudeSetupBoxOffer","claudeSetupId":"setup-1","tenantId":"tenant-1","boxId":"box-1","harness":"ClaudeCode","harnessVersion":"1",
+        "urlSeconds":60,"codeSeconds":60,"expiresAt":"2026-11-23T12:00:00Z","tokenUrl":"https://example.test/token","tokenCredential":"c".repeat(43),
+        "image":{"kind":"Full","imageDigest":"b".repeat(64),"kernelDigest":"c".repeat(64),"manifestDigest":"d".repeat(64),"imageUrl":"https://example.test/image","kernelUrl":"https://example.test/kernel","manifestUrl":"https://example.test/manifest","downloadExpiresAt":"2026-11-23T12:00:00Z","fetchSeconds":60}
+    });
+    for (field, future) in [
+        ("type", json!("FutureSetupOffer")),
+        ("harness", json!("FutureHarness")),
+        ("image", json!({"kind":"FutureImage"})),
+    ] {
+        let logs = UpdateLogs::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let mut channel = HostChannel::new(
+            empty_state(),
+            Disk::default(),
+            Recorder::default(),
+            "host-1".try_into().expect("host"),
+            "1".to_string(),
+        );
+        channel.phase = Phase::Open;
+        let mut unfamiliar = known.clone();
+        unfamiliar[field] = future;
+        unfamiliar["extra"] = json!(true);
+        assert!(matches!(
+            channel.receive(&json!({"type":"Frame","seq":1,"ack":0,"message":unfamiliar}).to_string()),
+            Ok(Event::None)
+        ));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut extended = known.clone();
+        extended["extra"] = json!(true);
+        assert!(
+            matches!(channel.receive(&json!({"type":"Frame","seq":2,"ack":0,"message":extended}).to_string()), Ok(Event::Message(message)) if matches!(*message, ChannelControlMessage::ClaudeSetupBoxOffer(_)))
+        );
+        assert_eq!(channel.state().received.0, 2);
+        assert_eq!(*logs.0.lock().expect("logs"), [super::UPDATE_REQUIRED]);
+    }
 }

@@ -287,20 +287,15 @@ impl Command {
             .collect()
     }
 
-    fn from_record(
-        record: SupervisorHandoverCommand,
-        session_id: &EntityId,
-        box_id: &EntityId,
-    ) -> Result<Self, String> {
+    fn from_record(record: SupervisorHandoverCommand, session_id: &EntityId, box_id: &EntityId) -> Option<Self> {
         let order = || TeardownOrder {
             session_id: session_id.clone(),
             box_id: box_id.clone(),
         };
-        Ok(match record {
-            SupervisorHandoverCommand::Unrecognised(record) => {
-                return Err(format!(
-                    "the handover queues a command this supervisor does not know: {record}"
-                ))
+        Some(match record {
+            SupervisorHandoverCommand::Unrecognised(_) => {
+                tumpel_channel::update_required();
+                return None;
             }
             SupervisorHandoverCommand::Snapshot(snapshot) => Self::Snapshot(SnapshotOrder {
                 snapshot_id: snapshot.snapshot_id,
@@ -402,10 +397,9 @@ fn standing_record(handed: &SupervisorHandoverBox) -> Result<SupervisorHandoverB
     let turn_id = match &handed.state {
         SupervisorHandoverBoxState::Turn(turn) => Some(turn.turn_id.clone()),
         SupervisorHandoverBoxState::Warm(_) => None,
-        SupervisorHandoverBoxState::Unrecognised(state) => {
-            return Err(format!(
-                "the handover names a box state this supervisor does not know: {state}"
-            ))
+        SupervisorHandoverBoxState::Unrecognised(_) => {
+            tumpel_channel::update_required();
+            return Err(tumpel_channel::UPDATE_REQUIRED.to_string());
         }
     };
     Ok(SupervisorHandoverBox {
@@ -1786,6 +1780,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 return Followed::Ended(Err(self.silent(turn_id, cancelling, first)));
             };
             match received {
+                Ok(GuestMessage::Unrecognised(_)) => tumpel_channel::update_required(),
                 Err(error) => {
                     return Followed::Ended(Err(Failure::turn(
                         TurnFailureReason::HarnessExited,
@@ -1817,10 +1812,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     let Some(first_line_seq) = u64::try_from(output.line_seq.0).ok().and_then(NonZeroU64::new) else {
                         return Followed::Ended(Err(Failure::turn(
                             TurnFailureReason::HarnessExited,
-                            format!(
-                                "the guest sent line {} of turn {}, and line numbers start at 1.",
-                                output.line_seq.0, **turn_id
-                            ),
+                            format!("the guest sent line {}; line numbers start at 1", output.line_seq.0),
                         )));
                     };
                     emit(
@@ -2740,8 +2732,8 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 .queued
                 .iter()
                 .cloned()
-                .map(|record| Command::from_record(record, &handed.session_id, &handed.box_id))
-                .collect::<Result<VecDeque<_>, _>>()?;
+                .filter_map(|record| Command::from_record(record, &handed.session_id, &handed.box_id))
+                .collect();
             Ok((record, image, queue))
         });
         let attached = read.and_then(|read| self.attach(&handed).map(|attached| (attached, read)));
@@ -2782,7 +2774,11 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             idle: duration(handed.idle_milliseconds),
         });
         match (handed.state, taken) {
-            (SupervisorHandoverBoxState::Warm(_) | SupervisorHandoverBoxState::Unrecognised(_), _) => {
+            (SupervisorHandoverBoxState::Unrecognised(_), _) => {
+                tumpel_channel::update_required();
+                return None;
+            }
+            (SupervisorHandoverBoxState::Warm(_), _) => {
                 slot.paused = true;
                 slot.idle_end = Some(Instant::now() + duration(handed.idle_milliseconds));
                 self.runner.standing.idle_until(&session, slot.idle_end);

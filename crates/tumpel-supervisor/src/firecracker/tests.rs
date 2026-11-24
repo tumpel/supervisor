@@ -286,3 +286,62 @@ fn a_start_deletes_the_disk_of_a_box_it_did_not_take_over_and_keeps_the_one_it_d
     assert!(data.join("sessions/kept/overlay.ext4").exists());
     assert!(!data.join("sessions/lost").exists());
 }
+
+#[tokio::test(start_paused = true)]
+async fn every_guest_family_survives_unknown_variants_and_extra_fields() {
+    use tokio::io::AsyncWriteExt;
+    use tracing_subscriber::layer::SubscriberExt;
+    for known in [
+        json!({"type":"GuestHello","protocolVersion":13,"harness":"Shell","harnessVersion":"1","lastLineSeq":0}),
+        json!({"type":"TurnRepositoryReady","turnId":"turn-1"}),
+        json!({"type":"TurnLine","turnId":"turn-1","lineSeq":1,"text":"known work"}),
+        json!({"type":"TurnRepositoryCloneFailed","turnId":"turn-1","cause":"Other","detail":"clone failed"}),
+        json!({"type":"TurnEnd","turnId":"turn-1","reason":"Completed","detail":"done","lastLineSeq":1}),
+        json!({"type":"ClaudeSetupUrl","claudeSetupId":"setup-1","signInUrl":"https://example.test/login"}),
+        json!({"type":"ClaudeSetupStored","claudeSetupId":"setup-1"}),
+        json!({"type":"ClaudeSetupFailed","claudeSetupId":"setup-1","reason":"UrlNotPrinted","detail":"no URL"}),
+    ] {
+        let logs = crate::test_logs::UpdateLogs::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let (mut producer, stream) = tokio::net::UnixStream::pair().expect("guest socket");
+        let mut guest = super::VsockGuest {
+            stream,
+            decoder: tumpel_guest::Decoder::default(),
+        };
+        let unknown = json!({"type":format!("Future{}",known["type"].as_str().expect("type")),"extra":true});
+        producer
+            .write_all(&encode(&unknown).expect("unknown frame"))
+            .await
+            .expect("send unknown");
+        let field = if known.get("reason").is_some() {
+            Some("reason")
+        } else if known.get("cause").is_some() {
+            Some("cause")
+        } else {
+            None
+        };
+        if let Some(field) = field {
+            let mut unknown_reason = known.clone();
+            unknown_reason[field] = json!("FutureFailureReason");
+            producer
+                .write_all(&encode(&unknown_reason).expect("future reason"))
+                .await
+                .expect("send reason");
+        }
+        if field.is_some() {
+            let message = guest.read_message().await.expect("known family with a future reason");
+            let value = serde_json::to_value(message).expect("message");
+            assert_eq!(value[field.expect("reason field")], json!("FutureFailureReason"));
+        }
+        let mut extended = known.clone();
+        extended["extra"] = json!(true);
+        producer
+            .write_all(&encode(&extended).expect("known frame"))
+            .await
+            .expect("send known");
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let message = guest.read_message().await.expect("known work continues");
+        assert_eq!(serde_json::to_value(message).expect("message"), known);
+        assert_eq!(*logs.0.lock().expect("logs"), vec![tumpel_channel::UPDATE_REQUIRED]);
+    }
+}

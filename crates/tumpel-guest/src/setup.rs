@@ -196,8 +196,10 @@ fn await_code(stream: &mut File, decoder: &mut Decoder) -> Result<Option<GuestCl
     let mut buffer = vec![0u8; 16 * 1024];
     loop {
         if let Some(input) = decoder.take::<GuestInput>().map_err(|error| error.to_string())? {
-            if let GuestInput::ClaudeSetupCode(code) = input {
-                return Ok(Some(code));
+            match input {
+                GuestInput::ClaudeSetupCode(code) => return Ok(Some(code)),
+                GuestInput::Unrecognised(_) => tumpel_guest::update_required(),
+                _ => {}
             }
             continue;
         }

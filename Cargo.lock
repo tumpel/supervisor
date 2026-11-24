@@ -1840,6 +1840,9 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "tumpel-api",
 ]
 

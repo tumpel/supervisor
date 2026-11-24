@@ -57,6 +57,10 @@ const RESTART_INTO_UPDATE: u8 = 75;
 
 fn exit_code(failure: &SupervisorFailure) -> ExitCode {
     match failure {
+        SupervisorFailure::Unrecognised(_) => {
+            eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
+            ExitCode::FAILURE
+        }
         SupervisorFailure::NotEnrolled => ExitCode::from(3),
         SupervisorFailure::ChannelStateLost => ExitCode::from(4),
         SupervisorFailure::HostRevoked => ExitCode::from(5),
@@ -64,7 +68,6 @@ fn exit_code(failure: &SupervisorFailure) -> ExitCode {
         SupervisorFailure::UsageUnreadable => ExitCode::from(7),
         SupervisorFailure::GuestDriveUnwritable => ExitCode::from(8),
         SupervisorFailure::UpdateNotOnline => ExitCode::from(10),
-        SupervisorFailure::Unrecognised(_) => ExitCode::FAILURE,
     }
 }
 

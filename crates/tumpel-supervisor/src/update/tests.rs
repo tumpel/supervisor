@@ -556,13 +556,16 @@ async fn a_release_notice_to_a_busy_host_updates_once_its_turns_finish_inside_th
 }
 
 #[test]
-fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
+fn a_release_manifest_with_unknown_architectures_and_extra_fields_keeps_the_known_release() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let logs = crate::test_logs::UpdateLogs::default();
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
     let body = br#"{
         "releaseVersion": "v1.4.0",
         "channelProtocolVersion": 20,
         "supervisors": [
             {
-                "architecture": "Arm64",
+                "architecture": "FutureArchitecture",
                 "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
                 "supervisorVersion": "0.4.0",
                 "signature": "a field a newer control plane adds"
@@ -604,6 +607,7 @@ fn a_release_manifest_with_fields_this_supervisor_does_not_know_is_read() {
     )
     .expect("the manifest of a rollback");
     assert!(release.rollback);
+    assert_eq!(*logs.0.lock().expect("logs"), [tumpel_channel::UPDATE_REQUIRED; 2]);
 }
 
 #[tokio::test]

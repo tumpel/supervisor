@@ -41,3 +41,6 @@ pub use snapshot::{Entry, Ext4Upper, Kind, Manifest, Scan, Upper};
 pub use store::{HttpStore, Store, UploadError};
 pub use telemetry::{install as install_telemetry, Telemetry};
 pub use update::on_trial;
+
+#[cfg(test)]
+mod test_logs;

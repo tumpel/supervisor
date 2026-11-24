@@ -223,6 +223,13 @@ fn announced_release(body: &[u8], url: &str, architecture: &HostArchitecture) ->
     let manifest: AnnouncedRelease = serde_json::from_slice(body).map_err(|error| {
         format!("{url} is no ReleaseManifest: {error}; check that the stage has published a release")
     })?;
+    if manifest
+        .supervisors
+        .iter()
+        .any(|supervisor| matches!(supervisor.architecture, HostArchitecture::Unrecognised(_)))
+    {
+        tumpel_channel::update_required();
+    }
     let supervisor = manifest
         .supervisors
         .into_iter()

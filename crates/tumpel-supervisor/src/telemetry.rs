@@ -408,6 +408,10 @@ pub fn guest_metrics(metrics: &[GuestMetric]) {
             return;
         };
         for metric in metrics {
+            if matches!(metric.kind, MetricKind::Unrecognised(_)) {
+                tumpel_channel::update_required();
+                continue;
+            }
             let Some(instrument) = declared(metric) else {
                 continue;
             };
@@ -479,6 +483,10 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        if event.metadata().target() == "tumpel::compatibility" {
+            eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
+            return;
+        }
         if event.metadata().target() != TARGET {
             return;
         }

@@ -130,6 +130,7 @@ fn connection(mut stream: File, guest: &Mutex<GuestState>) -> Result<(), String>
     loop {
         while let Some(input) = decoder.take::<GuestInput>().map_err(|error| error.to_string())? {
             match input {
+                GuestInput::Unrecognised(_) => tumpel_guest::update_required(),
                 GuestInput::TurnStart(start) => {
                     let mut guest = guest.lock().map_err(|_| "the box state was poisoned by a panic")?;
                     guest.run(&start, &mut stream)?;
@@ -142,11 +143,6 @@ fn connection(mut stream: File, guest: &Mutex<GuestState>) -> Result<(), String>
                     setup::run(&start, &config, &confinement, &mut stream, &mut decoder)?;
                 }
                 GuestInput::ClaudeSetupCode(_) | GuestInput::TurnCancel(_) => {}
-                GuestInput::Unrecognised(input) => {
-                    return Err(format!(
-                        "the host sent {input}, which this guest does not speak; update the guest image"
-                    ))
-                }
             }
         }
         let read = stream

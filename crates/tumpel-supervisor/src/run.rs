@@ -519,7 +519,11 @@ fn handed_turns(handover: &SupervisorHandover) -> Vec<EntityId> {
         .iter()
         .filter_map(|handed| match &handed.state {
             SupervisorHandoverBoxState::Turn(turn) => Some(turn.turn_id.clone()),
-            SupervisorHandoverBoxState::Warm(_) | SupervisorHandoverBoxState::Unrecognised(_) => None,
+            SupervisorHandoverBoxState::Warm(_) => None,
+            SupervisorHandoverBoxState::Unrecognised(_) => {
+                tumpel_channel::update_required();
+                None
+            }
         })
         .collect()
 }
@@ -993,12 +997,11 @@ fn closed_by_peer(frame: Option<&CloseFrame>, progressed: bool) -> Result<Ended,
     }
 }
 
-fn box_command(message: ChannelControlMessage) -> Result<BoxCommand, String> {
-    Ok(match message {
-        ChannelControlMessage::Unrecognised(message) => {
-            return Err(format!(
-                "the control plane sent {message}, which this supervisor does not know"
-            ))
+fn box_command(message: ChannelControlMessage) -> Result<Option<BoxCommand>, String> {
+    Ok(Some(match message {
+        ChannelControlMessage::Unrecognised(_) => {
+            tumpel_channel::update_required();
+            return Ok(None);
         }
         ChannelControlMessage::TurnOffer(offer) => turn(offer)?,
         ChannelControlMessage::SnapshotRequest(request) => BoxCommand::Snapshot(request),
@@ -1019,7 +1022,7 @@ fn box_command(message: ChannelControlMessage) -> Result<BoxCommand, String> {
         ChannelControlMessage::ClaudeSetupBoxDiscard(discard) => BoxCommand::Setup(SetupCommand::Discard {
             claude_setup_id: discard.claude_setup_id,
         }),
-    })
+    }))
 }
 
 fn accepted(channel: &mut Channel, commands: &UnboundedSender<BoxCommand>) -> Result<(), Failure> {
@@ -1100,10 +1103,10 @@ async fn session(
                                 }
                             }
                             Ok(Event::Message(message)) => match box_command(*message) {
-                                Ok(command) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
+                                Ok(Some(command)) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
+                                Ok(None) => None,
                                 Err(error) => Some(Err(fail(SupervisorFailure::ProtocolError, error))),
                             },
-                            Ok(Event::Unrecognised(detail)) => Some(Err(fail(SupervisorFailure::ProtocolError, detail))),
                             Ok(Event::FrameRefused { seq, reason }) => {
                                 eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
                                 None

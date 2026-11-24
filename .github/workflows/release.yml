@@ -55,6 +55,7 @@ jobs:
     if: needs.plan.outputs.version != ''
     permissions:
       contents: write
+      actions: read
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -101,3 +102,11 @@ jobs:
             true) gh release upload "$TAG" .tmp/release/* --clobber && gh release edit "$TAG" --draft=false --prerelease --latest=false ;;
             *) echo "release: $TAG is already published; its binaries stay as they are" >&2; exit 1 ;;
           esac
+
+      - id: dispatch-deploy
+        name: Dispatch component-released to deploy
+        continue-on-error: true
+        env:
+          DEPLOY_DISPATCH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: node npm-scripts/release.mjs dispatch-deploy

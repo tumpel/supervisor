@@ -89,10 +89,13 @@ pub fn arguments(protocol: &GuestHarnessProtocol, connectors: &[ChannelDispatchC
             .iter()
             .flat_map(|(key, url)| ["-c".to_string(), format!("mcp_servers.{key}.url={}", json!(url))])
             .collect(),
-        GuestHarnessProtocol::PiRpc
-        | GuestHarnessProtocol::PromptOnStdin
-        | GuestHarnessProtocol::ShellLines
-        | GuestHarnessProtocol::Unrecognised(_) => Vec::new(),
+        GuestHarnessProtocol::PiRpc | GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::ShellLines => {
+            Vec::new()
+        }
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_guest::update_required();
+            Vec::new()
+        }
     }
 }
 
@@ -219,7 +222,11 @@ fn harness_configs(protocol: &GuestHarnessProtocol) -> &'static [&'static str] {
         GuestHarnessProtocol::CodexExecJson => &[".codex/config.toml"],
         GuestHarnessProtocol::PromptOnStdin => &[".config/opencode/opencode.json", ".config/opencode/opencode.jsonc"],
         GuestHarnessProtocol::PiRpc => &[PI_CONFIG],
-        GuestHarnessProtocol::ShellLines | GuestHarnessProtocol::Unrecognised(_) => &[],
+        GuestHarnessProtocol::ShellLines => &[],
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_guest::update_required();
+            &[]
+        }
     }
 }
 

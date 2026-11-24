@@ -73,6 +73,10 @@ impl VsockGuest {
         let mut buffer = vec![0u8; 64 * 1024];
         loop {
             if let Some(message) = self.decoder.take::<GuestMessage>().map_err(|error| error.to_string())? {
+                if matches!(message, GuestMessage::Unrecognised(_)) {
+                    tumpel_channel::update_required();
+                    continue;
+                }
                 return Ok(message);
             }
             let read = self

@@ -100,6 +100,7 @@ impl HostWatch {
                         Ok(Some(GuestInput::TurnCancel(cancel))) if cancel.turn_id == turn_id => {
                             let _ = sender.send(Output::Cancelled(turn));
                         }
+                        Ok(Some(GuestInput::Unrecognised(_))) => tumpel_guest::update_required(),
                         Ok(Some(_)) => {}
                         Err(error) => {
                             let _ = sender.send(Output::HostGone(turn, format!("the host sent {error}")));
@@ -479,10 +480,9 @@ fn turn_arguments(
     let model = start.model.to_string();
     let connectors = connectors::arguments(protocol, &start.credential.connectors);
     Ok(match protocol {
-        GuestHarnessProtocol::Unrecognised(name) => {
-            return Err(format!(
-                "this guest speaks no harness protocol {name}; publish images built for this supervisor"
-            ))
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_guest::update_required();
+            return Err(tumpel_guest::UPDATE_REQUIRED.to_string());
         }
         GuestHarnessProtocol::ShellLines => Vec::new(),
         GuestHarnessProtocol::CodexExecJson => {
@@ -526,14 +526,16 @@ fn skips(protocol: &GuestHarnessProtocol, line: &str) -> bool {
         return false;
     };
     match protocol {
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_guest::update_required();
+            false
+        }
         GuestHarnessProtocol::PiRpc => {
             record_type(&value).is_some_and(|kind| PI_DELTAS.contains(&kind)) || pi_retry_off(&value)
         }
         GuestHarnessProtocol::ClaudeStreamJson => claude_thinking_tokens(&value),
         GuestHarnessProtocol::CodexExecJson => record_type(&value) == Some("item.updated"),
-        GuestHarnessProtocol::ShellLines
-        | GuestHarnessProtocol::PromptOnStdin
-        | GuestHarnessProtocol::Unrecognised(_) => false,
+        GuestHarnessProtocol::ShellLines | GuestHarnessProtocol::PromptOnStdin => false,
     }
 }
 
@@ -1089,13 +1091,15 @@ impl GuestState {
 
 fn prompt_input(protocol: &GuestHarnessProtocol, setup: bool, prompt: &str, marker: &str) -> String {
     match protocol {
+        GuestHarnessProtocol::Unrecognised(_) => {
+            tumpel_guest::update_required();
+            String::new()
+        }
         _ if setup => String::new(),
         GuestHarnessProtocol::ClaudeStreamJson => format!("{}\n", user_message(prompt)),
         GuestHarnessProtocol::PiRpc => pi_prompt(prompt),
         GuestHarnessProtocol::ShellLines => format!("{prompt}\nprintf '%s\\n' '{marker}'\n"),
-        GuestHarnessProtocol::PromptOnStdin
-        | GuestHarnessProtocol::CodexExecJson
-        | GuestHarnessProtocol::Unrecognised(_) => prompt.to_string(),
+        GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::CodexExecJson => prompt.to_string(),
     }
 }
 

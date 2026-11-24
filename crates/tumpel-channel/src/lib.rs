@@ -8,11 +8,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tumpel_api::frozen::{v37, v38};
 use tumpel_api::types::{
-    ChannelBootImage, ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited,
-    ChannelFrameRefused, ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType,
-    ChannelHostMessage, ChannelProtocol, ChannelSnapshotFailed, ChannelStoredHostFrame, ChannelStoredHostFrameType,
-    ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch,
-    Sequence, SupervisorChannelState,
+    ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
+    ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType, ChannelHostMessage,
+    ChannelProtocol, ChannelSnapshotFailed, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLines,
+    ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch, Sequence,
+    SupervisorChannelState,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
@@ -24,6 +24,17 @@ pub const PACK_REUSE: u16 = 39;
 pub const TURN_LINES_MAX_LINES: usize = 200;
 pub const TURN_LINES_MAX_BYTES: usize = 256_000;
 pub const TURN_LINES_WAIT: Duration = Duration::from_secs(2);
+
+pub const UPDATE_REQUIRED: &str =
+    "the control plane sent something this supervisor doesn't recognise; update the supervisor";
+
+pub fn update_required() {
+    if tracing::dispatcher::has_been_set() {
+        tracing::warn!(target: "tumpel::compatibility", "{UPDATE_REQUIRED}");
+        return;
+    }
+    eprintln!("{UPDATE_REQUIRED}");
+}
 
 const HELLO_CONTEXT: &[u8] = b"tumpel-channel-hello-v1";
 
@@ -175,18 +186,20 @@ fn mismatched(message: &Value, built: u16, session: u16) -> Result<Value, Channe
     serde_json::to_value(&failed).map_err(|error| protocol(format!("encoding a SnapshotFailed: {error}")))
 }
 
-fn unrecognised(message: &ChannelControlMessage) -> Option<String> {
+fn understood(message: &ChannelControlMessage) -> bool {
+    use tumpel_api::types::{BoxRetention, ChannelBootImage, ClaudeSetupHarness, Harness};
     match message {
-        ChannelControlMessage::Unrecognised(message) => Some(format!("message {message}")),
-        ChannelControlMessage::TurnOffer(offer) => match &offer.image {
-            ChannelBootImage::Unrecognised(image) => Some(format!("image {image}")),
-            _ => None,
-        },
-        ChannelControlMessage::ClaudeSetupBoxOffer(offer) => match &offer.image {
-            ChannelBootImage::Unrecognised(image) => Some(format!("image {image}")),
-            _ => None,
-        },
-        _ => None,
+        ChannelControlMessage::Unrecognised(_) => false,
+        ChannelControlMessage::TurnOffer(offer) => {
+            !matches!(offer.harness, Harness::Unrecognised(_))
+                && !matches!(offer.box_retention, BoxRetention::Unrecognised(_))
+                && !matches!(offer.image, ChannelBootImage::Unrecognised(_))
+        }
+        ChannelControlMessage::ClaudeSetupBoxOffer(offer) => {
+            !matches!(offer.harness, Some(ClaudeSetupHarness::Unrecognised(_)))
+                && !matches!(offer.image, ChannelBootImage::Unrecognised(_))
+        }
+        _ => true,
     }
 }
 
@@ -364,7 +377,6 @@ pub enum Event {
         retry_after: DateTime<Utc>,
     },
     Message(Box<ChannelControlMessage>),
-    Unrecognised(String),
 }
 
 pub struct HostChannel<S: Store, K: Signer> {
@@ -735,6 +747,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     fn handle(&mut self, envelope: ChannelControlEnvelope) -> Result<Event, ChannelError> {
         match (self.phase, envelope) {
+            (_, ChannelControlEnvelope::Unrecognised(_)) => {
+                update_required();
+                Ok(Event::None)
+            }
             (Phase::AwaitingChallenge, ChannelControlEnvelope::Challenge(challenge)) => {
                 self.phase = Phase::AwaitingHello;
                 Ok(Event::Challenged(challenge.nonce.to_string()))
@@ -841,16 +857,14 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                 frame.seq.0
             )));
         }
-        if let Some(unknown) = unrecognised(&frame.message) {
-            return Ok(Event::Unrecognised(format!(
-                "frame {} carries {unknown}, which this supervisor does not know; update the supervisor",
-                frame.seq.0
-            )));
-        }
         self.drop_acked(frame.ack.0)?;
         self.state.received = Sequence(frame.seq.0);
         self.progressed = true;
         self.store.save(&self.state)?;
+        if !understood(&frame.message) {
+            update_required();
+            return Ok(Event::None);
+        }
         match &frame.message {
             ChannelControlMessage::TurnOffer(offer) if !self.offered.contains(&offer.turn_id) => {
                 self.offered.push(offer.turn_id.clone());
