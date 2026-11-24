@@ -413,8 +413,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_record_with_wrong_socket_paths_fails_the_attachment_check() {
+    #[tokio::test]
+    async fn the_report_and_daemon_reject_the_same_wrong_socket_paths() {
         let host = Host::new("attachment", "http://127.0.0.1:9");
         let image = json!({
             "imageDigest": "a".repeat(64),
@@ -461,5 +461,52 @@ mod tests {
             .as_str()
             .expect("attachment reason")
             .contains("unexpected socket paths"));
+        let inventory = host.root.join("state/boxes.json");
+        let saved = fs::read(&inventory).expect("box inventory");
+        let mut daemon = tokio::process::Command::from(host.command(&["--daemon"]));
+        let failed = timeout(Duration::from_secs(5), daemon.kill_on_drop(true).output())
+            .await
+            .expect("attachment fails before daemon startup")
+            .expect("the daemon exits");
+        assert_eq!(failed.status.code(), Some(3), "{failed:?}");
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("unexpected socket paths"));
+        assert_eq!(fs::read(inventory).expect("the saved record is still present"), saved);
+    }
+
+    #[tokio::test]
+    async fn startup_keeps_unclaimed_scopes_and_their_files() {
+        let host = Host::new("unclaimed", "http://127.0.0.1:9");
+        let systemctl = host.root.join("systemctl");
+        fs::write(
+            &systemctl,
+            "#!/bin/sh\n[ \"$2\" = list-units ] || exit 99\nprintf '%s\n' 'tumpel-box0.scope loaded active running'\n",
+        )
+        .expect("the fake user manager only lists a running scope");
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).expect("executable service operation");
+        let box_dir = host.root.join("data/box0");
+        let session = host.root.join("data/sessions/unclaimed");
+        fs::create_dir(&box_dir).expect("box directory");
+        fs::create_dir_all(&session).expect("session directory");
+        let api_path = box_dir.join("api.sock");
+        let _api = std::os::unix::net::UnixListener::bind(&api_path).expect("the box API socket");
+        let overlay = session.join("overlay.ext4");
+        fs::write(&overlay, b"unclaimed overlay").expect("overlay");
+        let mut daemon = tokio::process::Command::from(host.command(&["--daemon"]));
+        let result = timeout(Duration::from_secs(5), daemon.kill_on_drop(true).output())
+            .await
+            .expect("startup finishes")
+            .expect("daemon exit");
+        assert_eq!(result.status.code(), Some(3), "{result:?}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("running box scopes outside the inventory"));
+        assert_eq!(
+            fs::read(overlay).expect("the box keeps its overlay"),
+            b"unclaimed overlay"
+        );
+        assert!(api_path.exists());
+        assert!(!host.root.join("state/boxes.json").exists());
+        assert_eq!(
+            host.notify.recv(&mut [0; 64]).expect_err("no readiness").kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 }

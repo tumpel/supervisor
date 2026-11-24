@@ -1,9 +1,7 @@
 use std::num::NonZeroU32;
-use std::os::fd::{IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-use tumpel_api::types::SupervisorHandoverMachine;
 
 use super::{Firecracker, Process};
 use crate::lifecycle::Vmm;
@@ -86,29 +84,16 @@ async fn exec_handed_supervisor() {
         .expect("the box an old release started as its child");
     let stdout = OwnedFd::from(child.stdout.take().expect("its standard output"));
     let stderr = OwnedFd::from(child.stderr.take().expect("its standard error"));
-    let handed = SupervisorHandoverMachine {
-        api_socket: data
-            .join("box63")
-            .join("api.sock")
-            .display()
-            .to_string()
-            .try_into()
-            .expect("a path"),
-        console_tail: String::new().try_into().expect("an empty tail"),
-        guest_buffer: String::new().try_into().expect("an empty buffer"),
-        guest_fd: guest.into_raw_fd(),
-        process_id: NonZeroU32::new(child.id()).expect("a pid"),
-        stderr_fd: stderr.into_raw_fd(),
-        stdout_fd: stdout.into_raw_fd(),
-        vsock: data
-            .join("box63")
-            .join("v.sock")
-            .display()
-            .to_string()
-            .try_into()
-            .expect("a path"),
-    };
     unsafe { fd_store::take_notify_socket(true) }.expect("the user manager's notify socket");
+    super::move_into_scope(i32::try_from(child.id()).expect("box PID"), "tumpel-box63.scope")
+        .expect("the old process runs in its box scope");
+    for (role, fd) in [
+        (fd_store::GUEST, guest.as_fd()),
+        (fd_store::STDOUT, stdout.as_fd()),
+        (fd_store::STDERR, stderr.as_fd()),
+    ] {
+        fd_store::keep(63, role, fd).expect("systemd keeps the box's descriptor");
+    }
     let layout = Layout::new(data.join("tumpel-supervisor"), data.clone(), unit_path());
     if let Err(failure) = run::refresh_unit(&layout, "the restart test fails").await {
         panic!("{}: {}", failure.kind, failure.detail);
@@ -124,11 +109,6 @@ async fn exec_handed_supervisor() {
         disk_mib: NonZeroU32::new(64).expect("64"),
     };
     let mut pool = TapPool::new(1024, mib);
-    let old_tap = pool.claim_device(63, mib).expect("tap 63");
-    let old_session = "restart-test-old".try_into().expect("session id");
-    let _old = vmm
-        .reattach(&old_session, &old_tap, &handed)
-        .expect("the supervisor takes the old box over");
     let new_tap = pool.claim_device(62, mib).expect("tap 62");
     let new_session = "restart-test-new".try_into().expect("session id");
     let mut new = vmm.machine(&new_session, &new_tap).expect("a new box");

@@ -348,8 +348,8 @@ async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_i
 
     std::env::set_var("NOTIFY_SOCKET", data.join("notify.sock"));
     unsafe { take_notify_socket(false) }.expect("the stand-in notify socket");
-    let mut descriptors = stored(&systemd);
-    let record = restored_descriptors(record, &mut descriptors);
+    let descriptors = stored(&systemd);
+    let record = restored_descriptors(record, &descriptors);
     let (runtime, settings) = crash_runtime(&data, &manifest_path);
     let (out, mut received) = unbounded_channel();
     let mut taker = Lifecycle::new(
@@ -363,6 +363,7 @@ async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_i
     taker
         .start(Some((record, Taken::Crashed)))
         .expect("the next supervisor takes the box over");
+    drop(descriptors);
     let failed = received.recv().await.expect("the cut turn is reported");
     assert!(
         matches!(&failed, Outgoing::Message(ChannelHostMessage::TurnFailed(failed)) if *failed.turn_id == "turn-1"),

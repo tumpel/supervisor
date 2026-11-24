@@ -122,10 +122,7 @@ fn read_inventory(layout: &Layout) -> Result<Vec<RecordedBox>, String> {
                 .iter_mut()
                 .find(|saved| saved.record.tap_index == box_.record.tap_index)
             {
-                if standing_box.record.session_id != box_.record.session_id
-                    || standing_box.record.machine.process_id != box_.record.machine.process_id
-                    || standing_box.record.box_id != box_.record.box_id
-                {
+                if !standing_box.same_machine(&box_) {
                     return Err(
                         "boxes.json and handover.json disagree about the box on a TAP device; inspect both records"
                             .to_string(),

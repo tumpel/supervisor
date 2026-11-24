@@ -32,6 +32,7 @@ use crate::exchange::{Answer, Answers, Cancels};
 use crate::fd_store;
 use crate::firecracker::Firecracker;
 use crate::guest_drive;
+use crate::inventory::{self, RestoredInventory};
 use crate::lifecycle::{
     turn_failed, Abandoned, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder,
     Taken, TeardownOrder,
@@ -408,8 +409,8 @@ fn start_boxes(
     received: UnboundedReceiver<BoxCommand>,
     out: UnboundedSender<Outgoing>,
     telemetry: Telemetry,
-    taken: Option<(SupervisorHandover, Taken)>,
-    standing: PathBuf,
+    taken: Option<RestoredInventory>,
+    layout: &Layout,
 ) -> Result<(Usage, IdleGate, BoxRunner), Failure> {
     let unreadable = |error: anyhow::Error| fail(SupervisorFailure::UsageUnreadable, format!("{error:#}"));
     usage::prepare_data_dir(Path::new(&*runtime.data_dir)).map_err(unreadable)?;
@@ -420,10 +421,14 @@ fn start_boxes(
         layer_cache_mib: runtime.layer_cache_mib,
     };
     let box_capacity = pool.capacity();
-    let mut lifecycle = Lifecycle::new(Firecracker::new(runtime), store, settings, pool, out, standing);
+    let mut lifecycle = Lifecycle::new(Firecracker::new(runtime), store, settings, pool, out, layout.boxes());
+    let recorded = taken.is_some();
     lifecycle
-        .start(taken)
+        .start_inventory(taken)
         .map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
+    if recorded {
+        update::forget_handover(layout).map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
+    }
     let usage = Usage {
         box_capacity,
         warm: lifecycle.warm(),
@@ -534,73 +539,6 @@ fn handed_turns(handover: &SupervisorHandover) -> Vec<EntityId> {
             }
         })
         .collect()
-}
-
-fn named_turns(text: &str) -> Vec<EntityId> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Vec::new();
-    };
-    value["boxes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|handed| handed["state"]["turnId"].as_str())
-        .filter_map(|turn_id| EntityId::try_from(turn_id.to_string()).ok())
-        .collect()
-}
-
-fn handover_lost(layout: &Layout, out: &UnboundedSender<Outgoing>, cause: &str, turns: &[EntityId]) {
-    eprintln!(
-        "tumpel-supervisor: HandoverLost: {cause}; this supervisor fails the {} turns it names and starts without the handed boxes",
-        turns.len()
-    );
-    for turn_id in turns {
-        turn_failed(
-            out,
-            turn_id,
-            TurnFailureReason::HarnessExited,
-            format!(
-                "the handover of the box of turn {} to this supervisor binary was lost: {cause}; send the turn again",
-                **turn_id
-            ),
-        );
-    }
-    if let Err(error) = update::forget_handover(layout) {
-        eprintln!("tumpel-supervisor: {error}; delete it by hand");
-    }
-}
-
-fn read_handover(layout: &Layout, out: &UnboundedSender<Outgoing>, handed: bool) -> Option<SupervisorHandover> {
-    let path = layout.handover();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) => {
-            handover_lost(layout, out, &format!("reading {} failed: {error}", path.display()), &[]);
-            return None;
-        }
-    };
-    match serde_json::from_str::<crate::inventory::Inventory>(&text).map(SupervisorHandover::from) {
-        Ok(handover) if handed => Some(handover),
-        Ok(handover) => {
-            handover_lost(
-                layout,
-                out,
-                "this supervisor started without the boxes' descriptors, so it cannot reach the boxes",
-                &handed_turns(&handover),
-            );
-            None
-        }
-        Err(error) => {
-            handover_lost(
-                layout,
-                out,
-                &format!("{} is no SupervisorHandover: {error}", path.display()),
-                &named_turns(&text),
-            );
-            None
-        }
-    }
 }
 
 fn store_lost(error: &ChannelError) -> Failure {
@@ -780,34 +718,47 @@ async fn online_deadline(deadline: Option<tokio::time::Instant>, mut confirmed: 
     }
 }
 
-fn read_standing(layout: &Layout) -> Option<SupervisorHandover> {
-    crate::inventory::load(&layout.boxes()).map_or_else(
-        |error| {
-            eprintln!("tumpel-supervisor: {error:#}; the boxes it names are stopped");
-            Some(SupervisorHandover {
-                boxes: Vec::new(),
-                handed_at: chrono::Utc::now().fixed_offset(),
-            })
-        },
-        |inventory| inventory.map(Into::into),
-    )
-}
-
 fn taken(
     layout: &Layout,
-    out: &UnboundedSender<Outgoing>,
     handed: bool,
-    mut received: BTreeMap<String, OwnedFd>,
-) -> Result<Option<(SupervisorHandover, Taken)>, Failure> {
-    let taken = match read_handover(layout, out, handed || !received.is_empty()) {
-        Some(handover) if received.is_empty() => Some((handover, Taken::Handed)),
-        Some(handover) => Some((fd_store::restored(handover, &mut received), Taken::Handed)),
-        None => read_standing(layout).map(|standing| (fd_store::restored(standing, &mut received), Taken::Crashed)),
+    received: &BTreeMap<String, OwnedFd>,
+) -> Result<Option<RestoredInventory>, Failure> {
+    let load =
+        |path: &Path| inventory::load(path).map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")));
+    let standing = load(&layout.boxes())?;
+    let handover = load(&layout.handover())?;
+    let handover = match handover {
+        Some(mut handover) if handed || !received.is_empty() => {
+            for box_ in &mut handover.boxes {
+                if let Some(record) = standing
+                    .iter()
+                    .flat_map(|inventory| &inventory.boxes)
+                    .find(|saved| saved.same_machine(box_))
+                {
+                    box_.observation.clone_from(&record.observation);
+                }
+                if !received.is_empty() {
+                    fd_store::restore_box(&mut box_.record, received);
+                }
+            }
+            return Ok(Some(RestoredInventory {
+                inventory: handover,
+                taken: Taken::Handed,
+                inherited: received.is_empty(),
+            }));
+        }
+        handover => handover,
     };
-    if taken.is_some() {
-        update::forget_handover(layout).map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
-    }
-    Ok(taken)
+    Ok(standing.or(handover).map(|mut inventory| {
+        for box_ in &mut inventory.boxes {
+            fd_store::restore_box(&mut box_.record, received);
+        }
+        RestoredInventory {
+            inventory,
+            taken: Taken::Crashed,
+            inherited: false,
+        }
+    }))
 }
 
 async fn start_update(
@@ -844,22 +795,23 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     let started = start()?;
     let trial = start_update(&started.layout, &started.running, &out, handed).await?;
     let on_trial = trial.is_some();
-    let taken = taken(&started.layout, &out, handed, received)?;
+    let taken = taken(&started.layout, handed, &received)?;
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
         .await
         .map_err(|error| fail(SupervisorFailure::GuestDriveUnwritable, error))?;
-    let (commands, received) = unbounded_channel();
+    let (commands, from_channel) = unbounded_channel();
     let (usage, idle, mut runner) = start_boxes(
         &started.runtime,
         started.box_size,
         started.store,
-        received,
+        from_channel,
         out.clone(),
         telemetry,
         taken,
-        started.layout.boxes(),
+        &started.layout,
     )?;
+    drop(received);
     fd_store::ready().map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?;
     let url = started.url;
     let config = started.config;

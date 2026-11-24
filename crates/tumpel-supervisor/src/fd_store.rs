@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use sendfd::SendWithFd;
-use tumpel_api::types::SupervisorHandover;
+use tumpel_api::types::{SupervisorHandover, SupervisorHandoverBox};
 
 pub const GUEST: &str = "guest";
 pub const STDOUT: &str = "stdout";
@@ -68,8 +68,12 @@ fn remove(name: &str) -> Result<(), String> {
 }
 
 pub fn keep(tap: u8, role: &str, fd: BorrowedFd<'_>) -> Result<(), String> {
+    remove(&name(tap, role))?;
+    store(tap, role, fd)
+}
+
+pub(crate) fn store(tap: u8, role: &str, fd: BorrowedFd<'_>) -> Result<(), String> {
     let name = name(tap, role);
-    remove(&name)?;
     notify(
         &format!("handing {name} to systemd"),
         &format!("FDSTORE=1\nFDNAME={name}\n"),
@@ -100,16 +104,20 @@ pub unsafe fn received() -> Result<BTreeMap<String, OwnedFd>, String> {
         .collect())
 }
 
+pub(crate) fn restore_box(handed: &mut SupervisorHandoverBox, received: &BTreeMap<String, OwnedFd>) {
+    let Ok(tap) = u8::try_from(handed.tap_index) else {
+        return;
+    };
+    let descriptor = |role| received.get(&name(tap, role)).map_or(-1, AsRawFd::as_raw_fd);
+    handed.machine.guest_fd = descriptor(GUEST);
+    handed.machine.stdout_fd = descriptor(STDOUT);
+    handed.machine.stderr_fd = descriptor(STDERR);
+}
+
 #[must_use]
-pub fn restored(mut handover: SupervisorHandover, received: &mut BTreeMap<String, OwnedFd>) -> SupervisorHandover {
+pub fn restored(mut handover: SupervisorHandover, received: &BTreeMap<String, OwnedFd>) -> SupervisorHandover {
     for handed in &mut handover.boxes {
-        let Ok(tap) = u8::try_from(handed.tap_index) else {
-            continue;
-        };
-        let mut take = |role| received.remove(&name(tap, role)).map_or(-1, IntoRawFd::into_raw_fd);
-        handed.machine.guest_fd = take(GUEST);
-        handed.machine.stdout_fd = take(STDOUT);
-        handed.machine.stderr_fd = take(STDERR);
+        restore_box(handed, received);
     }
     handover
 }
