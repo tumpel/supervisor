@@ -230,6 +230,20 @@ async fn reattach_adopts_a_live_child_and_its_guest_connection_where_the_old_bin
 }
 
 #[tokio::test]
+async fn stopping_an_already_exited_child_reaps_it_without_signalling_another_process() {
+    let pid = sleeper();
+    let start = super::process_start(pid).expect("process start");
+    zombie(pid);
+    let adopted = super::Adopted {
+        pid,
+        start,
+        owner: Owner::Child,
+    };
+    assert!(adopted.end().await.expect("the child is reaped").contains("signal 9"));
+    assert!(reaped(pid));
+}
+
+#[tokio::test]
 async fn reattach_of_a_box_whose_process_ended_leaves_the_incoming_descriptors_owned() {
     let vmm = firecracker("reattach-ended");
     let tap = TapPool::new(4096, BOX).claim(BOX, ROOMY).expect("tap");

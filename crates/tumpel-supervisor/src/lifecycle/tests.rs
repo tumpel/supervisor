@@ -1946,7 +1946,8 @@ async fn a_second_crash_can_still_report_an_interrupted_turn() {
     drop(first_failure);
     drop(recovering);
 
-    let retry = old.standing();
+    let mut retry = old.standing();
+    old.keep_guest(&mut retry.boxes[0], 41);
     assert!(
         matches!(&retry.boxes[0].state, SupervisorHandoverBoxState::Turn(turn) if turn.turn_id.as_str() == "turn-1")
     );
@@ -1954,6 +1955,7 @@ async fn a_second_crash_can_still_report_an_interrupted_turn() {
     restarted.settle_until_starts("failed HarnessExited:").await;
     restarted.turn("turn-2", "session-1", "two", Vec::new());
     restarted.settle_until("complete 1").await;
+    assert!(!restarted.log().iter().any(|entry| entry.starts_with("boot ")));
 }
 
 #[tokio::test(start_paused = true)]
