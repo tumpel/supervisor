@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use chrono::{DateTime, FixedOffset};
@@ -55,5 +56,23 @@ pub(crate) struct RestoredInventory {
 }
 
 pub(crate) fn load(path: &Path) -> anyhow::Result<Option<Inventory>> {
-    dir::read_json(path, "SupervisorHandover")
+    let inventory: Option<Inventory> = dir::read_json(path, "SupervisorHandover")?;
+    if let Some(inventory) = inventory.as_ref() {
+        validate(inventory.boxes.iter().map(|box_| &box_.record)).map_err(anyhow::Error::msg)?;
+    }
+    Ok(inventory)
+}
+
+pub(crate) fn validate<'a>(records: impl IntoIterator<Item = &'a SupervisorHandoverBox>) -> Result<(), String> {
+    let mut taps = HashSet::new();
+    let mut sessions = HashSet::new();
+    for record in records {
+        if !(0..i32::from(crate::pool::TAP_POOL)).contains(&record.tap_index)
+            || !taps.insert(record.tap_index)
+            || !sessions.insert(&record.session_id)
+        {
+            return Err("the box inventory has an invalid or duplicate TAP index or a duplicate session".to_string());
+        }
+    }
+    Ok(())
 }

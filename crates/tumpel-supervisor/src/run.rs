@@ -120,17 +120,13 @@ impl Updates {
 
     async fn welcomed(&mut self) -> Result<(), Failure> {
         if let Some(trial) = self.trial.take() {
-            let rewritten = update::refresh_unit(&self.layout)
-                .map_err(|detail| fail(SupervisorFailure::UpdateNotOnline, format!("{detail}; {ROLLED_BACK}")))?;
+            refresh_unit(&self.layout, ROLLED_BACK).await?;
             update::confirm(&self.layout, &trial, &self.out).map_err(|error| {
                 fail(
                     SupervisorFailure::UpdateNotOnline,
                     format!("{error}; the next start puts the previous binary back"),
                 )
             })?;
-            if rewritten {
-                reload_unit(&self.layout, RESTARTED).await?;
-            }
             self.confirmed.send_replace(true);
         }
         self.announced();
@@ -140,9 +136,18 @@ impl Updates {
 
 pub(crate) async fn refresh_unit(layout: &Layout, fix: &str) -> Result<(), Failure> {
     let failed = |detail: String| fail(SupervisorFailure::UpdateNotOnline, format!("{detail}; {fix}"));
-    if update::refresh_unit(layout).map_err(failed)? {
-        reload_unit(layout, fix).await?;
+    let marker = layout.unit.with_extension("service.reload-pending");
+    let pending = marker
+        .try_exists()
+        .map_err(|error| failed(format!("reading {}: {error}", marker.display())))?;
+    let current = crate::install::supervisor_unit_text(&layout.binary);
+    if !pending && std::fs::read_to_string(&layout.unit).is_ok_and(|unit| unit == current) {
+        return Ok(());
     }
+    std::fs::write(&marker, []).map_err(|error| failed(format!("writing {}: {error}", marker.display())))?;
+    update::refresh_unit(layout).map_err(&failed)?;
+    reload_unit(layout, fix).await?;
+    std::fs::remove_file(&marker).map_err(|error| failed(format!("removing {}: {error}", marker.display())))?;
     Ok(())
 }
 
@@ -422,13 +427,9 @@ fn start_boxes(
     };
     let box_capacity = pool.capacity();
     let mut lifecycle = Lifecycle::new(Firecracker::new(runtime), store, settings, pool, out, layout.boxes());
-    let recorded = taken.is_some();
     lifecycle
         .start_inventory(taken)
-        .map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
-    if recorded {
-        update::forget_handover(layout).map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
-    }
+        .map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
     let usage = Usage {
         box_capacity,
         warm: lifecycle.warm(),
@@ -735,33 +736,38 @@ fn taken(
     handed: bool,
     received: &BTreeMap<String, OwnedFd>,
 ) -> Result<Option<RestoredInventory>, Failure> {
-    let load =
-        |path: &Path| inventory::load(path).map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")));
+    let load = |path: &Path| {
+        inventory::load(path).map_err(|error| fail(SupervisorFailure::ChannelStateLost, format!("{error:#}")))
+    };
     let standing = load(&layout.boxes())?;
-    let handover = load(&layout.handover())?;
-    let handover = match handover {
-        Some(mut handover) if handed || !received.is_empty() => {
+    if handed || !received.is_empty() {
+        let handover = load(&layout.handover())?;
+        if let Some(mut handover) = handover.filter(|handover| {
+            standing
+                .as_ref()
+                .is_none_or(|saved| handed || saved.handed_at <= handover.handed_at)
+        }) {
+            let inherited = received.is_empty();
             for box_ in &mut handover.boxes {
-                if let Some(record) = standing
+                if let Some(saved) = standing
                     .iter()
                     .flat_map(|inventory| &inventory.boxes)
                     .find(|saved| saved.same_machine(box_))
                 {
-                    box_.observation.clone_from(&record.observation);
+                    box_.observation.clone_from(&saved.observation);
                 }
-                if !received.is_empty() {
+                if !inherited {
                     fd_store::restore_box(&mut box_.record, received);
                 }
             }
             return Ok(Some(RestoredInventory {
                 inventory: handover,
                 taken: Taken::Handed,
-                inherited: received.is_empty(),
+                inherited,
             }));
         }
-        handover => handover,
-    };
-    Ok(standing.or(handover).map(|mut inventory| {
+    }
+    Ok(standing.map(|mut inventory| {
         for box_ in &mut inventory.boxes {
             fd_store::restore_box(&mut box_.record, received);
         }
@@ -830,7 +836,7 @@ pub async fn run(
         &started.layout,
     )?;
     drop(received);
-    fd_store::ready().map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?;
+    update::forget_handover(&started.layout).map_err(|error| fail(SupervisorFailure::ChannelStateLost, error))?;
     started_daemon();
     let url = started.url;
     let config = started.config;

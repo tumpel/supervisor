@@ -314,7 +314,7 @@ impl Machine for MemoryMachine {
     }
 
     fn hand_over(self, guest: MemoryGuest) -> Result<SupervisorHandoverMachine, String> {
-        if self.boot == Boot::RefusesHandover {
+        if self.boot == Boot::RefusesHandover && self.session == "session-1" {
             return Err("its Firecracker process refused the handover".to_string());
         }
         let mut hands = self.hands.lock().expect("hands");
@@ -360,6 +360,7 @@ struct MemoryVmm {
     log: Log,
     hands: Hands,
     free_disk_mib: Arc<AtomicU64>,
+    unclaimed: Vec<u8>,
 }
 
 impl Vmm for MemoryVmm {
@@ -390,6 +391,10 @@ impl Vmm for MemoryVmm {
         pool: &mut TapPool,
         _: bool,
     ) -> Result<Option<Attached<MemoryMachine>>, String> {
+        if handed.guest_fd == 51 {
+            return Err("the Firecracker API did not respond".to_string());
+        }
+
         if handed.guest_fd < 3 {
             return Err("the guest descriptor was not passed".to_string());
         }
@@ -415,10 +420,15 @@ impl Vmm for MemoryVmm {
         })
     }
 
-    fn check_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
+    fn unclaimed_scopes(&self, claimed: &[u8]) -> Result<Vec<u8>, String> {
         if !claimed.is_empty() {
             note(&self.log, format!("check scopes {claimed:?}"));
         }
+        Ok(self.unclaimed.clone())
+    }
+
+    fn discard_setup(&self, index: u8) -> Result<(), String> {
+        note(&self.log, format!("discard setup scope {index}"));
         Ok(())
     }
 
@@ -885,6 +895,7 @@ fn host_on(
         log: Arc::default(),
         hands: Arc::default(),
         free_disk_mib: Arc::new(AtomicU64::new(1 << 30)),
+        unclaimed: Vec::new(),
     };
     start_host(
         vmm,
@@ -1842,12 +1853,14 @@ async fn a_failed_attachment_leaves_the_saved_inventory_and_skips_startup_cleanu
         out,
         path.clone(),
     );
-    let error = successor
+    successor
         .start(Some((standing, Taken::Crashed)))
-        .expect_err("the second guest descriptor is missing");
-    assert!(error.contains("the guest descriptor was not passed"), "{error}");
-    assert_eq!(old.log(), ["reattach session-1 on tumpel0"], "no scope or disk cleanup");
-    assert_eq!(std::fs::read(path).expect("original inventory"), saved);
+        .expect("the healthy box starts");
+    assert_eq!(old.log(), ["reattach session-1 on tumpel0", "check scopes [0]"]);
+    let kept: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("saved inventory")).expect("inventory JSON");
+    let original: serde_json::Value = serde_json::from_slice(&saved).expect("original inventory");
+    assert_eq!(kept["boxes"][1], original["boxes"][1]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1885,28 +1898,43 @@ async fn retiring_the_box_runner_leaves_its_live_boxes_and_records() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_failed_handover_keeps_the_box_record_and_queued_teardown() {
-    let mut old = host("handover-refused", 1, Harness::SlowClone, Boot::RefusesHandover);
+async fn a_failed_handover_keeps_its_record_and_hands_over_other_boxes() {
+    let mut old = host("handover-refused", 2, Harness::Echo, Boot::RefusesHandover);
     old.turn("turn-1", "session-1", "one", Vec::new());
-    old.settle_until("claim turn-1").await;
-    tokio::time::sleep(SLOW_CLONE / 2).await;
-    old.teardown("session-1");
-    assert!(old.ask_handover().await.is_err(), "the incomplete handover is rejected");
-    let saved = old.standing();
-    assert_eq!(saved.boxes.len(), 1);
-    assert!(matches!(
-        saved.boxes[0].queued.as_slice(),
-        [SupervisorHandoverCommand::Teardown(_)]
-    ));
-    let error = old
-        .runner
-        .await
-        .expect("the lifecycle ended")
-        .expect_err("the handover failed");
+    old.settle_until("complete 1").await;
+    old.turn("turn-2", "session-2", "two", Vec::new());
+    old.settle_until("complete 1").await;
+
+    let handover = old.ask_handover().await.expect("the good box is handed over");
+    assert_eq!(handover.boxes.len(), 1);
+    assert_eq!(handover.boxes[0].session_id.as_str(), "session-2");
+    assert_eq!(old.standing().boxes.len(), 2);
+    assert!(!old.log().iter().any(|entry| entry.starts_with("stop ")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_box_that_cannot_attach_and_an_unclaimed_scope_leave_the_rest_running() {
+    let mut old = host("isolated-attachment", 4, Harness::Echo, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    old.turn("turn-2", "session-2", "two", Vec::new());
+    old.settle_until("complete 1").await;
+    let mut standing = old.standing();
+    standing.boxes[0].machine.guest_fd = 51;
+    old.keep_guest(&mut standing.boxes[1], 52);
+    old.vmm.unclaimed = vec![0, 2];
+    let mut new = old.after_crash(standing);
+    assert_eq!(new.standing().boxes.len(), 2);
+    new.turn("turn-3", "session-2", "three", Vec::new());
+    new.settle_until("complete 1").await;
+    new.turn("turn-4", "session-3", "four", Vec::new());
+    new.settle_until("complete 1").await;
+    let log = new.log();
     assert!(
-        error.contains("its Firecracker process refused the handover"),
-        "{error}"
+        log.iter().any(|entry| entry == "reattach session-2 on tumpel1"),
+        "{log:?}"
     );
+    assert!(log.iter().any(|entry| entry == "boot session-3 on tumpel3"), "{log:?}");
 }
 
 #[tokio::test(start_paused = true)]
