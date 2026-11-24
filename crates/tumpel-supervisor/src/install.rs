@@ -10,7 +10,6 @@ use tumpel_api::types::SupervisorRuntime;
 use crate::dir::{self, CONFIG_FILE, RUNTIME_FILE, SUPERVISOR_UNIT};
 use crate::enrol;
 use crate::pool::TAP_POOL;
-use crate::update::{Layout, ROLLBACK_SCRIPT};
 
 const FIRECRACKER_ARCHIVE_URL: &str =
     "https://github.com/firecracker-microvm/firecracker/releases/download/v1.18.0/firecracker-v1.18.0-x86_64.tgz";
@@ -577,7 +576,6 @@ fn install_tap_pool(boxes: u32, account: &Account, staging: &Path) -> Result<()>
 }
 
 pub(crate) fn supervisor_unit_text(binary: &Path) -> String {
-    let previous = Layout::new(binary.to_path_buf(), PathBuf::new(), PathBuf::new()).previous;
     format!(
         "[Unit]
 Description=tumpel supervisor
@@ -585,7 +583,6 @@ StartLimitIntervalSec=3h
 StartLimitBurst=11
 
 [Service]
-ExecStartPre=/bin/sh -c '{rollback}' {binary} {previous}
 ExecStart={binary} run
 ExecStopPost=/bin/sh -c 'if [ \"$$EXIT_CODE\" = exited ] && [ \"$$EXIT_STATUS\" = 6 ]; then sleep 60; fi'
 Restart=on-failure
@@ -601,8 +598,6 @@ TimeoutStopSec=10min
 [Install]
 WantedBy=default.target
 ",
-        rollback = ROLLBACK_SCRIPT.replace('$', "$$"),
-        previous = previous.display(),
         binary = binary.display(),
         descriptors = 3 * u32::from(TAP_POOL)
     )

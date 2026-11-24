@@ -20,7 +20,7 @@ use tumpel_api::types::{
     ChannelHostMessage, ChannelSupervisorUpdateFailed, ChannelSupervisorUpdateFailedType, ChannelSupervisorUpdateStep,
     ChannelSupervisorUpdateStepReleaseVersion, ChannelSupervisorUpdateStepType, HostArchitecture,
     ReleaseManifestReleaseVersion, ReleaseSupervisorSupervisorVersion, Sha256Digest, SupervisorUpdateFailureReason,
-    SupervisorUpdatePending, SupervisorUpdatePhase, SupervisorUpdateRefusal,
+    SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
 use tumpel_channel::Outgoing;
 use tumpel_guest::setup_output::{redacted, strip_ansi};
@@ -31,13 +31,9 @@ use crate::install::supervisor_unit_text;
 use crate::report::CHANNEL_PROTOCOL_LINE;
 use crate::snapshot::hex;
 
-pub const PENDING_FILE: &str = "update-pending.json";
-pub const TRIAL_FILE: &str = "update-trial.json";
-pub const ROLLED_BACK_FILE: &str = "update-rolled-back.json";
 pub const REFUSAL_FILE: &str = "update-refusal.json";
 pub const HANDOVER_FILE: &str = "handover.json";
 pub const BOXES_FILE: &str = "boxes.json";
-pub const ROLLBACK_SCRIPT: &str = r#"state="${TUMPEL_SUPERVISOR_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tumpel-supervisor}"; if [ -e "$state/update-trial.json" ]; then cp "$1" "$0.part" && sync "$0.part" && mv "$0.part" "$0" && mv "$state/update-trial.json" "$state/update-rolled-back.json"; elif [ -e "$state/update-pending.json" ]; then mv "$state/update-pending.json" "$state/update-trial.json"; fi"#;
 const TAIL_LINES: usize = 20;
 const TAIL_LINE_CHARS: usize = 400;
 const DRAIN: Duration = Duration::from_secs(5);
@@ -49,7 +45,6 @@ pub struct Limits {
     pub place: Duration,
     pub dry_run: Duration,
     pub swap: Duration,
-    pub online: Duration,
 }
 
 impl Limits {
@@ -60,14 +55,12 @@ impl Limits {
         place: Duration::from_secs(60),
         dry_run: Duration::from_secs(60),
         swap: Duration::from_secs(30),
-        online: Duration::from_secs(120),
     };
 }
 
 #[derive(Clone)]
 pub struct Layout {
     pub binary: PathBuf,
-    pub previous: PathBuf,
     pub candidate: PathBuf,
     pub state: PathBuf,
     pub unit: PathBuf,
@@ -83,7 +76,6 @@ impl Layout {
     #[must_use]
     pub fn new(binary: PathBuf, state: PathBuf, unit: PathBuf) -> Self {
         Self {
-            previous: sibling(&binary, ".previous"),
             candidate: sibling(&binary, ".candidate"),
             binary,
             state,
@@ -91,16 +83,8 @@ impl Layout {
         }
     }
 
-    fn pending(&self) -> PathBuf {
-        self.state.join(PENDING_FILE)
-    }
-
-    fn trial(&self) -> PathBuf {
-        self.state.join(TRIAL_FILE)
-    }
-
-    fn rolled_back(&self) -> PathBuf {
-        self.state.join(ROLLED_BACK_FILE)
+    pub(crate) fn clear_candidate(&self) -> Result<(), String> {
+        remove(&self.candidate)
     }
 
     fn refusal(&self) -> PathBuf {
@@ -324,15 +308,6 @@ fn synced(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("flushing {} to disk failed: {error}", path.display()))
 }
 
-fn copy_into_place(from: &Path, to: &Path) -> Result<(), String> {
-    let staged = sibling(to, ".part");
-    std::fs::copy(from, &staged)
-        .map_err(|error| format!("copying {} to {} failed: {error}", from.display(), staged.display()))?;
-    synced(&staged)?;
-    std::fs::rename(&staged, to)
-        .map_err(|error| format!("moving {} to {} failed: {error}", staged.display(), to.display()))
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Current,
@@ -540,7 +515,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
     }
 
     fn refuse(&self, to: &Sha256Digest, stopped: Stop) -> Stop {
-        let candidate = remove(&self.layout.candidate);
+        let candidate = self.layout.clear_candidate();
         let refusal = SupervisorUpdateRefusal {
             to_sha256: to.clone(),
             reason: stopped.reason.clone(),
@@ -739,21 +714,16 @@ impl<S: Source, I: Idle> Updater<S, I> {
     }
 
     async fn swap(&self, to: &Sha256Digest) -> Result<(), Stop> {
-        let pending = SupervisorUpdatePending {
-            from_sha256: self.running.clone(),
-            to_sha256: to.clone(),
-            swapped_at: Utc::now().fixed_offset(),
-        };
-        let layout = self.layout.clone();
-        let swapped = timeout(
-            self.limits.swap,
-            tokio::task::spawn_blocking(move || swap(&layout, &pending)),
-        )
-        .await;
+        let candidate = &self.layout.candidate;
+        let binary = &self.layout.binary;
+        let swapped = timeout(self.limits.swap, tokio::fs::rename(candidate, binary)).await;
         let detail = match swapped {
-            Ok(Ok(Ok(()))) => return Ok(()),
-            Ok(Ok(Err(error))) => error,
-            Ok(Err(error)) => format!("the swap task stopped: {error}"),
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => format!(
+                "moving {} over {} failed: {error}",
+                candidate.display(),
+                binary.display()
+            ),
             Err(_) => format!("the swap ran past {} s", self.limits.swap.as_secs()),
         };
         Err(self.refuse(
@@ -763,117 +733,17 @@ impl<S: Source, I: Idle> Updater<S, I> {
     }
 }
 
-fn swap(layout: &Layout, pending: &SupervisorUpdatePending) -> Result<(), String> {
-    copy_into_place(&layout.binary, &layout.previous)?;
-    dir::write_json(&layout.pending(), pending).map_err(|error| format!("{error:#}"))?;
-    std::fs::rename(&layout.candidate, &layout.binary).map_err(|error| {
-        let undone = remove(&layout.pending())
-            .err()
-            .map_or_else(String::new, |undo| format!("; {undo}"));
-        format!(
-            "moving {} over {} failed: {error}{undone}",
-            layout.candidate.display(),
-            layout.binary.display()
-        )
-    })
-}
-
 pub fn forget_handover(layout: &Layout) -> Result<(), String> {
     remove(&layout.handover())
 }
 
-#[must_use]
-pub fn on_trial(state: &Path) -> bool {
-    state.join(TRIAL_FILE).exists()
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Startup {
-    Steady,
-    Trial(SupervisorUpdatePending),
-}
-
-fn steady(layout: &Layout) -> Result<Startup, String> {
-    if !layout.pending().exists() {
-        remove(&layout.previous)?;
-    }
-    remove(&layout.candidate)?;
-    Ok(Startup::Steady)
-}
-
-pub fn startup(layout: &Layout, running: &Sha256Digest, out: &UnboundedSender<Outgoing>) -> Result<Startup, String> {
-    let now = Utc::now().fixed_offset();
-    if let Some(record) = read::<SupervisorUpdatePending>(&layout.rolled_back(), "SupervisorUpdatePending")? {
-        let detail = format!(
-            "supervisor {} failed to start or did not reach Welcome within {} s after the swap, so systemd put {} back; this host skips {} until the release names another binary, and journalctl --user -u tumpel-supervisor shows why it stayed offline",
-            short(&record.to_sha256),
-            Limits::HOST.online.as_secs(),
-            short(&record.from_sha256),
-            short(&record.to_sha256)
-        );
-        let refusal = SupervisorUpdateRefusal {
-            to_sha256: record.to_sha256.clone(),
-            reason: SupervisorUpdateFailureReason::SupervisorUpdateRolledBack,
-            refused_at: now,
-        };
-        dir::write_json(&layout.refusal(), &refusal).map_err(|error| format!("{error:#}"))?;
-        let _ = out.send(
-            ChannelHostMessage::SupervisorUpdateFailed(ChannelSupervisorUpdateFailed {
-                type_: ChannelSupervisorUpdateFailedType::SupervisorUpdateFailed,
-                from_sha256: record.from_sha256,
-                to_sha256: record.to_sha256,
-                reason: SupervisorUpdateFailureReason::SupervisorUpdateRolledBack,
-                detail: reported("the update failure detail", &detail),
-                output_tail: Vec::new(),
-                failed_at: now,
-            })
-            .into(),
-        );
-        remove(&layout.rolled_back())?;
-    }
-    let Some(trial) = read::<SupervisorUpdatePending>(&layout.trial(), "SupervisorUpdatePending")? else {
-        return match read::<SupervisorUpdatePending>(&layout.pending(), "SupervisorUpdatePending")? {
-            Some(pending) if pending.to_sha256 == *running => Ok(Startup::Trial(pending)),
-            _ => steady(layout),
-        };
-    };
-    if trial.to_sha256 != *running {
-        remove(&layout.trial())?;
-        return steady(layout);
-    }
-    Ok(Startup::Trial(trial))
-}
-
-pub fn confirm(
-    layout: &Layout,
-    trial: &SupervisorUpdatePending,
-    out: &UnboundedSender<Outgoing>,
-) -> Result<(), String> {
-    let release_version = env!("TUMPEL_RELEASE_VERSION")
-        .parse()
-        .map_err(|error| format!("the supervisor version is empty: {error}"))?;
-    remove(&layout.trial())?;
-    remove(&layout.pending())?;
-    remove(&layout.previous)?;
-    let _ = out.send(
-        ChannelHostMessage::SupervisorUpdateStep(ChannelSupervisorUpdateStep {
-            type_: ChannelSupervisorUpdateStepType::SupervisorUpdateStep,
-            from_sha256: trial.from_sha256.clone(),
-            to_sha256: trial.to_sha256.clone(),
-            release_version,
-            boxes_running: 0,
-            phase: SupervisorUpdatePhase::Online,
-            at: Utc::now().fixed_offset(),
-        })
-        .into(),
-    );
-    Ok(())
-}
-
 pub fn refresh_unit(layout: &Layout) -> Result<bool, String> {
     let unit = supervisor_unit_text(&layout.binary);
-    if std::fs::read_to_string(&layout.unit).ok().as_deref() == Some(unit.as_str()) {
-        return Ok(false);
+    match std::fs::read_to_string(&layout.unit) {
+        Ok(current) if current == unit => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("reading {} failed: {error}", layout.unit.display())),
     }
     let staged = sibling(&layout.unit, ".part");
     std::fs::write(&staged, &unit).map_err(|error| format!("writing {} failed: {error}", staged.display()))?;

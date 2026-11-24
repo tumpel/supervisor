@@ -19,7 +19,7 @@ use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
     ChannelControlMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
     Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
-    SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
+    SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, TurnFailureReason,
 };
 use tumpel_channel::{
     Backoff, ChannelError, Event, HeldIds, HostChannel, Outgoing, Phase, Port, RateBackoff, RateLimit, Signer, Store,
@@ -39,14 +39,12 @@ use crate::lifecycle::{
 use crate::pool::{memory_budget_mib, mib, Held, Size, TapPool};
 use crate::store::{jitter, HttpStore};
 use crate::telemetry::Telemetry;
-use crate::update::{self, HttpSource, Layout, Limits, Outcome, Startup, Updater};
+use crate::update::{self, HttpSource, Layout, Limits, Outcome, Updater};
 use crate::usage;
 
 const TICK: Duration = Duration::from_millis(500);
 const UNIT_RELOAD: Duration = Duration::from_secs(30);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
-const ROLLED_BACK: &str = "the next start puts the previous binary back";
-const RESTARTED: &str = "this supervisor stops, and systemd starts it again, which rewrites the unit once more";
 
 pub struct Failure {
     pub kind: SupervisorFailure,
@@ -97,11 +95,7 @@ type BoxRunner = JoinHandle<Result<(), String>>;
 
 struct Updates {
     updater: Arc<HostUpdater>,
-    layout: Layout,
-    out: UnboundedSender<Outgoing>,
     restart: UnboundedSender<()>,
-    trial: Option<SupervisorUpdatePending>,
-    confirmed: watch::Sender<bool>,
     grace: Duration,
 }
 
@@ -116,25 +110,15 @@ impl Updates {
             }
         });
     }
-
-    async fn welcomed(&mut self) -> Result<(), Failure> {
-        if let Some(trial) = self.trial.take() {
-            refresh_unit(&self.layout, ROLLED_BACK).await?;
-            update::confirm(&self.layout, &trial, &self.out).map_err(|error| {
-                fail(
-                    SupervisorFailure::UpdateNotOnline,
-                    format!("{error}; the next start puts the previous binary back"),
-                )
-            })?;
-            self.confirmed.send_replace(true);
-        }
-        self.announced();
-        Ok(())
-    }
 }
 
-pub(crate) async fn refresh_unit(layout: &Layout, fix: &str) -> Result<(), Failure> {
-    let failed = |detail: String| fail(SupervisorFailure::UpdateNotOnline, format!("{detail}; {fix}"));
+pub(crate) async fn refresh_unit(layout: &Layout) -> Result<(), Failure> {
+    let failed = |detail: String| {
+        fail(
+            SupervisorFailure::NotEnrolled,
+            format!("Could not refresh the supervisor service. {detail}. Check the user service and restart it."),
+        )
+    };
     if !update::refresh_unit(layout).map_err(failed)? {
         return Ok(());
     }
@@ -736,16 +720,6 @@ pub(crate) fn start() -> Result<Started, Failure> {
     })
 }
 
-async fn online_deadline(deadline: Option<tokio::time::Instant>, mut confirmed: watch::Receiver<bool>) {
-    let Some(deadline) = deadline else {
-        return std::future::pending().await;
-    };
-    tokio::select! {
-        () = tokio::time::sleep_until(deadline) => {}
-        _ = confirmed.wait_for(|online| *online) => std::future::pending::<()>().await,
-    }
-}
-
 fn read_standing(layout: &Layout) -> Option<SupervisorHandover> {
     dir::read_json(&layout.boxes(), "SupervisorHandover").unwrap_or_else(|error| {
         eprintln!("tumpel-supervisor: {error:#}; the boxes it names are stopped");
@@ -782,16 +756,11 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     })?;
     let (out, mut from_box) = unbounded_channel();
     let started = start()?;
-    let trial = match update::startup(&started.layout, &started.running, &out)
-        .map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?
-    {
-        Startup::Steady => None,
-        Startup::Trial(pending) => Some(pending),
-    };
-    let on_trial = trial.is_some();
-    if handed {
-        refresh_unit(&started.layout, RESTARTED).await?;
-    }
+    started
+        .layout
+        .clear_candidate()
+        .map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?;
+    refresh_unit(&started.layout).await?;
     let taken = taken(&started.layout, &out, handed, received)?;
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
@@ -820,8 +789,7 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         env!("TUMPEL_RELEASE_VERSION").to_string(),
     );
     let (restart, mut restarted) = unbounded_channel();
-    let (confirmed, online) = watch::channel(false);
-    let mut updates = Updates {
+    let updates = Updates {
         updater: Arc::new(Updater::new(
             started.source,
             started.layout.clone(),
@@ -831,34 +799,25 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
             idle.clone(),
             out.clone(),
         )),
-        layout: started.layout,
-        out,
         restart,
-        trial,
-        confirmed,
         grace,
     };
-    let deadline = on_trial.then(|| tokio::time::Instant::now() + Limits::HOST.online);
     let served = tokio::select! {
-        served = serve(&mut channel, &url, heartbeat, &usage, &commands, &mut from_box, &config, &dir, &mut updates) => served,
+        served = serve(&mut channel, &url, heartbeat, &usage, &commands, &mut from_box, &config, &dir, &updates) => served,
         Some(()) = restarted.recv() => Ok(Served::Updated),
         Some(()) = terminated.recv() => Ok(Served::Terminated),
         ended = &mut runner => Ok(Served::BoxesStopped(boxes_stopped(ended))),
-        () = online_deadline(deadline, online) => Err(fail(
-            SupervisorFailure::UpdateNotOnline,
-            format!("this supervisor did not reach Welcome on {url} within {} s of its start after its swap; systemd restarts the unit, and its ExecStartPre puts the previous binary back", Limits::HOST.online.as_secs()),
-        )),
     };
     let stopped = match served {
         Ok(Served::Revoked) => Ok(Stopped::Revoked),
-        Ok(Served::Updated) => terminate(&commands, &updates.layout, &updates.out)
+        Ok(Served::Updated) => terminate(&commands, &started.layout, &out)
             .await
             .map(|()| Stopped::Updated),
-        Ok(Served::Terminated) => terminate(&commands, &updates.layout, &updates.out)
+        Ok(Served::Terminated) => terminate(&commands, &started.layout, &out)
             .await
             .map(|()| Stopped::Terminated),
         Err(failure) if restarts(&failure.kind) => {
-            if let Err(lost) = terminate(&commands, &updates.layout, &updates.out).await {
+            if let Err(lost) = terminate(&commands, &started.layout, &out).await {
                 store_unsent(&mut channel, &mut from_box)?;
                 return Err(lost);
             }
@@ -892,7 +851,7 @@ async fn serve(
     from_box: &mut UnboundedReceiver<Outgoing>,
     config: &SupervisorConfig,
     dir: &Path,
-    updates: &mut Updates,
+    updates: &Updates,
 ) -> Result<Served, Failure> {
     let mut backoff = Backoff::default();
     let mut limit = RateLimit::default();
@@ -1056,7 +1015,7 @@ async fn session(
     usage: &Usage,
     commands: &UnboundedSender<BoxCommand>,
     from_box: &mut UnboundedReceiver<Outgoing>,
-    updates: &mut Updates,
+    updates: &Updates,
     limit: &mut RateLimit,
 ) -> Result<Ended, Failure> {
     let stream = match tokio::time::timeout(CONNECT_DEADLINE, tokio_tungstenite::connect_async(url)).await {
@@ -1091,9 +1050,11 @@ async fn session(
                             Ok(Event::Welcomed) => {
                                 eprintln!("connected to {url}");
                                 last_beat = Instant::now();
-                                match commands.send(BoxCommand::Welcomed(channel.version())) {
-                                    Err(_) => Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
-                                    Ok(()) => updates.welcomed().await.err().map(Err),
+                                if commands.send(BoxCommand::Welcomed(channel.version())).is_err() {
+                                    Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
+                                } else {
+                                    updates.announced();
+                                    None
                                 }
                             }
                             Ok(Event::Message(message)) => match box_command(*message) {

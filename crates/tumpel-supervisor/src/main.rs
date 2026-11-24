@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use tumpel_api::types::SupervisorFailure;
 use tumpel_supervisor::{
-    check, enrol, install, install_telemetry, on_trial, received_descriptors, report, run, supervisor_dir,
-    take_notify_socket, Enrolment, Stopped,
+    check, enrol, install, install_telemetry, received_descriptors, report, run, take_notify_socket, Enrolment, Stopped,
 };
 
 #[derive(Parser)]
@@ -57,17 +56,18 @@ const RESTART_INTO_UPDATE: u8 = 75;
 
 fn exit_code(failure: &SupervisorFailure) -> ExitCode {
     match failure {
-        SupervisorFailure::Unrecognised(_) => {
-            eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
-            ExitCode::FAILURE
-        }
         SupervisorFailure::NotEnrolled => ExitCode::from(3),
         SupervisorFailure::ChannelStateLost => ExitCode::from(4),
         SupervisorFailure::HostRevoked => ExitCode::from(5),
         SupervisorFailure::ProtocolError => ExitCode::from(6),
         SupervisorFailure::UsageUnreadable => ExitCode::from(7),
         SupervisorFailure::GuestDriveUnwritable => ExitCode::from(8),
-        SupervisorFailure::UpdateNotOnline => ExitCode::from(10),
+        failure => {
+            if matches!(failure, SupervisorFailure::Unrecognised(_)) {
+                eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
+            }
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -134,15 +134,6 @@ fn main() -> ExitCode {
                 Ok(Stopped::Updated) => {
                     eprintln!("tumpel-supervisor: exiting so systemd starts the new binary, which takes the running boxes over");
                     ExitCode::from(RESTART_INTO_UPDATE)
-                }
-                Err(failure) if on_trial(&supervisor_dir()) => {
-                    eprintln!(
-                    "tumpel-supervisor: {}: {}: {}; this binary is on its update trial, so systemd restarts the unit and its ExecStartPre puts the previous binary back",
-                    SupervisorFailure::UpdateNotOnline,
-                    failure.kind,
-                    failure.detail
-                );
-                    exit_code(&SupervisorFailure::UpdateNotOnline)
                 }
                 Err(failure) => {
                     eprintln!("tumpel-supervisor: {}: {}", failure.kind, failure.detail);
