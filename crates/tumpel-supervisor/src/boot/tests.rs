@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use super::{resolve, Boot, BootOrder, Caches, Holds};
 use crate::layers::LayerCache;
 use crate::snapshot::hex;
-use crate::store::{Store, UploadError};
+use crate::store::{DownloadError, Store, UploadError};
 
 fn sha256(bytes: &[u8]) -> String {
     hex(digest(&SHA256, bytes).as_ref())
@@ -43,15 +43,21 @@ impl Store for Bucket {
         std::future::ready(Err(UploadError::Rejected(format!("PUT {url} is not served"))))
     }
 
-    fn download(&self, url: &str, file: &Path) -> impl Future<Output = Result<(), String>> + Send {
+    fn download(&self, url: &str, file: &Path) -> impl Future<Output = Result<(), DownloadError>> + Send {
         std::future::ready(match self.0.get(url) {
-            Some(bytes) => std::fs::write(file, bytes).map_err(|error| error.to_string()),
-            None => Err(format!("GET {url} answered 404 Not Found")),
+            Some(bytes) => std::fs::write(file, bytes).map_err(|error| DownloadError::Refused(error.to_string())),
+            None => Err(DownloadError::Refused(format!("GET {url} answered 404 Not Found"))),
         })
     }
 
-    fn download_range(&self, url: &str, _: &Path, _: u64, _: u64) -> impl Future<Output = Result<(), String>> + Send {
-        std::future::ready(Err(format!("GET {url} is not served")))
+    fn download_range(
+        &self,
+        url: &str,
+        _: &Path,
+        _: u64,
+        _: u64,
+    ) -> impl Future<Output = Result<(), DownloadError>> + Send {
+        std::future::ready(Err(DownloadError::Refused(format!("GET {url} is not served"))))
     }
 }
 

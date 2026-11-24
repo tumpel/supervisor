@@ -3,7 +3,6 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use ring::signature::Ed25519KeyPair;
 use std::collections::BTreeMap;
-use std::hash::{BuildHasher, RandomState};
 use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -38,7 +37,7 @@ use crate::lifecycle::{
     Taken, TeardownOrder,
 };
 use crate::pool::{memory_budget_mib, mib, Held, Size, TapPool};
-use crate::store::HttpStore;
+use crate::store::{jitter, HttpStore};
 use crate::telemetry::Telemetry;
 use crate::update::{self, HttpSource, Layout, Limits, Outcome, Startup, Updater};
 use crate::usage;
@@ -970,11 +969,6 @@ fn next<S: Store, K: Signer>(
             Next::Reconnect(wait)
         }
     }
-}
-
-fn jitter() -> u16 {
-    let [low, high, ..] = RandomState::new().hash_one(()).to_le_bytes();
-    u16::from_le_bytes([low, high])
 }
 
 fn dropped(progressed: bool, reason: impl Into<String>) -> Ended {

@@ -1,5 +1,8 @@
+use std::fmt;
 use std::future::Future;
+use std::hash::{BuildHasher, RandomState};
 use std::path::Path;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -12,6 +15,50 @@ pub enum UploadError {
     Unreadable(String),
 }
 
+pub enum DownloadError {
+    Transient(String),
+    Expired(String),
+    Refused(String),
+}
+
+impl fmt::Display for DownloadError {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transient(detail) | Self::Expired(detail) | Self::Refused(detail) => out.write_str(detail),
+        }
+    }
+}
+
+impl From<DownloadError> for String {
+    fn from(error: DownloadError) -> Self {
+        error.to_string()
+    }
+}
+
+pub const DOWNLOAD_ATTEMPTS: u32 = 10;
+pub const ATTEMPTS_PER_URL: u32 = 4;
+const FIRST_WAIT: Duration = Duration::from_millis(250);
+const LAST_WAIT: Duration = Duration::from_secs(8);
+
+#[must_use]
+pub fn backoff(attempt: u32, jitter: u16) -> Duration {
+    let wait = FIRST_WAIT
+        .saturating_mul(1 << attempt.saturating_sub(1).min(16))
+        .min(LAST_WAIT);
+    let half = wait / 2;
+    half + half.mul_f64(f64::from(jitter) / f64::from(u16::MAX))
+}
+
+pub async fn wait(attempt: u32) {
+    tokio::time::sleep(backoff(attempt, jitter())).await;
+}
+
+#[must_use]
+pub fn jitter() -> u16 {
+    let [low, high, ..] = RandomState::new().hash_one(()).to_le_bytes();
+    u16::from_le_bytes([low, high])
+}
+
 pub trait Store: Send + Sync + 'static {
     fn upload(&self, url: &str, file: &Path) -> impl Future<Output = Result<(), UploadError>> + Send;
     fn upload_checked(
@@ -20,14 +67,14 @@ pub trait Store: Send + Sync + 'static {
         file: &Path,
         sha256: &str,
     ) -> impl Future<Output = Result<(), UploadError>> + Send;
-    fn download(&self, url: &str, file: &Path) -> impl Future<Output = Result<(), String>> + Send;
+    fn download(&self, url: &str, file: &Path) -> impl Future<Output = Result<(), DownloadError>> + Send;
     fn download_range(
         &self,
         url: &str,
         file: &Path,
         first: u64,
         last: u64,
-    ) -> impl Future<Output = Result<(), String>> + Send;
+    ) -> impl Future<Output = Result<(), DownloadError>> + Send;
 }
 
 pub struct HttpStore(reqwest::Client);
@@ -76,34 +123,38 @@ impl HttpStore {
         file: &Path,
         headers: Vec<(HeaderName, HeaderValue)>,
         accepts: fn(StatusCode) -> bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), DownloadError> {
         let mut request = self.0.get(url);
         for (name, value) in headers {
             request = request.header(name, value);
         }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|error| format!("GET {}: {}", without_query(url), error.without_url()))?;
+        let mut response = request.send().await.map_err(|error| {
+            DownloadError::Transient(format!("GET {}: {}", without_query(url), error.without_url()))
+        })?;
         let status = response.status();
         if !accepts(status) {
-            return Err(format!("GET {} answered {status}", without_query(url)));
+            let detail = format!("GET {} answered {status}", without_query(url));
+            return Err(match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => DownloadError::Expired(detail),
+                _ if status.is_server_error() => DownloadError::Transient(detail),
+                _ => DownloadError::Refused(detail),
+            });
         }
         let mut out = tokio::fs::File::create(file)
             .await
-            .map_err(|error| format!("creating {}: {error}", file.display()))?;
+            .map_err(|error| DownloadError::Refused(format!("creating {}: {error}", file.display())))?;
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|error| format!("GET {}: {}", without_query(url), error.without_url()))?
+            .map_err(|error| DownloadError::Transient(format!("GET {}: {}", without_query(url), error.without_url())))?
         {
             out.write_all(&chunk)
                 .await
-                .map_err(|error| format!("writing {}: {error}", file.display()))?;
+                .map_err(|error| DownloadError::Refused(format!("writing {}: {error}", file.display())))?;
         }
         out.flush()
             .await
-            .map_err(|error| format!("writing {}: {error}", file.display()))
+            .map_err(|error| DownloadError::Refused(format!("writing {}: {error}", file.display())))
     }
 }
 
@@ -144,12 +195,13 @@ impl Store for HttpStore {
         .await
     }
 
-    async fn download(&self, url: &str, file: &Path) -> Result<(), String> {
+    async fn download(&self, url: &str, file: &Path) -> Result<(), DownloadError> {
         self.get(url, file, Vec::new(), |status| status.is_success()).await
     }
 
-    async fn download_range(&self, url: &str, file: &Path, first: u64, last: u64) -> Result<(), String> {
-        let range = HeaderValue::from_str(&format!("bytes={first}-{last}")).map_err(|error| error.to_string())?;
+    async fn download_range(&self, url: &str, file: &Path, first: u64, last: u64) -> Result<(), DownloadError> {
+        let range = HeaderValue::from_str(&format!("bytes={first}-{last}"))
+            .map_err(|error| DownloadError::Refused(error.to_string()))?;
         self.get(url, file, vec![(RANGE, range)], |status| {
             status == StatusCode::PARTIAL_CONTENT
         })
