@@ -114,6 +114,8 @@ fn a_healthy_bare_report_passes_without_writing_or_connecting() {
         "healthy",
         &format!("http://{}", control_plane.local_addr().expect("listener address")),
     );
+    fs::write(host.root.join("images/broken.json"), b"{").expect("unfinished cache manifest");
+    fs::write(host.root.join("images/broken.ext4"), b"partial image").expect("unfinished cache image");
     let before = contents(&host.root);
     let output = host.command(Path::new(BINARY)).output().expect("report exits");
     let report = String::from_utf8(output.stdout).expect("report text");
@@ -131,18 +133,18 @@ fn a_healthy_bare_report_passes_without_writing_or_connecting() {
 }
 
 #[test]
-fn a_corrupt_record_or_missing_firecracker_fails_while_the_other_checks_run() {
+fn a_failed_local_check_still_reports_the_other_checks() {
     for (file, failed) in [
         ("state/boxes.json", "boxes.json"),
         ("state/handover.json", "handover.json"),
-        ("images/broken.json", "image cache"),
+        ("images", "image cache"),
         ("firecracker", "Firecracker"),
     ] {
         let host = Host::new("broken", "http://127.0.0.1:9");
-        if file == "firecracker" {
-            fs::remove_file(host.root.join(file)).expect("remove Firecracker");
-        } else {
-            fs::write(host.root.join(file), b"{").expect("corrupt JSON");
+        match file {
+            "firecracker" => fs::remove_file(host.root.join(file)).expect("remove Firecracker"),
+            "images" => fs::remove_dir(host.root.join(file)).expect("remove image cache"),
+            _ => fs::write(host.root.join(file), b"{").expect("corrupt JSON"),
         }
         let before = contents(&host.root);
         let output = host.command(Path::new(BINARY)).output().expect("report exits");
