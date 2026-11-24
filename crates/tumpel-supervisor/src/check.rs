@@ -19,7 +19,7 @@ use crate::update::{self, Layout};
 use crate::{dir, images, lifecycle, usage};
 
 const VERSION: &str = env!("TUMPEL_RELEASE_VERSION");
-const CHECKS: [(&str, &str); 10] = [
+const CHECKS: [(&str, &str); 11] = [
     ("binary", "read the running binary and its version"),
     ("config", "read the host enrolment and control-plane address"),
     ("runtime", "read the host runtime settings"),
@@ -32,6 +32,7 @@ const CHECKS: [(&str, &str); 10] = [
         "attachment",
         "inspect the recorded processes, descriptors and Firecracker APIs",
     ),
+    ("handover", "decode the saved legacy handover"),
     ("update_state", "read the saved update records"),
 ];
 const MANIFEST: &str = "manifest";
@@ -102,43 +103,16 @@ impl Checks {
     }
 }
 
-fn read_inventory(layout: &Layout) -> Result<Vec<RecordedBox>, String> {
-    let mut standing = inventory::load(&layout.boxes())
-        .map_err(|_| "cannot decode boxes.json; inspect the saved box inventory")?
+fn read_inventory(path: &Path) -> Result<Vec<RecordedBox>, String> {
+    let boxes = inventory::load(path)
+        .map_err(|error| format!("{error:#}"))?
         .map_or_else(Vec::new, |inventory| inventory.boxes);
-    let handover =
-        inventory::load(&layout.handover()).map_err(|_| "cannot decode handover.json; inspect the saved handover")?;
     let mut taps = HashSet::new();
     let mut sessions = HashSet::new();
-    for box_ in &standing {
+    for box_ in &boxes {
         decode_box(box_, &mut taps, &mut sessions)?;
     }
-    if let Some(handover) = handover {
-        taps.clear();
-        sessions.clear();
-        for mut box_ in handover.boxes {
-            decode_box(&box_, &mut taps, &mut sessions)?;
-            if let Some(standing_box) = standing
-                .iter_mut()
-                .find(|saved| saved.record.tap_index == box_.record.tap_index)
-            {
-                if standing_box.record.session_id != box_.record.session_id
-                    || standing_box.record.machine.process_id != box_.record.machine.process_id
-                    || standing_box.record.box_id != box_.record.box_id
-                {
-                    return Err(
-                        "boxes.json and handover.json disagree about the box on a TAP device; inspect both records"
-                            .to_string(),
-                    );
-                }
-                box_.observation = standing_box.observation.take();
-                *standing_box = box_;
-            } else {
-                standing.push(box_);
-            }
-        }
-    }
-    Ok(standing)
+    Ok(boxes)
 }
 
 fn decode_box(box_: &RecordedBox, taps: &mut HashSet<i32>, sessions: &mut HashSet<String>) -> Result<(), String> {
@@ -149,33 +123,23 @@ fn decode_box(box_: &RecordedBox, taps: &mut HashSet<i32>, sessions: &mut HashSe
     {
         return Err("the box inventory has an invalid or duplicate TAP index or a duplicate session".to_string());
     }
-    let (_, _, queue) = lifecycle::decode_box(record).map_err(|_| {
-        format!(
-            "box {} has an unsupported image or turn record; check the saved box inventory",
-            record.tap_index
-        )
-    })?;
-    if queue.len() != record.queued.len() {
-        return Err(format!(
-            "box {} has an unsupported queued command; check the saved box inventory",
-            record.tap_index
-        ));
-    }
+    lifecycle::decode_box(record)
+        .map_err(|error| format!("box {} has an invalid image or turn record: {error}", record.tap_index))?;
     Ok(())
 }
 
-fn collect(manifest: Option<&Path>, checks: &Checks) {
+fn collect(manifest: Option<&Path>, checks: &Checks, legacy: bool) {
     let state = dir::supervisor_dir();
     let layout = Layout::new(PathBuf::from("/proc/self/exe"), state, dir::supervisor_unit_path());
     let digest = checks.check(
         "binary",
         "running binary SHA-256 and version read",
         (|| {
-            let digest = update::binary_sha256(&layout.binary)
-                .map_err(|_| "cannot read the running binary; reinstall the supervisor")?;
-            update::parse_version(VERSION)
-                .map_err(|_| "the binary has an invalid supervisor version; reinstall the supervisor")?;
-            Ok::<_, &str>(digest)
+            let digest = update::binary_sha256(&layout.binary)?;
+            update::parse_version(VERSION).map_err(|error| {
+                format!("the binary has an invalid supervisor version: {error}; reinstall the supervisor")
+            })?;
+            Ok::<_, String>(digest)
         })(),
     );
     checks
@@ -189,38 +153,42 @@ fn collect(manifest: Option<&Path>, checks: &Checks) {
         "host enrolment and control-plane address loaded",
         load_config(&layout.state)
             .and_then(|config| channel_url(&config.endpoint, &config.host_id))
-            .map_err(|_| "cannot load the enrolment in supervisor.json; check the host ID and endpoint"),
+            .map_err(|failure| failure.detail),
     );
     let runtime = checks.check(
         "runtime",
         "runtime settings loaded",
         load_runtime(&layout.state)
             .and_then(|runtime| box_size(&runtime).map(|_| runtime))
-            .map_err(|_| "cannot load runtime settings; check runtime.json and its memory size"),
+            .map_err(|failure| failure.detail),
     );
     checks.check(
         "host_key",
         "Ed25519 host key pair loaded",
-        load_key(&layout.state)
-            .map_err(|_| "cannot load a matching Ed25519 key pair from host-key.json; enrol this host again"),
+        load_key(&layout.state).map_err(|failure| failure.detail),
     );
     checks.check(
         "channel_state",
         "saved channel ledger loaded",
-        load_channel_state(&layout.state).map_err(|_| "cannot load the saved channel ledger; inspect channel.json"),
+        load_channel_state(&layout.state).map_err(|failure| failure.detail),
     );
     let boxes = checks.check(
         "inventory",
         "box inventory, images and turns decoded",
-        read_inventory(&layout),
+        read_inventory(&layout.boxes()),
     );
-    inspect_host(checks, runtime.as_ref(), boxes.as_deref());
+    if !legacy {
+        inspect_host(checks, runtime.as_ref(), boxes.as_deref());
+        checks.check(
+            "handover",
+            "legacy handover record decoded",
+            read_inventory(&layout.handover()),
+        );
+    }
     checks.check(
         "update_state",
         "saved update records decoded",
-        update::validate_state(&layout).map_err(|_| {
-            "cannot decode saved update state; inspect the pending, trial, rolled-back and refusal records"
-        }),
+        update::validate_state(&layout),
     );
     if let Some(manifest) = manifest {
         if let Some(digest) = digest {
@@ -257,8 +225,9 @@ fn inspect_host(
         checks.check(
             "usage",
             "CPU, memory and disk usage read",
-            usage::sample(0, Path::new(&*runtime.data_dir), &held)
-                .map_err(|_| "cannot read host usage; check procfs and dataDir in runtime.json"),
+            usage::sample(0, Path::new(&*runtime.data_dir), &held).map_err(|error| {
+                format!("cannot read host usage: {error:#}; check procfs and dataDir in runtime.json")
+            }),
         );
     } else {
         for name in ["image_cache", "usage"] {
@@ -295,7 +264,7 @@ fn check_manifest(path: &Path, digest: &Sha256Digest) -> Result<(), String> {
     update::verify_version(VERSION, &release, u32::from(ChannelProtocol::VERSION))
 }
 
-fn collect_until(manifest: Option<PathBuf>, deadline: Instant) -> Report {
+fn collect_until(manifest: Option<PathBuf>, deadline: Instant, legacy: bool) -> Report {
     let manifest_required = manifest.is_some();
     let (done, wait) = mpsc::channel();
     let shared = Arc::new(Mutex::new(Report {
@@ -306,7 +275,7 @@ fn collect_until(manifest: Option<PathBuf>, deadline: Instant) -> Report {
     }));
     let checks = Checks(Arc::clone(&shared));
     let started = thread::Builder::new().spawn(move || {
-        collect(manifest.as_deref(), &checks);
+        collect(manifest.as_deref(), &checks, legacy);
         done.send(())
     });
     let stopped = if started.is_err() {
@@ -328,6 +297,7 @@ fn collect_until(manifest: Option<PathBuf>, deadline: Instant) -> Report {
     };
     let mut pending = CHECKS
         .into_iter()
+        .filter(|(name, _)| !legacy || !matches!(*name, "image_cache" | "usage" | "attachment" | "handover"))
         .chain(manifest_required.then_some((MANIFEST, "read and verify the supplied manifest")))
         .filter(|(name, _)| !report.checks.contains_key(name));
     if let Some((name, action)) = pending.next() {
@@ -349,7 +319,7 @@ fn collect_until(manifest: Option<PathBuf>, deadline: Instant) -> Report {
 }
 
 pub fn report(format: ReportFormat, manifest: Option<PathBuf>, deadline: Instant) -> ExitCode {
-    let report = collect_until(manifest, deadline);
+    let report = collect_until(manifest, deadline, matches!(format, ReportFormat::Legacy));
     let stdout = io::stdout().lock();
     let output = match format {
         ReportFormat::Json => write_json(stdout, &report),

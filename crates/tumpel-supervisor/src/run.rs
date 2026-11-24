@@ -34,7 +34,7 @@ use crate::firecracker::Firecracker;
 use crate::guest_drive;
 use crate::lifecycle::{
     turn_failed, Abandoned, BoxTurn, Budgets, Command, IdleGate, Input, Lifecycle, Settings, SetupCommand, SetupOrder,
-    Taken, TeardownOrder,
+    Taken, TeardownOrder, Vmm,
 };
 use crate::pool::{memory_budget_mib, mib, Held, Size, TapPool};
 use crate::store::{jitter, HttpStore};
@@ -420,7 +420,12 @@ fn start_boxes(
         layer_cache_mib: runtime.layer_cache_mib,
     };
     let box_capacity = pool.capacity();
-    let mut lifecycle = Lifecycle::new(Firecracker::new(runtime), store, settings, pool, out, standing);
+    let vmm = Firecracker::new(runtime);
+    if taken.is_none() {
+        vmm.check_unclaimed(&[])
+            .map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
+    }
+    let mut lifecycle = Lifecycle::new(vmm, store, settings, pool, out, standing);
     lifecycle
         .start(taken)
         .map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
@@ -536,73 +541,6 @@ fn handed_turns(handover: &SupervisorHandover) -> Vec<EntityId> {
         .collect()
 }
 
-fn named_turns(text: &str) -> Vec<EntityId> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Vec::new();
-    };
-    value["boxes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|handed| handed["state"]["turnId"].as_str())
-        .filter_map(|turn_id| EntityId::try_from(turn_id.to_string()).ok())
-        .collect()
-}
-
-fn handover_lost(layout: &Layout, out: &UnboundedSender<Outgoing>, cause: &str, turns: &[EntityId]) {
-    eprintln!(
-        "tumpel-supervisor: HandoverLost: {cause}; this supervisor fails the {} turns it names and starts without the handed boxes",
-        turns.len()
-    );
-    for turn_id in turns {
-        turn_failed(
-            out,
-            turn_id,
-            TurnFailureReason::HarnessExited,
-            format!(
-                "the handover of the box of turn {} to this supervisor binary was lost: {cause}; send the turn again",
-                **turn_id
-            ),
-        );
-    }
-    if let Err(error) = update::forget_handover(layout) {
-        eprintln!("tumpel-supervisor: {error}; delete it by hand");
-    }
-}
-
-fn read_handover(layout: &Layout, out: &UnboundedSender<Outgoing>, handed: bool) -> Option<SupervisorHandover> {
-    let path = layout.handover();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) => {
-            handover_lost(layout, out, &format!("reading {} failed: {error}", path.display()), &[]);
-            return None;
-        }
-    };
-    match serde_json::from_str::<crate::inventory::Inventory>(&text).map(SupervisorHandover::from) {
-        Ok(handover) if handed => Some(handover),
-        Ok(handover) => {
-            handover_lost(
-                layout,
-                out,
-                "this supervisor started without the boxes' descriptors, so it cannot reach the boxes",
-                &handed_turns(&handover),
-            );
-            None
-        }
-        Err(error) => {
-            handover_lost(
-                layout,
-                out,
-                &format!("{} is no SupervisorHandover: {error}", path.display()),
-                &named_turns(&text),
-            );
-            None
-        }
-    }
-}
-
 fn store_lost(error: &ChannelError) -> Failure {
     fail(SupervisorFailure::ChannelStateLost, error.to_string())
 }
@@ -645,9 +583,21 @@ pub(crate) fn load_runtime(dir: &Path) -> Result<SupervisorRuntime, Failure> {
         .and_then(|current| dir::runtime_with_defaults(&path, &current).map_err(unreadable))
 }
 
+fn private_json_error(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<serde_json::Error>() {
+        Some(json) => format!(
+            "{error}: JSON {:?} error at line {}, column {}",
+            json.classify(),
+            json.line(),
+            json.column()
+        ),
+        None => format!("{error:#}"),
+    }
+}
+
 pub(crate) fn load_config(dir: &Path) -> Result<SupervisorConfig, Failure> {
     dir::read_json(&dir.join(CONFIG_FILE), "SupervisorConfig")
-        .map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")))?
+        .map_err(|error| fail(SupervisorFailure::NotEnrolled, private_json_error(&error)))?
         .ok_or_else(|| {
             fail(
                 SupervisorFailure::NotEnrolled,
@@ -661,7 +611,7 @@ pub(crate) fn load_config(dir: &Path) -> Result<SupervisorConfig, Failure> {
 
 pub(crate) fn load_key(dir: &Path) -> Result<Ed25519KeyPair, Failure> {
     let key: SupervisorHostKey = dir::read_json(&dir.join(KEY_FILE), "SupervisorHostKey")
-        .map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")))?
+        .map_err(|error| fail(SupervisorFailure::NotEnrolled, private_json_error(&error)))?
         .ok_or_else(|| {
             fail(
                 SupervisorFailure::HostRevoked,
@@ -694,7 +644,7 @@ pub(crate) fn load_key(dir: &Path) -> Result<Ed25519KeyPair, Failure> {
 
 pub(crate) fn load_channel_state(dir: &Path) -> Result<SupervisorChannelState, Failure> {
     let state: SupervisorChannelState = dir::read_json(&dir.join(CHANNEL_FILE), "SupervisorChannelState")
-        .map_err(|error| fail(SupervisorFailure::ChannelStateLost, format!("{error:#}")))?
+        .map_err(|error| fail(SupervisorFailure::ChannelStateLost, private_json_error(&error)))?
         .ok_or_else(|| fail(
             SupervisorFailure::ChannelStateLost,
             format!("{} is missing, so frames the control plane has not acked are lost; delete {} and enrol this host again",
@@ -780,41 +730,34 @@ async fn online_deadline(deadline: Option<tokio::time::Instant>, mut confirmed: 
     }
 }
 
-fn read_standing(layout: &Layout) -> Option<SupervisorHandover> {
-    crate::inventory::load(&layout.boxes()).map_or_else(
-        |error| {
-            eprintln!("tumpel-supervisor: {error:#}; the boxes it names are stopped");
-            Some(SupervisorHandover {
-                boxes: Vec::new(),
-                handed_at: chrono::Utc::now().fixed_offset(),
-            })
-        },
-        |inventory| inventory.map(Into::into),
-    )
-}
-
 fn taken(
     layout: &Layout,
-    out: &UnboundedSender<Outgoing>,
     handed: bool,
     mut received: BTreeMap<String, OwnedFd>,
 ) -> Result<Option<(SupervisorHandover, Taken)>, Failure> {
-    let taken = match read_handover(layout, out, handed || !received.is_empty()) {
-        Some(handover) if received.is_empty() => Some((handover, Taken::Handed)),
-        Some(handover) => Some((fd_store::restored(handover, &mut received), Taken::Handed)),
-        None => read_standing(layout).map(|standing| (fd_store::restored(standing, &mut received), Taken::Crashed)),
+    let load = |path: &Path| {
+        crate::inventory::load(path)
+            .map(|saved| saved.map(SupervisorHandover::from))
+            .map_err(|error| fail(SupervisorFailure::NotEnrolled, format!("{error:#}")))
     };
-    if taken.is_some() {
-        update::forget_handover(layout).map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
+    if handed || !received.is_empty() {
+        if let Some(handover) = load(&layout.handover())? {
+            let handover = if received.is_empty() {
+                handover
+            } else {
+                fd_store::restored(handover, &mut received)
+            };
+            return Ok(Some((handover, Taken::Handed)));
+        }
     }
-    Ok(taken)
+    let standing = load(&layout.boxes())?;
+    Ok(standing.map(|standing| (fd_store::restored(standing, &mut received), Taken::Crashed)))
 }
 
 async fn start_update(
     layout: &Layout,
     running: &Sha256Digest,
     out: &UnboundedSender<Outgoing>,
-    handed: bool,
 ) -> Result<Option<SupervisorUpdatePending>, Failure> {
     let trial =
         match update::startup(layout, running, out).map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))? {
@@ -827,13 +770,18 @@ async fn start_update(
             format!("reading the installed supervisor unit failed: {error}"),
         )
     })?;
-    if (handed || installed) && trial.is_none() {
+    if installed && trial.is_none() {
         refresh_unit(layout, RESTARTED).await?;
     }
     Ok(trial)
 }
 
-pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, OwnedFd>) -> Result<Stopped, Failure> {
+pub async fn run(
+    telemetry: Telemetry,
+    handed: bool,
+    received: BTreeMap<String, OwnedFd>,
+    started_daemon: impl FnOnce(),
+) -> Result<Stopped, Failure> {
     let mut terminated = signal(SignalKind::terminate()).map_err(|error| {
         fail(
             SupervisorFailure::NotEnrolled,
@@ -842,9 +790,12 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
     })?;
     let (out, mut from_box) = unbounded_channel();
     let started = start()?;
-    let trial = start_update(&started.layout, &started.running, &out, handed).await?;
-    let on_trial = trial.is_some();
-    let taken = taken(&started.layout, &out, handed, received)?;
+    let trial = start_update(&started.layout, &started.running, &out).await?;
+    let deadline = trial
+        .is_some()
+        .then(|| tokio::time::Instant::now() + Limits::HOST.online);
+    let taken = taken(&started.layout, handed, received)?;
+    let forget_handover = matches!(taken, Some((_, Taken::Handed)));
     let dir = dir::supervisor_dir();
     guest_drive::write(Path::new(&*started.runtime.image_cache_dir))
         .await
@@ -860,7 +811,11 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         taken,
         started.layout.boxes(),
     )?;
+    if forget_handover {
+        update::forget_handover(&started.layout).map_err(|error| fail(SupervisorFailure::NotEnrolled, error))?;
+    }
     fd_store::ready().map_err(|detail| fail(SupervisorFailure::NotEnrolled, detail))?;
+    started_daemon();
     let url = started.url;
     let config = started.config;
     let heartbeat = Duration::from_secs(u64::from(started.runtime.heartbeat_interval_seconds.get()));
@@ -891,7 +846,6 @@ pub async fn run(telemetry: Telemetry, handed: bool, received: BTreeMap<String, 
         confirmed,
         grace,
     };
-    let deadline = on_trial.then(|| tokio::time::Instant::now() + Limits::HOST.online);
     let served = tokio::select! {
         served = serve(&mut channel, &url, heartbeat, &usage, &commands, &mut from_box, &config, &dir, &mut updates) => served,
         Some(()) = restarted.recv() => Ok(Served::Updated),

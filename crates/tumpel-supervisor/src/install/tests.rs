@@ -106,3 +106,34 @@ fn only_numbered_tumpel_links_and_networkd_files_count_as_pool_members() {
     assert_eq!(tap_index("50-tumpel3.network"), Some(3));
     assert_eq!(tap_index("10-eth0.network"), None);
 }
+
+#[cfg(feature = "host-tests")]
+#[test]
+fn systemd_starts_the_generated_service_without_waiting_for_old_binary_readiness() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let binary = std::env::temp_dir().join(format!("tumpel-legacy-unit-{}", std::process::id()));
+    std::fs::write(&binary, "#!/bin/sh\n[ \"$*\" = run ] || exit 2\nsleep 2\n").expect("legacy daemon");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+        .expect("make the legacy daemon executable");
+    let generated = super::supervisor_unit_text(&binary);
+    let service_type = generated
+        .lines()
+        .find(|line| line.starts_with("Type="))
+        .expect("service type");
+    let mut argv = generated
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .expect("service command")
+        .split_whitespace();
+    let result = Command::new("systemd-run")
+        .args(["--user", "--quiet", "--wait", "--collect", "--property", service_type])
+        .args(["--property", "TimeoutStartSec=1s", "--"])
+        .arg(argv.next().expect("service executable"))
+        .args(argv)
+        .output()
+        .expect("systemd starts the service");
+    std::fs::remove_file(&binary).expect("remove the legacy daemon fixture");
+    assert!(result.status.success(), "{result:?}");
+}

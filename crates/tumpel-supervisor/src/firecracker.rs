@@ -133,14 +133,15 @@ fn entries(dir: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
     }
 }
 
+fn box_index(name: &std::ffi::OsStr) -> Option<u8> {
+    name.to_str()?.strip_prefix("box")?.parse().ok()
+}
+
 pub fn remove_leftovers(data: &Path, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String> {
     let kept_boxes: Vec<String> = boxes.iter().map(|index| format!("box{index}")).collect();
     for entry in entries(data)? {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_box = name
-            .strip_prefix("box")
-            .is_some_and(|index| index.parse::<u8>().is_ok());
-        if is_box && !kept_boxes.contains(&name) {
+        if box_index(&entry.file_name()).is_some() && !kept_boxes.contains(&name) {
             remove_dir(&entry.path())?;
         }
     }
@@ -246,7 +247,8 @@ fn booted_memory(socket: &Path, pid: libc::pid_t) -> Result<NonZeroU32, String> 
     use std::io::{BufRead, Read, Write};
     let failed = |error: std::io::Error| {
         format!(
-            "Firecracker did not answer GET /machine-config within {} s: {error}",
+            "reading GET /machine-config from {} within {} s: {error}",
+            socket.display(),
             API_ANSWER.as_secs()
         )
     };
@@ -307,7 +309,12 @@ fn booted_memory(socket: &Path, pid: libc::pid_t) -> Result<NonZeroU32, String> 
     }
     serde_json::from_slice::<MachineConfig>(&answer)
         .map(|config| config.mem_size_mib)
-        .map_err(|_| "Firecracker answered GET /machine-config without a positive mem_size_mib".to_string())
+        .map_err(|error| {
+            format!(
+                "invalid Firecracker GET /machine-config response from {}: {error}",
+                socket.display()
+            )
+        })
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), String> {
@@ -363,32 +370,19 @@ enum Owner {
 
 struct Adopted {
     pid: libc::pid_t,
-    owner: Option<Owner>,
+    owner: Owner,
 }
 
 impl Adopted {
-    fn end(&mut self) -> String {
-        match self.owner.take() {
-            None => "had already been ended".to_string(),
-            Some(Owner::Child) => end_child(self.pid),
-            Some(Owner::Scope(scope)) => match stop_scopes(std::slice::from_ref(&scope)) {
+    fn end(self) -> String {
+        match self.owner {
+            Owner::Child => end_child(self.pid),
+            Owner::Scope(scope) => match stop_scopes(std::slice::from_ref(&scope)) {
                 Ok(()) => format!(
                     "was stopped with {scope}; systemd holds its exit status, as this supervisor did not start it"
                 ),
                 Err(error) => error,
             },
-        }
-    }
-}
-
-impl Drop for Adopted {
-    fn drop(&mut self) {
-        if self.owner.is_some() {
-            let ended = self.end();
-            eprintln!(
-                "tumpel-supervisor: ending a box: Firecracker process {} {ended}",
-                self.pid
-            );
         }
     }
 }
@@ -406,14 +400,10 @@ impl Process {
         }
     }
 
-    fn keep(self) {
-        std::mem::forget(self);
-    }
-
     async fn kill(self) -> String {
         match self {
             Self::Spawned(mut child) => kill_child(&mut child).await,
-            Self::Adopted(mut adopted) => tokio::task::spawn_blocking(move || adopted.end())
+            Self::Adopted(adopted) => tokio::task::spawn_blocking(move || adopted.end())
                 .await
                 .unwrap_or_else(|error| format!("could not be ended: {error}")),
         }
@@ -522,17 +512,37 @@ fn in_scope(pid: libc::pid_t, scope: &str) -> bool {
     process_scope(pid, scope).is_ok_and(|inside| inside)
 }
 
-fn process_start(pid: libc::pid_t) -> Result<u64, String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map_err(|error| format!("reading the identity of process {pid}: {error}"))?;
-    let mut fields = stat.rsplit_once(") ").map_or("", |(_, rest)| rest).split_whitespace();
-    if matches!(fields.next(), Some("Z" | "X" | "x") | None) {
-        return Err(format!("process {pid} is no longer running"));
+#[derive(PartialEq, Eq)]
+struct ProcessIdentity {
+    parent: libc::pid_t,
+    start: u64,
+}
+
+fn process_identity(pid: libc::pid_t) -> Result<Option<ProcessIdentity>, String> {
+    let text = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("reading the identity of process {pid}: {error}")),
+    };
+    let (_, fields) = text
+        .rsplit_once(") ")
+        .ok_or_else(|| format!("process {pid} has no readable identity"))?;
+    let mut fields = fields.split_whitespace();
+    if matches!(fields.next(), Some("Z" | "X" | "x")) {
+        return Ok(None);
     }
-    fields
-        .nth(18)
-        .and_then(|field| field.parse().ok())
-        .ok_or_else(|| format!("process {pid} has no readable start time"))
+    let parent = fields.next().and_then(|field| field.parse().ok());
+    let start = fields.nth(17).and_then(|field| field.parse().ok());
+    match (parent, start) {
+        (Some(parent), Some(start)) => Ok(Some(ProcessIdentity { parent, start })),
+        _ => Err(format!("process {pid} has no readable parent and start time")),
+    }
+}
+
+fn process_start(pid: libc::pid_t) -> Result<u64, String> {
+    process_identity(pid)?
+        .map(|identity| identity.start)
+        .ok_or_else(|| format!("process {pid} is no longer running"))
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -670,10 +680,10 @@ fn handed_pid(handed: &SupervisorHandoverMachine) -> Option<libc::pid_t> {
 fn recorded_buffers(handed: &SupervisorHandoverMachine) -> Result<(Vec<u8>, Vec<u8>), String> {
     let guest = STANDARD
         .decode(handed.guest_buffer.as_bytes())
-        .map_err(|_| "guestBuffer is not base64")?;
+        .map_err(|error| format!("guestBuffer is not base64: {error}"))?;
     let console = STANDARD
         .decode(handed.console_tail.as_bytes())
-        .map_err(|_| "consoleTail is not base64")?;
+        .map_err(|error| format!("consoleTail is not base64: {error}"))?;
     Ok((guest, console))
 }
 
@@ -721,7 +731,7 @@ impl Firecracker {
         let index = u8::try_from(record.tap_index).map_err(|_| "the box has an invalid TAP index")?;
         self.inspect_attachment(index, &record.machine, box_.observation.as_ref(), &scope_of(index))?;
         self.booted_disk(&record.session_id)
-            .map_err(|_| "cannot read the box disk; check the recorded session and dataDir in runtime.json")?;
+            .map_err(|error| format!("{error}; check the recorded session and dataDir in runtime.json"))?;
         Ok(())
     }
 
@@ -787,10 +797,7 @@ impl Firecracker {
         machine.stdout = Some(stdout);
         machine.stderr = Some(stderr);
         let scoped = matches!(owner, Owner::Scope(_));
-        machine.process = Some(Process::Adopted(Adopted {
-            pid,
-            owner: Some(owner),
-        }));
+        machine.process = Some(Process::Adopted(Adopted { pid, owner }));
         machine.watcher = Some(watch(
             tap.index(),
             pid,
@@ -833,22 +840,36 @@ impl Vmm for Firecracker {
         tap: &Tap,
         handed: &SupervisorHandoverMachine,
     ) -> Result<(FirecrackerBox, VsockGuest), String> {
-        let mut taken = Taken::from(handed);
-        let attached = self
-            .attach_box(session_id, tap, handed, &mut taken)
-            .and_then(|(machine, guest)| machine.home(&guest).map(|()| (machine, guest)));
-        if attached.is_err() {
-            if let Some(pid) = handed_pid(handed) {
-                end_child(pid);
+        let fds = [handed.guest_fd, handed.stdout_fd, handed.stderr_fd];
+        let process = unsafe { libc::getpid() };
+        for (index, (fd, (name, socket))) in fds
+            .into_iter()
+            .zip([
+                ("the guest connection", true),
+                ("the box's standard output", false),
+                ("the box's standard error", false),
+            ])
+            .enumerate()
+        {
+            if fds[..index].contains(&fd) {
+                return Err("the box has duplicate descriptor numbers".to_string());
             }
+            Descriptor::read(process, fd, name, socket)?;
         }
-        drop(taken);
-        attached
+        let mut taken = Taken::from(handed);
+        self.attach_box(session_id, tap, handed, &mut taken)
+            .and_then(|(machine, guest)| machine.home(&guest).map(|()| (machine, guest)))
     }
 
-    fn booted_memory(&self, handed: &SupervisorHandoverMachine) -> Result<NonZeroU32, String> {
-        let pid = handed_pid(handed).ok_or_else(|| format!("process id {} is out of range", handed.process_id))?;
-        booted_memory(Path::new(&handed.api_socket), pid)
+    fn booted_memory(&self, index: u8, handed: &SupervisorHandoverMachine) -> Result<Option<NonZeroU32>, String> {
+        let pid = self.attachment_pid(index, handed)?;
+        let Some(identity) = process_identity(pid)? else {
+            return Ok(None);
+        };
+        if identity.parent != unsafe { libc::getpid() } && !process_scope(pid, &scope_of(index))? {
+            return Err(format!("Firecracker process {pid} is outside {}", scope_of(index)));
+        }
+        booted_memory(Path::new(&handed.api_socket), pid).map(Some)
     }
 
     fn booted_disk(&self, session_id: &EntityId) -> Result<NonZeroU32, String> {
@@ -871,24 +892,16 @@ impl Vmm for Firecracker {
         crate::usage::disk(&self.data, drives).map_err(|error| format!("{error:#}"))
     }
 
-    fn discard(&self, handed: &SupervisorHandoverMachine) {
-        let taken = Taken::from(handed);
-        if let Some(pid) = handed_pid(handed) {
-            end_child(pid);
+    fn check_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
+        if claimed.is_empty()
+            && !entries(&self.data)?
+                .iter()
+                .any(|entry| box_index(&entry.file_name()).is_some())
+        {
+            return Ok(());
         }
-        drop(taken);
-    }
-
-    fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
         let listed = std::process::Command::new("systemctl")
-            .args([
-                "--user",
-                "list-units",
-                "--all",
-                "--plain",
-                "--no-legend",
-                "tumpel-box*.scope",
-            ])
+            .args(["--user", "list-units", "--plain", "--no-legend", "tumpel-box*.scope"])
             .stdin(Stdio::null())
             .output()
             .map_err(|error| format!("starting systemctl to list the box scopes: {error}"))?;
@@ -909,11 +922,10 @@ impl Vmm for Firecracker {
         if unclaimed.is_empty() {
             return Ok(());
         }
-        eprintln!(
-            "tumpel-supervisor: stopping {}, boxes this supervisor could not take over",
+        Err(format!(
+            "found running box scopes outside the inventory: {}; restore their box records or stop those scopes explicitly",
             unclaimed.join(" ")
-        );
-        stop_scopes(&unclaimed)
+        ))
     }
 
     fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String> {
@@ -955,15 +967,6 @@ pub struct FirecrackerBox {
 impl Drop for FirecrackerBox {
     fn drop(&mut self) {
         self.unwatch();
-        if self.process.is_some() {
-            eprintln!(
-                "tumpel-supervisor: box {} ({}) of session {} was dropped while its Firecracker process ran, which ends that process unlogged. Console: {}",
-                self.index,
-                scope_of(self.index),
-                self.session_name(),
-                self.console_tail()
-            );
-        }
     }
 }
 
@@ -1026,7 +1029,8 @@ impl FirecrackerBox {
     async fn spawn(&mut self) -> Result<(), String> {
         create_private_dir(&self.dir)?;
         self.clear_sockets()?;
-        let mut child = Command::new("systemd-run")
+        let socket = self.api_socket();
+        let child = Command::new("systemd-run")
             .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
             .arg(scope_of(self.index))
             .arg("--")
@@ -1037,7 +1041,6 @@ impl FirecrackerBox {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
             .spawn()
             .map_err(|error| {
                 format!(
@@ -1045,6 +1048,10 @@ impl FirecrackerBox {
                     self.binary.display()
                 )
             })?;
+        self.process = Some(Process::Spawned(child));
+        let Some(Process::Spawned(child)) = self.process.as_mut() else {
+            return Err("Firecracker did not start".to_string());
+        };
         if let Some(stdout) = child.stdout.take() {
             let stdout = stdout
                 .into_owned_fd()
@@ -1061,7 +1068,6 @@ impl FirecrackerBox {
             fd_store::keep(self.index, fd_store::STDERR, stderr.as_fd())?;
             self.stderr = Some(stderr);
         }
-        let socket = self.api_socket();
         while UnixStream::connect(&socket).await.is_err() {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(format!(
@@ -1076,7 +1082,6 @@ impl FirecrackerBox {
             .ok_or_else(|| "Firecracker ended right after opening its API socket".to_string())?;
         self.unwatch();
         self.watcher = Some(watch(self.index, pid, self.session_name(), &self.console, false)?);
-        self.process = Some(Process::Spawned(child));
         Ok(())
     }
 
@@ -1349,9 +1354,6 @@ impl Machine for FirecrackerBox {
             ..self.record()?
         };
         self.unwatch();
-        if let Some(process) = self.process.take() {
-            process.keep();
-        }
         Ok(machine)
     }
 }

@@ -228,7 +228,7 @@ async fn reattach_of_a_box_whose_process_ended_closes_every_handed_descriptor() 
 }
 
 #[tokio::test]
-async fn reattach_with_the_wrong_descriptor_kills_and_reaps_the_live_child_and_closes_the_rest() {
+async fn a_failed_attachment_preserves_the_live_child_and_console_descriptors() {
     let vmm = firecracker("reattach-wrong");
     let tap = TapPool::new(4096, BOX).claim(BOX, ROOMY).expect("tap");
     let pid = sleeper();
@@ -238,9 +238,13 @@ async fn reattach_with_the_wrong_descriptor_kills_and_reaps_the_live_child_and_c
         panic!("a pipe handed as the guest connection is refused");
     };
     assert!(error.contains("is no socket"), "{error}");
-    assert!(reaped(pid), "the live child is killed and reaped");
-    let pipes = released(&mut handed.stdout) && released(&mut handed.stderr);
-    assert!(pipes, "the console pipes are closed");
+    assert_eq!(alive(pid, SCOPE), Ok(Owner::Child));
+    handed.stdout.write_all(b"out").expect("write to the preserved console");
+    handed.stderr.write_all(b"err").expect("write to the preserved console");
+    drop(Taken::from(&handed.machine));
+    zombie(pid);
+    assert!(alive(pid, SCOPE).is_err());
+    assert!(reaped(pid));
 }
 
 #[test]

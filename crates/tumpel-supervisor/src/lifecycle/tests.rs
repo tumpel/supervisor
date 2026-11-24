@@ -336,6 +336,13 @@ impl Machine for MemoryMachine {
         .expect("a recorded machine"))
     }
 
+    fn observation(&self, _: &MemoryGuest) -> Result<Option<crate::firecracker::Observation>, String> {
+        if self.session == "missing-observation" {
+            return Err("the process metadata is unavailable".to_string());
+        }
+        Ok(None)
+    }
+
     fn reconnect(&mut self, guest: &mut MemoryGuest) -> impl Future<Output = Result<(), String>> + Send {
         note(&self.log, format!("reconnect {}", self.session));
         *guest = self.guest();
@@ -394,18 +401,13 @@ impl Vmm for MemoryVmm {
         Ok((self.machine(session_id, tap)?, guest))
     }
 
-    fn booted_memory(&self, handed: &SupervisorHandoverMachine) -> Result<NonZeroU32, String> {
-        self.hands
+    fn booted_memory(&self, _: u8, handed: &SupervisorHandoverMachine) -> Result<Option<NonZeroU32>, String> {
+        Ok(self
+            .hands
             .lock()
             .expect("hands")
             .get(&handed.guest_fd)
-            .map(|(_, memory_mib)| *memory_mib)
-            .ok_or_else(|| {
-                format!(
-                    "its Firecracker process {} ended during the handover",
-                    handed.process_id
-                )
-            })
+            .map(|(_, memory_mib)| *memory_mib))
     }
 
     fn booted_disk(&self, _: &EntityId) -> Result<NonZeroU32, String> {
@@ -420,13 +422,8 @@ impl Vmm for MemoryVmm {
         })
     }
 
-    fn discard(&self, handed: &SupervisorHandoverMachine) {
-        self.hands.lock().expect("hands").remove(&handed.guest_fd);
-        note(&self.log, format!("discard {}", handed.process_id));
-    }
-
-    fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
-        note(&self.log, format!("keep boxes {claimed:?} and stop the rest"));
+    fn check_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
+        note(&self.log, format!("keep boxes {claimed:?}"));
         Ok(())
     }
 
@@ -1751,7 +1748,7 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
         [
             "hand over session-1",
             "reattach session-1 on tumpel0",
-            "keep boxes [0] and stop the rest",
+            "keep boxes [0]",
             "reconnect session-1",
             "pause session-1"
         ]
@@ -1812,7 +1809,7 @@ async fn a_supervisor_started_after_a_crash_keeps_every_box_and_fails_only_the_c
         [
             "reattach session-1 on tumpel0",
             "reattach session-2 on tumpel1",
-            "keep boxes [0, 1] and stop the rest",
+            "keep boxes [0, 1]",
             "reconnect session-2",
             "pause session-2"
         ]
@@ -1842,11 +1839,11 @@ async fn a_host_with_no_record_of_boxes_starts_without_the_systemd_user_manager_
     assert_eq!(standing.boxes.len(), 0);
     let next = first.after_crash(standing);
     tokio::time::sleep(Duration::from_millis(1)).await;
-    assert_eq!(next.log(), ["keep boxes [] and stop the rest"]);
+    assert_eq!(next.log(), ["keep boxes []"]);
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_box_on_record_that_cannot_be_reattached_after_a_crash_is_stopped_with_the_rest() {
+async fn only_a_box_with_an_ended_process_is_omitted_after_a_crash() {
     let mut old = host("crash-stops-lost-box", 2, Harness::SlowClone, Boot::Works);
     old.turn("turn-1", "session-1", "one", Vec::new());
     old.settle_until("complete 1").await;
@@ -1857,33 +1854,31 @@ async fn a_box_on_record_that_cannot_be_reattached_after_a_crash_is_stopped_with
     standing.boxes[1].machine.guest_fd = 41;
     let new = old.after_crash(standing);
     tokio::time::sleep(Duration::from_millis(1)).await;
-    assert_eq!(
-        new.log(),
-        [
-            "reattach session-1 on tumpel0",
-            "discard 99",
-            "keep boxes [0] and stop the rest"
-        ],
-        "the box of session-2 on tumpel1 is not kept, so its scope is stopped"
-    );
+    assert_eq!(new.log(), ["reattach session-1 on tumpel0", "keep boxes [0]"]);
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_box_that_cannot_be_handed_over_answers_its_queued_teardown_with_box_gone() {
+async fn a_failed_handover_keeps_the_box_record_and_queued_teardown() {
     let mut old = host("handover-refused", 1, Harness::SlowClone, Boot::RefusesHandover);
     old.turn("turn-1", "session-1", "one", Vec::new());
     old.settle_until("claim turn-1").await;
     tokio::time::sleep(SLOW_CLONE / 2).await;
     old.teardown("session-1");
-    let handover = old.ask_handover().await.expect("the handover answers");
-    assert_eq!(handover.boxes.len(), 0);
-    let failed = format!(
-        "failed {}: box box-session-1 of session session-1 could not be handed to the new supervisor binary and was stopped: its Firecracker process refused the handover; send the turn again",
-        TurnFailureReason::HarnessExited
-    );
-    assert_eq!(
-        old.settle_until("box gone session-1").await,
-        [failed.as_str(), "box gone session-1"]
+    assert!(old.ask_handover().await.is_err(), "the incomplete handover is rejected");
+    let saved = old.standing();
+    assert_eq!(saved.boxes.len(), 1);
+    assert!(matches!(
+        saved.boxes[0].queued.as_slice(),
+        [SupervisorHandoverCommand::Teardown(_)]
+    ));
+    let error = old
+        .runner
+        .await
+        .expect("the lifecycle ended")
+        .expect_err("the handover failed");
+    assert!(
+        error.contains("its Firecracker process refused the handover"),
+        "{error}"
     );
 }
 
@@ -1897,7 +1892,7 @@ async fn a_handed_box_whose_process_ended_fails_its_turn_and_frees_its_tap() {
     old.vmm.hands.lock().expect("hands").clear();
     let mut new = old.successor(&handover);
     let failed = format!(
-        "failed {}: box box-session-1 of session session-1 was lost in the handover to this supervisor binary: its Firecracker process 103 ended during the handover; send the turn again",
+        "failed {}: box box-session-1 of session session-1 lost its Firecracker process 103 during the handover; send the turn again",
         TurnFailureReason::HarnessExited
     );
     assert_eq!(new.settle_until(&failed).await, [failed]);
@@ -1928,11 +1923,38 @@ async fn a_warm_box_handed_over_takes_the_next_turn_without_a_boot() {
         [
             "hand over session-1",
             "reattach session-1 on tumpel0",
-            "keep boxes [0] and stop the rest",
+            "keep boxes [0]",
             "resume session-1",
             "reconnect session-1",
             "pause session-1"
         ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_observation_error_does_not_stop_a_box_at_boot_or_takeover() {
+    let mut old = host("observation-error", 1, Harness::Echo, Boot::Works);
+    old.turn("turn-1", "missing-observation", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    old.log();
+
+    let mut new = old.hand_over().await;
+    assert_eq!(new.standing().boxes.len(), 1);
+    new.turn("turn-2", "missing-observation", "two", Vec::new());
+    assert_eq!(
+        new.settle_until("complete 1").await,
+        ["claim turn-2", "line 1 two", "complete 1"]
+    );
+    let log = new.log();
+    assert!(
+        log.iter()
+            .any(|entry| entry == "reattach missing-observation on tumpel0"),
+        "{log:?}"
+    );
+    assert!(
+        !log.iter()
+            .any(|entry| entry.starts_with("stop ") || entry.starts_with("boot ")),
+        "{log:?}"
     );
 }
 
@@ -1962,7 +1984,7 @@ async fn a_warm_box_handed_over_with_a_queued_teardown_is_stopped_and_answers_bo
         [
             "hand over session-1",
             "reattach session-1 on tumpel0",
-            "keep boxes [0] and stop the rest",
+            "keep boxes [0]",
             "stop session-1"
         ]
     );
