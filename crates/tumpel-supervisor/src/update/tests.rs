@@ -44,6 +44,11 @@ impl Idle for &FakeIdle {
             let _ = busy.wait_for(|running| *running == 0).await;
         }
     }
+    fn prepare_update(&self, _: Duration) -> impl Future<Output = Result<(), String>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn cancel_update(&self) {}
 }
 
 struct FakeSource {
@@ -538,6 +543,21 @@ async fn an_announced_rollback_installs_an_older_supervisor_version() {
     exec_start_pre(&layout);
     let unit = text(&layout.unit);
     assert!(unit.lines().any(|line| line == "Type=simple"), "{unit}");
+}
+
+pub(crate) async fn assert_rollback_keeps_the_running_binary(idle: impl Idle) {
+    let layout = layout("blocked-rollback");
+    let source = FakeSource {
+        supervisor_version: "0.3.0-rc.4",
+        rollback: true,
+        ..FakeSource::binary(&good_script())
+    };
+    let (out, _events) = unbounded_channel();
+    let running = digest(&sha256_hex(OLD_BINARY.as_bytes()));
+    let updater = Updater::new(source, layout.clone(), limits(), running, "0.3.0-rc.5", idle, out);
+    assert_eq!(updater.announced(Duration::ZERO).await, Outcome::Busy);
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert!(!layout.pending().exists());
 }
 
 #[tokio::test]

@@ -119,6 +119,8 @@ pub trait Idle: Send + Sync {
     fn boxes(&self) -> u32;
     fn busy(&self) -> u32;
     fn settled(&self) -> impl Future<Output = ()> + Send;
+    fn prepare_update(&self, limit: Duration) -> impl Future<Output = Result<(), String>> + Send;
+    fn cancel_update(&self);
 }
 
 pub struct Release {
@@ -513,6 +515,14 @@ impl<S: Source, I: Idle> Updater<S, I> {
             self.fail(&release.sha256, stopped);
             return Outcome::Failed(reason);
         }
+        if let Err(error) = self.idle.prepare_update(self.limits.swap).await {
+            self.idle.cancel_update();
+            self.fail(
+                &release.sha256,
+                stop(SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed, error),
+            );
+            return Outcome::Busy;
+        }
         eprintln!(
             "tumpel-supervisor: swapping supervisor {} ({}) for {} and handing its boxes over",
             self.version,
@@ -523,6 +533,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         match self.swap(&release.sha256).await {
             Ok(()) => Outcome::Restart,
             Err(stopped) => {
+                self.idle.cancel_update();
                 let reason = stopped.reason.clone();
                 self.fail(&release.sha256, stopped);
                 Outcome::Failed(reason)
@@ -913,4 +924,4 @@ pub fn refresh_unit(layout: &Layout) -> Result<bool, String> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -518,11 +518,25 @@ pub(crate) struct MemoryStore(
     Arc<Mutex<Index>>,
     Duration,
     Arc<AtomicU32>,
+    Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 );
 
 const FETCHED_IMAGE_URL: &str = "https://r2.example.test/fetched/image";
 
 impl MemoryStore {
+    fn deliver_pack_reply(&self, answers: &Answers, answer: Answer) {
+        if let Some(wait) = self.5.lock().expect("pack reply gate").take() {
+            let answers = answers.clone();
+            tokio::spawn(async move {
+                if wait.await.is_ok() {
+                    answers.deliver(answer);
+                }
+            });
+        } else {
+            answers.deliver(answer);
+        }
+    }
+
     fn holds(&self, url: &str) -> bool {
         self.0.lock().expect("store").contains_key(url)
     }
@@ -838,7 +852,7 @@ fn control_plane(
                             .packs
                             .insert(pack.pack_digest.as_str().to_string(), pack.size_bytes);
                     }
-                    answers.deliver(Answer::PackUploads(ChannelSnapshotPackUploads {
+                    let answer = Answer::PackUploads(ChannelSnapshotPackUploads {
                         part: packs.part,
                         snapshot_id: packs.snapshot_id.clone(),
                         type_: ChannelSnapshotPackUploadsType::SnapshotPackUploads,
@@ -853,7 +867,8 @@ fn control_plane(
                                 url: pack_url(&pack.pack_digest).parse().expect("a pack URL"),
                             })
                             .collect(),
-                    }));
+                    });
+                    store.deliver_pack_reply(&answers, answer);
                     forward(&sender, ChannelHostMessage::SnapshotPacks(packs));
                 }
                 ChannelHostMessage::RestoreChunks(chunks) => {
@@ -2214,6 +2229,15 @@ async fn a_live_box_with_an_unattachable_turn_is_reported_held_and_the_turn_fail
         new.sessions.borrow().iter().map(EntityId::as_str).collect::<Vec<_>>(),
         ["session-1"]
     );
+    let (permit, blocked) = tokio::sync::oneshot::channel();
+    new.commands
+        .send(Input::PrepareUpdate(permit))
+        .expect("prepare an update");
+    assert!(blocked
+        .await
+        .expect("runner reports")
+        .expect_err("protected box prevents the update")
+        .contains("live boxes"));
     let frames = new
         .settle_until_starts(&format!("failed {}:", TurnFailureReason::HarnessExited))
         .await;
@@ -2267,6 +2291,64 @@ async fn a_live_box_with_an_unattachable_turn_is_reported_held_and_the_turn_fail
             .any(|entries| entries == ["discard protected scope 0", "boot session-1 on tumpel0"]),
         "{log:?}"
     );
+}
+
+#[tokio::test]
+async fn a_rollback_offer_leaves_a_protected_dirty_box_and_the_current_binary_in_place() {
+    let mut old = host("rollback-protected-box", 1, Harness::Echo, Boot::Works);
+    old.turn("turn-1", "session-1", "one", Vec::new());
+    old.settle_until("complete 1").await;
+    let saved = old.standing();
+    assert!(saved.boxes[0].dirty);
+    old.vmm.failed_attachments.insert(0);
+    let protected = old.after_crash(saved);
+    let held = tokio::sync::watch::channel(1).1;
+    let gate = super::IdleGate::new(held.clone(), held, protected.commands.clone());
+
+    crate::update::tests::assert_rollback_keeps_the_running_binary(gate).await;
+
+    assert!(!protected.runner.is_finished());
+    assert_eq!(protected.standing().boxes[0].box_id.as_str(), "box-session-1");
+    assert!(protected.standing().boxes[0].dirty);
+    assert!(!protected.log().iter().any(|entry| entry.starts_with("stop ")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn update_preparation_waits_for_a_snapshot_reply_and_can_resume_a_parked_turn() {
+    let mut host = host("prepare-online", 2, Harness::SlowClone, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("complete 1").await;
+    host.turn("turn-2", "session-2", "two", Vec::new());
+    host.settle_until("claim turn-2").await;
+
+    let (reply, wait) = tokio::sync::oneshot::channel();
+    *host.store.5.lock().expect("pack reply gate") = Some(wait);
+    host.snapshot("session-1");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(message) = host.received.recv().await {
+            if matches!(message, ChannelHostMessage::SnapshotPacks(_)) {
+                return;
+            }
+        }
+        panic!("the control-plane boundary closed before receiving the snapshot packs");
+    })
+    .await
+    .expect("the host asks for snapshot pack URLs");
+
+    let (permit, mut ready) = tokio::sync::oneshot::channel();
+    host.commands.send(Input::PrepareUpdate(permit)).expect("prepare");
+    host.turn("during", "session-3", "defer", Vec::new());
+    host.settle_until_starts("failed HostUpdating:").await;
+    assert!(matches!(
+        ready.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+
+    reply.send(()).expect("the snapshot request still accepts an answer");
+    host.settle_until_starts("snapshot done").await;
+    assert_eq!(ready.await.expect("the runner is still alive"), Ok(()));
+    host.commands.send(Input::CancelUpdate).expect("cancel preparation");
+    host.settle_until("complete 1").await;
 }
 
 #[tokio::test(start_paused = true)]
