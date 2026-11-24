@@ -44,7 +44,6 @@ pub struct Limits {
     pub verify: Duration,
     pub place: Duration,
     pub dry_run: Duration,
-    pub swap: Duration,
 }
 
 impl Limits {
@@ -54,7 +53,6 @@ impl Limits {
         verify: Duration::from_secs(30),
         place: Duration::from_secs(60),
         dry_run: Duration::from_secs(60),
-        swap: Duration::from_secs(30),
     };
 }
 
@@ -360,7 +358,7 @@ pub struct Updater<S: Source, I: Idle> {
     version: &'static str,
     idle: I,
     out: UnboundedSender<Outgoing>,
-    running_update: Mutex<()>,
+    prepared: Mutex<bool>,
 }
 
 impl<S: Source, I: Idle> Updater<S, I> {
@@ -381,22 +379,28 @@ impl<S: Source, I: Idle> Updater<S, I> {
             version,
             idle,
             out,
-            running_update: Mutex::new(()),
+            prepared: Mutex::new(false),
         }
     }
 
     pub async fn now(&self) -> Outcome {
-        let _running = self.running_update.lock().await;
+        let mut prepared = self.prepared.lock().await;
+        if *prepared {
+            return Outcome::Restart;
+        }
         match self.due().await {
-            Ok(release) => self.apply(&release).await,
+            Ok(release) => self.apply(&release, &mut prepared).await,
             Err(outcome) => outcome,
         }
     }
 
     pub async fn announced(&self, grace: Duration) -> Outcome {
-        let Ok(_running) = self.running_update.try_lock() else {
+        let Ok(mut prepared) = self.prepared.try_lock() else {
             return Outcome::Busy;
         };
+        if *prepared {
+            return Outcome::Busy;
+        }
         let release = match self.due().await {
             Ok(release) => release,
             Err(outcome) => return outcome,
@@ -423,7 +427,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
                 () = self.idle.settled() => {}
             }
         }
-        self.apply(&release).await
+        self.apply(&release, &mut prepared).await
     }
 
     async fn due(&self) -> Result<Release, Outcome> {
@@ -455,27 +459,21 @@ impl<S: Source, I: Idle> Updater<S, I> {
         }
     }
 
-    async fn apply(&self, release: &Release) -> Outcome {
+    async fn apply(&self, release: &Release, prepared: &mut bool) -> Outcome {
         if let Err(stopped) = self.prepare(release).await {
             let reason = stopped.reason.clone();
             self.fail(&release.sha256, stopped);
             return Outcome::Failed(reason);
         }
         eprintln!(
-            "tumpel-supervisor: swapping supervisor {} ({}) for {} and handing its boxes over",
+            "tumpel-supervisor: supervisor {} ({}) is ready to hand its boxes over to {}",
             self.version,
             short(&self.running),
             named(release)
         );
         self.step(release, SupervisorUpdatePhase::Restarting, self.idle.boxes());
-        match self.swap(&release.sha256).await {
-            Ok(()) => Outcome::Restart,
-            Err(stopped) => {
-                let reason = stopped.reason.clone();
-                self.fail(&release.sha256, stopped);
-                Outcome::Failed(reason)
-            }
-        }
+        *prepared = true;
+        Outcome::Restart
     }
 
     fn step(&self, release: &Release, phase: SupervisorUpdatePhase, boxes: u32) {
@@ -711,25 +709,6 @@ impl<S: Source, I: Idle> Updater<S, I> {
             )));
         }
         Ok(())
-    }
-
-    async fn swap(&self, to: &Sha256Digest) -> Result<(), Stop> {
-        let candidate = &self.layout.candidate;
-        let binary = &self.layout.binary;
-        let swapped = timeout(self.limits.swap, tokio::fs::rename(candidate, binary)).await;
-        let detail = match swapped {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(error)) => format!(
-                "moving {} over {} failed: {error}",
-                candidate.display(),
-                binary.display()
-            ),
-            Err(_) => format!("the swap ran past {} s", self.limits.swap.as_secs()),
-        };
-        Err(self.refuse(
-            to,
-            stop(SupervisorUpdateFailureReason::SupervisorUpdateSwapFailed, detail),
-        ))
     }
 }
 

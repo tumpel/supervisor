@@ -123,7 +123,6 @@ fn limits() -> Limits {
         verify: Duration::from_secs(5),
         place: Duration::from_secs(5),
         dry_run: Duration::from_secs(10),
-        swap: Duration::from_secs(5),
     }
 }
 
@@ -384,29 +383,25 @@ async fn a_refused_binary_is_never_downloaded_again() {
 const GRACE: Duration = Duration::from_secs(600);
 
 #[tokio::test]
-async fn a_release_notice_replaces_the_binary_on_an_idle_host_without_trial_files() {
+async fn a_release_notice_prepares_the_candidate_without_replacing_the_binary() {
     let layout = layout("notice-idle");
     let idle = FakeIdle::default();
     let mut run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
     assert_eq!(run.updater.announced(GRACE).await, Outcome::Restart);
     assert!(!seen(&mut run.events).contains(&Seen::Step(SupervisorUpdatePhase::WaitingForIdle)));
-    assert_eq!(text(&layout.binary), good_script());
-    assert!(!layout.candidate.exists());
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert_eq!(text(&layout.candidate), good_script());
+    assert_eq!(run.updater.announced(GRACE).await, Outcome::Busy);
+    assert_eq!(run.updater.now().await, Outcome::Restart);
+    assert_eq!(run.updater.source.downloads.load(Ordering::SeqCst), 1);
     assert_eq!(
         std::fs::read_dir(&layout.state).expect("the state directory").count(),
         0
     );
-    assert_eq!(
-        std::fs::read_dir(layout.binary.parent().expect("the binary directory"))
-            .expect("the binary directory")
-            .map(|entry| entry.expect("the directory entry").path())
-            .collect::<Vec<_>>(),
-        vec![layout.binary]
-    );
 }
 
 #[tokio::test]
-async fn an_announced_rollback_installs_an_older_supervisor_version() {
+async fn an_announced_rollback_prepares_an_older_supervisor_version() {
     assert_eq!(version_refusal("0.3.0-rc.5", "0.3.0-rc.4", true), None);
     assert!(version_refusal("0.3.0-rc.5", "0.3.0-rc.5", true).is_some());
 
@@ -419,7 +414,8 @@ async fn an_announced_rollback_installs_an_older_supervisor_version() {
     };
     let run = updater(&layout, source, &idle, limits());
     assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
-    assert_eq!(text(&layout.binary), good_script());
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert_eq!(text(&layout.candidate), good_script());
 }
 
 #[tokio::test]
@@ -443,7 +439,8 @@ async fn a_release_notice_to_a_busy_host_waits_out_the_grace_period_then_updates
     tokio::time::resume();
     assert_eq!(notice.await, Outcome::Restart);
     assert!(started.elapsed() >= GRACE);
-    assert_eq!(text(&layout.binary), good_script());
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert_eq!(text(&layout.candidate), good_script());
 }
 
 #[tokio::test]
@@ -463,7 +460,8 @@ async fn a_release_notice_to_a_busy_host_updates_once_its_turns_finish_inside_th
     tokio::time::resume();
     assert_eq!(notice.await, Outcome::Restart);
     assert!(started.elapsed() < GRACE);
-    assert_eq!(text(&layout.binary), good_script());
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert_eq!(text(&layout.candidate), good_script());
 }
 
 #[test]
@@ -560,7 +558,8 @@ async fn an_update_goes_only_to_a_newer_supervisor_version() {
     assert_eq!(
         run.updater.now().await,
         Outcome::Restart,
-        "a downgrade the control plane demands installs"
+        "a downgrade the control plane demands is prepared"
     );
-    assert_eq!(text(&layout.binary), good_script());
+    assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert_eq!(text(&layout.candidate), good_script());
 }
