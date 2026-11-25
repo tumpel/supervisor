@@ -10,7 +10,7 @@ use std::time::Duration;
 use chrono::{DateTime, FixedOffset};
 use futures_util::TryStreamExt;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{oneshot, watch, Mutex, RwLock};
+use tokio::sync::{oneshot, watch, Mutex};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{timeout, timeout_at, Instant};
 use tracing::Instrument;
@@ -767,16 +767,6 @@ impl Drop for CancelOnDrop {
     }
 }
 
-fn prepare_archive(dir: &Path) -> Result<PathBuf, String> {
-    let path = dir.join("restore.tar");
-    if let Err(error) = std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(format!("creating {}: {error}", path.display()));
-        }
-    }
-    Ok(path)
-}
-
 fn rebuild_archive(
     manifest: Manifest,
     cache: &ChunkCache,
@@ -789,13 +779,6 @@ fn rebuild_archive(
         .map_err(|error| format!("opening {}: {error}", output.display()))?;
     if cancelled.load(Ordering::Relaxed) {
         return Err(crate::snapshot::CANCELLED.to_string());
-    }
-    let metadata = out
-        .metadata()
-        .map_err(|error| format!("reading {}: {error}", output.display()))?;
-    if metadata.is_file() {
-        out.set_len(0)
-            .map_err(|error| format!("clearing {}: {error}", output.display()))?;
     }
     write_restore(&manifest, cache, BufWriter::new(&out), cancelled)?;
     let archived = out
@@ -878,7 +861,7 @@ struct Claiming {
 }
 
 impl Claiming {
-    async fn during<T>(&mut self, setup: impl Future<Output = T>) -> Result<T, String> {
+    async fn during<T>(&mut self, setup: impl Future<Output = T>) -> Result<T, ()> {
         if self.asking.waiting.is_none() {
             return Ok(setup.await);
         }
@@ -886,7 +869,7 @@ impl Claiming {
         tokio::select! {
             biased;
             answer = self.answer() => match answer {
-                Some(Answer::ClaimRefused { detail, .. }) => Err(detail),
+                Some(Answer::ClaimRefused(_)) => Err(()),
                 answer => {
                     self.early = answer;
                     Ok(setup.await)
@@ -918,23 +901,6 @@ impl Drop for Asking {
 }
 
 type Restored = (PathBuf, Base, u64, Charge);
-
-#[derive(Clone)]
-struct RestoreStage {
-    dir: PathBuf,
-    cache: Arc<ChunkCache>,
-    workers: Arc<RwLock<()>>,
-}
-
-impl RestoreStage {
-    async fn work<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> JoinHandle<T> {
-        let running = Arc::clone(&self.workers).read_owned().await;
-        tokio::task::spawn_blocking(move || {
-            let _running = running;
-            work()
-        })
-    }
-}
 
 struct Runner<V: Vmm, S: Store> {
     vmm: Arc<V>,
@@ -1043,21 +1009,9 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
-    fn claim_refused(
-        &self,
-        turn: &BoxTurn,
-        detail: String,
-        tap: Tap,
-        stopped: Result<(), String>,
-    ) -> Outcome<V::Machine> {
+    fn claim_refused(&self, turn: &BoxTurn, tap: Tap, stopped: Result<(), String>) -> Outcome<V::Machine> {
         self.cancels.forget(&turn.turn_id);
-        turn_failed(&self.out, &turn.turn_id, TurnFailureReason::Undelivered, detail);
         Outcome::Gone(tap, stopped.and(remove_dir(&turn.files_dir.join(&*turn.turn_id))))
-    }
-
-    async fn stop_refused(&self, live: LiveBox<V::Machine>, turn: &BoxTurn, detail: String) -> Outcome<V::Machine> {
-        let (tap, _, stopped) = stop_box(&self.standing, live, BoxEnd::ClaimRefused).await;
-        self.claim_refused(turn, detail, tap, stopped)
     }
 
     async fn warm_turn(&self, mut live: LiveBox<V::Machine>, turn: &BoxTurn) -> Outcome<V::Machine> {
@@ -1066,8 +1020,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let mut claiming = self.claim(turn);
         let files = match claiming.during(self.files(turn)).await {
             Ok(Some(files)) => files,
-            Ok(None) => return Outcome::Kept(live),
-            Err(detail) => return self.stop_refused(live, turn, detail).await,
+            Ok(None) | Err(()) => return Outcome::Kept(live),
         };
         let seconds = self.settings.budgets.boot.as_secs();
         let failed = match self.standing.put(&live, Some(&turn.turn_id)) {
@@ -1082,7 +1035,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 ))
                 .await
             {
-                Err(detail) => return self.stop_refused(live, turn, detail).await,
+                Err(()) => return self.pause(live).await,
                 Ok(Ok(Ok(()))) => return self.run_turn(live, turn, files, claiming).await,
                 Ok(Ok(Err(error))) => format!(
                     "resuming the paused box of session {} failed: {error}",
@@ -1108,7 +1061,6 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         &self,
         turn: &BoxTurn,
         tap: &Tap,
-        workers: &Arc<RwLock<()>>,
     ) -> Result<Option<Restored>, (TurnFailureReason, String)> {
         let restoring = (!turn.snapshots.is_empty())
             .then(|| expired(&turn.credential, "before its snapshot was restored"))
@@ -1116,7 +1068,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         if let Some(detail) = restoring {
             return Err((TurnFailureReason::DispatchCredentialExpired, detail));
         }
-        timeout_at(instant_at(turn.credential.expires_at), self.restore(turn, tap, workers))
+        timeout_at(instant_at(turn.credential.expires_at), self.restore(turn, tap))
             .await
             .map_err(|_| {
                 (
@@ -1131,20 +1083,15 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let files = match claiming.during(self.files(turn)).await {
             Ok(Some(files)) => files,
             Ok(None) => return Outcome::Gone(tap, Ok(())),
-            Err(detail) => return self.claim_refused(turn, detail, tap, Ok(())),
+            Err(()) => return self.claim_refused(turn, tap, Ok(())),
         };
-        let workers = Arc::new(RwLock::new(()));
-        let restored = match claiming.during(self.restore_for_turn(turn, &tap, &workers)).await {
+        let restored = match claiming.during(self.restore_for_turn(turn, &tap)).await {
             Ok(Ok(restored)) => restored,
             Ok(Err((reason, detail))) => {
                 turn_failed(&self.out, &turn.turn_id, reason, detail);
                 return Outcome::Gone(tap, Ok(()));
             }
-            Err(detail) => {
-                let outcome = self.claim_refused(turn, detail, tap, Ok(()));
-                drop(workers.write().await);
-                return outcome;
-            }
+            Err(()) => return self.claim_refused(turn, tap, Ok(())),
         };
         let (image, hold) = match claiming.during(self.image(turn)).await {
             Ok(Ok(booted)) => booted,
@@ -1156,7 +1103,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 turn_failed(&self.out, &turn.turn_id, refusal.reason, detail);
                 return Outcome::Gone(tap, Ok(()));
             }
-            Err(detail) => return self.claim_refused(turn, detail, tap, Ok(())),
+            Err(()) => return self.claim_refused(turn, tap, Ok(())),
         };
         let mut machine = match self.vmm.machine(&turn.session_id, &tap) {
             Ok(machine) => machine,
@@ -1182,7 +1129,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         drop(charge);
         let started = match started {
             Ok(started) => started,
-            Err(detail) => {
+            Err(()) => {
                 let stopped = end_box(
                     machine,
                     tap.index(),
@@ -1191,7 +1138,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     BoxEnd::ClaimRefused,
                 )
                 .await;
-                return self.claim_refused(turn, detail, tap, stopped.and(cleaned));
+                return self.claim_refused(turn, tap, stopped.and(cleaned));
             }
         };
         let failed = match (started, cleaned) {
@@ -1367,7 +1314,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         &self,
         turn_id: &EntityId,
         wanted: Vec<Place>,
-        stage: &RestoreStage,
+        cache: &Arc<ChunkCache>,
+        dir: &Path,
         deadline: Instant,
     ) -> Result<(), String> {
         let parts = restore_parts(wanted, DIGESTS_PER_PART);
@@ -1409,8 +1357,9 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         })
         .try_for_each_concurrent(TRANSFERS, move |(urls, fetch)| {
             let runner = runner.clone();
-            let stage = stage.clone();
-            async move { runner.download_pack(urls, fetch, stage, deadline).await }
+            let cache = Arc::clone(cache);
+            let dir = dir.to_path_buf();
+            async move { runner.download_pack(urls, fetch, cache, dir, deadline).await }
         });
         futures_util::future::try_join(asking, downloading).await.map(|_| ())
     }
@@ -1446,14 +1395,15 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         &self,
         urls: Arc<PartUrls>,
         fetch: Fetch,
-        stage: RestoreStage,
+        cache: Arc<ChunkCache>,
+        dir: PathBuf,
         deadline: Instant,
     ) -> Result<(), String> {
         let named = fetch
             .chunks
             .first()
             .map_or(fetch.pack.as_str(), |place| place.digest.as_str());
-        let staged = stage.dir.join(format!("pack-{named}.part"));
+        let staged = dir.join(format!("pack-{named}.part"));
         let (mut generation, mut url) = url_of(&*urls.urls.lock().await, &fetch.pack)?;
         let mut attempt = 1;
         loop {
@@ -1461,7 +1411,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 Span::Whole => self.store.download(&url, &staged).await,
                 Span::Range { first, last } => self.store.download_range(&url, &staged, first, last).await,
             };
-            let refresh_url = match fetched {
+            let stale = match fetched {
                 Ok(()) => break,
                 Err(DownloadError::Refused(error)) => {
                     return Err(format!("pack {} is unreadable: {error}", fetch.pack))
@@ -1473,21 +1423,18 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 Err(DownloadError::Transient(_)) => attempt % ATTEMPTS_PER_URL == 0,
             };
             wait(attempt).await;
-            if refresh_url {
+            if stale {
                 (generation, url) = self.refresh(&urls, generation, &fetch.pack, deadline).await?;
             }
             attempt += 1;
         }
-        let cache = Arc::clone(&stage.cache);
-        stage
-            .work(move || -> Result<(), String> {
-                let bytes = std::fs::read(&staged).map_err(|error| format!("reading {}: {error}", staged.display()))?;
-                remove_file(&staged)?;
-                unpack(&fetch, &bytes, &cache)
-            })
-            .await
-            .await
-            .map_err(|error| format!("unpacking a pack stopped: {error}"))?
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let bytes = std::fs::read(&staged).map_err(|error| format!("reading {}: {error}", staged.display()))?;
+            remove_file(&staged)?;
+            unpack(&fetch, &bytes, &cache)
+        })
+        .await
+        .map_err(|error| format!("unpacking a pack stopped: {error}"))?
     }
 
     async fn download_root(&self, url: &str, file: &Path) -> Result<(), DownloadError> {
@@ -1505,7 +1452,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         &self,
         turn: &BoxTurn,
         wanted: Vec<Place>,
-        stage: &RestoreStage,
+        cache: &Arc<ChunkCache>,
+        dir: &Path,
         named: &str,
         expires: DateTime<FixedOffset>,
     ) -> Result<(), String> {
@@ -1513,7 +1461,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             return Ok(());
         }
         let deadline = instant_at(expires);
-        match timeout_at(deadline, self.fetch(&turn.turn_id, wanted, stage, deadline)).await {
+        match timeout_at(deadline, self.fetch(&turn.turn_id, wanted, cache, dir, deadline)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(format!(
                 "restoring {named}: {error}; offer the turn again for fresh download URLs, or start a new session when the snapshot is damaged"
@@ -1525,13 +1473,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
-    async fn restore(
-        &self,
-        turn: &BoxTurn,
-        tap: &Tap,
-        workers: &Arc<RwLock<()>>,
-    ) -> Result<Option<Restored>, (TurnFailureReason, String)> {
-        telemetry::timed(Phase::Restore, self.restore_snapshot(turn, tap, workers), |restored| {
+    async fn restore(&self, turn: &BoxTurn, tap: &Tap) -> Result<Option<Restored>, (TurnFailureReason, String)> {
+        telemetry::timed(Phase::Restore, self.restore_snapshot(turn, tap), |restored| {
             matches!(restored, Ok(Some(_)))
         })
         .await
@@ -1598,7 +1541,6 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         &self,
         turn: &BoxTurn,
         tap: &Tap,
-        workers: &Arc<RwLock<()>>,
     ) -> Result<Option<Restored>, (TurnFailureReason, String)> {
         let unreadable = |detail: String| (TurnFailureReason::SnapshotUnreadable, detail);
         let Some(snapshot) = turn.snapshots.last() else {
@@ -1618,64 +1560,63 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 "{named} is unreadable: {error}; the stored snapshot is damaged, so start a new session"
             ))
         };
-        let stage = RestoreStage {
-            cache: Arc::new(ChunkCache::new(dir.join(CHUNKS))),
-            dir,
-            workers: Arc::clone(workers),
-        };
-        let reading = Arc::clone(&stage.cache);
+        let cache = Arc::new(ChunkCache::new(dir.join(CHUNKS)));
+        let reading = Arc::clone(&cache);
+        cache.create().map_err(damaged)?;
         let root_file = file.clone();
-        let read = stage
-            .work(move || -> Result<(Vec<Place>, Vec<Place>), String> {
-                let bytes =
-                    std::fs::read(&root_file).map_err(|error| format!("reading {}: {error}", root_file.display()))?;
-                let root = decode_root(&bytes)?;
-                reading.create()?;
-                let wanted = lacking(&root, &reading)?;
-                Ok((root, wanted))
-            })
-            .await
-            .await
-            .map_err(|error| unreadable(format!("reading the root of {named} stopped: {error}")))?;
+        let read = tokio::task::spawn_blocking(move || -> Result<(Vec<Place>, Vec<Place>), String> {
+            let bytes =
+                std::fs::read(&root_file).map_err(|error| format!("reading {}: {error}", root_file.display()))?;
+            let root = decode_root(&bytes)?;
+            let wanted = lacking(&root, &reading)?;
+            Ok((root, wanted))
+        })
+        .await
+        .map_err(|error| unreadable(format!("reading the root of {named} stopped: {error}")))?;
         remove_file(&file).map_err(unreadable)?;
         let (root, wanted) = read.map_err(damaged)?;
-        self.fetch_within(turn, wanted, &stage, &named, expires)
+        self.fetch_within(turn, wanted, &cache, &dir, &named, expires)
             .await
             .map_err(unreadable)?;
-        let reading = Arc::clone(&stage.cache);
+        let reading = Arc::clone(&cache);
         let manifest_places = root.clone();
-        let read = stage
-            .work(move || -> Result<(Manifest, Vec<Place>), String> {
-                let manifest = decode(&assemble(&manifest_places, &reading)?)?;
-                let wanted = lacking(manifest.values().flat_map(|stored| stored.chunks.iter()), &reading)?;
-                Ok((manifest, wanted))
-            })
-            .await
-            .await
-            .map_err(|error| unreadable(format!("reading the manifest of {named} stopped: {error}")))?;
+        let read = tokio::task::spawn_blocking(move || -> Result<(Manifest, Vec<Place>), String> {
+            let manifest = decode(&assemble(&manifest_places, &reading)?)?;
+            let wanted = lacking(manifest.values().flat_map(|stored| stored.chunks.iter()), &reading)?;
+            Ok((manifest, wanted))
+        })
+        .await
+        .map_err(|error| unreadable(format!("reading the manifest of {named} stopped: {error}")))?;
         let (manifest, wanted) = read.map_err(damaged)?;
         let overlay = u64::from(tap.disk_mib().get()) * 1024 * 1024;
         let (bytes, entries) = restore_size(&named, &manifest, overlay).map_err(unreadable)?;
         let charge = self.charge_restore(&named, bytes, tap)?;
-        self.fetch_within(turn, wanted, &stage, &named, expires)
+        self.fetch_within(turn, wanted, &cache, &dir, &named, expires)
             .await
             .map_err(unreadable)?;
-        let target = prepare_archive(&stage.dir).map_err(unreadable)?;
+        let target = dir.join("restore.tar");
         let output = target.clone();
-        let chunks = stage.dir.join(CHUNKS);
+        let chunks = dir.join(CHUNKS);
         let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
         let cancelled = Arc::clone(&cancel.0);
-        let cache = Arc::clone(&stage.cache);
-        let rebuild = tokio::task::spawn_blocking(move || rebuild_archive(manifest, &cache, &output, &cancelled));
+
         let budget = restore_budget(self.settings.budgets.boot, bytes, entries);
         let seconds = budget.as_secs();
-        let outcome = timeout(budget, rebuild).await;
+        let outcome = timeout(budget, async {
+            tokio::fs::File::create(&target)
+                .await
+                .map_err(|error| format!("creating {}: {error}", target.display()))?;
+            tokio::task::spawn_blocking(move || rebuild_archive(manifest, &cache, &output, &cancelled))
+                .await
+                .map_err(|error| format!("reassembling the files of {named} stopped: {error}"))?
+        })
+        .await;
         if outcome.is_err() {
             cancel.0.store(true, Ordering::Relaxed);
             remove_file(&target).map_err(unreadable)?;
         }
         match outcome {
-            Ok(Ok(Ok((manifest, archived)))) => {
+            Ok(Ok((manifest, archived))) => {
                 remove_dir(&chunks).map_err(unreadable)?;
                 Ok(Some((
                     target,
@@ -1688,10 +1629,9 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     charge,
                 )))
             }
-            Ok(Ok(Err(error))) => Err(unreadable(format!(
+            Ok(Err(error)) => Err(unreadable(format!(
                 "reassembling the files of {named} failed: {error}; the stored snapshot is damaged, so start a new session"
             ))),
-            Ok(Err(error)) => Err(unreadable(format!("reassembling the files of {named} stopped: {error}"))),
             Err(_) => Err(unreadable(format!(
                 "reassembling the files of {named} took longer than {seconds} s for {bytes} bytes in {entries} entries; send the turn again"
             ))),
@@ -1796,7 +1736,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 );
                 return self.pause(live).await;
             }
-            Some(Answer::ClaimRefused { detail, .. }) => return self.stop_refused(live, turn, detail).await,
+            Some(Answer::ClaimRefused(_)) => return self.pause(live).await,
             Some(_) => Followed::Ended(Err(Failure::turn(
                 TurnFailureReason::NotClaimed,
                 unexpected(&claiming.asking.key),

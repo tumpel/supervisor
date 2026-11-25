@@ -1678,28 +1678,53 @@ async fn a_refused_claim_stops_a_cold_turn_while_its_restore_pack_is_held() {
         settings(),
         120,
     );
-    let mut receive = crate::run::open_test_channel(second.vmm.staging.join("channel.json"));
     second.turn("refused-claim", "session-1", "two", vec![snapshot]);
     let claim = second.received.recv().await.expect("claim");
     assert!(matches!(&claim, ChannelHostMessage::TurnClaim(claim) if claim.turn_id.as_str() == "refused-claim"));
     hold.0.notified().await;
 
     let refused_at = tokio::time::Instant::now();
-    if let Some(answer) = receive(
-        Outgoing::Message(claim),
-        r#"{"type":"FrameRefused","seq":1,"reason":"the turn offer expired"}"#,
-    ) {
-        second.answers.deliver(answer);
-    }
-    assert_eq!(
-        second.settle_until("failed Undelivered: the turn offer expired").await,
-        ["failed Undelivered: the turn offer expired"]
-    );
+    second
+        .answers
+        .deliver(Answer::ClaimRefused("refused-claim".try_into().expect("turn id")));
+    let handover = tokio::time::timeout(SETTLE, second.ask_handover())
+        .await
+        .expect("handover before the pack is released")
+        .expect("handover settles");
     assert_eq!(tokio::time::Instant::now(), refused_at);
-    assert_eq!(second.ask_handover().await.expect("handover settles").boxes, []);
+    assert_eq!(handover.boxes, []);
     hold.1.notify_one();
     assert!(second.log().is_empty(), "the cancelled restore never starts a VM");
     assert!(!second.vmm.staging.join("session-1").exists());
+    assert!(
+        second.received.try_recv().is_err(),
+        "the channel owns the terminal failure"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_warm_claim_pauses_the_box_and_keeps_it_for_another_turn() {
+    let mut host = host("refused-warm-claim", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("complete 1").await;
+    host.log();
+
+    host.turn("refused-claim", "session-1", "two", Vec::new());
+    assert_eq!(host.settle_until("claim refused-claim").await, ["claim refused-claim"]);
+    host.answers
+        .deliver(Answer::ClaimRefused("refused-claim".try_into().expect("turn id")));
+    assert_eq!(host.settle(SETTLE).await, Vec::<String>::new());
+    assert_eq!(host.log(), ["resume session-1", "pause session-1"]);
+
+    host.turn("turn-3", "session-1", "three", Vec::new());
+    assert_eq!(
+        host.settle_until("complete 1").await,
+        ["claim turn-3", "line 1 three", "complete 1"]
+    );
+    assert_eq!(
+        host.log(),
+        ["resume session-1", "reconnect session-1", "pause session-1"]
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -10,9 +10,9 @@ use tumpel_api::frozen::{v37, v38};
 use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType, ChannelHostMessage,
-    ChannelProtocol, ChannelSnapshotFailed, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLines,
-    ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch, Sequence,
-    SupervisorChannelState,
+    ChannelProtocol, ChannelSnapshotFailed, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnFailed,
+    ChannelTurnFailedType, ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth,
+    HostUsage, MetricBatch, Sequence, SupervisorChannelState, TurnFailureReason,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
@@ -840,6 +840,21 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                 };
                 Some(Box::new(message))
             });
+        if let Some(ChannelHostMessage::TurnClaim(claim)) = message.as_deref() {
+            let failed = ChannelTurnFailed {
+                credential_file: None,
+                detail: refused
+                    .reason
+                    .as_str()
+                    .try_into()
+                    .map_err(|error| protocol(format!("reporting the refused claim: {error}")))?,
+                failed_at: Utc::now().fixed_offset(),
+                reason: TurnFailureReason::Undelivered,
+                turn_id: claim.turn_id.clone(),
+                type_: ChannelTurnFailedType::TurnFailed,
+            };
+            self.push(to_value(&failed.into())?);
+        }
         self.store.save(&self.state)?;
         Ok(Event::FrameRefused {
             seq: refused.seq.0,
