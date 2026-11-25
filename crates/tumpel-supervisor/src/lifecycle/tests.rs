@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
+use tumpel_api::types::ChannelHostMessage::SnapshotPacks;
 use tumpel_api::types::{
     BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
     ChannelProtocol, ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld,
@@ -587,6 +588,8 @@ const SLOW_BOOT: Duration = Duration::from_millis(50);
 const SLOW_CUT: Duration = Duration::from_millis(300);
 const LATE_CLAIM: Duration = Duration::from_millis(150);
 const STALLED_CLAIM: Duration = Duration::from_secs(600);
+const REFUSED_PACK: (&str, u32) = ("refused-snapshot-packs", 2);
+const REFUSED_RESTORE: &str = "refused-restore-chunks";
 
 fn settings() -> Settings {
     Settings {
@@ -779,12 +782,7 @@ fn control_plane(
                         type_: ChannelSnapshotChunksHeldType::SnapshotChunksHeld,
                     }));
                 }
-                ChannelHostMessage::SnapshotPacks(packs)
-                    if packs.snapshot_id.as_str() == "refused-snapshot-packs" && packs.part.get() == 2 =>
-                {
-                    forward(&sender, ChannelHostMessage::SnapshotPacks(packs));
-                }
-                ChannelHostMessage::SnapshotPacks(packs) => {
+                SnapshotPacks(packs) if (packs.snapshot_id.as_str(), packs.part.get()) != REFUSED_PACK => {
                     for chunk in &packs.chunks {
                         index
                             .chunks
@@ -812,12 +810,9 @@ fn control_plane(
                             })
                             .collect(),
                     }));
-                    forward(&sender, ChannelHostMessage::SnapshotPacks(packs));
+                    forward(&sender, SnapshotPacks(packs));
                 }
-                ChannelHostMessage::RestoreChunks(chunks) if chunks.turn_id.as_str() == "refused-restore-chunks" => {
-                    forward(&sender, ChannelHostMessage::RestoreChunks(chunks));
-                }
-                ChannelHostMessage::RestoreChunks(chunks) => {
+                ChannelHostMessage::RestoreChunks(chunks) if chunks.turn_id.as_str() != REFUSED_RESTORE => {
                     let mut packs: Vec<ChannelPackUrl> = Vec::new();
                     for chunk in &chunks.chunks {
                         let Some(size) = index.packs.get(chunk.pack_digest.as_str()).copied() else {
@@ -2447,7 +2442,7 @@ async fn a_refused_snapshot_packs_part_fails_the_snapshot_at_once() {
             );
         }
     }
-    let snapshot_id: EntityId = "refused-snapshot-packs".try_into().expect("snapshot id");
+    let snapshot_id: EntityId = REFUSED_PACK.0.try_into().expect("snapshot id");
     host.send(Command::Snapshot(SnapshotOrder {
         snapshot_id: snapshot_id.clone(),
         session_id: "session-1".try_into().expect("session id"),
@@ -2457,10 +2452,9 @@ async fn a_refused_snapshot_packs_part_fails_the_snapshot_at_once() {
         upload_expires_at: in_seconds(60),
     }));
     for part in [1, 2] {
-        let Some(ChannelHostMessage::SnapshotPacks(packs)) =
-            tokio::time::timeout(Duration::from_secs(10), host.received.recv())
-                .await
-                .expect("snapshot packs")
+        let Some(SnapshotPacks(packs)) = tokio::time::timeout(Duration::from_secs(10), host.received.recv())
+            .await
+            .expect("snapshot packs")
         else {
             panic!("expected SnapshotPacks part {part}");
         };
@@ -2494,8 +2488,8 @@ async fn a_refused_snapshot_packs_part_fails_the_snapshot_at_once() {
 
 #[tokio::test(start_paused = true)]
 async fn a_refused_restore_chunks_part_fails_the_turn_at_once() {
-    let (mut host, snapshot) = restoring("refused-restore-chunks", settings()).await;
-    host.turn("refused-restore-chunks", "session-1", "two", vec![snapshot]);
+    let (mut host, snapshot) = restoring(REFUSED_RESTORE, settings()).await;
+    host.turn(REFUSED_RESTORE, "session-1", "two", vec![snapshot]);
     assert_eq!(
         host.settle_until("claim refused-restore-chunks").await,
         ["claim refused-restore-chunks"]
