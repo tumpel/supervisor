@@ -829,13 +829,12 @@ fn control_plane(
                 ChannelHostMessage::TurnClaim(claim) => {
                     let turn_id = claim.turn_id.clone();
                     forward(&sender, ChannelHostMessage::TurnClaim(claim));
-                    if turn_id.as_str() == "refused-claim" {
-                        continue;
-                    }
                     let delay = if turn_id.starts_with("late") {
                         LATE_CLAIM
                     } else if turn_id.starts_with("stalled") {
                         STALLED_CLAIM
+                    } else if turn_id.as_str() == "refused-claim" {
+                        continue;
                     } else {
                         answers.deliver(claim_answer(turn_id));
                         continue;
@@ -1697,7 +1696,7 @@ async fn a_refused_claim_stops_a_cold_turn_while_its_restore_pack_is_held() {
         ["failed Undelivered: the turn offer expired"]
     );
     assert_eq!(tokio::time::Instant::now(), refused_at);
-    assert!(second.ask_handover().await.expect("handover settles").boxes.is_empty());
+    assert_eq!(second.ask_handover().await.expect("handover settles").boxes, []);
     hold.1.notify_one();
     assert!(second.log().is_empty(), "the cancelled restore never starts a VM");
     assert!(!second.vmm.staging.join("session-1").exists());

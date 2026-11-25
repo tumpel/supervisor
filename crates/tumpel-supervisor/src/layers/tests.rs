@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use ring::digest::{digest, SHA256};
@@ -144,7 +145,7 @@ async fn a_layer_whose_bytes_miss_the_release_digest_is_never_placed() {
         &cache,
         &published.order,
         &Holds::default(),
-        &Mutex::new(()),
+        &Arc::new(Mutex::new(())),
         deadline(),
     )
     .await
@@ -171,7 +172,7 @@ async fn a_landed_layer_evicts_the_least_recently_attached_layers_no_box_holds_u
     let reattached = publish(3, 300 * 1024, "3");
     let newest = publish(4, 300 * 1024, "4");
     let bucket = bucket.with(&idle).with(&held).with(&reattached).with(&newest);
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
     for published in [&idle, &held, &reattached] {
         resolve(&bucket, &cache, &published.order, &Holds::default(), &lock, deadline())
             .await
@@ -209,7 +210,7 @@ async fn a_landed_layer_evicts_the_least_recently_attached_layers_no_box_holds_u
 async fn waiting_on_another_fetch_counts_against_the_layer_budget() {
     let cache = cache("waiting", 64);
     let published = publish(1, 1024, "1");
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
     let _another = lock.lock().await;
     let started = Instant::now();
 

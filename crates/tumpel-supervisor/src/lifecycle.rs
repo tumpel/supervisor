@@ -11,7 +11,7 @@ use chrono::{DateTime, FixedOffset};
 use futures_util::TryStreamExt;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch, Mutex, RwLock};
-use tokio::task::{AbortHandle, JoinError, JoinHandle};
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{timeout, timeout_at, Instant};
 use tracing::Instrument;
 use tumpel_api::types::{
@@ -901,6 +901,7 @@ impl Drop for Asking {
 
 type Restored = (PathBuf, Base, u64, Charge);
 
+#[derive(Clone)]
 struct RestoreStage {
     dir: PathBuf,
     cache: Arc<ChunkCache>,
@@ -908,13 +909,12 @@ struct RestoreStage {
 }
 
 impl RestoreStage {
-    async fn work<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> Result<T, JoinError> {
+    async fn work<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> JoinHandle<T> {
         let running = Arc::clone(&self.workers).read_owned().await;
         tokio::task::spawn_blocking(move || {
             let _running = running;
             work()
         })
-        .await
     }
 }
 
@@ -1034,7 +1034,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     ) -> Outcome<V::Machine> {
         self.cancels.forget(&turn.turn_id);
         turn_failed(&self.out, &turn.turn_id, TurnFailureReason::Undelivered, detail);
-        Outcome::Gone(tap, stopped)
+        Outcome::Gone(tap, stopped.and(remove_dir(&turn.files_dir.join(&*turn.turn_id))))
     }
 
     async fn stop_refused(&self, live: LiveBox<V::Machine>, turn: &BoxTurn, detail: String) -> Outcome<V::Machine> {
@@ -1392,6 +1392,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         })
         .try_for_each_concurrent(TRANSFERS, move |(urls, fetch)| {
             let runner = runner.clone();
+            let stage = stage.clone();
             async move { runner.download_pack(urls, fetch, stage, deadline).await }
         });
         futures_util::future::try_join(asking, downloading).await.map(|_| ())
@@ -1428,7 +1429,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         &self,
         urls: Arc<PartUrls>,
         fetch: Fetch,
-        stage: &RestoreStage,
+        stage: RestoreStage,
         deadline: Instant,
     ) -> Result<(), String> {
         let named = fetch
@@ -1443,7 +1444,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 Span::Whole => self.store.download(&url, &staged).await,
                 Span::Range { first, last } => self.store.download_range(&url, &staged, first, last).await,
             };
-            let stale = match fetched {
+            let refresh_url = match fetched {
                 Ok(()) => break,
                 Err(DownloadError::Refused(error)) => {
                     return Err(format!("pack {} is unreadable: {error}", fetch.pack))
@@ -1455,7 +1456,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 Err(DownloadError::Transient(_)) => attempt % ATTEMPTS_PER_URL == 0,
             };
             wait(attempt).await;
-            if stale {
+            if refresh_url {
                 (generation, url) = self.refresh(&urls, generation, &fetch.pack, deadline).await?;
             }
             attempt += 1;
@@ -1467,6 +1468,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 remove_file(&staged)?;
                 unpack(&fetch, &bytes, &cache)
             })
+            .await
             .await
             .map_err(|error| format!("unpacking a pack stopped: {error}"))?
     }
@@ -1616,6 +1618,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 Ok((root, wanted))
             })
             .await
+            .await
             .map_err(|error| unreadable(format!("reading the root of {named} stopped: {error}")))?;
         remove_file(&file).map_err(unreadable)?;
         let (root, wanted) = read.map_err(damaged)?;
@@ -1631,6 +1634,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 Ok((manifest, wanted))
             })
             .await
+            .await
             .map_err(|error| unreadable(format!("reading the manifest of {named} stopped: {error}")))?;
         let (manifest, wanted) = read.map_err(damaged)?;
         let overlay = u64::from(tap.disk_mib().get()) * 1024 * 1024;
@@ -1645,7 +1649,9 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
         let cancelled = Arc::clone(&cancel.0);
         let cache = Arc::clone(&stage.cache);
-        let rebuild = stage.work(move || rebuild_archive(manifest, &cache, &output, &chunks, &cancelled));
+        let rebuild = stage
+            .work(move || rebuild_archive(manifest, &cache, &output, &chunks, &cancelled))
+            .await;
         let budget = restore_budget(self.settings.budgets.boot, bytes, entries);
         let seconds = budget.as_secs();
         let outcome = timeout(budget, rebuild).await;

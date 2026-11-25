@@ -833,12 +833,12 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             .iter()
             .position(|own| own.seq == refused.seq)
             .map(|index| self.state.unacked.remove(index).message)
-            .and_then(|message| match serde_json::from_value(message) {
-                Ok(message) => Some(Box::new(message)),
-                Err(_) => {
+            .and_then(|message| {
+                let Ok(message) = serde_json::from_value(message) else {
                     update_required();
-                    None
-                }
+                    return None;
+                };
+                Some(Box::new(message))
             });
         self.store.save(&self.state)?;
         Ok(Event::FrameRefused {
