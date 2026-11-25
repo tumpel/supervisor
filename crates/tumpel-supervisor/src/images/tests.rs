@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ring::digest::{digest, SHA256};
 use serde_json::json;
@@ -229,7 +230,7 @@ async fn the_fetch_budget_counts_the_wait_for_another_image_from_turn_image_fetc
     let cache = cache("waiting");
     let new = image("new rootfs", "1");
     let order = order_within(&new, "1", 30);
-    let lock = tokio::sync::Mutex::new(());
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
     let _another = lock.lock().await;
     let started = tokio::time::Instant::now();
     let mut sent = None;

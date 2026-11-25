@@ -1057,21 +1057,22 @@ async fn session(
                             Ok(Event::Welcomed) => {
                                 eprintln!("connected to {url}");
                                 last_beat = Instant::now();
-                                if commands.send(BoxCommand::Welcomed(channel.version())).is_err() {
-                                    Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
-                                } else {
-                                    updates.announced();
-                                    None
-                                }
+                                commands.send(BoxCommand::Welcomed(channel.version()))
+                                    .inspect(|()| updates.announced())
+                                    .err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
                             }
                             Ok(Event::Message(message)) => match box_command(*message) {
                                 Ok(Some(command)) => commands.send(command).err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor"))),
                                 Ok(None) => None,
                                 Err(error) => Some(Err(fail(SupervisorFailure::ProtocolError, error))),
                             },
-                            Ok(Event::FrameRefused { seq, reason }) => {
+                            Ok(Event::FrameRefused { seq, reason, key }) => {
                                 eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
-                                None
+                                if key.is_some_and(|key| commands.send(BoxCommand::Answer(Answer::Refused(key, reason))).is_err()) {
+                                    Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
+                                } else {
+                                    channel.transmit_due(Instant::now(), &mut outbox).err().map(|error| Err(store_lost(&error)))
+                                }
                             }
                             Ok(Event::FrameRateLimited { seq: _, reason, frames_per_minute, retry_after }) => {
                                 rate_limited(limit, url, &reason, frames_per_minute, retry_after);

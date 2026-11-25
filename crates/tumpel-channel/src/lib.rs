@@ -10,9 +10,9 @@ use tumpel_api::frozen::{v37, v38};
 use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType, ChannelHostMessage,
-    ChannelProtocol, ChannelSnapshotFailed, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLines,
-    ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch, Sequence,
-    SupervisorChannelState,
+    ChannelProtocol, ChannelSnapshotFailed, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnFailed,
+    ChannelTurnFailedType, ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth,
+    HostUsage, MetricBatch, Sequence, SupervisorChannelState, TurnFailureReason,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
@@ -174,15 +174,22 @@ fn snapshot_id(message: &Value) -> Option<EntityId> {
 
 fn mismatched(message: &Value, built: u16, session: u16) -> Result<Value, ChannelError> {
     let kind = message.get("type").and_then(Value::as_str).unwrap_or_default();
+    snapshot_failed(
+        message,
+        &format!("this host built the snapshot's {kind} for channel protocol {built}, but the session speaks {session}; ask for the snapshot again"),
+    )
+}
+
+fn snapshot_failed(message: &Value, detail: &str) -> Result<Value, ChannelError> {
     let failed = serde_json::json!({
         "type": "SnapshotFailed",
         "snapshotId": message.get("snapshotId").cloned().unwrap_or(Value::Null),
         "reason": "NotAnswered",
         "failedAt": Utc::now().fixed_offset(),
-        "detail": format!("this host built the snapshot's {kind} for channel protocol {built}, but the session speaks {session}; ask for the snapshot again"),
+        "detail": detail,
     });
-    let failed: ChannelSnapshotFailed = serde_json::from_value(failed)
-        .map_err(|error| protocol(format!("failing a {kind} built for protocol {built}: {error}")))?;
+    let failed: ChannelSnapshotFailed =
+        serde_json::from_value(failed).map_err(|error| protocol(format!("building a SnapshotFailed: {error}")))?;
     serde_json::to_value(&failed).map_err(|error| protocol(format!("encoding a SnapshotFailed: {error}")))
 }
 
@@ -359,6 +366,53 @@ impl RateLimit {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Ask {
+    SnapshotChunks,
+    SnapshotPacks,
+    RestoreChunks,
+    TurnClaim,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Key {
+    pub ask: Ask,
+    pub id: EntityId,
+    pub part: NonZeroU32,
+}
+
+impl Key {
+    fn restore(message: &Value) -> Option<Self> {
+        Some(Self {
+            ask: Ask::RestoreChunks,
+            id: message["turnId"].as_str()?.try_into().ok()?,
+            part: serde_json::from_value(message["part"].clone()).ok()?,
+        })
+    }
+
+    #[must_use]
+    pub fn claim(turn_id: &EntityId) -> Self {
+        Self {
+            ask: Ask::TurnClaim,
+            id: turn_id.clone(),
+            part: NonZeroU32::MIN,
+        }
+    }
+}
+
+impl fmt::Display for Key {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id = &*self.id;
+        let part = self.part;
+        match self.ask {
+            Ask::SnapshotChunks => write!(out, "SnapshotChunks part {part} of snapshot {id}"),
+            Ask::SnapshotPacks => write!(out, "SnapshotPacks part {part} of snapshot {id}"),
+            Ask::RestoreChunks => write!(out, "RestoreChunks part {part} of turn {id}"),
+            Ask::TurnClaim => write!(out, "the TurnClaim of turn {id}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
     None,
@@ -369,6 +423,7 @@ pub enum Event {
     FrameRefused {
         seq: i64,
         reason: String,
+        key: Option<Key>,
     },
     FrameRateLimited {
         seq: i64,
@@ -826,11 +881,49 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     fn refused(&mut self, refused: ChannelFrameRefused) -> Result<Event, ChannelError> {
         self.progressed = true;
-        self.state.unacked.retain(|own| own.seq.0 != refused.seq.0);
+        let message = self
+            .state
+            .unacked
+            .iter()
+            .position(|own| own.seq == refused.seq)
+            .map_or(Value::Null, |index| self.state.unacked.remove(index).message);
+        let (key, snapshot) = match message["type"].as_str() {
+            Some("TurnClaim") => {
+                let turn_id = message["turnId"].as_str().and_then(|id| id.try_into().ok());
+                (turn_id.as_ref().map(Key::claim), None)
+            }
+            Some("SnapshotDone" | "SnapshotChunks" | "SnapshotPacks") => {
+                self.push(snapshot_failed(&message, refused.reason.as_str())?);
+                (None, snapshot_id(&message))
+            }
+            Some("RestoreChunks") => (Key::restore(&message), None),
+            _ => (None, None),
+        };
+        if let Some(key) = &key {
+            let failed = ChannelTurnFailed {
+                credential_file: None,
+                detail: refused
+                    .reason
+                    .as_str()
+                    .try_into()
+                    .map_err(|error| protocol(format!("reporting the refusal of {key}: {error}")))?,
+                failed_at: Utc::now().fixed_offset(),
+                reason: if key.ask == Ask::TurnClaim {
+                    TurnFailureReason::Undelivered
+                } else {
+                    TurnFailureReason::SnapshotUnreadable
+                },
+                turn_id: key.id.clone(),
+                type_: ChannelTurnFailedType::TurnFailed,
+            };
+            self.push(to_value(&failed.into())?);
+        }
         self.store.save(&self.state)?;
+        self.failed.extend(snapshot);
         Ok(Event::FrameRefused {
             seq: refused.seq.0,
             reason: String::from(refused.reason),
+            key,
         })
     }
 

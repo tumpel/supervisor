@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
 use tumpel_api::types::{
     BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
     ChannelProtocol, ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld,
@@ -19,7 +20,7 @@ use tumpel_api::types::{
     SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
     SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
 };
-use tumpel_channel::Outgoing;
+use tumpel_channel::{Ask, Key, Outgoing};
 
 use super::{
     restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SnapshotOrder, Stopped,
@@ -466,9 +467,11 @@ struct MemoryStore(
     Arc<Mutex<Index>>,
     Duration,
     Arc<AtomicU32>,
+    Option<Arc<(Notify, Notify)>>,
 );
 
 const FETCHED_IMAGE_URL: &str = "https://r2.example.test/fetched/image";
+const PERSONA_FILE_URL: &str = "https://r2.example.test/persona/file";
 
 impl MemoryStore {
     fn holds(&self, url: &str) -> bool {
@@ -532,6 +535,17 @@ impl MemoryStore {
             .ok_or_else(|| DownloadError::Refused(format!("GET {url} answered 416")))?;
         std::fs::write(file, part).map_err(|error| DownloadError::Refused(error.to_string()))
     }
+
+    async fn hold_download(&self, url: &str) {
+        if let Some((started, release)) = self
+            .5
+            .as_deref()
+            .filter(|_| url.contains("/packs/") || url == PERSONA_FILE_URL)
+        {
+            started.notify_one();
+            release.notified().await;
+        }
+    }
 }
 
 impl Store for MemoryStore {
@@ -549,20 +563,16 @@ impl Store for MemoryStore {
     }
 
     async fn download(&self, url: &str, file: &Path) -> Result<(), DownloadError> {
+        self.hold_download(url).await;
         if url == FETCHED_IMAGE_URL {
             tokio::time::sleep(self.3).await;
         }
         self.download_now(url, file)
     }
 
-    fn download_range(
-        &self,
-        url: &str,
-        file: &Path,
-        first: u64,
-        last: u64,
-    ) -> impl Future<Output = Result<(), DownloadError>> + Send {
-        std::future::ready(self.download_range_now(url, file, first, last))
+    async fn download_range(&self, url: &str, file: &Path, first: u64, last: u64) -> Result<(), DownloadError> {
+        self.hold_download(url).await;
+        self.download_range_now(url, file, first, last)
     }
 }
 
@@ -577,6 +587,7 @@ const SLOW_BOOT: Duration = Duration::from_millis(50);
 const SLOW_CUT: Duration = Duration::from_millis(300);
 const LATE_CLAIM: Duration = Duration::from_millis(150);
 const STALLED_CLAIM: Duration = Duration::from_secs(600);
+const WITHHOLD_RESTORE_ANSWER: &str = "refused-restore-chunks";
 
 fn settings() -> Settings {
     Settings {
@@ -656,6 +667,7 @@ struct Host {
     answering: Arc<AtomicBool>,
     accepting: Arc<AtomicBool>,
     session: Arc<AtomicU16>,
+    answers: Answers,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -798,7 +810,7 @@ fn control_plane(
                     }));
                     forward(&sender, ChannelHostMessage::SnapshotPacks(packs));
                 }
-                ChannelHostMessage::RestoreChunks(chunks) => {
+                ChannelHostMessage::RestoreChunks(chunks) if chunks.turn_id.as_str() != WITHHOLD_RESTORE_ANSWER => {
                     let mut packs: Vec<ChannelPackUrl> = Vec::new();
                     for chunk in &chunks.chunks {
                         let Some(size) = index.packs.get(chunk.pack_digest.as_str()).copied() else {
@@ -827,6 +839,8 @@ fn control_plane(
                         LATE_CLAIM
                     } else if turn_id.starts_with("stalled") {
                         STALLED_CLAIM
+                    } else if turn_id.as_str() == "refused-claim" {
+                        continue;
                     } else {
                         answers.deliver(claim_answer(turn_id));
                         continue;
@@ -929,9 +943,10 @@ fn start_host(
     let accepting = Arc::new(AtomicBool::new(true));
     let (commands, from_host) = unbounded_channel();
     let session = Arc::new(AtomicU16::new(welcome.unwrap_or(ChannelProtocol::VERSION)));
+    let answers = lifecycle.answers();
     let received = control_plane(
         store.clone(),
-        lifecycle.answers(),
+        answers.clone(),
         Arc::clone(&log),
         Arc::clone(&answering),
         channel(from_lifecycle, Arc::clone(&session), commands.clone()),
@@ -967,6 +982,7 @@ fn start_host(
         answering,
         accepting,
         session,
+        answers,
     }
 }
 
@@ -1649,6 +1665,137 @@ async fn a_restore_missing_a_chunk_fails_the_turn_snapshot_unreadable() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_refused_claim_stops_a_cold_turn_while_its_restore_pack_is_held() {
+    let mut first = host("refused-claim-source", 1, Harness::Echo, Boot::Works);
+    first.turn("turn-1", "session-1", "one", Vec::new());
+    first.settle_until("complete 1").await;
+    let snapshot = first.snapshot("session-1");
+    assert_eq!(first.settle_until("snapshot done").await, ["snapshot done"]);
+
+    let hold = Arc::new((Notify::new(), Notify::new()));
+    let mut store = first.store.clone();
+    store.5 = Some(Arc::clone(&hold));
+    let mut second = host_on(
+        "refused-claim-restore",
+        store,
+        1,
+        Harness::Echo,
+        Boot::Works,
+        settings(),
+        120,
+    );
+    second.turn("refused-claim", "session-1", "two", vec![snapshot]);
+    let claim = second.received.recv().await.expect("claim");
+    assert!(matches!(&claim, ChannelHostMessage::TurnClaim(claim) if claim.turn_id.as_str() == "refused-claim"));
+    hold.0.notified().await;
+
+    let refused_at = tokio::time::Instant::now();
+    second.answers.deliver(Answer::Refused(
+        Key::claim(&"refused-claim".try_into().expect("turn id")),
+        "the turn offer expired".to_string(),
+    ));
+    let handover = tokio::time::timeout(SETTLE, second.ask_handover())
+        .await
+        .expect("handover before the pack is released")
+        .expect("handover settles");
+    assert_eq!(tokio::time::Instant::now(), refused_at);
+    assert_eq!(handover.boxes, []);
+    hold.1.notify_one();
+    assert!(second.log().is_empty(), "the cancelled restore never starts a VM");
+    assert!(!second.vmm.staging.join("session-1").exists());
+    assert!(
+        second.received.try_recv().is_err(),
+        "the channel owns the terminal failure"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_warm_claim_pauses_the_box_and_keeps_it_for_another_turn() {
+    let mut host = host("refused-warm-claim", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("complete 1").await;
+    host.log();
+
+    host.turn("refused-claim", "session-1", "two", Vec::new());
+    let turn_id: EntityId = "refused-claim".try_into().expect("turn id");
+    assert_eq!(host.settle_until("claim refused-claim").await, ["claim refused-claim"]);
+    host.cancels.cancel(turn_id.clone());
+    host.answers.deliver(Answer::Refused(
+        Key::claim(&turn_id),
+        "the turn offer expired".to_string(),
+    ));
+    assert_eq!(host.settle(SETTLE).await, Vec::<String>::new());
+    assert!(!host.cancels.contains(&turn_id));
+    assert_eq!(host.log(), ["resume session-1", "pause session-1"]);
+
+    host.turn("turn-3", "session-1", "three", Vec::new());
+    assert_eq!(
+        host.settle_until("complete 1").await,
+        ["claim turn-3", "line 1 three", "complete 1"]
+    );
+    assert_eq!(
+        host.log(),
+        ["resume session-1", "reconnect session-1", "pause session-1"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_warm_claim_cancels_the_files_stage_and_keeps_the_box() {
+    let hold = Arc::new((Notify::new(), Notify::new()));
+    let store = MemoryStore {
+        5: Some(Arc::clone(&hold)),
+        ..MemoryStore::default()
+    };
+    let mut host = host_on(
+        "refused-warm-files",
+        store,
+        1,
+        Harness::Echo,
+        Boot::Works,
+        settings(),
+        120,
+    );
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("complete 1").await;
+    host.log();
+
+    let mut turn = host.box_turn("refused-claim", "session-1", "two", Vec::new(), 300);
+    turn.files_dir = host.vmm.staging.join("persona-files");
+    turn.persona_files = vec![serde_json::from_value(json!({
+        "path": "README.md", "digest": "a".repeat(64), "sizeBytes": 1,
+        "downloadUrl": PERSONA_FILE_URL, "downloadExpiresAt": in_seconds(300),
+    }))
+    .expect("a persona file")];
+    let turn_id = turn.turn_id.clone();
+    let staged = turn.files_dir.join(turn_id.as_str());
+    host.send(Command::Turn(Box::new(turn)));
+    assert_eq!(host.settle_until("claim refused-claim").await, ["claim refused-claim"]);
+    tokio::time::timeout(SETTLE, hold.0.notified())
+        .await
+        .expect("the download starts");
+    assert!(staged.is_dir());
+    host.cancels.cancel(turn_id.clone());
+
+    let refused_at = tokio::time::Instant::now();
+    host.answers.deliver(Answer::Refused(
+        Key::claim(&turn_id),
+        "the turn offer expired".to_string(),
+    ));
+    host.turn("turn-3", "session-1", "three", Vec::new());
+    assert_eq!(
+        host.settle_until("complete 1").await,
+        ["claim turn-3", "line 1 three", "complete 1"]
+    );
+    assert_eq!(tokio::time::Instant::now(), refused_at);
+    assert!(!host.cancels.contains(&turn_id));
+    assert!(!staged.exists());
+    assert_eq!(
+        host.log(),
+        ["resume session-1", "reconnect session-1", "pause session-1"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_restore_retries_a_pack_download_that_fails_once_and_runs_the_turn() {
     let (mut host, snapshot) = restoring("pack-retry", settings()).await;
     host.store.4.store(1, Ordering::SeqCst);
@@ -2280,6 +2427,72 @@ async fn a_teardown_that_arrives_before_the_ack_of_its_snapshot_done_stops_the_b
         .expect("send");
     assert_eq!(host.settle(SETTLE).await, Vec::<String>::new());
     assert_eq!(host.log(), ["stop session-1"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_restore_chunks_part_ends_setup_at_once() {
+    let (mut host, snapshot) = restoring(WITHHOLD_RESTORE_ANSWER, settings()).await;
+    host.turn(WITHHOLD_RESTORE_ANSWER, "session-1", "two", vec![snapshot]);
+    assert_eq!(
+        host.settle_until("claim refused-restore-chunks").await,
+        ["claim refused-restore-chunks"]
+    );
+    let Some(ChannelHostMessage::RestoreChunks(chunks)) =
+        tokio::time::timeout(Duration::from_secs(10), host.received.recv())
+            .await
+            .expect("restore chunks")
+    else {
+        panic!("expected RestoreChunks part 1");
+    };
+    assert_eq!(chunks.turn_id.as_str(), WITHHOLD_RESTORE_ANSWER);
+    assert_eq!(chunks.part.get(), 1);
+
+    let refused_at = tokio::time::Instant::now();
+    host.answers.deliver(Answer::Refused(
+        Key {
+            ask: Ask::RestoreChunks,
+            id: chunks.turn_id,
+            part: chunks.part,
+        },
+        "the restore index is unreadable".to_string(),
+    ));
+    let handover = tokio::time::timeout(SETTLE, host.ask_handover())
+        .await
+        .expect("handover immediately after refusal")
+        .expect("handover settles");
+    assert_eq!(tokio::time::Instant::now(), refused_at);
+    assert_eq!(handover.boxes, []);
+    assert_eq!(host.log(), Vec::<String>::new());
+    assert!(
+        host.received.try_recv().is_err(),
+        "the channel owns the terminal failure"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_teardown_after_a_failed_snapshot_keeps_the_dirty_box() {
+    let mut host = host("teardown-after-snapshot-refusal", 1, Harness::Echo, Boot::Works);
+    host.accepting.store(false, Ordering::SeqCst);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    let snapshot = host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    host.log();
+
+    host.commands
+        .send(Input::SnapshotFailed(snapshot.snapshot_id))
+        .expect("send");
+    host.teardown("session-1");
+    let seen = host.settle(SETTLE).await;
+    assert!(
+        matches!(seen.as_slice(), [failure] if failure.starts_with(&format!(
+            "teardown failed {}:",
+            ChannelBoxTeardownFailureReason::BoxDirty
+        ))),
+        "{seen:?}"
+    );
+    assert_eq!(host.log(), Vec::<String>::new());
+    assert!(host.standing().boxes[0].dirty);
 }
 
 #[tokio::test(start_paused = true)]

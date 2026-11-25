@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -10,8 +10,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    empty_state, hello_bytes, Backoff, ChannelError, Event, HeldIds, HostChannel, Outgoing, Phase, Port, RateBackoff,
-    RateLimit, Signer, Store, Usage, TURN_LINES_WAIT,
+    empty_state, hello_bytes, Ask, Backoff, ChannelError, Event, HeldIds, HostChannel, Key, Outgoing, Phase, Port,
+    RateBackoff, RateLimit, Signer, Store, Usage, TURN_LINES_WAIT,
 };
 
 #[derive(Default)]
@@ -34,11 +34,12 @@ impl Wire {
 }
 
 #[derive(Clone, Default)]
-struct Disk(Rc<RefCell<Option<SupervisorChannelState>>>);
+struct Disk(Rc<RefCell<Option<SupervisorChannelState>>>, Rc<Cell<usize>>);
 
 impl Store for Disk {
     fn save(&mut self, state: &SupervisorChannelState) -> Result<(), ChannelError> {
         *self.0.borrow_mut() = Some(state.clone());
+        self.1.set(self.1.get() + 1);
         Ok(())
     }
 }
@@ -410,7 +411,7 @@ fn a_saved_frame_no_reader_knows_is_resent_unchanged_and_dropped_once_the_contro
     assert_eq!(sent[0], json!({"type": "Frame", "seq": 7, "ack": 4, "message": step}));
 
     let refused = json!({"type": "FrameRefused", "seq": 7, "reason": "message.phase: Invalid option"}).to_string();
-    let Ok(Event::FrameRefused { seq, reason }) = channel.receive(&refused) else {
+    let Ok(Event::FrameRefused { seq, reason, .. }) = channel.receive(&refused) else {
         panic!("the refusal is reported");
     };
     assert_eq!((seq, reason.as_str()), (7, "message.phase: Invalid option"));
@@ -424,6 +425,105 @@ fn a_saved_frame_no_reader_knows_is_resent_unchanged_and_dropped_once_the_contro
 }
 
 #[test]
+fn a_refused_claim_is_returned_and_replaced_by_an_undelivered_failure_in_one_save() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    let claim: ChannelHostMessage =
+        serde_json::from_value(json!({"type":"TurnClaim", "turnId":"turn-1", "boxId":"box-1"})).expect("claim");
+    channel.send(claim, &mut wire).expect("send claim");
+    let sent = wire.sent();
+    assert_eq!(sent[0]["seq"], 1);
+    let before = disk.1.get();
+
+    let Ok(Event::FrameRefused { seq: 1, reason, key }) =
+        channel.receive(r#"{"type":"FrameRefused","seq":1,"reason":"the turn offer expired"}"#)
+    else {
+        panic!("expected refusal");
+    };
+    assert_eq!(reason, "the turn offer expired");
+    assert_eq!(key, Some(Key::claim(&"turn-1".try_into().expect("turn id"))));
+    assert_eq!(disk.1.get(), before + 1);
+    let saved = disk.0.borrow().clone().expect("saved state");
+    let [failed] = saved.unacked.as_slice() else {
+        panic!("expected only the failure in the saved outbox");
+    };
+    assert_eq!(failed.seq.0, 2);
+    assert_eq!(saved.sent.0, 2);
+    assert_eq!(failed.message["type"], "TurnFailed");
+    assert_eq!(failed.message["turnId"], "turn-1");
+    assert_eq!(failed.message["reason"], "Undelivered");
+    assert_eq!(failed.message["detail"], "the turn offer expired");
+
+    channel.transmit_due(Instant::now(), &mut wire).expect("send failure");
+    assert_eq!(wire.sent()[0]["message"], failed.message);
+}
+
+#[test]
+fn a_refused_chunk_ask_is_replaced_by_its_failure_in_one_save() {
+    let cases = [
+        (
+            json!({"type":"SnapshotChunks","snapshotId":"snap-1","part":1,"digests":[]}),
+            json!({"type":"SnapshotFailed","snapshotId":"snap-1","reason":"NotAnswered","detail":"the snapshot request expired"}),
+        ),
+        (
+            json!({"type":"SnapshotPacks","snapshotId":"snap-2","part":2,"packs":[],"chunks":[],"reusedPackDigests":[]}),
+            json!({"type":"SnapshotFailed","snapshotId":"snap-2","reason":"NotAnswered","detail":"the upload window closed"}),
+        ),
+        (
+            json!({"type":"RestoreChunks","turnId":"turn-1","part":1,"chunks":[]}),
+            json!({"type":"TurnFailed","turnId":"turn-1","reason":"SnapshotUnreadable","detail":"the restore index is unreadable"}),
+        ),
+    ];
+    for (ask, mut expected) in cases {
+        let message = serde_json::from_value(ask.clone()).expect("chunk ask");
+        let outgoing = if ask["type"] == "SnapshotPacks" {
+            Outgoing::Snapshot(message, ChannelProtocol::VERSION)
+        } else {
+            Outgoing::Message(message)
+        };
+        let disk = Disk::default();
+        let mut channel = channel(&disk, &Recorder::default());
+        let mut wire = Wire::default();
+        open(&mut channel, &mut wire);
+        channel.send(outgoing, &mut wire).expect("send ask");
+        assert_eq!(wire.sent()[0]["seq"], 1);
+        let before = disk.1.get();
+
+        let refusal = json!({"type":"FrameRefused","seq":1,"reason":expected["detail"]});
+        let Ok(Event::FrameRefused { seq: 1, reason, key }) = channel.receive(&refusal.to_string()) else {
+            panic!("expected refusal");
+        };
+        assert_eq!(reason, expected["detail"]);
+        assert_eq!(disk.1.get(), before + 1);
+        let saved = disk.0.borrow().clone().expect("saved state");
+        let [failed] = saved.unacked.as_slice() else {
+            panic!("expected only {expected} in the saved outbox, got {:?}", saved.unacked);
+        };
+        assert_eq!(failed.seq.0, 2);
+        expected["failedAt"] = failed.message["failedAt"].clone();
+        assert_eq!(failed.message, expected);
+        if expected["type"] == "TurnFailed" {
+            assert_eq!(
+                key,
+                Some(Key {
+                    ask: Ask::RestoreChunks,
+                    id: "turn-1".try_into().expect("turn id"),
+                    part: NonZeroU32::MIN,
+                })
+            );
+        } else {
+            assert_eq!(key, None);
+            let id: EntityId = serde_json::from_value(ask["snapshotId"].clone()).expect("snapshot id");
+            assert_eq!(channel.take_failed(), [id]);
+        }
+        channel.transmit_due(Instant::now(), &mut wire).expect("send failure");
+        assert_eq!(wire.sent()[0]["message"], failed.message);
+    }
+}
+
+#[test]
 fn an_acked_snapshot_done_is_accepted_and_a_refused_one_retires_without_acceptance() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
@@ -431,6 +531,8 @@ fn an_acked_snapshot_done_is_accepted_and_a_refused_one_retires_without_acceptan
     open(&mut channel, &mut wire);
     channel.send(done("snap-1"), &mut wire).expect("send");
     channel.send(done("snap-2"), &mut wire).expect("send");
+    wire.sent();
+    let before = disk.1.get();
     let refused = json!({"type": "FrameRefused", "seq": 2, "reason": "the manifest did not parse"}).to_string();
     let Ok(Event::FrameRefused { seq: 2, .. }) = channel.receive(&refused) else {
         panic!("the refusal is reported");
@@ -440,10 +542,29 @@ fn an_acked_snapshot_done_is_accepted_and_a_refused_one_retires_without_acceptan
         Vec::<EntityId>::new(),
         "a refusal accepts nothing"
     );
+    assert_eq!(disk.1.get(), before + 1);
+    let saved = disk.0.borrow().clone().expect("saved state");
+    let [pending, failed] = saved.unacked.as_slice() else {
+        panic!("expected the first completion and the second snapshot's failure");
+    };
+    assert_eq!(pending.seq.0, 1);
+    assert_eq!(failed.seq.0, 3);
+    assert_eq!(saved.sent.0, 3);
+    assert_eq!(failed.message["type"], "SnapshotFailed");
+    assert_eq!(failed.message["snapshotId"], "snap-2");
+    assert_eq!(failed.message["reason"], "NotAnswered");
+    assert_eq!(failed.message["detail"], "the manifest did not parse");
+    channel.transmit_due(Instant::now(), &mut wire).expect("send failure");
+    let [sent]: [Value; 1] = wire.sent().try_into().expect("one frame");
+    assert_eq!(sent["message"], failed.message);
+    assert_eq!(
+        channel.take_failed(),
+        [EntityId::try_from("snap-2").expect("snapshot id")]
+    );
 
     channel
         .receive(&json!({"type": "Ack", "seq": 2}).to_string())
-        .expect("the ack retires both frames");
+        .expect("the ack retires the first completion");
     let accepted: Vec<String> = channel.take_accepted().into_iter().map(|id| id.to_string()).collect();
     assert_eq!(accepted, ["snap-1"]);
     assert_eq!(channel.take_accepted(), Vec::<EntityId>::new());

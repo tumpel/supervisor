@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ring::digest::{digest, SHA256};
 use serde_json::json;
@@ -148,7 +149,7 @@ async fn a_layered_boot_fetches_base_kernel_and_layer_and_holds_them_while_its_b
     let third = publish(&mut bucket, "third base", 3);
     let layers = LayerCache::new(&images, NonZeroU32::MIN);
     let holds = Holds::default();
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
     let caches = Caches {
         store: &bucket,
         images: &images,
