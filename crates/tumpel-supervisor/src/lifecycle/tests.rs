@@ -2254,12 +2254,12 @@ async fn a_refused_clone_reaches_the_channel_with_its_cause_after_the_claim() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_first_line_budget_starts_when_the_repository_is_ready() {
     let mut host = host("slow-clone", 1, Harness::SlowClone, Boot::Works);
     host.turn("turn-1", "session-1", "one", Vec::new());
     assert_eq!(
-        host.settle(SLOW_CLONE + SETTLE).await,
+        host.settle_until("complete 1").await,
         ["claim turn-1", "line 1 one", "complete 1"]
     );
 }
