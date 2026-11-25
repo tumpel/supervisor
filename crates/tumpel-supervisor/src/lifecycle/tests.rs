@@ -1448,7 +1448,7 @@ fn open_snapshot_channel(
                 host: tumpel_api::types::HostUsage {
                     load_average: 0.0,
                     memory_available_mib: 4096,
-                    disk_budget_mib: 32768,
+                    disk_budget_mib: 32_768,
                     disk_held_mib: 0,
                     memory_budget_mib: 4096,
                     memory_held_mib: 0,
@@ -1513,7 +1513,7 @@ async fn a_refused_snapshot_done_reports_the_refusal_and_the_box_takes_its_queue
         panic!("only the snapshot failure stays in the saved outbox");
     };
     assert_eq!(queued.message, failure["message"]);
-    assert!(channel.take_accepted().is_empty());
+    assert_eq!(channel.take_accepted(), Vec::<EntityId>::new());
     let failed = channel.take_failed();
     assert_eq!(failed, [snapshot.snapshot_id]);
     for snapshot_id in failed {
