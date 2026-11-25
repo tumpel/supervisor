@@ -1101,9 +1101,9 @@ async fn session(
                                 Ok(None) => None,
                                 Err(error) => Some(Err(fail(SupervisorFailure::ProtocolError, error))),
                             },
-                            Ok(Event::FrameRefused { seq, reason, claim }) => {
+                            Ok(Event::FrameRefused { seq, reason, key }) => {
                                 eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
-                                if claim.is_some_and(|turn_id| commands.send(BoxCommand::Answer(Answer::ClaimRefused(turn_id))).is_err()) {
+                                if key.is_some_and(|key| commands.send(BoxCommand::Answer(Answer::Refused(key, reason))).is_err()) {
                                     Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
                                 } else {
                                     channel.transmit_due(Instant::now(), &mut outbox).err().map(|error| Err(store_lost(&error)))

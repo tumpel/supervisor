@@ -33,11 +33,11 @@ use tumpel_api::types::{
     SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
     SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
 };
-use tumpel_channel::{Outgoing, PACK_REUSE};
+use tumpel_channel::{Ask, Key, Outgoing, PACK_REUSE};
 
 use crate::boot::{self, Boot, BootOrder, Caches, Hold, Holds};
 use crate::bounded::{bounded, reported};
-use crate::exchange::{part_number, Answer, Answers, Ask, Cancels, Key, Waiting, DIGESTS_PER_PART};
+use crate::exchange::{part_number, Answer, Answers, Cancels, Waiting, DIGESTS_PER_PART};
 use crate::harness_result::{error_result, exit_result, turn_end};
 use crate::images;
 use crate::layers::LayerCache;
@@ -869,7 +869,7 @@ impl Claiming {
         tokio::select! {
             biased;
             answer = self.answer() => match answer {
-                Some(Answer::ClaimRefused(_)) => Err(()),
+                Some(Answer::Refused(..)) => Err(()),
                 answer => {
                     self.early = answer;
                     Ok(setup.await)
@@ -896,6 +896,20 @@ impl Drop for Asking {
     fn drop(&mut self) {
         if self.waiting.is_some() {
             self.answers.forget(&self.key);
+        }
+    }
+}
+
+struct RestoreFailure {
+    report: Option<TurnFailureReason>,
+    detail: String,
+}
+
+impl From<String> for RestoreFailure {
+    fn from(detail: String) -> Self {
+        Self {
+            report: Some(TurnFailureReason::SnapshotUnreadable),
+            detail,
         }
     }
 }
@@ -1059,24 +1073,21 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         Outcome::Gone(tap, stopped)
     }
 
-    async fn restore_for_turn(
-        &self,
-        turn: &BoxTurn,
-        tap: &Tap,
-    ) -> Result<Option<Restored>, (TurnFailureReason, String)> {
+    async fn restore_for_turn(&self, turn: &BoxTurn, tap: &Tap) -> Result<Option<Restored>, RestoreFailure> {
         let restoring = (!turn.snapshots.is_empty())
             .then(|| expired(&turn.credential, "before its snapshot was restored"))
             .flatten();
         if let Some(detail) = restoring {
-            return Err((TurnFailureReason::DispatchCredentialExpired, detail));
+            return Err(RestoreFailure {
+                report: Some(TurnFailureReason::DispatchCredentialExpired),
+                detail,
+            });
         }
         timeout_at(instant_at(turn.credential.expires_at), self.restore(turn, tap))
             .await
-            .map_err(|_| {
-                (
-                    TurnFailureReason::DispatchCredentialExpired,
-                    credential_expired(&turn.credential, "while its snapshot was restored"),
-                )
+            .map_err(|_| RestoreFailure {
+                report: Some(TurnFailureReason::DispatchCredentialExpired),
+                detail: credential_expired(&turn.credential, "while its snapshot was restored"),
             })?
     }
 
@@ -1092,11 +1103,14 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         };
         let restored = match claiming.during(self.restore_for_turn(turn, &tap)).await {
             Ok(Ok(restored)) => restored,
-            Ok(Err((reason, detail))) => {
+            Ok(Err(RestoreFailure {
+                report: Some(reason),
+                detail,
+            })) => {
                 turn_failed(&self.out, &turn.turn_id, reason, detail);
                 return Outcome::Gone(tap, Ok(()));
             }
-            Err(()) => {
+            Ok(Err(RestoreFailure { report: None, .. })) | Err(()) => {
                 self.cancels.forget(&turn.turn_id);
                 return Outcome::Gone(tap, Ok(()));
             }
@@ -1326,7 +1340,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         cache: &Arc<ChunkCache>,
         dir: &Path,
         deadline: Instant,
-    ) -> Result<(), String> {
+    ) -> Result<(), RestoreFailure> {
         let parts = restore_parts(wanted, DIGESTS_PER_PART);
         let (jobs, queue) = unbounded_channel::<(Arc<PartUrls>, Fetch)>();
         let asking = async move {
@@ -1358,11 +1372,11 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                         .map_err(|_| "the pack downloads stopped".to_string())?;
                 }
             }
-            Ok::<(), String>(())
+            Ok::<(), RestoreFailure>(())
         };
         let runner = self.clone();
         let downloading = futures_util::stream::unfold(queue, |mut queue| async move {
-            queue.recv().await.map(|job| (Ok::<_, String>(job), queue))
+            queue.recv().await.map(|job| (Ok::<_, RestoreFailure>(job), queue))
         })
         .try_for_each_concurrent(TRANSFERS, move |(urls, fetch)| {
             let runner = runner.clone();
@@ -1378,11 +1392,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         key: &Key,
         message: ChannelRestoreChunks,
         deadline: Instant,
-    ) -> Result<ChannelRestoreDownloads, String> {
-        let Answer::Downloads(answer) = self.ask(key.clone(), message, deadline).await? else {
-            return Err(unexpected(key));
-        };
-        Ok(answer)
+    ) -> Result<ChannelRestoreDownloads, RestoreFailure> {
+        match self.ask(key.clone(), message, deadline).await? {
+            Answer::Downloads(answer) => Ok(answer),
+            Answer::Refused(_, detail) => Err(RestoreFailure { report: None, detail }),
+            _ => Err(RestoreFailure::from(unexpected(key))),
+        }
     }
 
     async fn refresh(
@@ -1391,13 +1406,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         seen: u32,
         pack: &str,
         deadline: Instant,
-    ) -> Result<(u32, String), String> {
+    ) -> Result<(u32, String), RestoreFailure> {
         let mut held = urls.urls.lock().await;
         if held.0 == seen {
             let answer = self.restore_urls(&urls.key, urls.message.clone(), deadline).await?;
             *held = (seen + 1, pack_urls(answer));
         }
-        url_of(&held, pack)
+        url_of(&held, pack).map_err(RestoreFailure::from)
     }
 
     async fn download_pack(
@@ -1407,7 +1422,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         cache: Arc<ChunkCache>,
         dir: PathBuf,
         deadline: Instant,
-    ) -> Result<(), String> {
+    ) -> Result<(), RestoreFailure> {
         let named = fetch
             .chunks
             .first()
@@ -1423,10 +1438,16 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             let stale = match fetched {
                 Ok(()) => break,
                 Err(DownloadError::Refused(error)) => {
-                    return Err(format!("pack {} is unreadable: {error}", fetch.pack))
+                    return Err(RestoreFailure::from(format!(
+                        "pack {} is unreadable: {error}",
+                        fetch.pack
+                    )))
                 }
                 Err(error) if attempt >= DOWNLOAD_ATTEMPTS => {
-                    return Err(format!("pack {} is unreadable: {error}", fetch.pack))
+                    return Err(RestoreFailure::from(format!(
+                        "pack {} is unreadable: {error}",
+                        fetch.pack
+                    )))
                 }
                 Err(DownloadError::Expired(_)) => true,
                 Err(DownloadError::Transient(_)) => attempt % ATTEMPTS_PER_URL == 0,
@@ -1444,6 +1465,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         })
         .await
         .map_err(|error| format!("unpacking a pack stopped: {error}"))?
+        .map_err(RestoreFailure::from)
     }
 
     async fn download_root(&self, url: &str, file: &Path) -> Result<(), DownloadError> {
@@ -1465,33 +1487,39 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         dir: &Path,
         named: &str,
         expires: DateTime<FixedOffset>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RestoreFailure> {
         if wanted.is_empty() {
             return Ok(());
         }
         let deadline = instant_at(expires);
         match timeout_at(deadline, self.fetch(&turn.turn_id, wanted, cache, dir, deadline)).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(format!(
-                "restoring {named}: {error}; offer the turn again for fresh download URLs, or start a new session when the snapshot is damaged"
-            )),
-            Err(_) => Err(format!(
+            Ok(Err(error)) if error.report.is_none() => Err(error),
+            Ok(Err(error)) => Err(RestoreFailure::from(format!(
+                "restoring {named}: {}; offer the turn again for fresh download URLs, or start a new session when the snapshot is damaged",
+                error.detail
+            ))),
+            Err(_) => Err(RestoreFailure::from(format!(
                 "the packs of {named} did not download before their URLs expired at {}; check the host's bandwidth to object storage and offer the turn again",
                 expires.to_rfc3339()
-            )),
+            ))),
         }
     }
 
-    async fn restore(&self, turn: &BoxTurn, tap: &Tap) -> Result<Option<Restored>, (TurnFailureReason, String)> {
+    async fn restore(&self, turn: &BoxTurn, tap: &Tap) -> Result<Option<Restored>, RestoreFailure> {
         telemetry::timed(Phase::Restore, self.restore_snapshot(turn, tap), |restored| {
             matches!(restored, Ok(Some(_)))
         })
         .await
-        .map_err(|(reason, detail)| match self.host_disk_full() {
-            Some(full) if reason == TurnFailureReason::SnapshotUnreadable => {
-                (TurnFailureReason::BoxDiskFull, format!("{full}; {detail}"))
+        .map_err(|mut failure| {
+            if failure.report != Some(TurnFailureReason::SnapshotUnreadable) {
+                return failure;
             }
-            _ => (reason, detail),
+            if let Some(full) = self.host_disk_full() {
+                failure.report = Some(TurnFailureReason::BoxDiskFull);
+                failure.detail = format!("{full}; {}", failure.detail);
+            }
+            failure
         })
     }
 
@@ -1522,17 +1550,15 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
-    fn charge_restore(&self, named: &str, bytes: u64, tap: &Tap) -> Result<Charge, (TurnFailureReason, String)> {
+    fn charge_restore(&self, named: &str, bytes: u64, tap: &Tap) -> Result<Charge, RestoreFailure> {
         let charge_mib = restore_charge_mib(bytes, tap.disk_mib());
         self.vmm
             .disk(&[])
             .map_err(|error| format!("reading the host's free disk failed: {error}"))
             .and_then(|disk| disk.stages(self.reserves.mib(), self.staging.mib(), charge_mib))
-            .map_err(|detail| {
-                (
-                    TurnFailureReason::BoxDiskFull,
-                    format!("restoring {named} of {bytes} bytes: {detail}"),
-                )
+            .map_err(|detail| RestoreFailure {
+                report: Some(TurnFailureReason::BoxDiskFull),
+                detail: format!("restoring {named} of {bytes} bytes: {detail}"),
             })?;
         Ok(self.staging.charge(charge_mib))
     }
@@ -1546,12 +1572,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         })
     }
 
-    async fn restore_snapshot(
-        &self,
-        turn: &BoxTurn,
-        tap: &Tap,
-    ) -> Result<Option<Restored>, (TurnFailureReason, String)> {
-        let unreadable = |detail: String| (TurnFailureReason::SnapshotUnreadable, detail);
+    async fn restore_snapshot(&self, turn: &BoxTurn, tap: &Tap) -> Result<Option<Restored>, RestoreFailure> {
+        let unreadable = RestoreFailure::from;
         let Some(snapshot) = turn.snapshots.last() else {
             return Ok(None);
         };
@@ -1584,9 +1606,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         .map_err(|error| unreadable(format!("reading the root of {named} stopped: {error}")))?;
         remove_file(&file).map_err(unreadable)?;
         let (root, wanted) = read.map_err(damaged)?;
-        self.fetch_within(turn, wanted, &cache, &dir, &named, expires)
-            .await
-            .map_err(unreadable)?;
+        self.fetch_within(turn, wanted, &cache, &dir, &named, expires).await?;
         let reading = Arc::clone(&cache);
         let manifest_places = root.clone();
         let read = tokio::task::spawn_blocking(move || -> Result<(Manifest, Vec<Place>), String> {
@@ -1600,9 +1620,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let overlay = u64::from(tap.disk_mib().get()) * 1024 * 1024;
         let (bytes, entries) = restore_size(&named, &manifest, overlay).map_err(unreadable)?;
         let charge = self.charge_restore(&named, bytes, tap)?;
-        self.fetch_within(turn, wanted, &cache, &dir, &named, expires)
-            .await
-            .map_err(unreadable)?;
+        self.fetch_within(turn, wanted, &cache, &dir, &named, expires).await?;
         let target = dir.join("restore.tar");
         let output = target.clone();
         let chunks = dir.join(CHUNKS);
@@ -1745,7 +1763,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 );
                 return self.pause(live).await;
             }
-            Some(Answer::ClaimRefused(_)) => {
+            Some(Answer::Refused(..)) => {
                 self.cancels.forget(&turn.turn_id);
                 return self.pause(live).await;
             }

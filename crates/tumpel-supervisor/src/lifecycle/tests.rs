@@ -20,7 +20,7 @@ use tumpel_api::types::{
     SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
     SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
 };
-use tumpel_channel::Outgoing;
+use tumpel_channel::{Ask, Key, Outgoing};
 
 use super::{
     restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SnapshotOrder, Stopped,
@@ -587,6 +587,7 @@ const SLOW_BOOT: Duration = Duration::from_millis(50);
 const SLOW_CUT: Duration = Duration::from_millis(300);
 const LATE_CLAIM: Duration = Duration::from_millis(150);
 const STALLED_CLAIM: Duration = Duration::from_secs(600);
+const WITHHOLD_RESTORE_ANSWER: &str = "refused-restore-chunks";
 
 fn settings() -> Settings {
     Settings {
@@ -809,7 +810,7 @@ fn control_plane(
                     }));
                     forward(&sender, ChannelHostMessage::SnapshotPacks(packs));
                 }
-                ChannelHostMessage::RestoreChunks(chunks) => {
+                ChannelHostMessage::RestoreChunks(chunks) if chunks.turn_id.as_str() != WITHHOLD_RESTORE_ANSWER => {
                     let mut packs: Vec<ChannelPackUrl> = Vec::new();
                     for chunk in &chunks.chunks {
                         let Some(size) = index.packs.get(chunk.pack_digest.as_str()).copied() else {
@@ -1689,9 +1690,10 @@ async fn a_refused_claim_stops_a_cold_turn_while_its_restore_pack_is_held() {
     hold.0.notified().await;
 
     let refused_at = tokio::time::Instant::now();
-    second
-        .answers
-        .deliver(Answer::ClaimRefused("refused-claim".try_into().expect("turn id")));
+    second.answers.deliver(Answer::Refused(
+        Key::claim(&"refused-claim".try_into().expect("turn id")),
+        "the turn offer expired".to_string(),
+    ));
     let handover = tokio::time::timeout(SETTLE, second.ask_handover())
         .await
         .expect("handover before the pack is released")
@@ -1718,7 +1720,10 @@ async fn a_refused_warm_claim_pauses_the_box_and_keeps_it_for_another_turn() {
     let turn_id: EntityId = "refused-claim".try_into().expect("turn id");
     assert_eq!(host.settle_until("claim refused-claim").await, ["claim refused-claim"]);
     host.cancels.cancel(turn_id.clone());
-    host.answers.deliver(Answer::ClaimRefused(turn_id.clone()));
+    host.answers.deliver(Answer::Refused(
+        Key::claim(&turn_id),
+        "the turn offer expired".to_string(),
+    ));
     assert_eq!(host.settle(SETTLE).await, Vec::<String>::new());
     assert!(!host.cancels.contains(&turn_id));
     assert_eq!(host.log(), ["resume session-1", "pause session-1"]);
@@ -1772,7 +1777,10 @@ async fn a_refused_warm_claim_cancels_the_files_stage_and_keeps_the_box() {
     host.cancels.cancel(turn_id.clone());
 
     let refused_at = tokio::time::Instant::now();
-    host.answers.deliver(Answer::ClaimRefused(turn_id.clone()));
+    host.answers.deliver(Answer::Refused(
+        Key::claim(&turn_id),
+        "the turn offer expired".to_string(),
+    ));
     host.turn("turn-3", "session-1", "three", Vec::new());
     assert_eq!(
         host.settle_until("complete 1").await,
@@ -2422,7 +2430,47 @@ async fn a_teardown_that_arrives_before_the_ack_of_its_snapshot_done_stops_the_b
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_teardown_after_a_refused_snapshot_done_keeps_the_dirty_box() {
+async fn a_refused_restore_chunks_part_ends_setup_at_once() {
+    let (mut host, snapshot) = restoring(WITHHOLD_RESTORE_ANSWER, settings()).await;
+    host.turn(WITHHOLD_RESTORE_ANSWER, "session-1", "two", vec![snapshot]);
+    assert_eq!(
+        host.settle_until("claim refused-restore-chunks").await,
+        ["claim refused-restore-chunks"]
+    );
+    let Some(ChannelHostMessage::RestoreChunks(chunks)) =
+        tokio::time::timeout(Duration::from_secs(10), host.received.recv())
+            .await
+            .expect("restore chunks")
+    else {
+        panic!("expected RestoreChunks part 1");
+    };
+    assert_eq!(chunks.turn_id.as_str(), WITHHOLD_RESTORE_ANSWER);
+    assert_eq!(chunks.part.get(), 1);
+
+    let refused_at = tokio::time::Instant::now();
+    host.answers.deliver(Answer::Refused(
+        Key {
+            ask: Ask::RestoreChunks,
+            id: chunks.turn_id,
+            part: chunks.part,
+        },
+        "the restore index is unreadable".to_string(),
+    ));
+    let handover = tokio::time::timeout(SETTLE, host.ask_handover())
+        .await
+        .expect("handover immediately after refusal")
+        .expect("handover settles");
+    assert_eq!(tokio::time::Instant::now(), refused_at);
+    assert_eq!(handover.boxes, []);
+    assert_eq!(host.log(), Vec::<String>::new());
+    assert!(
+        host.received.try_recv().is_err(),
+        "the channel owns the terminal failure"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_teardown_after_a_failed_snapshot_keeps_the_dirty_box() {
     let mut host = host("teardown-after-snapshot-refusal", 1, Harness::Echo, Boot::Works);
     host.accepting.store(false, Ordering::SeqCst);
     host.turn("turn-1", "session-1", "one", Vec::new());

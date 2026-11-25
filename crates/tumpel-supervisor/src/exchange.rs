@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -9,52 +8,15 @@ use tumpel_api::types::{
     ChannelTurnWithdrawn, ChunkExchange, EntityId,
 };
 
+use tumpel_channel::{Ask, Key};
+
 pub enum Answer {
     ChunksHeld(ChannelSnapshotChunksHeld),
     PackUploads(ChannelSnapshotPackUploads),
     Downloads(ChannelRestoreDownloads),
     Claimed(ChannelTurnClaimed),
     Withdrawn(ChannelTurnWithdrawn),
-    ClaimRefused(EntityId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Ask {
-    SnapshotChunks,
-    SnapshotPacks,
-    RestoreChunks,
-    TurnClaim,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Key {
-    pub ask: Ask,
-    pub id: EntityId,
-    pub part: NonZeroU32,
-}
-
-impl Key {
-    #[must_use]
-    pub fn claim(turn_id: &EntityId) -> Self {
-        Self {
-            ask: Ask::TurnClaim,
-            id: turn_id.clone(),
-            part: NonZeroU32::MIN,
-        }
-    }
-}
-
-impl fmt::Display for Key {
-    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let id = &*self.id;
-        let part = self.part;
-        match self.ask {
-            Ask::SnapshotChunks => write!(out, "SnapshotChunks part {part} of snapshot {id}"),
-            Ask::SnapshotPacks => write!(out, "SnapshotPacks part {part} of snapshot {id}"),
-            Ask::RestoreChunks => write!(out, "RestoreChunks part {part} of turn {id}"),
-            Ask::TurnClaim => write!(out, "the TurnClaim of turn {id}"),
-        }
-    }
+    Refused(Key, String),
 }
 
 impl Answer {
@@ -77,7 +39,7 @@ impl Answer {
             },
             Self::Claimed(answer) => Key::claim(&answer.turn_id),
             Self::Withdrawn(answer) => Key::claim(&answer.turn_id),
-            Self::ClaimRefused(turn_id) => Key::claim(turn_id),
+            Self::Refused(key, _) => key.clone(),
         }
     }
 }
