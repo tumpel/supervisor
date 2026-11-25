@@ -2489,7 +2489,7 @@ async fn a_refused_snapshot_packs_part_fails_the_snapshot_at_once() {
     assert_eq!(failed.reason, ChannelSnapshotFailureReason::NotAnswered);
     assert_eq!(failed.detail.as_str(), reason);
     assert!(host.standing().boxes[0].dirty);
-    assert!(host.store.uploads().is_empty());
+    assert_eq!(host.store.uploads(), Vec::<String>::new());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2533,7 +2533,7 @@ async fn a_refused_restore_chunks_part_fails_the_turn_at_once() {
         failed.detail.as_str(),
         format!("restoring snapshot snapshot-1 (seq 1) of session session-1: {reason}; offer the turn again for fresh download URLs, or start a new session when the snapshot is damaged")
     );
-    assert!(host.log().is_empty());
+    assert_eq!(host.log(), Vec::<String>::new());
 }
 
 #[tokio::test(start_paused = true)]

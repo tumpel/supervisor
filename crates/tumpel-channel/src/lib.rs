@@ -886,8 +886,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             .unacked
             .iter()
             .position(|own| own.seq == refused.seq)
-            .map(|index| self.state.unacked.remove(index).message)
-            .unwrap_or(Value::Null);
+            .map_or(Value::Null, |index| self.state.unacked.remove(index).message);
         let mut snapshot = None;
         let key = match message["type"].as_str() {
             Some("TurnClaim") => {

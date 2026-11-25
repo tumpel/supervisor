@@ -513,7 +513,7 @@ fn a_refused_chunk_ask_reports_its_key_and_reason() {
                 part: NonZeroU32::new(part).expect("part"),
             })
         );
-        assert!(unacked_seqs(&disk).is_empty());
+        assert_eq!(unacked_seqs(&disk), Vec::<i64>::new());
     }
 }
 
