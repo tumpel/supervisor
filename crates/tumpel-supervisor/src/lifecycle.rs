@@ -1010,16 +1010,30 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     fn claim_refused(&self, turn: &BoxTurn, tap: Tap, stopped: Result<(), String>) -> Outcome<V::Machine> {
+        Outcome::Gone(tap, stopped.and(self.clean_refused_claim(turn)))
+    }
+
+    fn clean_refused_claim(&self, turn: &BoxTurn) -> Result<(), String> {
         self.cancels.forget(&turn.turn_id);
-        Outcome::Gone(tap, stopped.and(remove_dir(&turn.files_dir.join(&*turn.turn_id))))
+        remove_dir(&turn.files_dir.join(&*turn.turn_id))
     }
 
     async fn warm_turn(&self, mut live: LiveBox<V::Machine>, turn: &BoxTurn) -> Outcome<V::Machine> {
         live.box_retention = turn.box_retention.clone();
         live.idle = Duration::from_secs(u64::from(turn.idle_seconds.get()));
         let mut claiming = self.claim(turn);
-        let Ok(Some(files)) = claiming.during(self.files(turn)).await else {
-            return Outcome::Kept(live);
+        let files = match claiming.during(self.files(turn)).await {
+            Ok(Some(files)) => files,
+            Ok(None) => return Outcome::Kept(live),
+            Err(()) => {
+                if let Err(error) = self.clean_refused_claim(turn) {
+                    eprintln!(
+                        "tumpel-supervisor: cleaning up the refused claim of turn {}: {error}",
+                        *turn.turn_id
+                    );
+                }
+                return Outcome::Kept(live);
+            }
         };
         let seconds = self.settings.budgets.boot.as_secs();
         let failed = match self.standing.put(&live, Some(&turn.turn_id)) {
@@ -1558,12 +1572,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         };
         let cache = Arc::new(ChunkCache::new(dir.join(CHUNKS)));
         let reading = Arc::clone(&cache);
-        cache.create().map_err(damaged)?;
         let root_file = file.clone();
         let read = tokio::task::spawn_blocking(move || -> Result<(Vec<Place>, Vec<Place>), String> {
             let bytes =
                 std::fs::read(&root_file).map_err(|error| format!("reading {}: {error}", root_file.display()))?;
             let root = decode_root(&bytes)?;
+            reading.create()?;
             let wanted = lacking(&root, &reading)?;
             Ok((root, wanted))
         })

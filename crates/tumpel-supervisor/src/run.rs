@@ -17,8 +17,8 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
-    HostReportedHealth, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    ChannelControlMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
+    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
 };
 use tumpel_channel::{
@@ -1101,9 +1101,9 @@ async fn session(
                                 Ok(None) => None,
                                 Err(error) => Some(Err(fail(SupervisorFailure::ProtocolError, error))),
                             },
-                            Ok(Event::FrameRefused { seq, reason, message }) => {
+                            Ok(Event::FrameRefused { seq, reason, claim }) => {
                                 eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
-                                if matches!(message.as_deref(), Some(ChannelHostMessage::TurnClaim(claim)) if commands.send(BoxCommand::Answer(Answer::ClaimRefused(claim.turn_id.clone()))).is_err()) {
+                                if claim.is_some_and(|turn_id| commands.send(BoxCommand::Answer(Answer::ClaimRefused(turn_id))).is_err()) {
                                     Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
                                 } else {
                                     channel.transmit_due(Instant::now(), &mut outbox).err().map(|error| Err(store_lost(&error)))

@@ -140,8 +140,8 @@ impl HttpStore {
                 _ => DownloadError::Refused(detail),
             });
         }
-        let mut out = std::fs::File::create(file)
-            .map(tokio::fs::File::from_std)
+        let mut out = tokio::fs::File::create(file)
+            .await
             .map_err(|error| DownloadError::Refused(format!("creating {}: {error}", file.display())))?;
         while let Some(chunk) = response
             .chunk()

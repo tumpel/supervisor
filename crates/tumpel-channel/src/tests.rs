@@ -432,21 +432,18 @@ fn a_refused_claim_is_returned_and_replaced_by_an_undelivered_failure_in_one_sav
     open(&mut channel, &mut wire);
     let claim: ChannelHostMessage =
         serde_json::from_value(json!({"type":"TurnClaim", "turnId":"turn-1", "boxId":"box-1"})).expect("claim");
-    channel.send(claim.clone(), &mut wire).expect("send claim");
+    channel.send(claim, &mut wire).expect("send claim");
     let sent = wire.sent();
     assert_eq!(sent[0]["seq"], 1);
     let before = disk.1.get();
 
-    let Ok(Event::FrameRefused {
-        seq: 1,
-        reason,
-        message,
-    }) = channel.receive(r#"{"type":"FrameRefused","seq":1,"reason":"the turn offer expired"}"#)
+    let Ok(Event::FrameRefused { seq: 1, reason, claim }) =
+        channel.receive(r#"{"type":"FrameRefused","seq":1,"reason":"the turn offer expired"}"#)
     else {
         panic!("expected refusal");
     };
     assert_eq!(reason, "the turn offer expired");
-    assert_eq!(message.as_deref(), Some(&claim));
+    assert_eq!(claim.expect("the refused claim's turn id").as_str(), "turn-1");
     assert_eq!(disk.1.get(), before + 1);
     let saved = disk.0.borrow().clone().expect("saved state");
     let [failed] = saved.unacked.as_slice() else {

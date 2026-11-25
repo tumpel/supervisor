@@ -369,7 +369,7 @@ pub enum Event {
     FrameRefused {
         seq: i64,
         reason: String,
-        message: Option<Box<ChannelHostMessage>>,
+        claim: Option<EntityId>,
     },
     FrameRateLimited {
         seq: i64,
@@ -827,20 +827,19 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     fn refused(&mut self, refused: ChannelFrameRefused) -> Result<Event, ChannelError> {
         self.progressed = true;
-        let message = self
+        let claim: Option<EntityId> = self
             .state
             .unacked
             .iter()
             .position(|own| own.seq == refused.seq)
             .map(|index| self.state.unacked.remove(index).message)
             .and_then(|message| {
-                let Ok(message) = serde_json::from_value(message) else {
-                    update_required();
+                if message["type"] != "TurnClaim" {
                     return None;
-                };
-                Some(Box::new(message))
+                }
+                message["turnId"].as_str()?.try_into().ok()
             });
-        if let Some(ChannelHostMessage::TurnClaim(claim)) = message.as_deref() {
+        if let Some(turn_id) = &claim {
             let failed = ChannelTurnFailed {
                 credential_file: None,
                 detail: refused
@@ -850,7 +849,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                     .map_err(|error| protocol(format!("reporting the refused claim: {error}")))?,
                 failed_at: Utc::now().fixed_offset(),
                 reason: TurnFailureReason::Undelivered,
-                turn_id: claim.turn_id.clone(),
+                turn_id: turn_id.clone(),
                 type_: ChannelTurnFailedType::TurnFailed,
             };
             self.push(to_value(&failed.into())?);
@@ -859,7 +858,7 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
         Ok(Event::FrameRefused {
             seq: refused.seq.0,
             reason: String::from(refused.reason),
-            message,
+            claim,
         })
     }
 
