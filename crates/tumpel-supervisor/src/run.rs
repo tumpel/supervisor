@@ -17,8 +17,8 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
-    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
+    HostReportedHealth, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, SupervisorUpdatePending, TurnFailureReason,
 };
 use tumpel_channel::{
@@ -1019,6 +1019,72 @@ fn box_command(message: ChannelControlMessage) -> Result<Option<BoxCommand>, Str
     }))
 }
 
+fn refused_answer(seq: i64, reason: String, message: Option<ChannelHostMessage>) -> Option<Answer> {
+    eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
+    let Some(ChannelHostMessage::TurnClaim(claim)) = message else {
+        return None;
+    };
+    Some(Answer::ClaimRefused {
+        turn_id: claim.turn_id,
+        detail: reason,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn open_test_channel(path: PathBuf) -> impl FnMut(Outgoing, &str) -> Option<Answer> {
+    let pair = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).expect("generate host key");
+    let mut channel = HostChannel::new(
+        tumpel_channel::empty_state(),
+        ChannelFile(path),
+        HostKey(Ed25519KeyPair::from_pkcs8(pair.as_ref()).expect("read host key")),
+        "host-1".try_into().expect("host id"),
+        "0.1.0".to_string(),
+    );
+    let mut wire = Outbox::default();
+    channel.connect();
+    let Ok(Event::Challenged(nonce)) =
+        channel.receive(r#"{"type":"Challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#)
+    else {
+        panic!("expected challenge");
+    };
+    channel
+        .hello(
+            &nonce,
+            NonZeroU32::MIN,
+            tumpel_channel::Usage {
+                host: tumpel_api::types::HostUsage {
+                    load_average: 0.0,
+                    memory_available_mib: 4096,
+                    disk_budget_mib: 32768,
+                    disk_held_mib: 32768,
+                    memory_budget_mib: 4096,
+                    memory_held_mib: 4096,
+                },
+            },
+            Vec::new(),
+            &mut wire,
+        )
+        .expect("send hello");
+    assert!(matches!(
+        channel.receive(
+            &serde_json::json!({
+                "type": "Welcome",
+                "hostId": "host-1",
+                "protocolVersion": tumpel_api::types::ChannelProtocol::VERSION,
+            })
+            .to_string()
+        ),
+        Ok(Event::Welcomed)
+    ));
+    move |outgoing, envelope| {
+        channel.send(outgoing, &mut wire).expect("persist and send the claim");
+        let Ok(Event::FrameRefused { seq, reason, message }) = channel.receive(envelope) else {
+            panic!("expected frame refusal");
+        };
+        refused_answer(seq, reason, message.map(|message| *message))
+    }
+}
+
 fn accepted(channel: &mut Channel, commands: &UnboundedSender<BoxCommand>) -> Result<(), Failure> {
     let accepted = channel.take_accepted().into_iter().map(BoxCommand::SnapshotAccepted);
     let failed = channel.take_failed().into_iter().map(BoxCommand::SnapshotFailed);
@@ -1101,9 +1167,9 @@ async fn session(
                                 Ok(None) => None,
                                 Err(error) => Some(Err(fail(SupervisorFailure::ProtocolError, error))),
                             },
-                            Ok(Event::FrameRefused { seq, reason }) => {
-                                eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
-                                None
+                            Ok(Event::FrameRefused { seq, reason, message }) => {
+                                refused_answer(seq, reason, message.map(|message| *message)).and_then(|answer| commands.send(BoxCommand::Answer(answer)).err())
+                                    .map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
                             }
                             Ok(Event::FrameRateLimited { seq: _, reason, frames_per_minute, retry_after }) => {
                                 rate_limited(limit, url, &reason, frames_per_minute, retry_after);

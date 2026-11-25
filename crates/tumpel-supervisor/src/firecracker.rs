@@ -923,6 +923,10 @@ impl FirecrackerBox {
             self.stderr = Some(stderr);
         }
         let socket = self.api_socket();
+        self.process = Some(Process::Spawned(child));
+        let Some(Process::Spawned(child)) = self.process.as_mut() else {
+            return Err("the box is not running".to_string());
+        };
         while UnixStream::connect(&socket).await.is_err() {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(format!(
@@ -937,7 +941,6 @@ impl FirecrackerBox {
             .ok_or_else(|| "Firecracker ended right after opening its API socket".to_string())?;
         self.unwatch();
         self.watcher = Some(watch(self.index, pid, self.session_name(), &self.console, false)?);
-        self.process = Some(Process::Spawned(child));
         Ok(())
     }
 

@@ -15,6 +15,7 @@ pub enum Answer {
     Downloads(ChannelRestoreDownloads),
     Claimed(ChannelTurnClaimed),
     Withdrawn(ChannelTurnWithdrawn),
+    ClaimRefused { turn_id: EntityId, detail: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -76,6 +77,7 @@ impl Answer {
             },
             Self::Claimed(answer) => Key::claim(&answer.turn_id),
             Self::Withdrawn(answer) => Key::claim(&answer.turn_id),
+            Self::ClaimRefused { turn_id, .. } => Key::claim(turn_id),
         }
     }
 }
