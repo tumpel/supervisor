@@ -3,19 +3,19 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use tumpel_api::types::SupervisorFailure;
 use tumpel_supervisor::{
-    check, enrol, install, install_telemetry, on_trial, received_descriptors, run, supervisor_dir, take_notify_socket,
-    Enrolment, Stopped,
+    check, enrol, install, install_telemetry, received_descriptors, report, run, take_notify_socket, Enrolment,
+    RunFailure, Stopped,
 };
 
 #[derive(Parser)]
 #[command(
     name = "tumpel-supervisor",
     version,
-    about = "Runs tumpel boxes on this host and keeps its channel to the control plane"
+    about = "Report host readiness or run tumpel boxes"
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -57,22 +57,25 @@ const RESTART_INTO_UPDATE: u8 = 75;
 
 fn exit_code(failure: &SupervisorFailure) -> ExitCode {
     match failure {
-        SupervisorFailure::Unrecognised(_) => {
-            eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
-            ExitCode::FAILURE
-        }
         SupervisorFailure::NotEnrolled => ExitCode::from(3),
         SupervisorFailure::ChannelStateLost => ExitCode::from(4),
         SupervisorFailure::HostRevoked => ExitCode::from(5),
         SupervisorFailure::ProtocolError => ExitCode::from(6),
         SupervisorFailure::UsageUnreadable => ExitCode::from(7),
         SupervisorFailure::GuestDriveUnwritable => ExitCode::from(8),
-        SupervisorFailure::UpdateNotOnline => ExitCode::from(10),
+        failure => {
+            if matches!(failure, SupervisorFailure::Unrecognised(_)) {
+                eprintln!("{}", tumpel_channel::UPDATE_REQUIRED);
+            }
+            ExitCode::FAILURE
+        }
     }
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let Some(command) = Cli::parse().command else {
+        return report();
+    };
     let received = match unsafe { received_descriptors() } {
         Ok(received) => received,
         Err(error) => {
@@ -80,7 +83,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let handed = matches!(cli.command, Command::Run { handover: true, .. });
+    let handed = matches!(command, Command::Run { handover: true, .. });
     if let Err(error) = unsafe { take_notify_socket(handed) } {
         eprintln!("tumpel-supervisor: {error}");
         return ExitCode::FAILURE;
@@ -92,7 +95,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match cli.command {
+    match command {
         Command::Enrol {
             endpoint,
             token_file,
@@ -133,16 +136,11 @@ fn main() -> ExitCode {
                     eprintln!("tumpel-supervisor: exiting so systemd starts the new binary, which takes the running boxes over");
                     ExitCode::from(RESTART_INTO_UPDATE)
                 }
-                Err(failure) if on_trial(&supervisor_dir()) => {
-                    eprintln!(
-                    "tumpel-supervisor: {}: {}: {}; this binary is on its update trial, so systemd restarts the unit and its ExecStartPre puts the previous binary back",
-                    SupervisorFailure::UpdateNotOnline,
-                    failure.kind,
-                    failure.detail
-                );
-                    exit_code(&SupervisorFailure::UpdateNotOnline)
+                Err(RunFailure::Startup(detail)) => {
+                    eprintln!("tumpel-supervisor: startup failed. {detail}. On failure, systemd restarts the supervisor and it takes over the running boxes.");
+                    ExitCode::FAILURE
                 }
-                Err(failure) => {
+                Err(RunFailure::Supervisor(failure)) => {
                     eprintln!("tumpel-supervisor: {}: {}", failure.kind, failure.detail);
                     exit_code(&failure.kind)
                 }
@@ -177,6 +175,6 @@ mod tests {
         let exec_start =
             "/home/u/.local/bin/tumpel-supervisor run --update-binary /home/u/.local/bin/tumpel-supervisor";
         let cli = Cli::try_parse_from(exec_start.split(' ')).expect("the old ExecStart parses");
-        assert!(matches!(cli.command, Command::Run { .. }));
+        assert!(matches!(cli.command, Some(Command::Run { .. })));
     }
 }

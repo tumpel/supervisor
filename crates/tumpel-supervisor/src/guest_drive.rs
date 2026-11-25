@@ -17,6 +17,14 @@ fn name(drive: &[u8]) -> String {
     format!("{}.squashfs", hex(digest(&SHA256, drive).as_ref()))
 }
 
+pub(crate) fn check() -> Result<&'static str, String> {
+    match DRIVE {
+        Some(drive) if drive.starts_with(b"hsqs") => Ok("embedded SquashFS drive is present"),
+        Some(_) => Err("the embedded drive is not SquashFS; install a supervisor built by the release workflow".into()),
+        None => Ok("this development build has no embedded guest drive"),
+    }
+}
+
 fn place(images: &Path, drive: &[u8]) -> Result<PathBuf, String> {
     let dir = images.join("guest");
     let name = name(drive);

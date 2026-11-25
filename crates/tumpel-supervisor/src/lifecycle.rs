@@ -418,6 +418,20 @@ fn standing_record(handed: &SupervisorHandoverBox) -> Result<SupervisorHandoverB
     })
 }
 
+pub(crate) fn decode_box(
+    handed: &SupervisorHandoverBox,
+) -> Result<(SupervisorHandoverBox, Boot, VecDeque<Command>), String> {
+    let record = standing_record(handed)?;
+    let image = Boot::from_record(handed.image.clone())?;
+    let queue = handed
+        .queued
+        .iter()
+        .cloned()
+        .filter_map(|record| Command::from_record(record, &handed.session_id, &handed.box_id))
+        .collect();
+    Ok((record, image, queue))
+}
+
 #[derive(Clone)]
 struct Standing {
     path: PathBuf,
@@ -2900,16 +2914,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
 
     fn adopt(&mut self, handed: SupervisorHandoverBox, taken: Taken) -> Option<SupervisorHandoverBox> {
         let session = handed.session_id.to_string();
-        let read = standing_record(&handed).and_then(|record| {
-            let image = Boot::from_record(handed.image.clone())?;
-            let queue = handed
-                .queued
-                .iter()
-                .cloned()
-                .filter_map(|record| Command::from_record(record, &handed.session_id, &handed.box_id))
-                .collect();
-            Ok((record, image, queue))
-        });
+        let read = decode_box(&handed);
         let attached = read.and_then(|read| self.attach(&handed).map(|attached| (attached, read)));
         let ((machine, guest, tap), (record, image, queue)) = match attached {
             Ok(attached) => attached,

@@ -8,13 +8,13 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::sync::watch;
 use tumpel_api::types::{
     ChannelHostMessage, ChannelProtocol, HostArchitecture, Sha256Digest, SupervisorUpdateFailureReason,
-    SupervisorUpdatePhase,
+    SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
 use tumpel_channel::Outgoing;
 
 use super::{
-    announced_release, confirm, named, refresh_unit, sha256_hex, startup, version_refusal, Idle, Layout, Limits,
-    Outcome, Release, Source, Startup, Updater, PENDING_FILE, REFUSAL_FILE, ROLLED_BACK_FILE, TRIAL_FILE,
+    announced_release, named, refresh_unit, sha256_hex, version_refusal, Idle, Layout, Limits, Outcome, Release,
+    Source, Updater, REFUSAL_FILE,
 };
 use crate::install::supervisor_unit_text;
 
@@ -91,7 +91,7 @@ fn digest(hex: &str) -> Sha256Digest {
 
 fn report_script(protocol: u32) -> String {
     format!(
-        "#!/bin/sh\necho 'supervisor starts as host h' >&2\necho '{{\"supervisorVersion\":\"0.2.0\",\"channelProtocolVersion\":{protocol},\"guestProtocolVersion\":6}}'\n"
+        "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 2\necho 'PASS startup: host settings loaded'\necho 'PASS channel protocol {protocol}'\n"
     )
 }
 
@@ -123,8 +123,6 @@ fn limits() -> Limits {
         verify: Duration::from_secs(5),
         place: Duration::from_secs(5),
         dry_run: Duration::from_secs(10),
-        swap: Duration::from_secs(5),
-        online: Duration::from_secs(120),
     }
 }
 
@@ -174,26 +172,6 @@ fn text(path: &Path) -> String {
     std::fs::read_to_string(path).expect("the file is readable")
 }
 
-fn exec_start_pre(layout: &Layout) {
-    let unit = supervisor_unit_text(&layout.binary);
-    let line = unit
-        .lines()
-        .find_map(|line| line.strip_prefix("ExecStartPre="))
-        .expect("the unit has an ExecStartPre")
-        .replace("$$", "$");
-    let (shell, quoted) = line.split_once(" -c '").expect("the ExecStartPre runs a shell script");
-    let (script, arguments) = quoted.rsplit_once("' ").expect("the script is quoted");
-    let status = std::process::Command::new(shell)
-        .arg("-c")
-        .arg(script)
-        .args(arguments.split(' '))
-        .env_remove("XDG_STATE_HOME")
-        .env("TUMPEL_SUPERVISOR_DIR", &layout.state)
-        .status()
-        .expect("the ExecStartPre script runs");
-    assert!(status.success(), "the ExecStartPre script exits 0");
-}
-
 #[tokio::test]
 async fn a_binary_that_does_not_hash_to_the_release_sha256_is_never_run() {
     let layout = layout("checksum");
@@ -234,24 +212,53 @@ async fn a_release_naming_the_running_binary_changes_nothing() {
 
 #[tokio::test]
 async fn a_failed_dry_run_keeps_the_running_binary_and_refuses_the_candidate() {
+    const CHILD: &str = "TUMPEL_TEST_FAILED_DRY_RUN_CHILD";
+    let boxes = "FAIL boxes.json: invalid box record";
+    let firecracker = "FAIL Firecracker: binary is missing";
+    if std::env::var_os(CHILD).is_none() {
+        let output = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "update::tests::a_failed_dry_run_keeps_the_running_binary_and_refuses_the_candidate",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .expect("test subprocess");
+        let log = String::from_utf8(output.stderr).expect("supervisor log");
+        assert!(output.status.success(), "{log}");
+        for line in [boxes, firecracker] {
+            let expected = format!("tumpel-supervisor: {line}");
+            assert_eq!(log.lines().filter(|logged| *logged == expected).count(), 1, "{log}");
+        }
+        return;
+    }
+
     let layout = layout("dry-run-fails");
     let idle = FakeIdle::default();
     let token = format!("{}-{}", ["sk", "ant", "oat01"].join("-"), "Ab3d".repeat(10));
-    let script =
-        format!("#!/bin/sh\necho 'NotEnrolled: runtime.json is missing' >&2\necho 'token {token}' >&2\nexit 3\n");
+    let script = format!("#!/bin/sh\necho '{boxes}'\necho '{firecracker}'\necho 'token {token}' >&2\nexit 1\n");
     let mut run = updater(&layout, FakeSource::binary(&script), &idle, limits());
     assert_eq!(
         run.updater.announced(Duration::ZERO).await,
         Outcome::Failed(SupervisorUpdateFailureReason::SupervisorUpdateDryRunFailed)
     );
     let (detail, tail) = failure(&mut run.events);
-    assert!(detail.contains("exited with exit status: 3"), "{detail}");
+    assert!(detail.contains("exited with exit status: 1"), "{detail}");
+    assert!(!detail.contains("FAIL "), "{detail}");
     assert!(detail.contains("the running supervisor stays"), "{detail}");
-    assert_eq!(tail, vec!["NotEnrolled: runtime.json is missing", "token [token]"]);
+    assert_eq!(tail, vec!["token [token]", boxes, firecracker]);
     assert_eq!(text(&layout.binary), OLD_BINARY, "the running binary is untouched");
-    assert!(!layout.previous.exists(), "nothing was swapped");
     assert!(!layout.candidate.exists());
-    assert!(!layout.state.join(PENDING_FILE).exists());
+    let refusal: SupervisorUpdateRefusal =
+        serde_json::from_str(&text(&layout.refusal())).expect("the refusal is written");
+    assert_eq!(*refusal.to_sha256, sha256_hex(script.as_bytes()));
+    assert_eq!(
+        refusal.reason,
+        SupervisorUpdateFailureReason::SupervisorUpdateDryRunFailed
+    );
     assert_eq!(
         run.updater.announced(Duration::ZERO).await,
         Outcome::Refused,
@@ -278,7 +285,7 @@ async fn a_dry_run_killed_by_a_signal_names_the_version_and_the_signal() {
     let (detail, _) = failure(&mut run.events);
     assert!(
         detail.starts_with(&format!(
-            "the check of supervisor 0.3.1 ({short}) exited with signal: 8 (SIGFPE)"
+            "the report from supervisor 0.3.1 ({short}) exited with signal: 8 (SIGFPE)"
         )),
         "{detail}"
     );
@@ -303,6 +310,7 @@ async fn a_dry_run_speaking_another_channel_protocol_fails() {
         "{detail}"
     );
     assert_eq!(text(&layout.binary), OLD_BINARY);
+    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Refused);
 }
 
 #[tokio::test]
@@ -343,123 +351,16 @@ async fn an_unreadable_refusal_file_is_reported_and_not_skipped_silently() {
     assert_eq!(text(&layout.binary), OLD_BINARY);
 }
 
-async fn swapped(layout: &Layout) -> (Sha256Digest, Sha256Digest) {
-    let script = good_script();
-    let idle = FakeIdle::default();
-    let run = updater(layout, FakeSource::binary(&script), &idle, limits());
-    assert_eq!(run.updater.announced(Duration::ZERO).await, Outcome::Restart);
-    (
-        digest(&sha256_hex(OLD_BINARY.as_bytes())),
-        digest(&sha256_hex(script.as_bytes())),
-    )
-}
-
-#[tokio::test]
-async fn the_start_after_a_swap_puts_the_new_binary_on_trial_before_it_runs() {
-    let layout = layout("trial-marked");
-    let (_, new) = swapped(&layout).await;
-    exec_start_pre(&layout);
-    assert!(!layout.state.join(PENDING_FILE).exists());
-    assert!(layout.state.join(TRIAL_FILE).exists());
-    assert_eq!(*super::binary_sha256(&layout.binary).expect("the binary hashes"), *new);
-}
-
-#[tokio::test]
-async fn a_new_binary_that_reaches_welcome_ends_its_trial_deletes_the_binary_it_replaced_and_the_next_start_keeps_it() {
-    let layout = layout("confirmed");
-    let (_, new) = swapped(&layout).await;
-    exec_start_pre(&layout);
-    assert!(layout.previous.exists());
-    let (out, mut events) = unbounded_channel();
-    let Startup::Trial(trial) = startup(&layout, &new, &out).expect("startup reads the state") else {
-        panic!("the new binary starts its trial");
-    };
-    confirm(&layout, &trial, &out).expect("the trial ends");
-    assert_eq!(seen(&mut events), vec![Seen::Step(SupervisorUpdatePhase::Online)]);
-    assert!(!layout.state.join(TRIAL_FILE).exists());
-    assert!(!layout.previous.exists());
-    exec_start_pre(&layout);
-    assert_eq!(*super::binary_sha256(&layout.binary).expect("the binary hashes"), *new);
-    assert_eq!(startup(&layout, &new, &out), Ok(Startup::Steady));
-}
-
-#[tokio::test]
-async fn a_new_binary_that_crashes_before_it_runs_any_code_gives_way_to_the_previous_one_which_reports_it() {
-    let layout = layout("crash-before-mark");
-    let (old, _) = swapped(&layout).await;
-    exec_start_pre(&layout);
-    exec_start_pre(&layout);
-    assert_eq!(text(&layout.binary), OLD_BINARY, "the previous binary runs again");
-    assert!(!layout.state.join(TRIAL_FILE).exists());
-    assert!(!layout.state.join(PENDING_FILE).exists());
-    assert!(layout.state.join(ROLLED_BACK_FILE).exists());
-    let (out, mut events) = unbounded_channel();
-    assert_eq!(
-        startup(&layout, &old, &out),
-        Ok(Startup::Steady),
-        "the restored binary starts no trial"
-    );
-    assert_eq!(
-        seen(&mut events),
-        vec![Seen::Failed(SupervisorUpdateFailureReason::SupervisorUpdateRolledBack)]
-    );
-    assert!(
-        !layout.state.join(ROLLED_BACK_FILE).exists(),
-        "the rollback is reported once"
-    );
-    exec_start_pre(&layout);
-    assert_eq!(text(&layout.binary), OLD_BINARY, "a later start rolls back nothing");
-    let idle = FakeIdle::default();
-    let run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
-    assert_eq!(
-        run.updater.announced(Duration::ZERO).await,
-        Outcome::Refused,
-        "the rolled back binary is skipped"
-    );
-}
-
-#[tokio::test]
-async fn a_trial_naming_another_binary_is_deleted_and_starts_no_trial() {
-    let layout = layout("trial-stale");
-    let (old, _) = swapped(&layout).await;
-    exec_start_pre(&layout);
-    let (out, _events) = unbounded_channel();
-    assert_eq!(startup(&layout, &old, &out), Ok(Startup::Steady));
-    assert!(!layout.state.join(TRIAL_FILE).exists());
-}
-
-fn unit_before_the_shell_owned_trial(layout: &Layout) -> String {
-    format!(
-        "[Unit]\nDescription=tumpel supervisor\n\n[Service]\nExecStartPre=/bin/sh -c 'if [ -x \"$$0\" ]; then exec \"$$0\" rollback --binary \"$$1\"; fi' {previous} {binary}\nExecStart={binary} run --update-binary {binary}\nRestart=on-failure\n",
-        previous = layout.previous.display(),
-        binary = layout.binary.display()
-    )
-}
-
-#[tokio::test]
-async fn a_binary_swapped_in_under_the_old_unit_ends_its_trial_and_rewrites_the_unit() {
+#[test]
+fn refresh_unit_replaces_an_installed_unit_with_a_rollback_line() {
     let layout = layout("old-unit");
-    let (old, new) = swapped(&layout).await;
-    std::fs::write(&layout.unit, unit_before_the_shell_owned_trial(&layout)).expect("the old unit is written");
-    let mut legacy: serde_json::Value =
-        serde_json::from_str(&text(&layout.state.join(PENDING_FILE))).expect("update-pending.json is JSON");
-    legacy["onlineBy"] = serde_json::Value::String("2026-11-16T09:30:00+00:00".to_string());
-    std::fs::write(layout.state.join(PENDING_FILE), legacy.to_string()).expect("the old pending file is written");
-    let (out, mut events) = unbounded_channel();
-    let Startup::Trial(trial) = startup(&layout, &new, &out).expect("startup reads the state") else {
-        panic!("a pending swap to the running binary is its trial when no shell marked it");
-    };
-    assert_eq!(trial.from_sha256, old);
+    let current = supervisor_unit_text(&layout.binary);
+    let old = current.replacen("[Service]\n", "[Service]\nExecStartPre=/bin/sh -c 'exit 0'\n", 1);
+    std::fs::write(&layout.unit, old).expect("the old unit is written");
+
     assert_eq!(refresh_unit(&layout), Ok(true));
-    assert_eq!(text(&layout.unit), supervisor_unit_text(&layout.binary));
-    confirm(&layout, &trial, &out).expect("the trial ends");
-    assert_eq!(seen(&mut events), vec![Seen::Step(SupervisorUpdatePhase::Online)]);
-    assert!(!layout.state.join(PENDING_FILE).exists());
-    assert!(!layout.state.join(TRIAL_FILE).exists());
-    assert_eq!(refresh_unit(&layout), Ok(false), "a current unit is left alone");
-    exec_start_pre(&layout);
-    assert_eq!(*super::binary_sha256(&layout.binary).expect("the binary hashes"), *new);
-    assert_eq!(startup(&layout, &new, &out), Ok(Startup::Steady));
+    assert_eq!(text(&layout.unit), current);
+    assert_eq!(refresh_unit(&layout), Ok(false));
 }
 
 #[tokio::test]
@@ -485,13 +386,14 @@ async fn a_refused_binary_is_never_downloaded_again() {
 const GRACE: Duration = Duration::from_secs(600);
 
 #[tokio::test]
-async fn a_release_notice_updates_an_idle_host_at_once() {
+async fn a_release_notice_replaces_the_binary_on_an_idle_host() {
     let layout = layout("notice-idle");
     let idle = FakeIdle::default();
     let mut run = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
     assert_eq!(run.updater.announced(GRACE).await, Outcome::Restart);
     assert!(!seen(&mut run.events).contains(&Seen::Step(SupervisorUpdatePhase::WaitingForIdle)));
     assert_eq!(text(&layout.binary), good_script());
+    assert!(!layout.candidate.exists());
 }
 
 #[tokio::test]

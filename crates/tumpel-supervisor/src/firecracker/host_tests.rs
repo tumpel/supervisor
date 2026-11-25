@@ -110,9 +110,7 @@ async fn exec_handed_supervisor() {
     };
     unsafe { fd_store::take_notify_socket(true) }.expect("the user manager's notify socket");
     let layout = Layout::new(data.join("tumpel-supervisor"), data.clone(), unit_path());
-    if let Err(failure) = run::refresh_unit(&layout, "the restart test fails").await {
-        panic!("{}: {}", failure.kind, failure.detail);
-    }
+    run::refresh_unit(&layout).await.expect("refresh the unit");
     let vmm = Firecracker {
         binary: data.join("firecracker"),
         images: data.clone(),
