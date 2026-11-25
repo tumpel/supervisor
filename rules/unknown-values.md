@@ -1,6 +1,6 @@
-# Client-first compatibility
+# Unknown values
 
-Clients ship before the control plane. A supervisor must keep doing known work when the control plane sends an enum, failure reason, pause reason or field it does not recognise. Decode received messages with the generated protocol types. Keep request validation strict.
+A supervisor must keep doing known work when the control plane sends an enum, failure reason, pause reason or field it does not recognise. Decode received messages with the generated protocol types. Keep request validation strict.
 
 An unknown value logs one plain line: `the control plane sent something this supervisor doesn't recognise; update the supervisor`. Never panic or expose a decode error for it. Ignore work that needs an unknown variant. Consume a sequenced unknown command and persist its cursor so the next known command can run. Preserve free-form failure and pause reasons and their known sequencing and pacing effects.
 
