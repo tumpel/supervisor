@@ -2362,6 +2362,32 @@ async fn a_teardown_that_arrives_before_the_ack_of_its_snapshot_done_stops_the_b
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_teardown_after_a_refused_snapshot_done_keeps_the_dirty_box() {
+    let mut host = host("teardown-after-snapshot-refusal", 1, Harness::Echo, Boot::Works);
+    host.accepting.store(false, Ordering::SeqCst);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    let snapshot = host.snapshot("session-1");
+    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
+    host.log();
+
+    host.commands
+        .send(Input::SnapshotFailed(snapshot.snapshot_id))
+        .expect("send");
+    host.teardown("session-1");
+    let seen = host.settle(SETTLE).await;
+    assert!(
+        matches!(seen.as_slice(), [failure] if failure.starts_with(&format!(
+            "teardown failed {}:",
+            ChannelBoxTeardownFailureReason::BoxDirty
+        ))),
+        "{seen:?}"
+    );
+    assert_eq!(host.log(), Vec::<String>::new());
+    assert!(host.standing().boxes[0].dirty);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_box_snapshotted_late_is_stopped_once_the_idle_time_since_its_turn_runs_out() {
     let mut host = host("idle-late-snapshot", 1, Harness::Echo, Boot::Works);
     host.idle_seconds = NonZeroU32::new(900).expect("fifteen minutes");
