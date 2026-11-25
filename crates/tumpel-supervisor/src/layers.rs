@@ -2,9 +2,10 @@ use std::collections::BTreeSet;
 use std::io::ErrorKind;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::{timeout_at, Instant};
 use tumpel_api::types::{HarnessLayerManifest, ReleaseHarnessLayer, TurnFailureReason};
 
@@ -106,6 +107,12 @@ impl Staged {
                 eprintln!("tumpel-supervisor: {error}");
             }
         }
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        self.remove();
     }
 }
 
@@ -270,6 +277,7 @@ async fn fetch(
     order: &LayerOrder,
     holds: &Holds,
     deadline: Instant,
+    fetching: OwnedMutexGuard<()>,
 ) -> Result<Layer, Refusal> {
     std::fs::create_dir_all(&cache.dir)
         .map_err(|error| order.failed(format!("creating the layer cache {}: {error}", cache.dir.display())))?;
@@ -285,11 +293,9 @@ async fn fetch(
     match timeout_at(deadline, downloads).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
-            staged.remove();
             return Err(order.failed(format!("downloading it failed: {error}")));
         }
         Err(_) => {
-            staged.remove();
             return Err(order.timed_out());
         }
     }
@@ -297,8 +303,11 @@ async fn fetch(
     match timeout_at(
         deadline,
         tokio::task::spawn_blocking(move || {
+            let _fetching = fetching;
             let (cache, order, holds) = adopting;
-            adopt(&cache, &order, &staged, &holds)
+            let adopted = adopt(&cache, &order, &staged, &holds);
+            drop(staged);
+            adopted
         }),
     )
     .await
@@ -314,19 +323,19 @@ pub async fn resolve(
     cache: &LayerCache,
     order: &LayerOrder,
     holds: &Holds,
-    lock: &Mutex<()>,
+    lock: &Arc<Mutex<()>>,
     deadline: Instant,
 ) -> Result<Layer, Refusal> {
     if let Some(layer) = cached(cache, order)? {
         return Ok(layer);
     }
-    let Ok(_fetching) = timeout_at(deadline, lock.lock()).await else {
+    let Ok(fetching) = timeout_at(deadline, Arc::clone(lock).lock_owned()).await else {
         return Err(order.timed_out());
     };
     if let Some(layer) = cached(cache, order)? {
         return Ok(layer);
     }
-    fetch(store, cache, order, holds, deadline).await
+    fetch(store, cache, order, holds, deadline, fetching).await
 }
 
 #[cfg(test)]

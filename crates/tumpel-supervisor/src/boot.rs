@@ -198,7 +198,7 @@ pub struct Caches<'a, S: Store> {
     pub images: &'a Path,
     pub layers: &'a LayerCache,
     pub holds: &'a Holds,
-    pub lock: &'a Mutex<()>,
+    pub lock: &'a Arc<Mutex<()>>,
 }
 
 fn broken(detail: String) -> Refusal {

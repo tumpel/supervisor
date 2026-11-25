@@ -10,9 +10,9 @@ use tumpel_api::frozen::{v37, v38};
 use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType, ChannelHostMessage,
-    ChannelProtocol, ChannelSnapshotFailed, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnLines,
-    ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth, HostUsage, MetricBatch, Sequence,
-    SupervisorChannelState,
+    ChannelProtocol, ChannelSnapshotFailed, ChannelStoredHostFrame, ChannelStoredHostFrameType, ChannelTurnFailed,
+    ChannelTurnFailedType, ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId, HostReportedHealth,
+    HostUsage, MetricBatch, Sequence, SupervisorChannelState, TurnFailureReason,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
@@ -369,6 +369,7 @@ pub enum Event {
     FrameRefused {
         seq: i64,
         reason: String,
+        claim: Option<EntityId>,
     },
     FrameRateLimited {
         seq: i64,
@@ -826,11 +827,38 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     fn refused(&mut self, refused: ChannelFrameRefused) -> Result<Event, ChannelError> {
         self.progressed = true;
-        self.state.unacked.retain(|own| own.seq.0 != refused.seq.0);
+        let claim: Option<EntityId> = self
+            .state
+            .unacked
+            .iter()
+            .position(|own| own.seq == refused.seq)
+            .map(|index| self.state.unacked.remove(index).message)
+            .and_then(|message| {
+                if message["type"] != "TurnClaim" {
+                    return None;
+                }
+                message["turnId"].as_str()?.try_into().ok()
+            });
+        if let Some(turn_id) = &claim {
+            let failed = ChannelTurnFailed {
+                credential_file: None,
+                detail: refused
+                    .reason
+                    .as_str()
+                    .try_into()
+                    .map_err(|error| protocol(format!("reporting the refused claim: {error}")))?,
+                failed_at: Utc::now().fixed_offset(),
+                reason: TurnFailureReason::Undelivered,
+                turn_id: turn_id.clone(),
+                type_: ChannelTurnFailedType::TurnFailed,
+            };
+            self.push(to_value(&failed.into())?);
+        }
         self.store.save(&self.state)?;
         Ok(Event::FrameRefused {
             seq: refused.seq.0,
             reason: String::from(refused.reason),
+            claim,
         })
     }
 

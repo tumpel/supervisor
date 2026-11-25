@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -34,11 +34,12 @@ impl Wire {
 }
 
 #[derive(Clone, Default)]
-struct Disk(Rc<RefCell<Option<SupervisorChannelState>>>);
+struct Disk(Rc<RefCell<Option<SupervisorChannelState>>>, Rc<Cell<usize>>);
 
 impl Store for Disk {
     fn save(&mut self, state: &SupervisorChannelState) -> Result<(), ChannelError> {
         *self.0.borrow_mut() = Some(state.clone());
+        self.1.set(self.1.get() + 1);
         Ok(())
     }
 }
@@ -410,7 +411,7 @@ fn a_saved_frame_no_reader_knows_is_resent_unchanged_and_dropped_once_the_contro
     assert_eq!(sent[0], json!({"type": "Frame", "seq": 7, "ack": 4, "message": step}));
 
     let refused = json!({"type": "FrameRefused", "seq": 7, "reason": "message.phase: Invalid option"}).to_string();
-    let Ok(Event::FrameRefused { seq, reason }) = channel.receive(&refused) else {
+    let Ok(Event::FrameRefused { seq, reason, .. }) = channel.receive(&refused) else {
         panic!("the refusal is reported");
     };
     assert_eq!((seq, reason.as_str()), (7, "message.phase: Invalid option"));
@@ -421,6 +422,42 @@ fn a_saved_frame_no_reader_knows_is_resent_unchanged_and_dropped_once_the_contro
     channel.send(done("snap-8"), &mut wire).expect("send");
     let next = wire.sent();
     assert_eq!((next[0]["seq"].as_i64(), next[0]["ack"].as_i64()), (Some(8), Some(4)));
+}
+
+#[test]
+fn a_refused_claim_is_returned_and_replaced_by_an_undelivered_failure_in_one_save() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    let claim: ChannelHostMessage =
+        serde_json::from_value(json!({"type":"TurnClaim", "turnId":"turn-1", "boxId":"box-1"})).expect("claim");
+    channel.send(claim, &mut wire).expect("send claim");
+    let sent = wire.sent();
+    assert_eq!(sent[0]["seq"], 1);
+    let before = disk.1.get();
+
+    let Ok(Event::FrameRefused { seq: 1, reason, claim }) =
+        channel.receive(r#"{"type":"FrameRefused","seq":1,"reason":"the turn offer expired"}"#)
+    else {
+        panic!("expected refusal");
+    };
+    assert_eq!(reason, "the turn offer expired");
+    assert_eq!(claim.expect("the refused claim's turn id").as_str(), "turn-1");
+    assert_eq!(disk.1.get(), before + 1);
+    let saved = disk.0.borrow().clone().expect("saved state");
+    let [failed] = saved.unacked.as_slice() else {
+        panic!("expected only the failure in the saved outbox");
+    };
+    assert_eq!(failed.seq.0, 2);
+    assert_eq!(saved.sent.0, 2);
+    assert_eq!(failed.message["type"], "TurnFailed");
+    assert_eq!(failed.message["turnId"], "turn-1");
+    assert_eq!(failed.message["reason"], "Undelivered");
+    assert_eq!(failed.message["detail"], "the turn offer expired");
+
+    channel.transmit_due(Instant::now(), &mut wire).expect("send failure");
+    assert_eq!(wire.sent()[0]["message"], failed.message);
 }
 
 #[test]

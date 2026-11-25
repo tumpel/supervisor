@@ -2,10 +2,11 @@ use std::collections::{BTreeSet, HashSet};
 use std::io::{ErrorKind, Read};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ring::digest::{Context, SHA256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::{timeout_at, Instant};
 use tumpel_api::types::{
     BaseImageManifest, ChannelBaseImageDownload, ChannelGuestImageDownload, GuestImageManifest, TurnFailureReason,
@@ -100,6 +101,12 @@ impl Staged {
                 }
             }
         }
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        self.remove();
     }
 }
 
@@ -404,6 +411,7 @@ async fn fetch(
     order: &ImageOrder,
     holds: &Holds,
     deadline: Instant,
+    fetching: OwnedMutexGuard<()>,
 ) -> Result<GuestImageManifest, Refusal> {
     let staged = stage(cache, order)?;
     let urls = Urls {
@@ -414,11 +422,9 @@ async fn fetch(
     match timeout_at(deadline, download(store, urls, &staged)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            staged.remove();
             return Err(order.failed(format!("downloading it failed: {error}")));
         }
         Err(_) => {
-            staged.remove();
             return Err(timed_out(order));
         }
     }
@@ -427,7 +433,12 @@ async fn fetch(
     let holds = holds.clone();
     match timeout_at(
         deadline,
-        tokio::task::spawn_blocking(move || adopt(&cache, &adopting, &staged, &holds)),
+        tokio::task::spawn_blocking(move || {
+            let _fetching = fetching;
+            let adopted = adopt(&cache, &adopting, &staged, &holds);
+            drop(staged);
+            adopted
+        }),
     )
     .await
     {
@@ -445,7 +456,7 @@ pub async fn resolve(
     cache: &Path,
     order: &ImageOrder,
     holds: &Holds,
-    lock: &Mutex<()>,
+    lock: &Arc<Mutex<()>>,
     fetching: impl FnOnce(),
 ) -> Result<GuestImageManifest, Refusal> {
     if let Some(manifest) = cached(cache, order.digest())? {
@@ -453,13 +464,13 @@ pub async fn resolve(
     }
     let deadline = Instant::now() + Duration::from_secs(u64::from(order.download.fetch_seconds.get()));
     fetching();
-    let Ok(_fetching) = timeout_at(deadline, lock.lock()).await else {
+    let Ok(fetching) = timeout_at(deadline, Arc::clone(lock).lock_owned()).await else {
         return Err(timed_out(order));
     };
     if let Some(manifest) = cached(cache, order.digest())? {
         return Ok(manifest);
     }
-    fetch(store, cache, order, holds, deadline).await
+    fetch(store, cache, order, holds, deadline, fetching).await
 }
 
 pub fn cached_base(cache: &Path, image_digest: &str) -> Result<Option<BaseImageManifest>, Refusal> {
@@ -553,6 +564,7 @@ async fn fetch_base(
     order: &BaseOrder,
     holds: &Holds,
     deadline: Instant,
+    fetching: OwnedMutexGuard<()>,
 ) -> Result<BaseImageManifest, Refusal> {
     let staged = stage_base(cache, order)?;
     let urls = Urls {
@@ -563,11 +575,9 @@ async fn fetch_base(
     match timeout_at(deadline, download(store, urls, &staged)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            staged.remove();
             return Err(order.failed(format!("downloading it failed: {error}")));
         }
         Err(_) => {
-            staged.remove();
             return Err(order.timed_out());
         }
     }
@@ -575,8 +585,11 @@ async fn fetch_base(
     match timeout_at(
         deadline,
         tokio::task::spawn_blocking(move || {
+            let _fetching = fetching;
             let (cache, order, holds) = adopting;
-            adopt_base(&cache, &order, &staged, &holds)
+            let adopted = adopt_base(&cache, &order, &staged, &holds);
+            drop(staged);
+            adopted
         }),
     )
     .await
@@ -592,19 +605,19 @@ pub async fn resolve_base(
     cache: &Path,
     order: &BaseOrder,
     holds: &Holds,
-    lock: &Mutex<()>,
+    lock: &Arc<Mutex<()>>,
     deadline: Instant,
 ) -> Result<BaseImageManifest, Refusal> {
     if let Some(manifest) = cached_base(cache, order.digest())? {
         return Ok(manifest);
     }
-    let Ok(_fetching) = timeout_at(deadline, lock.lock()).await else {
+    let Ok(fetching) = timeout_at(deadline, Arc::clone(lock).lock_owned()).await else {
         return Err(order.timed_out());
     };
     if let Some(manifest) = cached_base(cache, order.digest())? {
         return Ok(manifest);
     }
-    fetch_base(store, cache, order, holds, deadline).await
+    fetch_base(store, cache, order, holds, deadline, fetching).await
 }
 
 #[cfg(test)]

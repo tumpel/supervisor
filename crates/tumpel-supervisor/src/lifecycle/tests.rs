@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
 use tumpel_api::types::{
     BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
     ChannelProtocol, ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld,
@@ -466,6 +467,7 @@ struct MemoryStore(
     Arc<Mutex<Index>>,
     Duration,
     Arc<AtomicU32>,
+    Option<Arc<(Notify, Notify)>>,
 );
 
 const FETCHED_IMAGE_URL: &str = "https://r2.example.test/fetched/image";
@@ -532,6 +534,13 @@ impl MemoryStore {
             .ok_or_else(|| DownloadError::Refused(format!("GET {url} answered 416")))?;
         std::fs::write(file, part).map_err(|error| DownloadError::Refused(error.to_string()))
     }
+
+    async fn hold_pack(&self, url: &str) {
+        if let Some((started, release)) = self.5.as_deref().filter(|_| url.contains("/packs/")) {
+            started.notify_one();
+            release.notified().await;
+        }
+    }
 }
 
 impl Store for MemoryStore {
@@ -549,20 +558,16 @@ impl Store for MemoryStore {
     }
 
     async fn download(&self, url: &str, file: &Path) -> Result<(), DownloadError> {
+        self.hold_pack(url).await;
         if url == FETCHED_IMAGE_URL {
             tokio::time::sleep(self.3).await;
         }
         self.download_now(url, file)
     }
 
-    fn download_range(
-        &self,
-        url: &str,
-        file: &Path,
-        first: u64,
-        last: u64,
-    ) -> impl Future<Output = Result<(), DownloadError>> + Send {
-        std::future::ready(self.download_range_now(url, file, first, last))
+    async fn download_range(&self, url: &str, file: &Path, first: u64, last: u64) -> Result<(), DownloadError> {
+        self.hold_pack(url).await;
+        self.download_range_now(url, file, first, last)
     }
 }
 
@@ -656,6 +661,7 @@ struct Host {
     answering: Arc<AtomicBool>,
     accepting: Arc<AtomicBool>,
     session: Arc<AtomicU16>,
+    answers: Answers,
 }
 
 fn staging(name: &str) -> PathBuf {
@@ -827,6 +833,8 @@ fn control_plane(
                         LATE_CLAIM
                     } else if turn_id.starts_with("stalled") {
                         STALLED_CLAIM
+                    } else if turn_id.as_str() == "refused-claim" {
+                        continue;
                     } else {
                         answers.deliver(claim_answer(turn_id));
                         continue;
@@ -929,9 +937,10 @@ fn start_host(
     let accepting = Arc::new(AtomicBool::new(true));
     let (commands, from_host) = unbounded_channel();
     let session = Arc::new(AtomicU16::new(welcome.unwrap_or(ChannelProtocol::VERSION)));
+    let answers = lifecycle.answers();
     let received = control_plane(
         store.clone(),
-        lifecycle.answers(),
+        answers.clone(),
         Arc::clone(&log),
         Arc::clone(&answering),
         channel(from_lifecycle, Arc::clone(&session), commands.clone()),
@@ -967,6 +976,7 @@ fn start_host(
         answering,
         accepting,
         session,
+        answers,
     }
 }
 
@@ -1646,6 +1656,75 @@ async fn a_restore_missing_a_chunk_fails_the_turn_snapshot_unreadable() {
         "{seen:?}"
     );
     assert!(!second.vmm.staging.join("session-1").exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_claim_stops_a_cold_turn_while_its_restore_pack_is_held() {
+    let mut first = host("refused-claim-source", 1, Harness::Echo, Boot::Works);
+    first.turn("turn-1", "session-1", "one", Vec::new());
+    first.settle_until("complete 1").await;
+    let snapshot = first.snapshot("session-1");
+    assert_eq!(first.settle_until("snapshot done").await, ["snapshot done"]);
+
+    let hold = Arc::new((Notify::new(), Notify::new()));
+    let mut store = first.store.clone();
+    store.5 = Some(Arc::clone(&hold));
+    let mut second = host_on(
+        "refused-claim-restore",
+        store,
+        1,
+        Harness::Echo,
+        Boot::Works,
+        settings(),
+        120,
+    );
+    second.turn("refused-claim", "session-1", "two", vec![snapshot]);
+    let claim = second.received.recv().await.expect("claim");
+    assert!(matches!(&claim, ChannelHostMessage::TurnClaim(claim) if claim.turn_id.as_str() == "refused-claim"));
+    hold.0.notified().await;
+
+    let refused_at = tokio::time::Instant::now();
+    second
+        .answers
+        .deliver(Answer::ClaimRefused("refused-claim".try_into().expect("turn id")));
+    let handover = tokio::time::timeout(SETTLE, second.ask_handover())
+        .await
+        .expect("handover before the pack is released")
+        .expect("handover settles");
+    assert_eq!(tokio::time::Instant::now(), refused_at);
+    assert_eq!(handover.boxes, []);
+    hold.1.notify_one();
+    assert!(second.log().is_empty(), "the cancelled restore never starts a VM");
+    assert!(!second.vmm.staging.join("session-1").exists());
+    assert!(
+        second.received.try_recv().is_err(),
+        "the channel owns the terminal failure"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_warm_claim_pauses_the_box_and_keeps_it_for_another_turn() {
+    let mut host = host("refused-warm-claim", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("complete 1").await;
+    host.log();
+
+    host.turn("refused-claim", "session-1", "two", Vec::new());
+    assert_eq!(host.settle_until("claim refused-claim").await, ["claim refused-claim"]);
+    host.answers
+        .deliver(Answer::ClaimRefused("refused-claim".try_into().expect("turn id")));
+    assert_eq!(host.settle(SETTLE).await, Vec::<String>::new());
+    assert_eq!(host.log(), ["resume session-1", "pause session-1"]);
+
+    host.turn("turn-3", "session-1", "three", Vec::new());
+    assert_eq!(
+        host.settle_until("complete 1").await,
+        ["claim turn-3", "line 1 three", "complete 1"]
+    );
+    assert_eq!(
+        host.log(),
+        ["resume session-1", "reconnect session-1", "pause session-1"]
+    );
 }
 
 #[tokio::test(start_paused = true)]
