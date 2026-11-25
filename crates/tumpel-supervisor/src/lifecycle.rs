@@ -767,21 +767,39 @@ impl Drop for CancelOnDrop {
     }
 }
 
+fn prepare_archive(dir: &Path) -> Result<PathBuf, String> {
+    let path = dir.join("restore.tar");
+    if let Err(error) = std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(format!("creating {}: {error}", path.display()));
+        }
+    }
+    Ok(path)
+}
+
 fn rebuild_archive(
     manifest: Manifest,
     cache: &ChunkCache,
     output: &Path,
-    chunks: &Path,
     cancelled: &AtomicBool,
 ) -> Result<(Manifest, u64), String> {
-    let out = std::fs::File::create(output).map_err(|error| format!("creating {}: {error}", output.display()))?;
-    let written = write_restore(&manifest, cache, BufWriter::new(out), cancelled);
+    let out = std::fs::OpenOptions::new()
+        .write(true)
+        .open(output)
+        .map_err(|error| format!("opening {}: {error}", output.display()))?;
     if cancelled.load(Ordering::Relaxed) {
-        remove_file(output)?;
+        return Err(crate::snapshot::CANCELLED.to_string());
     }
-    written?;
-    remove_dir(chunks)?;
-    let archived = std::fs::metadata(output)
+    let metadata = out
+        .metadata()
+        .map_err(|error| format!("reading {}: {error}", output.display()))?;
+    if metadata.is_file() {
+        out.set_len(0)
+            .map_err(|error| format!("clearing {}: {error}", output.display()))?;
+    }
+    write_restore(&manifest, cache, BufWriter::new(&out), cancelled)?;
+    let archived = out
+        .metadata()
         .map_err(|error| format!("reading the size of {}: {error}", output.display()))?
         .len();
     Ok((manifest, archived))
@@ -1120,7 +1138,6 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Ok(Ok(restored)) => restored,
             Ok(Err((reason, detail))) => {
                 turn_failed(&self.out, &turn.turn_id, reason, detail);
-                drop(workers.write().await);
                 return Outcome::Gone(tap, Ok(()));
             }
             Err(detail) => {
@@ -1643,15 +1660,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         self.fetch_within(turn, wanted, &stage, &named, expires)
             .await
             .map_err(unreadable)?;
-        let target = stage.dir.join("restore.tar");
+        let target = prepare_archive(&stage.dir).map_err(unreadable)?;
         let output = target.clone();
         let chunks = stage.dir.join(CHUNKS);
         let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
         let cancelled = Arc::clone(&cancel.0);
         let cache = Arc::clone(&stage.cache);
-        let rebuild = stage
-            .work(move || rebuild_archive(manifest, &cache, &output, &chunks, &cancelled))
-            .await;
+        let rebuild = tokio::task::spawn_blocking(move || rebuild_archive(manifest, &cache, &output, &cancelled));
         let budget = restore_budget(self.settings.budgets.boot, bytes, entries);
         let seconds = budget.as_secs();
         let outcome = timeout(budget, rebuild).await;
@@ -1660,16 +1675,19 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             remove_file(&target).map_err(unreadable)?;
         }
         match outcome {
-            Ok(Ok(Ok((manifest, archived)))) => Ok(Some((
-                target,
-                Base {
-                    manifest,
-                    root,
-                    births: Births::new(),
-                },
-                archived,
-                charge,
-            ))),
+            Ok(Ok(Ok((manifest, archived)))) => {
+                remove_dir(&chunks).map_err(unreadable)?;
+                Ok(Some((
+                    target,
+                    Base {
+                        manifest,
+                        root,
+                        births: Births::new(),
+                    },
+                    archived,
+                    charge,
+                )))
+            }
             Ok(Ok(Err(error))) => Err(unreadable(format!(
                 "reassembling the files of {named} failed: {error}; the stored snapshot is damaged, so start a new session"
             ))),
