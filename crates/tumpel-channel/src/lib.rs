@@ -382,10 +382,10 @@ pub struct Key {
 }
 
 impl Key {
-    fn chunk(ask: Ask, message: &Value, id: &str) -> Option<Self> {
+    fn restore(message: &Value) -> Option<Self> {
         Some(Self {
-            ask,
-            id: message[id].as_str()?.try_into().ok()?,
+            ask: Ask::RestoreChunks,
+            id: message["turnId"].as_str()?.try_into().ok()?,
             part: serde_json::from_value(message["part"].clone()).ok()?,
         })
     }
@@ -887,37 +887,37 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             .iter()
             .position(|own| own.seq == refused.seq)
             .map_or(Value::Null, |index| self.state.unacked.remove(index).message);
-        let mut snapshot = None;
-        let key = match message["type"].as_str() {
+        let (key, snapshot) = match message["type"].as_str() {
             Some("TurnClaim") => {
-                let turn_id: Option<EntityId> = message["turnId"].as_str().and_then(|id| id.try_into().ok());
-                if let Some(turn_id) = &turn_id {
-                    let failed = ChannelTurnFailed {
-                        credential_file: None,
-                        detail: refused
-                            .reason
-                            .as_str()
-                            .try_into()
-                            .map_err(|error| protocol(format!("reporting the refused claim: {error}")))?,
-                        failed_at: Utc::now().fixed_offset(),
-                        reason: TurnFailureReason::Undelivered,
-                        turn_id: turn_id.clone(),
-                        type_: ChannelTurnFailedType::TurnFailed,
-                    };
-                    self.push(to_value(&failed.into())?);
-                }
-                turn_id.as_ref().map(Key::claim)
+                let turn_id = message["turnId"].as_str().and_then(|id| id.try_into().ok());
+                (turn_id.as_ref().map(Key::claim), None)
             }
-            Some("SnapshotDone") => {
+            Some("SnapshotDone" | "SnapshotChunks" | "SnapshotPacks") => {
                 self.push(snapshot_failed(&message, refused.reason.as_str())?);
-                snapshot = snapshot_id(&message);
-                None
+                (None, snapshot_id(&message))
             }
-            Some("SnapshotChunks") => Key::chunk(Ask::SnapshotChunks, &message, "snapshotId"),
-            Some("SnapshotPacks") => Key::chunk(Ask::SnapshotPacks, &message, "snapshotId"),
-            Some("RestoreChunks") => Key::chunk(Ask::RestoreChunks, &message, "turnId"),
-            _ => None,
+            Some("RestoreChunks") => (Key::restore(&message), None),
+            _ => (None, None),
         };
+        if let Some(key) = &key {
+            let failed = ChannelTurnFailed {
+                credential_file: None,
+                detail: refused
+                    .reason
+                    .as_str()
+                    .try_into()
+                    .map_err(|error| protocol(format!("reporting the refusal of {key}: {error}")))?,
+                failed_at: Utc::now().fixed_offset(),
+                reason: if key.ask == Ask::TurnClaim {
+                    TurnFailureReason::Undelivered
+                } else {
+                    TurnFailureReason::SnapshotUnreadable
+                },
+                turn_id: key.id.clone(),
+                type_: ChannelTurnFailedType::TurnFailed,
+            };
+            self.push(to_value(&failed.into())?);
+        }
         self.store.save(&self.state)?;
         self.failed.extend(snapshot);
         Ok(Event::FrameRefused {

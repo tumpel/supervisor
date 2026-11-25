@@ -8,7 +8,7 @@ use tumpel_api::types::{
     ChannelTurnWithdrawn, ChunkExchange, EntityId,
 };
 
-pub use tumpel_channel::{Ask, Key};
+use tumpel_channel::{Ask, Key};
 
 pub enum Answer {
     ChunksHeld(ChannelSnapshotChunksHeld),
@@ -16,18 +16,10 @@ pub enum Answer {
     Downloads(ChannelRestoreDownloads),
     Claimed(ChannelTurnClaimed),
     Withdrawn(ChannelTurnWithdrawn),
-    ClaimRefused(EntityId),
     Refused(Key, String),
 }
 
 impl Answer {
-    pub(crate) fn refused(key: Key, reason: String) -> Self {
-        match key.ask {
-            Ask::TurnClaim => Self::ClaimRefused(key.id),
-            _ => Self::Refused(key, reason),
-        }
-    }
-
     fn key(&self) -> Key {
         match self {
             Self::ChunksHeld(answer) => Key {
@@ -47,7 +39,6 @@ impl Answer {
             },
             Self::Claimed(answer) => Key::claim(&answer.turn_id),
             Self::Withdrawn(answer) => Key::claim(&answer.turn_id),
-            Self::ClaimRefused(turn_id) => Key::claim(turn_id),
             Self::Refused(key, _) => key.clone(),
         }
     }

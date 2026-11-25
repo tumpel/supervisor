@@ -1103,7 +1103,7 @@ async fn session(
                             },
                             Ok(Event::FrameRefused { seq, reason, key }) => {
                                 eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
-                                if key.is_some_and(|key| commands.send(BoxCommand::Answer(Answer::refused(key, reason))).is_err()) {
+                                if key.is_some_and(|key| commands.send(BoxCommand::Answer(Answer::Refused(key, reason))).is_err()) {
                                     Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
                                 } else {
                                     channel.transmit_due(Instant::now(), &mut outbox).err().map(|error| Err(store_lost(&error)))
