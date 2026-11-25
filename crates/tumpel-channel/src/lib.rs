@@ -174,15 +174,22 @@ fn snapshot_id(message: &Value) -> Option<EntityId> {
 
 fn mismatched(message: &Value, built: u16, session: u16) -> Result<Value, ChannelError> {
     let kind = message.get("type").and_then(Value::as_str).unwrap_or_default();
+    snapshot_failed(
+        message,
+        &format!("this host built the snapshot's {kind} for channel protocol {built}, but the session speaks {session}; ask for the snapshot again"),
+    )
+}
+
+fn snapshot_failed(message: &Value, detail: &str) -> Result<Value, ChannelError> {
     let failed = serde_json::json!({
         "type": "SnapshotFailed",
         "snapshotId": message.get("snapshotId").cloned().unwrap_or(Value::Null),
         "reason": "NotAnswered",
         "failedAt": Utc::now().fixed_offset(),
-        "detail": format!("this host built the snapshot's {kind} for channel protocol {built}, but the session speaks {session}; ask for the snapshot again"),
+        "detail": detail,
     });
-    let failed: ChannelSnapshotFailed = serde_json::from_value(failed)
-        .map_err(|error| protocol(format!("failing a {kind} built for protocol {built}: {error}")))?;
+    let failed: ChannelSnapshotFailed =
+        serde_json::from_value(failed).map_err(|error| protocol(format!("building a SnapshotFailed: {error}")))?;
     serde_json::to_value(&failed).map_err(|error| protocol(format!("encoding a SnapshotFailed: {error}")))
 }
 
@@ -827,18 +834,16 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     fn refused(&mut self, refused: ChannelFrameRefused) -> Result<Event, ChannelError> {
         self.progressed = true;
-        let claim: Option<EntityId> = self
+        let message = self
             .state
             .unacked
             .iter()
             .position(|own| own.seq == refused.seq)
-            .map(|index| self.state.unacked.remove(index).message)
-            .and_then(|message| {
-                if message["type"] != "TurnClaim" {
-                    return None;
-                }
-                message["turnId"].as_str()?.try_into().ok()
-            });
+            .map(|index| self.state.unacked.remove(index).message);
+        let claim: Option<EntityId> = message
+            .as_ref()
+            .filter(|message| message["type"] == "TurnClaim")
+            .and_then(|message| message["turnId"].as_str()?.try_into().ok());
         if let Some(turn_id) = &claim {
             let failed = ChannelTurnFailed {
                 credential_file: None,
@@ -854,7 +859,14 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             };
             self.push(to_value(&failed.into())?);
         }
+        let snapshot = if let Some(done) = message.as_ref().filter(|message| message["type"] == "SnapshotDone") {
+            self.push(snapshot_failed(done, refused.reason.as_str())?);
+            snapshot_id(done)
+        } else {
+            None
+        };
         self.store.save(&self.state)?;
+        self.failed.extend(snapshot);
         Ok(Event::FrameRefused {
             seq: refused.seq.0,
             reason: String::from(refused.reason),

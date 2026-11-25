@@ -1398,6 +1398,140 @@ async fn a_snapshot_whose_drive_reads_past_the_snapshot_budget_is_stored_before_
     assert_eq!(host.settle(SLOW_CUT * 2).await, ["snapshot done"]);
 }
 
+struct SnapshotWire(Vec<serde_json::Value>);
+
+impl tumpel_channel::Port for SnapshotWire {
+    fn send(&mut self, text: String) -> Result<(), tumpel_channel::ChannelError> {
+        self.0
+            .push(serde_json::from_str(&text).expect("the channel sends JSON"));
+        Ok(())
+    }
+}
+
+fn open_snapshot_channel(
+    path: PathBuf,
+) -> (
+    tumpel_channel::HostChannel<crate::dir::ChannelFile, impl tumpel_channel::Signer>,
+    SnapshotWire,
+) {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use ring::signature::Ed25519KeyPair;
+    use tumpel_channel::{empty_state, Event, HostChannel, Signer, Usage};
+
+    struct Key(Ed25519KeyPair);
+
+    impl Signer for Key {
+        fn sign(&self, bytes: &[u8]) -> String {
+            STANDARD.encode(self.0.sign(bytes).as_ref())
+        }
+    }
+
+    let mut channel = HostChannel::new(
+        empty_state(),
+        crate::dir::ChannelFile(path),
+        Key(Ed25519KeyPair::from_seed_unchecked(&[0; 32]).expect("host key")),
+        "host-1".try_into().expect("host id"),
+        "0.1.0".to_string(),
+    );
+    let mut wire = SnapshotWire(Vec::new());
+    channel.connect();
+    let Ok(Event::Challenged(nonce)) =
+        channel.receive(r#"{"type":"Challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#)
+    else {
+        panic!("the challenge asks for a Hello");
+    };
+    channel
+        .hello(
+            &nonce,
+            NonZeroU32::MIN,
+            Usage {
+                host: tumpel_api::types::HostUsage {
+                    load_average: 0.0,
+                    memory_available_mib: 4096,
+                    disk_budget_mib: 32768,
+                    disk_held_mib: 0,
+                    memory_budget_mib: 4096,
+                    memory_held_mib: 0,
+                },
+            },
+            Vec::new(),
+            &mut wire,
+        )
+        .expect("hello");
+    channel
+        .receive(&json!({"type":"Welcome","hostId":"host-1","protocolVersion":ChannelProtocol::VERSION}).to_string())
+        .expect("welcome");
+    wire.0.clear();
+    (channel, wire)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_snapshot_done_reports_the_refusal_and_the_box_takes_its_queued_turn() {
+    let mut host = host("refused-snapshot-done", 1, Harness::Echo, Boot::Works);
+    host.accepting.store(false, Ordering::SeqCst);
+    let path = host.vmm.staging.join("channel.json");
+    let (mut channel, mut wire) = open_snapshot_channel(path.clone());
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("complete 1").await;
+    host.log();
+    let snapshot = host.snapshot("session-1");
+    host.turn("turn-2", "session-1", "two", Vec::new());
+    let done = loop {
+        let message = tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
+            .await
+            .expect("snapshot finishes")
+            .expect("the lifecycle is running");
+        match message {
+            ChannelHostMessage::SnapshotDone(done) => break done,
+            ChannelHostMessage::SnapshotPacks(_) => {}
+            other => panic!("expected the snapshot before the queued turn, got {other:?}"),
+        }
+    };
+    assert_eq!(done.snapshot_id, snapshot.snapshot_id);
+    channel
+        .send(Outgoing::Snapshot(done.into(), ChannelProtocol::VERSION), &mut wire)
+        .expect("send snapshot done");
+    wire.0.clear();
+
+    let refused_at = tokio::time::Instant::now();
+    channel
+        .receive(r#"{"type":"FrameRefused","seq":1,"reason":"the manifest did not parse"}"#)
+        .expect("receive refusal");
+    channel
+        .transmit_due(std::time::Instant::now(), &mut wire)
+        .expect("send failure");
+    let [failure] = wire.0.as_slice() else {
+        panic!("expected one SnapshotFailed, got {:?}", wire.0);
+    };
+    assert_eq!(failure["message"]["type"], "SnapshotFailed");
+    assert_eq!(failure["message"]["snapshotId"], json!(snapshot.snapshot_id));
+    assert_eq!(failure["message"]["reason"], "NotAnswered");
+    assert_eq!(failure["message"]["detail"], "the manifest did not parse");
+    let saved: tumpel_api::types::SupervisorChannelState =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("saved channel")).expect("channel state");
+    let [queued] = saved.unacked.as_slice() else {
+        panic!("only the snapshot failure stays in the saved outbox");
+    };
+    assert_eq!(queued.message, failure["message"]);
+    assert!(channel.take_accepted().is_empty());
+    let failed = channel.take_failed();
+    assert_eq!(failed, [snapshot.snapshot_id]);
+    for snapshot_id in failed {
+        host.commands
+            .send(Input::SnapshotFailed(snapshot_id))
+            .expect("deliver failure");
+    }
+    assert_eq!(
+        host.settle_until("complete 1").await,
+        ["claim turn-2", "line 1 two", "complete 1"]
+    );
+    assert_eq!(tokio::time::Instant::now(), refused_at);
+    assert_eq!(
+        host.log(),
+        ["resume session-1", "reconnect session-1", "pause session-1"]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_snapshot_over_a_base_names_each_reused_pack_once_and_counts_every_placement() {
     let mut host = host("reused-packs", 1, Harness::Echo, Boot::Works);
