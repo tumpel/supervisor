@@ -1018,9 +1018,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         live.box_retention = turn.box_retention.clone();
         live.idle = Duration::from_secs(u64::from(turn.idle_seconds.get()));
         let mut claiming = self.claim(turn);
-        let files = match claiming.during(self.files(turn)).await {
-            Ok(Some(files)) => files,
-            Ok(None) | Err(()) => return Outcome::Kept(live),
+        let Ok(Some(files)) = claiming.during(self.files(turn)).await else {
+            return Outcome::Kept(live);
         };
         let seconds = self.settings.budgets.boot.as_secs();
         let failed = match self.standing.put(&live, Some(&turn.turn_id)) {
@@ -1127,19 +1126,16 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let started = claiming.during(timeout(budget, booting)).await;
         let cleaned = restore.as_deref().map_or(Ok(()), remove_file);
         drop(charge);
-        let started = match started {
-            Ok(started) => started,
-            Err(()) => {
-                let stopped = end_box(
-                    machine,
-                    tap.index(),
-                    &turn.session_id,
-                    &turn.box_id,
-                    BoxEnd::ClaimRefused,
-                )
-                .await;
-                return self.claim_refused(turn, tap, stopped.and(cleaned));
-            }
+        let Ok(started) = started else {
+            let stopped = end_box(
+                machine,
+                tap.index(),
+                &turn.session_id,
+                &turn.box_id,
+                BoxEnd::ClaimRefused,
+            )
+            .await;
+            return self.claim_refused(turn, tap, stopped.and(cleaned));
         };
         let failed = match (started, cleaned) {
             (Ok(Ok((guest, hello))), Ok(())) => match mismatch(&hello, &image) {
