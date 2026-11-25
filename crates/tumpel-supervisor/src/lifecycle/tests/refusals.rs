@@ -75,8 +75,10 @@ pub(super) fn refuse_claim(host: &Host, claim: ChannelHostMessage) -> serde_json
 #[tokio::test(start_paused = true)]
 async fn dropping_a_persona_download_removes_its_staging_dir() {
     let hold = Arc::new((Notify::new(), Notify::new()));
-    let mut store = MemoryStore::default();
-    store.5 = Some(hold);
+    let store = MemoryStore {
+        5: Some(hold),
+        ..MemoryStore::default()
+    };
     let dir = staging("dropped-persona-download");
     let files = [serde_json::from_value(json!({
         "path": "README.md", "digest": "a".repeat(64), "sizeBytes": 1,
@@ -99,8 +101,10 @@ async fn dropping_a_persona_download_removes_its_staging_dir() {
 #[tokio::test(start_paused = true)]
 async fn a_refused_warm_claim_cancels_the_files_stage_and_keeps_the_box() {
     let hold = Arc::new((Notify::new(), Notify::new()));
-    let mut store = MemoryStore::default();
-    store.5 = Some(Arc::clone(&hold));
+    let store = MemoryStore {
+        5: Some(Arc::clone(&hold)),
+        ..MemoryStore::default()
+    };
     let mut host = host_on(
         "refused-warm-files",
         store,
