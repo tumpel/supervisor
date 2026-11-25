@@ -21,7 +21,7 @@ pub enum Answer {
 }
 
 impl Answer {
-    pub fn refused(key: Key, reason: String) -> Self {
+    pub(crate) fn refused(key: Key, reason: String) -> Self {
         match key.ask {
             Ask::TurnClaim => Self::ClaimRefused(key.id),
             _ => Self::Refused(key, reason),
