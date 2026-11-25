@@ -8,25 +8,15 @@ use tumpel_api::types::{ChannelPersonaFileDownload, GuestPersonaFile};
 
 use crate::bounded::bounded;
 use crate::lifecycle::remove_dir;
-use crate::lifecycle::setup::then;
 use crate::store::Store;
 
 pub const DIR: &str = "persona-files";
 
-struct Staged<'a> {
-    dir: Option<&'a Path>,
-}
-
-impl Staged<'_> {
-    fn remove(mut self) -> Result<(), String> {
-        self.dir.take().map_or(Ok(()), remove_dir)
-    }
-}
+struct Staged<'a>(&'a Path);
 
 impl Drop for Staged<'_> {
     fn drop(&mut self) {
-        let Some(dir) = self.dir else { return };
-        if let Err(error) = remove_dir(dir) {
+        if let Err(error) = remove_dir(self.0) {
             eprintln!("tumpel-supervisor: {error}");
         }
     }
@@ -79,22 +69,16 @@ pub async fn fetch(
         return Ok(Vec::new());
     }
     std::fs::create_dir_all(dir).map_err(|error| format!("creating {}: {error}", dir.display()))?;
-    let staged = Staged { dir: Some(dir) };
+    let _staged = Staged(dir);
     let mut fetched = Vec::with_capacity(files.len());
     for file in files {
-        let content = match blob(store, dir, file)
-            .await
-            .and_then(|bytes| bounded(&format!("persona file {}", file.path), STANDARD.encode(bytes)))
-        {
-            Ok(content) => content,
-            Err(error) => return Err(then(error, staged.remove())),
-        };
+        let bytes = blob(store, dir, file).await?;
+        let content = bounded(&format!("persona file {}", file.path), STANDARD.encode(bytes))?;
         fetched.push(GuestPersonaFile {
             content,
             digest: file.digest.clone(),
             path: file.path.clone(),
         });
     }
-    staged.remove()?;
     Ok(fetched)
 }

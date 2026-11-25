@@ -1009,15 +1009,6 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
-    fn claim_refused(&self, turn: &BoxTurn, tap: Tap, stopped: Result<(), String>) -> Outcome<V::Machine> {
-        self.clean_refused_claim(turn);
-        Outcome::Gone(tap, stopped)
-    }
-
-    fn clean_refused_claim(&self, turn: &BoxTurn) {
-        self.cancels.forget(&turn.turn_id);
-    }
-
     async fn warm_turn(&self, mut live: LiveBox<V::Machine>, turn: &BoxTurn) -> Outcome<V::Machine> {
         live.box_retention = turn.box_retention.clone();
         live.idle = Duration::from_secs(u64::from(turn.idle_seconds.get()));
@@ -1026,7 +1017,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Ok(Some(files)) => files,
             Ok(None) => return Outcome::Kept(live),
             Err(()) => {
-                self.clean_refused_claim(turn);
+                self.cancels.forget(&turn.turn_id);
                 return Outcome::Kept(live);
             }
         };
@@ -1044,7 +1035,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 .await
             {
                 Err(()) => {
-                    self.clean_refused_claim(turn);
+                    self.cancels.forget(&turn.turn_id);
                     return self.pause(live).await;
                 }
                 Ok(Ok(Ok(()))) => return self.run_turn(live, turn, files, claiming).await,
@@ -1094,7 +1085,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let files = match claiming.during(self.files(turn)).await {
             Ok(Some(files)) => files,
             Ok(None) => return Outcome::Gone(tap, Ok(())),
-            Err(()) => return self.claim_refused(turn, tap, Ok(())),
+            Err(()) => {
+                self.cancels.forget(&turn.turn_id);
+                return Outcome::Gone(tap, Ok(()));
+            }
         };
         let restored = match claiming.during(self.restore_for_turn(turn, &tap)).await {
             Ok(Ok(restored)) => restored,
@@ -1102,7 +1096,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 turn_failed(&self.out, &turn.turn_id, reason, detail);
                 return Outcome::Gone(tap, Ok(()));
             }
-            Err(()) => return self.claim_refused(turn, tap, Ok(())),
+            Err(()) => {
+                self.cancels.forget(&turn.turn_id);
+                return Outcome::Gone(tap, Ok(()));
+            }
         };
         let (image, hold) = match claiming.during(self.image(turn)).await {
             Ok(Ok(booted)) => booted,
@@ -1114,7 +1111,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 turn_failed(&self.out, &turn.turn_id, refusal.reason, detail);
                 return Outcome::Gone(tap, Ok(()));
             }
-            Err(()) => return self.claim_refused(turn, tap, Ok(())),
+            Err(()) => {
+                self.cancels.forget(&turn.turn_id);
+                return Outcome::Gone(tap, Ok(()));
+            }
         };
         let mut machine = match self.vmm.machine(&turn.session_id, &tap) {
             Ok(machine) => machine,
@@ -1147,7 +1147,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 BoxEnd::ClaimRefused,
             )
             .await;
-            return self.claim_refused(turn, tap, stopped.and(cleaned));
+            self.cancels.forget(&turn.turn_id);
+            return Outcome::Gone(tap, stopped.and(cleaned));
         };
         let failed = match (started, cleaned) {
             (Ok(Ok((guest, hello))), Ok(())) => match mismatch(&hello, &image) {
@@ -1745,7 +1746,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 return self.pause(live).await;
             }
             Some(Answer::ClaimRefused(_)) => {
-                self.clean_refused_claim(turn);
+                self.cancels.forget(&turn.turn_id);
                 return self.pause(live).await;
             }
             Some(_) => Followed::Ended(Err(Failure::turn(
