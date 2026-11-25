@@ -42,9 +42,7 @@ fn write_report(mut out: impl Write) -> io::Result<bool> {
         (
             "image cache",
             runtime.map_err(unavailable).and_then(|runtime| {
-                let cache = Path::new(&*runtime.image_cache_dir);
-                std::fs::read_dir(cache).map_err(|error| format!("reading {} failed: {error}", cache.display()))?;
-                guest_drive::access(cache).map(|()| "the cache can hold the guest drive")
+                guest_drive::access(Path::new(&*runtime.image_cache_dir)).map(|()| "the cache can hold the guest drive")
             }),
         ),
         (

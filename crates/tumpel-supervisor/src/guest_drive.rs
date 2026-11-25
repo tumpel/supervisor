@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::io::{self, ErrorKind};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -30,17 +30,23 @@ pub(crate) fn check() -> Result<&'static str, String> {
 }
 
 pub(crate) fn access(images: &Path) -> Result<(), String> {
-    let guest = images.join(DIRECTORY);
-    let (dir, result) = match check_permissions(&guest) {
-        Err(error) if error.kind() == ErrorKind::NotFound => (images, check_permissions(images)),
-        checked => (guest.as_path(), checked),
+    let check = |dir: &Path| {
+        check_permissions(dir).map_err(|error| {
+            format!(
+                "{} needs read, write and search access: {error}; {CACHE_FIX}",
+                dir.display()
+            )
+        })
     };
-    result.map_err(|error| {
-        format!(
-            "{} needs read, write and search access: {error}; {CACHE_FIX}",
-            dir.display()
-        )
-    })
+    check(images)?;
+    let guest = images.join(DIRECTORY);
+    let exists = guest
+        .try_exists()
+        .map_err(|error| format!("checking {}: {error}; {CACHE_FIX}", guest.display()))?;
+    if exists {
+        check(&guest)?;
+    }
+    Ok(())
 }
 
 fn check_permissions(dir: &Path) -> io::Result<()> {

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -134,10 +134,8 @@ fn a_healthy_bare_report_passes_without_writing_or_connecting() {
 }
 
 #[test]
-fn a_bare_report_checks_guest_drive_access_as_an_unprivileged_user() {
+fn a_bare_report_checks_cache_and_guest_drive_access() {
     let host = Host::new("guest-cache", "http://127.0.0.1:9").expect("test host");
-    let binary = host.root.join("supervisor");
-    fs::copy(BINARY, &binary).expect("fixture binary");
     let images = host.root.join("images");
     let guest = images.join("guest");
     let denied = io::Error::from_raw_os_error(libc::EACCES);
@@ -149,30 +147,25 @@ fn a_bare_report_checks_guest_drive_access_as_an_unprivileged_user() {
         )
     };
 
-    for (dir, mode, exit_status, expected) in [
-        (&images, 0o555, 1, cache_failure(&images)),
+    for (images_mode, guest_mode, exit_status, expected) in [
+        (0o555, None, 1, cache_failure(&images)),
+        (0o555, Some(0o777), 1, cache_failure(&images)),
         (
-            &guest,
-            0o777,
+            0o755,
+            Some(0o777),
             0,
             "PASS image cache: the cache can hold the guest drive".into(),
         ),
-        (&guest, 0o555, 1, cache_failure(&guest)),
-        (&guest, 0o333, 1, cache_failure(&guest)),
+        (0o755, Some(0o333), 1, cache_failure(&guest)),
+        (0o755, Some(0o555), 1, cache_failure(&guest)),
     ] {
-        fs::create_dir_all(dir).expect("cache or guest directory");
-        let permissions = fs::metadata(dir).expect("directory metadata").permissions();
-        fs::set_permissions(dir, fs::Permissions::from_mode(mode)).expect("set directory access");
-        let mut candidate = host.command(&binary);
-        if unsafe { libc::geteuid() } == 0 {
-            candidate.uid(65534);
+        if let Some(mode) = guest_mode {
+            fs::create_dir_all(&guest).expect("guest directory");
+            fs::set_permissions(&guest, fs::Permissions::from_mode(mode)).expect("set guest access");
         }
-
-        let output = candidate.output();
-        fs::set_permissions(dir, permissions).expect("restore directory access");
-        if dir == &guest {
-            fs::remove_dir(&guest).expect("remove guest directory");
-        }
+        fs::set_permissions(&images, fs::Permissions::from_mode(images_mode)).expect("set cache access");
+        let output = host.command(Path::new(BINARY)).output();
+        fs::set_permissions(&images, fs::Permissions::from_mode(0o755)).expect("restore cache access");
         let output = output.expect("report exits");
         let report = String::from_utf8(output.stdout).expect("report text");
 
