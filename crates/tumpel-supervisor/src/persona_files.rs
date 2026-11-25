@@ -13,6 +13,25 @@ use crate::store::Store;
 
 pub const DIR: &str = "persona-files";
 
+struct Staged<'a> {
+    dir: Option<&'a Path>,
+}
+
+impl Staged<'_> {
+    fn remove(mut self) -> Result<(), String> {
+        self.dir.take().map_or(Ok(()), remove_dir)
+    }
+}
+
+impl Drop for Staged<'_> {
+    fn drop(&mut self) {
+        let Some(dir) = self.dir else { return };
+        if let Err(error) = remove_dir(dir) {
+            eprintln!("tumpel-supervisor: {error}");
+        }
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::with_capacity(64), |mut text, byte| {
@@ -60,6 +79,7 @@ pub async fn fetch(
         return Ok(Vec::new());
     }
     std::fs::create_dir_all(dir).map_err(|error| format!("creating {}: {error}", dir.display()))?;
+    let staged = Staged { dir: Some(dir) };
     let mut fetched = Vec::with_capacity(files.len());
     for file in files {
         let content = match blob(store, dir, file)
@@ -67,7 +87,7 @@ pub async fn fetch(
             .and_then(|bytes| bounded(&format!("persona file {}", file.path), STANDARD.encode(bytes)))
         {
             Ok(content) => content,
-            Err(error) => return Err(then(error, remove_dir(dir))),
+            Err(error) => return Err(then(error, staged.remove())),
         };
         fetched.push(GuestPersonaFile {
             content,
@@ -75,6 +95,6 @@ pub async fn fetch(
             path: file.path.clone(),
         });
     }
-    remove_dir(dir)?;
+    staged.remove()?;
     Ok(fetched)
 }

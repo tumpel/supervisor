@@ -33,6 +33,8 @@ use crate::pool::{Disk, Held, Size, Tap, TapPool};
 use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Scan, Stored, Upper};
 use crate::store::{DownloadError, Store, UploadError, DOWNLOAD_ATTEMPTS};
 
+mod refusals;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Harness {
     Echo,
@@ -471,6 +473,7 @@ struct MemoryStore(
 );
 
 const FETCHED_IMAGE_URL: &str = "https://r2.example.test/fetched/image";
+const PERSONA_FILE_URL: &str = "https://r2.example.test/persona/file";
 
 impl MemoryStore {
     fn holds(&self, url: &str) -> bool {
@@ -535,8 +538,12 @@ impl MemoryStore {
         std::fs::write(file, part).map_err(|error| DownloadError::Refused(error.to_string()))
     }
 
-    async fn hold_pack(&self, url: &str) {
-        if let Some((started, release)) = self.5.as_deref().filter(|_| url.contains("/packs/")) {
+    async fn hold_download(&self, url: &str) {
+        if let Some((started, release)) = self
+            .5
+            .as_deref()
+            .filter(|_| url.contains("/packs/") || url == PERSONA_FILE_URL)
+        {
             started.notify_one();
             release.notified().await;
         }
@@ -558,7 +565,7 @@ impl Store for MemoryStore {
     }
 
     async fn download(&self, url: &str, file: &Path) -> Result<(), DownloadError> {
-        self.hold_pack(url).await;
+        self.hold_download(url).await;
         if url == FETCHED_IMAGE_URL {
             tokio::time::sleep(self.3).await;
         }
@@ -566,7 +573,7 @@ impl Store for MemoryStore {
     }
 
     async fn download_range(&self, url: &str, file: &Path, first: u64, last: u64) -> Result<(), DownloadError> {
-        self.hold_pack(url).await;
+        self.hold_download(url).await;
         self.download_range_now(url, file, first, last)
     }
 }
@@ -1710,10 +1717,16 @@ async fn a_refused_warm_claim_pauses_the_box_and_keeps_it_for_another_turn() {
     host.log();
 
     host.turn("refused-claim", "session-1", "two", Vec::new());
-    assert_eq!(host.settle_until("claim refused-claim").await, ["claim refused-claim"]);
-    host.answers
-        .deliver(Answer::ClaimRefused("refused-claim".try_into().expect("turn id")));
+    let turn_id: EntityId = "refused-claim".try_into().expect("turn id");
+    let claim = tokio::time::timeout(SETTLE, host.received.recv())
+        .await
+        .expect("the claim goes out")
+        .expect("the claim");
+    assert!(matches!(&claim, ChannelHostMessage::TurnClaim(claim) if claim.turn_id == turn_id));
+    host.cancels.cancel(turn_id.clone());
+    refusals::refuse_claim(&host, claim);
     assert_eq!(host.settle(SETTLE).await, Vec::<String>::new());
+    assert!(!host.cancels.contains(&turn_id));
     assert_eq!(host.log(), ["resume session-1", "pause session-1"]);
 
     host.turn("turn-3", "session-1", "three", Vec::new());

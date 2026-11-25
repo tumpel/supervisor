@@ -1010,12 +1010,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     fn claim_refused(&self, turn: &BoxTurn, tap: Tap, stopped: Result<(), String>) -> Outcome<V::Machine> {
-        Outcome::Gone(tap, stopped.and(self.clean_refused_claim(turn)))
+        self.clean_refused_claim(turn);
+        Outcome::Gone(tap, stopped)
     }
 
-    fn clean_refused_claim(&self, turn: &BoxTurn) -> Result<(), String> {
+    fn clean_refused_claim(&self, turn: &BoxTurn) {
         self.cancels.forget(&turn.turn_id);
-        remove_dir(&turn.files_dir.join(&*turn.turn_id))
     }
 
     async fn warm_turn(&self, mut live: LiveBox<V::Machine>, turn: &BoxTurn) -> Outcome<V::Machine> {
@@ -1026,12 +1026,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Ok(Some(files)) => files,
             Ok(None) => return Outcome::Kept(live),
             Err(()) => {
-                if let Err(error) = self.clean_refused_claim(turn) {
-                    eprintln!(
-                        "tumpel-supervisor: cleaning up the refused claim of turn {}: {error}",
-                        *turn.turn_id
-                    );
-                }
+                self.clean_refused_claim(turn);
                 return Outcome::Kept(live);
             }
         };
@@ -1048,7 +1043,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 ))
                 .await
             {
-                Err(()) => return self.pause(live).await,
+                Err(()) => {
+                    self.clean_refused_claim(turn);
+                    return self.pause(live).await;
+                }
                 Ok(Ok(Ok(()))) => return self.run_turn(live, turn, files, claiming).await,
                 Ok(Ok(Err(error))) => format!(
                     "resuming the paused box of session {} failed: {error}",
@@ -1746,7 +1744,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 );
                 return self.pause(live).await;
             }
-            Some(Answer::ClaimRefused(_)) => return self.pause(live).await,
+            Some(Answer::ClaimRefused(_)) => {
+                self.clean_refused_claim(turn);
+                return self.pause(live).await;
+            }
             Some(_) => Followed::Ended(Err(Failure::turn(
                 TurnFailureReason::NotClaimed,
                 unexpected(&claiming.asking.key),
