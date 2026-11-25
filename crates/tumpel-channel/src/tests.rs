@@ -468,6 +468,8 @@ fn an_acked_snapshot_done_is_accepted_and_a_refused_one_retires_without_acceptan
     open(&mut channel, &mut wire);
     channel.send(done("snap-1"), &mut wire).expect("send");
     channel.send(done("snap-2"), &mut wire).expect("send");
+    wire.sent();
+    let before = disk.1.get();
     let refused = json!({"type": "FrameRefused", "seq": 2, "reason": "the manifest did not parse"}).to_string();
     let Ok(Event::FrameRefused { seq: 2, .. }) = channel.receive(&refused) else {
         panic!("the refusal is reported");
@@ -477,10 +479,29 @@ fn an_acked_snapshot_done_is_accepted_and_a_refused_one_retires_without_acceptan
         Vec::<EntityId>::new(),
         "a refusal accepts nothing"
     );
+    assert_eq!(disk.1.get(), before + 1);
+    let saved = disk.0.borrow().clone().expect("saved state");
+    let [pending, failed] = saved.unacked.as_slice() else {
+        panic!("expected the first completion and the second snapshot's failure");
+    };
+    assert_eq!(pending.seq.0, 1);
+    assert_eq!(failed.seq.0, 3);
+    assert_eq!(saved.sent.0, 3);
+    assert_eq!(failed.message["type"], "SnapshotFailed");
+    assert_eq!(failed.message["snapshotId"], "snap-2");
+    assert_eq!(failed.message["reason"], "NotAnswered");
+    assert_eq!(failed.message["detail"], "the manifest did not parse");
+    channel.transmit_due(Instant::now(), &mut wire).expect("send failure");
+    let [sent]: [Value; 1] = wire.sent().try_into().expect("one frame");
+    assert_eq!(sent["message"], failed.message);
+    assert_eq!(
+        channel.take_failed(),
+        [EntityId::try_from("snap-2").expect("snapshot id")]
+    );
 
     channel
         .receive(&json!({"type": "Ack", "seq": 2}).to_string())
-        .expect("the ack retires both frames");
+        .expect("the ack retires the first completion");
     let accepted: Vec<String> = channel.take_accepted().into_iter().map(|id| id.to_string()).collect();
     assert_eq!(accepted, ["snap-1"]);
     assert_eq!(channel.take_accepted(), Vec::<EntityId>::new());
