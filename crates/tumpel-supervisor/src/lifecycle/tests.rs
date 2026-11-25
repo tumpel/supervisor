@@ -27,7 +27,7 @@ use super::{
     Taken, TeardownOrder, Vmm,
 };
 use crate::boot::BootOrder;
-use crate::exchange::{Answer, Answers, Cancels};
+use crate::exchange::{Answer, Answers, Ask, Cancels, Key, DIGESTS_PER_PART};
 use crate::images::ImageOrder;
 use crate::pool::{Disk, Held, Size, Tap, TapPool};
 use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Scan, Stored, Upper};
@@ -779,6 +779,11 @@ fn control_plane(
                         type_: ChannelSnapshotChunksHeldType::SnapshotChunksHeld,
                     }));
                 }
+                ChannelHostMessage::SnapshotPacks(packs)
+                    if packs.snapshot_id.as_str() == "refused-snapshot-packs" && packs.part.get() == 2 =>
+                {
+                    forward(&sender, ChannelHostMessage::SnapshotPacks(packs));
+                }
                 ChannelHostMessage::SnapshotPacks(packs) => {
                     for chunk in &packs.chunks {
                         index
@@ -808,6 +813,9 @@ fn control_plane(
                             .collect(),
                     }));
                     forward(&sender, ChannelHostMessage::SnapshotPacks(packs));
+                }
+                ChannelHostMessage::RestoreChunks(chunks) if chunks.turn_id.as_str() == "refused-restore-chunks" => {
+                    forward(&sender, ChannelHostMessage::RestoreChunks(chunks));
                 }
                 ChannelHostMessage::RestoreChunks(chunks) => {
                     let mut packs: Vec<ChannelPackUrl> = Vec::new();
@@ -2422,7 +2430,114 @@ async fn a_teardown_that_arrives_before_the_ack_of_its_snapshot_done_stops_the_b
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_teardown_after_a_refused_snapshot_done_keeps_the_dirty_box() {
+async fn a_refused_snapshot_packs_part_fails_the_snapshot_at_once() {
+    let mut host = host("refused-snapshot-packs", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle_until("complete 1").await;
+    {
+        let mut drives = host.vmm.drives.lock().expect("drives");
+        let drive = host.vmm.staging.join("session-1/overlay");
+        let files = drives.get_mut(&drive).expect("box drive");
+        let mut found = files[b"root/turn-1".as_slice()].0.clone();
+        found.entry.kind = Kind::File { size: 4 };
+        for index in 0..u32::try_from(DIGESTS_PER_PART).expect("digests per part") {
+            files.insert(
+                format!("root/file-{index}").into_bytes(),
+                (found.clone(), index.to_le_bytes().to_vec()),
+            );
+        }
+    }
+    let snapshot_id: EntityId = "refused-snapshot-packs".try_into().expect("snapshot id");
+    host.send(Command::Snapshot(SnapshotOrder {
+        snapshot_id: snapshot_id.clone(),
+        session_id: "session-1".try_into().expect("session id"),
+        box_id: "box-session-1".try_into().expect("box id"),
+        snapshot_seq: Sequence(1),
+        upload_url: "https://store.example/session-1/1".to_string(),
+        upload_expires_at: in_seconds(60),
+    }));
+    for part in [1, 2] {
+        let Some(ChannelHostMessage::SnapshotPacks(packs)) =
+            tokio::time::timeout(Duration::from_secs(10), host.received.recv())
+                .await
+                .expect("snapshot packs")
+        else {
+            panic!("expected SnapshotPacks part {part}");
+        };
+        assert_eq!(packs.snapshot_id, snapshot_id);
+        assert_eq!(packs.part.get(), part);
+    }
+
+    let reason = "the snapshot upload window closed";
+    let refused_at = tokio::time::Instant::now();
+    host.answers.deliver(Answer::Refused(
+        Key {
+            ask: Ask::SnapshotPacks,
+            id: snapshot_id.clone(),
+            part: NonZeroU32::new(2).expect("part"),
+        },
+        reason.to_string(),
+    ));
+    let Some(ChannelHostMessage::SnapshotFailed(failed)) = tokio::time::timeout(SETTLE, host.received.recv())
+        .await
+        .expect("SnapshotFailed immediately after refusal")
+    else {
+        panic!("expected SnapshotFailed");
+    };
+    assert_eq!(tokio::time::Instant::now(), refused_at);
+    assert_eq!(failed.snapshot_id, snapshot_id);
+    assert_eq!(failed.reason, ChannelSnapshotFailureReason::NotAnswered);
+    assert_eq!(failed.detail.as_str(), reason);
+    assert!(host.standing().boxes[0].dirty);
+    assert!(host.store.uploads().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_restore_chunks_part_fails_the_turn_at_once() {
+    let (mut host, snapshot) = restoring("refused-restore-chunks", settings()).await;
+    host.turn("refused-restore-chunks", "session-1", "two", vec![snapshot]);
+    assert_eq!(
+        host.settle_until("claim refused-restore-chunks").await,
+        ["claim refused-restore-chunks"]
+    );
+    let Some(ChannelHostMessage::RestoreChunks(chunks)) =
+        tokio::time::timeout(Duration::from_secs(10), host.received.recv())
+            .await
+            .expect("restore chunks")
+    else {
+        panic!("expected RestoreChunks part 1");
+    };
+    assert_eq!(chunks.turn_id.as_str(), "refused-restore-chunks");
+    assert_eq!(chunks.part.get(), 1);
+
+    let reason = "the restore index is unreadable";
+    let refused_at = tokio::time::Instant::now();
+    host.answers.deliver(Answer::Refused(
+        Key {
+            ask: Ask::RestoreChunks,
+            id: chunks.turn_id.clone(),
+            part: chunks.part,
+        },
+        reason.to_string(),
+    ));
+    let Some(ChannelHostMessage::TurnFailed(failed)) = tokio::time::timeout(SETTLE, host.received.recv())
+        .await
+        .expect("TurnFailed immediately after refusal")
+    else {
+        panic!("expected TurnFailed");
+    };
+    assert_eq!(tokio::time::Instant::now(), refused_at);
+    assert_eq!(failed.turn_id, chunks.turn_id);
+    assert_eq!(failed.reason, TurnFailureReason::SnapshotUnreadable);
+    assert_eq!(
+        failed.detail.as_str(),
+        format!("restoring snapshot snapshot-1 (seq 1) of session session-1: {reason}; offer the turn again for fresh download URLs, or start a new session when the snapshot is damaged")
+    );
+    assert!(host.log().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_teardown_after_a_failed_snapshot_keeps_the_dirty_box() {
     let mut host = host("teardown-after-snapshot-refusal", 1, Harness::Echo, Boot::Works);
     host.accepting.store(false, Ordering::SeqCst);
     host.turn("turn-1", "session-1", "one", Vec::new());

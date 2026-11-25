@@ -28,7 +28,7 @@ use tumpel_channel::{
 
 use crate::boot::BootOrder;
 use crate::dir::{self, ChannelFile, CHANNEL_FILE, CONFIG_FILE, KEY_FILE, RUNTIME_FILE};
-use crate::exchange::{Answer, Answers, Cancels};
+use crate::exchange::{Answer, Answers, Ask, Cancels};
 use crate::fd_store;
 use crate::firecracker::Firecracker;
 use crate::guest_drive;
@@ -1101,9 +1101,13 @@ async fn session(
                                 Ok(None) => None,
                                 Err(error) => Some(Err(fail(SupervisorFailure::ProtocolError, error))),
                             },
-                            Ok(Event::FrameRefused { seq, reason, claim }) => {
+                            Ok(Event::FrameRefused { seq, reason, key }) => {
                                 eprintln!("tumpel-supervisor: FrameRefused: the control plane refused frame {seq} and counted it received: {reason}; dropped it from channel.json");
-                                if claim.is_some_and(|turn_id| commands.send(BoxCommand::Answer(Answer::ClaimRefused(turn_id))).is_err()) {
+                                let answer = key.map(|key| match key.ask {
+                                    Ask::TurnClaim => Answer::ClaimRefused(key.id),
+                                    _ => Answer::Refused(key, reason),
+                                });
+                                if answer.is_some_and(|answer| commands.send(BoxCommand::Answer(answer)).is_err()) {
                                     Some(Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
                                 } else {
                                     channel.transmit_due(Instant::now(), &mut outbox).err().map(|error| Err(store_lost(&error)))

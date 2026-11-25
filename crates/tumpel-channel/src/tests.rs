@@ -10,8 +10,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    empty_state, hello_bytes, Backoff, ChannelError, Event, HeldIds, HostChannel, Outgoing, Phase, Port, RateBackoff,
-    RateLimit, Signer, Store, Usage, TURN_LINES_WAIT,
+    empty_state, hello_bytes, Ask, Backoff, ChannelError, Event, HeldIds, HostChannel, Key, Outgoing, Phase, Port,
+    RateBackoff, RateLimit, Signer, Store, Usage, TURN_LINES_WAIT,
 };
 
 #[derive(Default)]
@@ -437,13 +437,13 @@ fn a_refused_claim_is_returned_and_replaced_by_an_undelivered_failure_in_one_sav
     assert_eq!(sent[0]["seq"], 1);
     let before = disk.1.get();
 
-    let Ok(Event::FrameRefused { seq: 1, reason, claim }) =
+    let Ok(Event::FrameRefused { seq: 1, reason, key }) =
         channel.receive(r#"{"type":"FrameRefused","seq":1,"reason":"the turn offer expired"}"#)
     else {
         panic!("expected refusal");
     };
     assert_eq!(reason, "the turn offer expired");
-    assert_eq!(claim.expect("the refused claim's turn id").as_str(), "turn-1");
+    assert_eq!(key, Some(Key::claim(&"turn-1".try_into().expect("turn id"))));
     assert_eq!(disk.1.get(), before + 1);
     let saved = disk.0.borrow().clone().expect("saved state");
     let [failed] = saved.unacked.as_slice() else {
@@ -458,6 +458,63 @@ fn a_refused_claim_is_returned_and_replaced_by_an_undelivered_failure_in_one_sav
 
     channel.transmit_due(Instant::now(), &mut wire).expect("send failure");
     assert_eq!(wire.sent()[0]["message"], failed.message);
+}
+
+#[test]
+fn a_refused_chunk_ask_reports_its_key_and_reason() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+
+    let cases = [
+        (
+            json!({"type":"SnapshotChunks","snapshotId":"snap-1","part":1,"digests":[]}),
+            Ask::SnapshotChunks,
+            "snap-1",
+            1,
+            "the snapshot request expired",
+        ),
+        (
+            json!({"type":"SnapshotPacks","snapshotId":"snap-1","part":2,"packs":[],"chunks":[],"reusedPackDigests":[]}),
+            Ask::SnapshotPacks,
+            "snap-1",
+            2,
+            "the upload window closed",
+        ),
+        (
+            json!({"type":"RestoreChunks","turnId":"turn-1","part":1,"chunks":[]}),
+            Ask::RestoreChunks,
+            "turn-1",
+            1,
+            "the turn ended",
+        ),
+    ];
+    for (message, ask, id, part, detail) in cases {
+        let message = serde_json::from_value(message).expect("chunk ask");
+        let outgoing = if ask == Ask::SnapshotPacks {
+            Outgoing::Snapshot(message, ChannelProtocol::VERSION)
+        } else {
+            Outgoing::Message(message)
+        };
+        channel.send(outgoing, &mut wire).expect("send ask");
+        let [frame] = wire.sent().try_into().expect("one frame");
+        let refused = json!({"type":"FrameRefused","seq":frame["seq"],"reason":detail});
+        let Ok(Event::FrameRefused { seq, reason, key }) = channel.receive(&refused.to_string()) else {
+            panic!("expected refusal");
+        };
+        assert_eq!(Some(seq), frame["seq"].as_i64());
+        assert_eq!(reason, detail);
+        assert_eq!(
+            key,
+            Some(Key {
+                ask,
+                id: id.try_into().expect("ask id"),
+                part: NonZeroU32::new(part).expect("part"),
+            })
+        );
+        assert!(unacked_seqs(&disk).is_empty());
+    }
 }
 
 #[test]

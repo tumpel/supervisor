@@ -366,6 +366,53 @@ impl RateLimit {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Ask {
+    SnapshotChunks,
+    SnapshotPacks,
+    RestoreChunks,
+    TurnClaim,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Key {
+    pub ask: Ask,
+    pub id: EntityId,
+    pub part: NonZeroU32,
+}
+
+impl Key {
+    fn chunk(ask: Ask, message: &Value, id: &str) -> Option<Self> {
+        Some(Self {
+            ask,
+            id: message[id].as_str()?.try_into().ok()?,
+            part: serde_json::from_value(message["part"].clone()).ok()?,
+        })
+    }
+
+    #[must_use]
+    pub fn claim(turn_id: &EntityId) -> Self {
+        Self {
+            ask: Ask::TurnClaim,
+            id: turn_id.clone(),
+            part: NonZeroU32::MIN,
+        }
+    }
+}
+
+impl fmt::Display for Key {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id = &*self.id;
+        let part = self.part;
+        match self.ask {
+            Ask::SnapshotChunks => write!(out, "SnapshotChunks part {part} of snapshot {id}"),
+            Ask::SnapshotPacks => write!(out, "SnapshotPacks part {part} of snapshot {id}"),
+            Ask::RestoreChunks => write!(out, "RestoreChunks part {part} of turn {id}"),
+            Ask::TurnClaim => write!(out, "the TurnClaim of turn {id}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
     None,
@@ -376,7 +423,7 @@ pub enum Event {
     FrameRefused {
         seq: i64,
         reason: String,
-        claim: Option<EntityId>,
+        key: Option<Key>,
     },
     FrameRateLimited {
         seq: i64,
@@ -839,38 +886,45 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
             .unacked
             .iter()
             .position(|own| own.seq == refused.seq)
-            .map(|index| self.state.unacked.remove(index).message);
-        let claim: Option<EntityId> = message
-            .as_ref()
-            .filter(|message| message["type"] == "TurnClaim")
-            .and_then(|message| message["turnId"].as_str()?.try_into().ok());
-        if let Some(turn_id) = &claim {
-            let failed = ChannelTurnFailed {
-                credential_file: None,
-                detail: refused
-                    .reason
-                    .as_str()
-                    .try_into()
-                    .map_err(|error| protocol(format!("reporting the refused claim: {error}")))?,
-                failed_at: Utc::now().fixed_offset(),
-                reason: TurnFailureReason::Undelivered,
-                turn_id: turn_id.clone(),
-                type_: ChannelTurnFailedType::TurnFailed,
-            };
-            self.push(to_value(&failed.into())?);
-        }
-        let snapshot = if let Some(done) = message.as_ref().filter(|message| message["type"] == "SnapshotDone") {
-            self.push(snapshot_failed(done, refused.reason.as_str())?);
-            snapshot_id(done)
-        } else {
-            None
+            .map(|index| self.state.unacked.remove(index).message)
+            .unwrap_or(Value::Null);
+        let mut snapshot = None;
+        let key = match message["type"].as_str() {
+            Some("TurnClaim") => {
+                let turn_id: Option<EntityId> = message["turnId"].as_str().and_then(|id| id.try_into().ok());
+                if let Some(turn_id) = &turn_id {
+                    let failed = ChannelTurnFailed {
+                        credential_file: None,
+                        detail: refused
+                            .reason
+                            .as_str()
+                            .try_into()
+                            .map_err(|error| protocol(format!("reporting the refused claim: {error}")))?,
+                        failed_at: Utc::now().fixed_offset(),
+                        reason: TurnFailureReason::Undelivered,
+                        turn_id: turn_id.clone(),
+                        type_: ChannelTurnFailedType::TurnFailed,
+                    };
+                    self.push(to_value(&failed.into())?);
+                }
+                turn_id.as_ref().map(Key::claim)
+            }
+            Some("SnapshotDone") => {
+                self.push(snapshot_failed(&message, refused.reason.as_str())?);
+                snapshot = snapshot_id(&message);
+                None
+            }
+            Some("SnapshotChunks") => Key::chunk(Ask::SnapshotChunks, &message, "snapshotId"),
+            Some("SnapshotPacks") => Key::chunk(Ask::SnapshotPacks, &message, "snapshotId"),
+            Some("RestoreChunks") => Key::chunk(Ask::RestoreChunks, &message, "turnId"),
+            _ => None,
         };
         self.store.save(&self.state)?;
         self.failed.extend(snapshot);
         Ok(Event::FrameRefused {
             seq: refused.seq.0,
             reason: String::from(refused.reason),
-            claim,
+            key,
         })
     }
 

@@ -832,6 +832,17 @@ async fn stop_box<M: Machine>(standing: &Standing, live: LiveBox<M>, end: BoxEnd
     (tap, tail, stopped)
 }
 
+enum AskError {
+    Refused(String),
+    Other(String),
+}
+
+impl From<String> for AskError {
+    fn from(detail: String) -> Self {
+        Self::Other(detail)
+    }
+}
+
 struct Asking {
     answers: Answers,
     key: Key,
@@ -1215,22 +1226,29 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
-    async fn ask(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Instant) -> Result<Answer, String> {
+    async fn ask(
+        &self,
+        key: Key,
+        message: impl Into<ChannelHostMessage>,
+        deadline: Instant,
+    ) -> Result<Answer, AskError> {
         self.ask_outgoing(key, Outgoing::Message(message.into()), deadline)
             .await
     }
 
-    async fn ask_outgoing(&self, key: Key, outgoing: Outgoing, deadline: Instant) -> Result<Answer, String> {
+    async fn ask_outgoing(&self, key: Key, outgoing: Outgoing, deadline: Instant) -> Result<Answer, AskError> {
         let mut asking = self.send_outgoing(key, outgoing, Some(deadline));
-        asking.answer().await.ok_or_else(|| {
-            format!(
+        match asking.answer().await {
+            Some(Answer::Refused(_, reason)) => Err(AskError::Refused(reason)),
+            Some(answer) => Ok(answer),
+            None => Err(AskError::Other(format!(
                 "the control plane did not answer {} before its URLs would expire; check the channel to the control plane",
                 asking.key
-            )
-        })
+            ))),
+        }
     }
 
-    async fn held(&self, snapshot_id: &EntityId, digests: &[String], deadline: Instant) -> Result<Places, String> {
+    async fn held(&self, snapshot_id: &EntityId, digests: &[String], deadline: Instant) -> Result<Places, AskError> {
         let mut held = Places::new();
         for (index, part) in digests.chunks(DIGESTS_PER_PART).enumerate() {
             let key = Key {
@@ -1248,7 +1266,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 type_: ChannelSnapshotChunksType::SnapshotChunks,
             };
             let Answer::ChunksHeld(answer) = self.ask(key.clone(), message, deadline).await? else {
-                return Err(unexpected(&key));
+                return Err(unexpected(&key).into());
             };
             for placement in &answer.held {
                 let place = Place::from_wire(placement)?;
@@ -1265,7 +1283,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         reused: &[String],
         protocol: u16,
         deadline: Instant,
-    ) -> Result<BTreeMap<String, String>, String> {
+    ) -> Result<BTreeMap<String, String>, AskError> {
         let sizes: BTreeMap<&str, u64> = packs.iter().map(|pack| (pack.digest.as_str(), pack.size)).collect();
         let placed: Vec<&Place> = packs.iter().flat_map(|pack| pack.chunks.iter()).collect();
         let parts = if protocol < PACK_REUSE {
@@ -1307,7 +1325,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             };
             let outgoing = Outgoing::Snapshot(message.into(), protocol);
             let Answer::PackUploads(answer) = self.ask_outgoing(key.clone(), outgoing, deadline).await? else {
-                return Err(unexpected(&key));
+                return Err(unexpected(&key).into());
             };
             urls.extend(
                 answer
@@ -1379,7 +1397,13 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         message: ChannelRestoreChunks,
         deadline: Instant,
     ) -> Result<ChannelRestoreDownloads, String> {
-        let Answer::Downloads(answer) = self.ask(key.clone(), message, deadline).await? else {
+        let answer = self
+            .ask(key.clone(), message, deadline)
+            .await
+            .map_err(|error| match error {
+                AskError::Refused(detail) | AskError::Other(detail) => detail,
+            })?;
+        let Answer::Downloads(answer) = answer else {
             return Err(unexpected(key));
         };
         Ok(answer)
@@ -2150,7 +2174,14 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             .cut_files(drive, Arc::clone(base), Arc::clone(&cache), order)
             .await?;
         let new = fresh(draft_digests(&cut.draft), &known);
-        let held = self.held(&order.snapshot_id, &new, deadline).await.map_err(expired)?;
+        let ask_failed = |error| match error {
+            AskError::Refused(detail) => (ChannelSnapshotFailureReason::NotAnswered, detail),
+            AskError::Other(detail) => expired(detail),
+        };
+        let held = self
+            .held(&order.snapshot_id, &new, deadline)
+            .await
+            .map_err(ask_failed)?;
         let staging = dir.to_path_buf();
         let packing = tokio::task::spawn_blocking(move || stage(cut, known, held, &new, &cache, &staging));
         let staged = match timeout_at(deadline, packing).await {
@@ -2162,7 +2193,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let urls = self
             .pack_uploads(&order.snapshot_id, &staged.packs, &staged.reused, protocol, deadline)
             .await
-            .map_err(expired)?;
+            .map_err(ask_failed)?;
         let uploads: Vec<(&String, &PackFile)> = staged
             .packs
             .iter()
