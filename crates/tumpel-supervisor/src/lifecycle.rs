@@ -123,6 +123,7 @@ pub struct Settings {
 pub trait Guest: Send + 'static {
     fn send(&mut self, input: &GuestInput) -> impl Future<Output = Result<(), String>> + Send;
     fn receive(&mut self) -> impl Future<Output = Result<GuestMessage, String>> + Send;
+    fn between_frames(&self) -> bool;
 }
 
 pub trait Machine: Send + 'static {
@@ -1926,7 +1927,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             let received = tokio::select! {
                 biased;
                 () = self.cancels.cancelled(turn_id), if !cancelling => None,
-                Ok(_) = parking.wait_for(|parking| *parking) => return Followed::Parked(state.park()),
+                Ok(_) = parking.wait_for(|parking| *parking), if live.guest.between_frames() => return Followed::Parked(state.park()),
                 _ = disk_check.tick() => match self.disk_failure() {
                     Some(failure) => return Followed::Ended(Err(failure)),
                     None => continue,
