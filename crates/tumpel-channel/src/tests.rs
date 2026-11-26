@@ -515,6 +515,36 @@ fn a_refused_chunk_ask_is_replaced_by_its_failure_in_one_save() {
 }
 
 #[test]
+fn a_refused_chunk_check_is_returned_to_its_snapshot_and_fails_nothing() {
+    let disk = Disk::default();
+    let mut channel = channel(&disk, &Recorder::default());
+    let mut wire = Wire::default();
+    open(&mut channel, &mut wire);
+    let check: ChannelHostMessage = serde_json::from_value(
+        json!({"type":"SnapshotChunkCheck","snapshotId":"snap-1","check":3,"digests":["a".repeat(64)]}),
+    )
+    .expect("check");
+    channel.send(check, &mut wire).expect("send check");
+    assert_eq!(wire.sent()[0]["seq"], 1);
+
+    let Ok(Event::FrameRefused { seq: 1, key, .. }) =
+        channel.receive(r#"{"type":"FrameRefused","seq":1,"reason":"message.type: Invalid option"}"#)
+    else {
+        panic!("expected refusal");
+    };
+    assert_eq!(
+        key,
+        Some(Key {
+            ask: Ask::SnapshotChunkCheck,
+            id: "snap-1".try_into().expect("snapshot id"),
+            part: NonZeroU32::new(3).expect("check 3"),
+        })
+    );
+    assert!(disk.0.borrow().clone().expect("saved state").unacked.is_empty());
+    assert!(channel.take_failed().is_empty());
+}
+
+#[test]
 fn an_acked_snapshot_done_is_accepted_and_a_refused_one_retires_without_acceptance() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());

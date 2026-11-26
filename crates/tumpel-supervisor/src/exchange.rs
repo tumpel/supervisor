@@ -4,13 +4,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::{oneshot, watch};
 use tumpel_api::types::{
-    ChannelRestoreDownloads, ChannelSnapshotPackUploads, ChannelTurnClaimed, ChannelTurnWithdrawn, ChunkExchange,
-    EntityId,
+    ChannelRestoreDownloads, ChannelSnapshotChunkCheckHeld, ChannelSnapshotPackUploads, ChannelTurnClaimed,
+    ChannelTurnWithdrawn, ChunkExchange, EntityId,
 };
 
 use tumpel_channel::{Ask, Key};
 
 pub enum Answer {
+    ChunkCheckHeld(ChannelSnapshotChunkCheckHeld),
     PackUploads(ChannelSnapshotPackUploads),
     Downloads(ChannelRestoreDownloads),
     Claimed(ChannelTurnClaimed),
@@ -21,6 +22,11 @@ pub enum Answer {
 impl Answer {
     fn key(&self) -> Key {
         match self {
+            Self::ChunkCheckHeld(answer) => Key {
+                ask: Ask::SnapshotChunkCheck,
+                id: answer.snapshot_id.clone(),
+                part: answer.check,
+            },
             Self::PackUploads(answer) => Key {
                 ask: Ask::SnapshotPacks,
                 id: answer.snapshot_id.clone(),
@@ -39,6 +45,7 @@ impl Answer {
 }
 
 pub const DIGESTS_PER_PART: usize = ChunkExchange::DIGESTS_PER_PART as usize;
+pub const DIGESTS_PER_CHECK: usize = ChunkExchange::DIGESTS_PER_CHECK as usize;
 
 pub fn part_number(index: usize) -> Result<NonZeroU32, String> {
     u32::try_from(index + 1)
