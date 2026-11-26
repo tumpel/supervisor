@@ -412,16 +412,14 @@ fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
     let data = dir.join("data");
     let cgroups = dir.join("cgroups");
     std::fs::create_dir_all(images.join("layers")).expect("the image cache");
-    let (full, base, layer) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+    let (full, base, layer, other) = ("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
     std::fs::write(images.join(format!("{full}.ext4")), b"full").expect("the full image");
     std::fs::write(
         images.join(format!("{full}.json")),
         format!(
-            r#"{{ "imageDigest": "{full}", "kernelUrl": "https://example.com/vmlinux", "kernelDigest": "{}",
-            "baseRootfsUrl": "https://example.com/rootfs.squashfs", "baseRootfsDigest": "{}",
-            "harness": {HARNESS}, "components": [] }}"#,
-            "d".repeat(64),
-            "e".repeat(64)
+            r#"{{ "imageDigest": "{full}", "kernelUrl": "https://example.com/vmlinux", "kernelDigest": "{other}",
+            "baseRootfsUrl": "https://example.com/rootfs.squashfs", "baseRootfsDigest": "{other}",
+            "harness": {HARNESS}, "components": [] }}"#
         ),
     )
     .expect("the full manifest");
@@ -429,21 +427,16 @@ fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
     std::fs::write(
         images.join(format!("{base}.json")),
         format!(
-            r#"{{ "imageDigest": "{base}", "kernelUrl": "https://example.com/vmlinux", "kernelDigest": "{}",
-            "baseRootfsUrl": "https://example.com/rootfs.squashfs", "baseRootfsDigest": "{}",
-            "baseLayoutVersion": 1, "components": [] }}"#,
-            "d".repeat(64),
-            "e".repeat(64)
+            r#"{{ "imageDigest": "{base}", "kernelUrl": "https://example.com/vmlinux", "kernelDigest": "{other}",
+            "baseRootfsUrl": "https://example.com/rootfs.squashfs", "baseRootfsDigest": "{other}",
+            "baseLayoutVersion": 1, "components": [] }}"#
         ),
     )
     .expect("the base manifest");
     std::fs::write(images.join("layers").join(format!("{layer}.squashfs")), b"layer").expect("the layer");
     std::fs::write(
         images.join("layers").join(format!("{layer}.json")),
-        format!(
-            r#"{{ "layerDigest": "{layer}", "recipeDigest": "{}", "architecture": "Amd64", "harness": {HARNESS} }}"#,
-            "f".repeat(64)
-        ),
+        format!(r#"{{ "layerDigest": "{layer}", "recipeDigest": "{other}", "architecture": "Amd64", "harness": {HARNESS} }}"#),
     )
     .expect("the layer manifest");
     let full_box = holding(&[

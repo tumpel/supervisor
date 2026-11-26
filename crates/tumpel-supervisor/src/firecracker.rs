@@ -673,6 +673,8 @@ pub struct Scanned {
     pub size: Size,
 }
 
+pub type ScannedBoxes = Vec<(u8, Result<Scanned, String>)>;
+
 fn scopes(listing: &str) -> Vec<(u8, String)> {
     listing
         .split("\n\n")
@@ -724,7 +726,7 @@ struct Held {
 impl Firecracker {
     /// # Errors
     /// Fails when systemd does not list the box scopes.
-    pub fn scan(&self) -> Result<Vec<(u8, Result<Scanned, String>)>, String> {
+    pub fn scan(&self) -> Result<ScannedBoxes, String> {
         let listed = std::process::Command::new("systemctl")
             .args(["--user", "show", "--property=Id,ControlGroup", "tumpel-box*.scope"])
             .stdin(Stdio::null())
@@ -740,7 +742,7 @@ impl Firecracker {
         Ok(self.scanned(&String::from_utf8_lossy(&listed.stdout), Path::new("/sys/fs/cgroup")))
     }
 
-    fn scanned(&self, listing: &str, cgroups: &Path) -> Vec<(u8, Result<Scanned, String>)> {
+    fn scanned(&self, listing: &str, cgroups: &Path) -> ScannedBoxes {
         scopes(listing)
             .into_iter()
             .map(|(index, group)| (index, self.scan_box(cgroups, index, &group)))
@@ -791,7 +793,7 @@ impl Firecracker {
     fn held(&self, pid: libc::pid_t) -> Result<Held, String> {
         let fds = PathBuf::from(format!("/proc/{pid}/fd"));
         let listed = std::fs::read_dir(&fds)
-            .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+            .and_then(Iterator::collect::<std::io::Result<Vec<_>>>)
             .map_err(|error| format!("listing {}: {error}", fds.display()))?;
         let sessions = self.data.join("sessions");
         let layers = self.images.join("layers");
