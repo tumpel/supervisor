@@ -794,9 +794,16 @@ fn decode_chunk_list(list: &[u8]) -> Result<Vec<Place>, String> {
             usize::try_from(table_bytes).map_err(|error| format!("the chunk list's pack table: {error}"))?,
         )
         .ok_or("the chunk list ends inside its pack table")?;
-    let packs: Vec<String> = table.chunks_exact(LIST_PACK_BYTES).map(hex).collect();
+    let packs: Vec<String> = table
+        .as_chunks::<LIST_PACK_BYTES>()
+        .0
+        .iter()
+        .map(|pack| hex(pack.as_slice()))
+        .collect();
     records
-        .chunks_exact(LIST_RECORD_BYTES)
+        .as_chunks::<LIST_RECORD_BYTES>()
+        .0
+        .iter()
         .map(|record| -> Result<Place, String> {
             let (digest, fields) = record.split_at(32);
             let field = |at: usize| fields.get(at..at + 4).and_then(le_u32).unwrap_or(0);
