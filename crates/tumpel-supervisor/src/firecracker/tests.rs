@@ -502,7 +502,9 @@ fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
             ),
         ]
     );
-    servers.map(|server| server.join().expect("the API answers"));
+    for server in servers {
+        server.join().expect("the API answers");
+    }
     for mut child in [full_box, layered_box] {
         child.kill().expect("the box stops");
         child.wait().expect("the box is reaped");
