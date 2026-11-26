@@ -19,7 +19,7 @@ use tumpel_api::types::{
     SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind,
     SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
 };
-use tumpel_channel::{Ask, Key, Outgoing};
+use tumpel_channel::{Ask, Key};
 
 use super::{
     restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, ScannedBoxes, Settings, SnapshotOrder,
@@ -626,6 +626,8 @@ fn describe(message: ChannelHostMessage) -> Option<String> {
         ChannelHostMessage::TurnClaim(claim) => format!("claim {}", *claim.turn_id),
         ChannelHostMessage::TurnRepositoryReady(_)
         | ChannelHostMessage::SnapshotChunks(_)
+        | ChannelHostMessage::SnapshotChunkCheck(_)
+        | ChannelHostMessage::SnapshotIndexAsk(_)
         | ChannelHostMessage::SnapshotPacks(_)
         | ChannelHostMessage::RestoreChunks(_)
         | ChannelHostMessage::SupervisorUpdateStep(_)
@@ -739,11 +741,10 @@ fn forward(sender: &UnboundedSender<ChannelHostMessage>, message: ChannelHostMes
         .expect("the host reads what the control plane forwards");
 }
 
-fn channel(mut from_lifecycle: UnboundedReceiver<Outgoing>) -> UnboundedReceiver<ChannelHostMessage> {
+fn channel(mut from_lifecycle: UnboundedReceiver<ChannelHostMessage>) -> UnboundedReceiver<ChannelHostMessage> {
     let (sender, sent) = unbounded_channel();
     tokio::spawn(async move {
-        while let Some(outgoing) = from_lifecycle.recv().await {
-            let Outgoing::Message(message) = outgoing;
+        while let Some(message) = from_lifecycle.recv().await {
             let _ = sender.send(message);
         }
     });
@@ -1441,6 +1442,10 @@ async fn a_snapshot_over_a_base_names_each_reused_pack_once_and_counts_every_pla
         .map(|place| place.pack.clone())
         .collect();
     assert_eq!(referenced, written.union(&once).cloned().collect::<BTreeSet<_>>());
+}
+
+fn pack_uploads(uploads: &[String]) -> usize {
+    uploads.iter().filter(|url| url.contains("/packs/")).count()
 }
 
 #[tokio::test]

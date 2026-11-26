@@ -90,17 +90,6 @@ fn append_lines(batch: &mut Value, added: &ChannelTurnLines) -> bool {
     true
 }
 
-#[derive(Debug)]
-pub enum Outgoing {
-    Message(ChannelHostMessage),
-}
-
-impl From<ChannelHostMessage> for Outgoing {
-    fn from(message: ChannelHostMessage) -> Self {
-        Self::Message(message)
-    }
-}
-
 fn snapshot_id(message: &Value) -> Option<EntityId> {
     let snapshot_id = message.get("snapshotId").and_then(Value::as_str)?;
     EntityId::try_from(snapshot_id.to_string()).ok()
@@ -471,10 +460,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
 
     /// # Errors
     /// Fails when the state cannot be saved or the port refuses the frame.
-    pub fn send(&mut self, outgoing: impl Into<Outgoing>, port: &mut impl Port) -> Result<(), ChannelError> {
-        match outgoing.into() {
-            Outgoing::Message(ChannelHostMessage::TurnLines(lines)) => self.store_lines(lines)?,
-            Outgoing::Message(message) => self.push(to_value(&message)?),
+    pub fn send(&mut self, message: ChannelHostMessage, port: &mut impl Port) -> Result<(), ChannelError> {
+        match message {
+            ChannelHostMessage::TurnLines(lines) => self.store_lines(lines)?,
+            message => self.push(to_value(&message)?),
         }
         self.store.save(&self.state)?;
         self.transmit_due(Instant::now(), port)

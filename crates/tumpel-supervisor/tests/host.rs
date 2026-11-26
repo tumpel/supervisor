@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tumpel_api::types::{BoxRetention, ChannelHostMessage, GuestImageManifest, Sequence, SupervisorRuntime};
-use tumpel_channel::Outgoing;
 use tumpel_supervisor::{
     restored_descriptors, take_notify_socket, BootOrder, BoxTurn, Budgets, Command, Ext4Upper, Firecracker, HttpStore,
     ImageOrder, Input, Lifecycle, Settings, Size, Taken, TapPool, Upper,
@@ -73,14 +72,13 @@ fn turn(image: &GuestImageManifest, turn_id: &str, prompt: &str, last_line_seq: 
 }
 
 #[cfg(test)]
-async fn until_complete(received: &mut UnboundedReceiver<Outgoing>) -> Vec<String> {
+async fn until_complete(received: &mut UnboundedReceiver<ChannelHostMessage>) -> Vec<String> {
     let mut seen = Vec::new();
     loop {
         let message = tokio::time::timeout(Duration::from_mins(1), received.recv())
             .await
             .expect("a message within 60 s")
             .expect("the channel stays open");
-        let Outgoing::Message(message) = message;
         let done = matches!(message, ChannelHostMessage::TurnComplete(_));
         seen.push(match message {
             ChannelHostMessage::TurnClaim(claim) => format!("claim {}", *claim.turn_id),
@@ -299,7 +297,7 @@ async fn crashing_supervisor() {
         .send(turn(&image, "turn-1", "sleep 60\necho too late", 0))
         .expect("send");
     while let Some(message) = received.recv().await {
-        if matches!(message, Outgoing::Message(ChannelHostMessage::TurnRepositoryReady(_))) {
+        if matches!(message, ChannelHostMessage::TurnRepositoryReady(_)) {
             println!("TURN RUNNING");
             std::future::pending::<()>().await;
         }
@@ -365,7 +363,7 @@ async fn a_supervisor_started_after_a_crash_takes_over_a_box_mid_turn_and_runs_i
         .expect("the next supervisor takes the box over");
     let failed = received.recv().await.expect("the cut turn is reported");
     assert!(
-        matches!(&failed, Outgoing::Message(ChannelHostMessage::TurnFailed(failed)) if *failed.turn_id == "turn-1"),
+        matches!(&failed, ChannelHostMessage::TurnFailed(failed) if *failed.turn_id == "turn-1"),
         "{failed:?}"
     );
     let (commands, from_test) = unbounded_channel();

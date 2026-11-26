@@ -23,7 +23,6 @@ use tumpel_api::types::{
     ReleaseManifestReleaseVersion, ReleaseSupervisorSupervisorVersion, Sha256Digest, SupervisorUpdateFailureReason,
     SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
-use tumpel_channel::Outgoing;
 use tumpel_guest::setup_output::{redacted, strip_ansi};
 
 use crate::bounded::reported;
@@ -358,7 +357,7 @@ pub struct Updater<S: Source, I: Idle> {
     running: Sha256Digest,
     version: ChannelSupervisorUpdateStepReleaseVersion,
     idle: I,
-    out: UnboundedSender<Outgoing>,
+    out: UnboundedSender<ChannelHostMessage>,
     running_update: Mutex<()>,
     online: AtomicBool,
 }
@@ -371,7 +370,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         running: Sha256Digest,
         version: ChannelSupervisorUpdateStepReleaseVersion,
         idle: I,
-        out: UnboundedSender<Outgoing>,
+        out: UnboundedSender<ChannelHostMessage>,
     ) -> Self {
         Self {
             source,

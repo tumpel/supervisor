@@ -33,7 +33,7 @@ use tumpel_api::types::{
     SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
     SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
 };
-use tumpel_channel::{Ask, Key, Outgoing};
+use tumpel_channel::{Ask, Key};
 
 use crate::boot::{self, Boot, BootOrder, Caches, Hold, Holds};
 use crate::bounded::{bounded, reported};
@@ -706,20 +706,20 @@ pub fn instant_at(at: DateTime<FixedOffset>) -> Instant {
     Instant::now() + (at - now()).to_std().unwrap_or(Duration::ZERO)
 }
 
-fn emit(out: &UnboundedSender<Outgoing>, message: impl Into<ChannelHostMessage>) {
+fn emit(out: &UnboundedSender<ChannelHostMessage>, message: impl Into<ChannelHostMessage>) {
     let message = message.into();
     telemetry::ended(&message);
-    send_out(out, Outgoing::Message(message));
+    send_out(out, message);
 }
 
-fn send_out(out: &UnboundedSender<Outgoing>, outgoing: Outgoing) {
+fn send_out(out: &UnboundedSender<ChannelHostMessage>, outgoing: ChannelHostMessage) {
     if out.send(outgoing).is_err() {
         eprintln!("tumpel-supervisor: the channel stopped taking box messages; the supervisor is shutting down");
     }
 }
 
 pub(crate) fn turn_failed(
-    out: &UnboundedSender<Outgoing>,
+    out: &UnboundedSender<ChannelHostMessage>,
     turn_id: &EntityId,
     reason: TurnFailureReason,
     detail: impl AsRef<str>,
@@ -737,7 +737,7 @@ pub(crate) fn turn_failed(
     );
 }
 
-fn report_failure(out: &UnboundedSender<Outgoing>, turn_id: &EntityId, report: Report, detail: String) {
+fn report_failure(out: &UnboundedSender<ChannelHostMessage>, turn_id: &EntityId, report: Report, detail: String) {
     match report {
         Report::Turn(reason) => turn_failed(out, turn_id, reason, detail),
         Report::Clone(cause) => emit(
@@ -961,7 +961,7 @@ struct Runner<V: Vmm, S: Store> {
     vmm: Arc<V>,
     store: Arc<S>,
     settings: Settings,
-    out: UnboundedSender<Outgoing>,
+    out: UnboundedSender<ChannelHostMessage>,
     answers: Answers,
     fetching: Arc<Mutex<()>>,
     layers: LayerCache,
@@ -1256,10 +1256,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     fn send(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Option<Instant>) -> Asking {
-        self.send_outgoing(key, Outgoing::Message(message.into()), deadline)
+        self.send_outgoing(key, message.into(), deadline)
     }
 
-    fn send_outgoing(&self, key: Key, outgoing: Outgoing, deadline: Option<Instant>) -> Asking {
+    fn send_outgoing(&self, key: Key, outgoing: ChannelHostMessage, deadline: Option<Instant>) -> Asking {
         let Waiting { key, answer } = self.answers.expect(key);
         send_out(&self.out, outgoing);
         Asking {
@@ -1271,11 +1271,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     async fn ask(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Instant) -> Result<Answer, String> {
-        self.ask_outgoing(key, Outgoing::Message(message.into()), deadline)
-            .await
+        self.ask_outgoing(key, message.into(), deadline).await
     }
 
-    async fn ask_outgoing(&self, key: Key, outgoing: Outgoing, deadline: Instant) -> Result<Answer, String> {
+    async fn ask_outgoing(&self, key: Key, outgoing: ChannelHostMessage, deadline: Instant) -> Result<Answer, String> {
         let mut asking = self.send_outgoing(key, outgoing, Some(deadline));
         asking.answer().await.ok_or_else(|| {
             format!(
@@ -1327,7 +1326,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 snapshot_id: snapshot_id.clone(),
                 type_: ChannelSnapshotPacksType::SnapshotPacks,
             };
-            let outgoing = Outgoing::Message(message.into());
+            let outgoing: ChannelHostMessage = message.into();
             let Answer::PackUploads(answer) = self.ask_outgoing(key.clone(), outgoing, deadline).await? else {
                 return Err(unexpected(&key));
             };
@@ -2067,7 +2066,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     type_: ChannelSnapshotDoneType::SnapshotDone,
                     uploaded_bytes,
                 };
-                Outgoing::Message(done.into())
+                done.into()
             }
             Err((reason, detail)) => {
                 let failed = ChannelSnapshotFailed {
@@ -2077,11 +2076,10 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     snapshot_id: order.snapshot_id.clone(),
                     type_: ChannelSnapshotFailedType::SnapshotFailed,
                 };
-                Outgoing::Message(failed.into())
+                failed.into()
             }
         };
-        let Outgoing::Message(message) = &outgoing;
-        telemetry::ended(message);
+        telemetry::ended(&outgoing);
         send_out(&self.out, outgoing);
         Outcome::Kept(live)
     }
@@ -2399,7 +2397,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         store: S,
         settings: Settings,
         pool: TapPool,
-        out: UnboundedSender<Outgoing>,
+        out: UnboundedSender<ChannelHostMessage>,
         standing: PathBuf,
     ) -> Self {
         let (events, finished) = unbounded_channel();

@@ -10,8 +10,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    empty_state, hello_bytes, Ask, Backoff, ChannelError, Event, HeldIds, HostChannel, Key, Outgoing, Phase, Port,
-    RateBackoff, RateLimit, Signer, Store, Usage, TURN_LINES_WAIT,
+    empty_state, hello_bytes, Ask, Backoff, ChannelError, Event, HeldIds, HostChannel, Key, Phase, Port, RateBackoff,
+    RateLimit, Signer, Store, Usage, TURN_LINES_WAIT,
 };
 
 #[derive(Default)]
@@ -91,14 +91,14 @@ fn channel(disk: &Disk, signer: &Recorder) -> HostChannel<Disk, Recorder> {
     )
 }
 
-fn done(snapshot: &str) -> Outgoing {
+fn done(snapshot: &str) -> ChannelHostMessage {
     let message = ChannelSnapshotDone {
         snapshot_id: snapshot.try_into().expect("snapshot id"),
         uploaded_bytes: 10,
         chunk_count: 3,
         type_: ChannelSnapshotDoneType::SnapshotDone,
     };
-    Outgoing::Message(message.into())
+    message.into()
 }
 
 fn frame(seq: i64, ack: i64, snapshot: &str) -> String {
@@ -474,12 +474,11 @@ fn a_refused_chunk_ask_is_replaced_by_its_failure_in_one_save() {
     ];
     for (ask, mut expected) in cases {
         let message = serde_json::from_value(ask.clone()).expect("chunk ask");
-        let outgoing = Outgoing::Message(message);
         let disk = Disk::default();
         let mut channel = channel(&disk, &Recorder::default());
         let mut wire = Wire::default();
         open(&mut channel, &mut wire);
-        channel.send(outgoing, &mut wire).expect("send ask");
+        channel.send(message, &mut wire).expect("send ask");
         assert_eq!(wire.sent()[0]["seq"], 1);
         let before = disk.1.get();
 
