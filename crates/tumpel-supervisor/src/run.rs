@@ -17,9 +17,10 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
-    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
-    SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, TurnFailureReason,
+    ChannelControlMessage, ChannelSnapshotRequest, ChannelSupervisorUpdateStepReleaseVersion, ChannelTurnOffer,
+    ClaudeSetupHarness, EntityId, HostReportedHealth, Sha256Digest, SupervisorChannelState, SupervisorConfig,
+    SupervisorFailure, SupervisorHandover, SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime,
+    TurnFailureReason,
 };
 use tumpel_channel::{
     Backoff, ChannelError, Event, HeldIds, HostChannel, Outgoing, Phase, Port, RateBackoff, RateLimit, Signer, Store,
@@ -111,6 +112,17 @@ struct Updates {
 }
 
 impl Updates {
+    fn welcomed(&self) {
+        if self.updater.first_online() {
+            tokio::spawn(async {
+                if let Err(error) = systemctl(&["reset-failed", dir::SUPERVISOR_UNIT]).await {
+                    eprintln!("tumpel-supervisor: {error}; systemd keeps its restart counter");
+                }
+            });
+        }
+        self.announced();
+    }
+
     fn announced(&self) {
         let updater = Arc::clone(&self.updater);
         let restart = self.restart.clone();
@@ -132,24 +144,28 @@ pub(crate) async fn refresh_unit(layout: &Layout) -> Result<(), String> {
         "rewrote {} to the unit this binary installs; reloading systemd",
         layout.unit.display()
     );
-    let reloaded = tokio::time::timeout(
+    systemctl(&["daemon-reload"]).await.map_err(failed)
+}
+
+async fn systemctl(args: &[&str]) -> Result<(), String> {
+    let command = args.join(" ");
+    let ran = tokio::time::timeout(
         UNIT_RELOAD,
         tokio::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
+            .arg("--user")
+            .args(args)
             .kill_on_drop(true)
             .status(),
     )
     .await;
-    match reloaded {
+    match ran {
         Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => Err(failed(format!("systemctl --user daemon-reload exited with {status}"))),
-        Ok(Err(error)) => Err(failed(format!(
-            "starting systemctl --user daemon-reload failed: {error}"
-        ))),
-        Err(_) => Err(failed(format!(
-            "systemctl --user daemon-reload ran past {} s",
+        Ok(Ok(status)) => Err(format!("systemctl --user {command} exited with {status}")),
+        Ok(Err(error)) => Err(format!("starting systemctl --user {command} failed: {error}")),
+        Err(_) => Err(format!(
+            "systemctl --user {command} ran past {} s",
             UNIT_RELOAD.as_secs()
-        ))),
+        )),
     }
 }
 
@@ -680,6 +696,7 @@ pub(crate) struct Started {
     pub(crate) url: String,
     layout: Layout,
     pub(crate) running: Sha256Digest,
+    version: ChannelSupervisorUpdateStepReleaseVersion,
     source: HttpSource,
     box_size: Size,
     store: HttpStore,
@@ -691,6 +708,9 @@ pub(crate) fn start() -> Result<Started, Failure> {
     let binary = std::env::current_exe()
         .map_err(|error| unusable(format!("finding this supervisor's own binary failed: {error}")))?;
     let running = update::binary_sha256(&binary).map_err(unusable)?;
+    let version = env!("TUMPEL_RELEASE_VERSION")
+        .parse()
+        .map_err(|error| unusable(format!("the supervisor version does not fit the contract: {error}")))?;
     let layout = Layout::new(binary, dir.clone(), dir::supervisor_unit_path());
     let (config, pair, state) = load()?;
     let runtime = load_runtime(&dir)?;
@@ -720,6 +740,7 @@ pub(crate) fn start() -> Result<Started, Failure> {
         url,
         layout,
         running,
+        version,
         source,
         box_size,
         store,
@@ -802,7 +823,7 @@ pub async fn run(
             started.layout.clone(),
             Limits::HOST,
             started.running,
-            env!("TUMPEL_RELEASE_VERSION"),
+            started.version,
             idle.clone(),
             out.clone(),
         )),
@@ -1064,7 +1085,7 @@ async fn session(
                                 eprintln!("connected to {url}");
                                 last_beat = Instant::now();
                                 commands.send(BoxCommand::Welcomed(channel.version()))
-                                    .inspect(|()| updates.announced())
+                                    .inspect(|()| updates.welcomed())
                                     .err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
                             }
                             Ok(Event::Message(message)) => match box_command(*message) {
