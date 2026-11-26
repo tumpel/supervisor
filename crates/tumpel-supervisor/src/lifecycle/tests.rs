@@ -768,18 +768,6 @@ fn control_plane(
         while let Some(message) = from_lifecycle.recv().await {
             let mut index = store.2.lock().expect("index");
             match message {
-                ChannelHostMessage::SnapshotChunks(chunks) => {
-                    answers.deliver(Answer::ChunksHeld(ChannelSnapshotChunksHeld {
-                        held: chunks
-                            .digests
-                            .iter()
-                            .filter_map(|digest| index.chunks.get(digest.as_str()).cloned())
-                            .collect(),
-                        part: chunks.part,
-                        snapshot_id: chunks.snapshot_id,
-                        type_: ChannelSnapshotChunksHeldType::SnapshotChunksHeld,
-                    }));
-                }
                 ChannelHostMessage::SnapshotPacks(packs) => {
                     for chunk in &packs.chunks {
                         index
@@ -1544,27 +1532,57 @@ async fn a_torn_down_box_restores_its_next_turn_from_the_latest_snapshot() {
     );
 }
 
-#[tokio::test]
-async fn a_snapshot_uploads_no_chunk_the_store_holds_already() {
-    let mut host = host("dedup", 2, Harness::Echo, Boot::Works);
-    host.turn("turn-1", "session-1", "same bytes", Vec::new());
-    host.turn("turn-2", "session-2", "same bytes", Vec::new());
-    host.settle(SETTLE).await;
-    host.snapshot("session-1");
-    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
-    assert_eq!(pack_uploads(&host.store.uploads()), 2);
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_asks_for_no_held_chunks_and_uploads_every_chunk_its_base_does_not_place() {
+    let mut host = host("unasked", 1, Harness::Echo, Boot::Works);
+    let mut snapshots = Vec::new();
+    for (turn_id, prompt) in [("turn-1", "one"), ("turn-2", "two")] {
+        host.turn(turn_id, "session-1", prompt, Vec::new());
+        host.settle(SETTLE).await;
+        let order = host.snapshot("session-1");
+        let mut sent = BTreeSet::new();
+        loop {
+            match tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
+                .await
+                .expect("the snapshot ends within its budget")
+                .expect("the lifecycle is running")
+            {
+                ChannelHostMessage::SnapshotChunks(asked) => panic!("the snapshot asked for held chunks: {asked:?}"),
+                ChannelHostMessage::SnapshotPacks(packs) => {
+                    sent.extend(packs.chunks.iter().map(|chunk| chunk.digest.as_str().to_string()));
+                }
+                ChannelHostMessage::SnapshotDone(_) => break,
+                _ => {}
+            }
+        }
+        let root = decode_root(&host.store.get(order.download_url.as_str()).expect("the root")).expect("the root json");
+        let mut bytes = Vec::new();
+        for place in &root {
+            let pack = host.store.get(&pack_url(&place.pack)).expect("a pack");
+            let from = usize::try_from(place.offset).expect("an offset");
+            bytes.extend_from_slice(&pack[from..from + place.length as usize]);
+        }
+        let placed: BTreeSet<String> = decode(&bytes)
+            .expect("the manifest")
+            .values()
+            .flat_map(|stored| stored.chunks.iter())
+            .chain(&root)
+            .map(|place| place.digest.clone())
+            .collect();
+        snapshots.push((sent, placed));
+    }
+    let [(first_sent, first_placed), (second_sent, second_placed)] =
+        <[_; 2]>::try_from(snapshots).expect("two snapshots");
 
-    let second = host.snapshot("session-2");
-    assert_eq!(host.settle_until("snapshot done").await, ["snapshot done"]);
-    let uploads = host.store.uploads();
-    assert_eq!(uploads.last().map(String::as_str), Some(second.download_url.as_str()));
-    let packs: Vec<Vec<u8>> = uploads
-        .iter()
-        .filter(|url| url.contains("/packs/"))
-        .map(|url| host.store.get(url).expect("pack"))
-        .collect();
-    assert_eq!(packs.len(), 1, "{uploads:?}");
-    assert!(!packs[0].windows(10).any(|bytes| bytes == b"same bytes"));
+    assert_eq!(first_sent, first_placed);
+    assert!(!second_sent.is_empty());
+    assert_eq!(
+        second_sent,
+        second_placed
+            .difference(&first_placed)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    );
 }
 
 #[tokio::test]
