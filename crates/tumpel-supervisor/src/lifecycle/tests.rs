@@ -184,7 +184,8 @@ impl Guest for MemoryGuest {
         if let (true, Harness::SlowClone, Some(ready_at)) = (cloning, self.harness, self.ready_at) {
             tokio::time::sleep_until(ready_at).await;
         }
-        if let (Some(GuestMessage::TurnLine(_)), Harness::SlowLine) = (self.pending.front(), self.harness) {
+        let later_line = matches!(self.pending.front(), Some(GuestMessage::TurnLine(line)) if line.line_seq.0 > 1);
+        if let (true, Harness::SlowLine) = (later_line, self.harness) {
             let complete_at = *self
                 .mid_frame
                 .get_or_insert_with(|| tokio::time::Instant::now() + SLOW_LINE);
@@ -1937,14 +1938,14 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
 #[tokio::test(start_paused = true)]
 async fn a_turn_mid_frame_parks_only_after_the_frame_completes() {
     let mut old = host("handover-mid-frame", 2, Harness::SlowLine, Boot::Works);
-    old.turn("turn-1", "session-1", "one", Vec::new());
-    assert_eq!(old.settle_until("claim turn-1").await, ["claim turn-1"]);
+    old.turn("turn-1", "session-1", "one\ntwo", Vec::new());
+    assert_eq!(old.settle_until("line 1 one").await, ["claim turn-1", "line 1 one"]);
     tokio::time::sleep(SLOW_LINE / 2).await;
     let handover = old.ask_handover();
-    assert_eq!(old.settle_until("line 1 one").await, ["line 1 one"]);
+    assert_eq!(old.settle_until("line 2 two").await, ["line 2 two"]);
     let handover = handover.await.expect("the boxes are handed over");
     let mut new = old.successor(&handover);
-    assert_eq!(new.settle_until("complete 1").await, ["complete 1"]);
+    assert_eq!(new.settle_until("complete 2").await, ["complete 2"]);
 }
 
 #[tokio::test(start_paused = true)]
