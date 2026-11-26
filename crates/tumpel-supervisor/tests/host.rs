@@ -80,7 +80,7 @@ async fn until_complete(received: &mut UnboundedReceiver<Outgoing>) -> Vec<Strin
             .await
             .expect("a message within 60 s")
             .expect("the channel stays open");
-        let (Outgoing::Message(message) | Outgoing::Snapshot(message, _)) = message;
+        let Outgoing::Message(message) = message;
         let done = matches!(message, ChannelHostMessage::TurnComplete(_));
         seen.push(match message {
             ChannelHostMessage::TurnClaim(claim) => format!("claim {}", *claim.turn_id),

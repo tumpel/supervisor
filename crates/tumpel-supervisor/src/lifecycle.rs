@@ -33,7 +33,7 @@ use tumpel_api::types::{
     SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
     SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
 };
-use tumpel_channel::{Ask, Key, Outgoing, PACK_REUSE};
+use tumpel_channel::{Ask, Key, Outgoing};
 
 use crate::boot::{self, Boot, BootOrder, Caches, Hold, Holds};
 use crate::bounded::{bounded, reported};
@@ -1290,16 +1290,11 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         snapshot_id: &EntityId,
         packs: &[PackFile],
         reused: &[String],
-        protocol: u16,
         deadline: Instant,
     ) -> Result<BTreeMap<String, String>, String> {
         let sizes: BTreeMap<&str, u64> = packs.iter().map(|pack| (pack.digest.as_str(), pack.size)).collect();
         let placed: Vec<&Place> = packs.iter().flat_map(|pack| pack.chunks.iter()).collect();
-        let parts = if protocol < PACK_REUSE {
-            placed.chunks(DIGESTS_PER_PART).map(|part| (part, &[][..])).collect()
-        } else {
-            pack_parts(&placed, reused, DIGESTS_PER_PART)
-        };
+        let parts = pack_parts(&placed, reused, DIGESTS_PER_PART);
         let mut urls = BTreeMap::new();
         for (index, (part, reused)) in parts.into_iter().enumerate() {
             let key = Key {
@@ -1332,7 +1327,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 snapshot_id: snapshot_id.clone(),
                 type_: ChannelSnapshotPacksType::SnapshotPacks,
             };
-            let outgoing = Outgoing::Snapshot(message.into(), protocol);
+            let outgoing = Outgoing::Message(message.into());
             let Answer::PackUploads(answer) = self.ask_outgoing(key.clone(), outgoing, deadline).await? else {
                 return Err(unexpected(&key));
             };
@@ -2058,14 +2053,9 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
-    async fn snapshot(
-        &self,
-        mut live: LiveBox<V::Machine>,
-        order: &SnapshotOrder,
-        protocol: u16,
-    ) -> Outcome<V::Machine> {
+    async fn snapshot(&self, mut live: LiveBox<V::Machine>, order: &SnapshotOrder) -> Outcome<V::Machine> {
         let drive = live.machine.drive();
-        let stored = self.store_snapshot(drive, &live.base, order, protocol).await;
+        let stored = self.store_snapshot(drive, &live.base, order).await;
         self.cancels.forget(&order.snapshot_id);
         let outgoing = match stored {
             Ok(None) => return Outcome::Kept(live),
@@ -2077,7 +2067,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     type_: ChannelSnapshotDoneType::SnapshotDone,
                     uploaded_bytes,
                 };
-                Outgoing::Snapshot(done.into(), protocol)
+                Outgoing::Message(done.into())
             }
             Err((reason, detail)) => {
                 let failed = ChannelSnapshotFailed {
@@ -2090,7 +2080,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 Outgoing::Message(failed.into())
             }
         };
-        let (Outgoing::Snapshot(message, _) | Outgoing::Message(message)) = &outgoing;
+        let Outgoing::Message(message) = &outgoing;
         telemetry::ended(message);
         send_out(&self.out, outgoing);
         Outcome::Kept(live)
@@ -2101,7 +2091,6 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         drive: PathBuf,
         base: &Arc<Base>,
         order: &SnapshotOrder,
-        protocol: u16,
     ) -> Result<Option<(i64, i32, Base)>, (ChannelSnapshotFailureReason, String)> {
         let unreadable = |detail: String| (ChannelSnapshotFailureReason::UpperDirectoryUnreadable, detail);
         let dir = self
@@ -2113,7 +2102,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         let staged = tokio::select! {
             biased;
             () = self.cancels.cancelled(&order.snapshot_id) => Ok(None),
-            staged = self.stage_snapshot(drive, base, order, &dir, protocol) => staged.map(Some),
+            staged = self.stage_snapshot(drive, base, order, &dir) => staged.map(Some),
         };
         let stored = staged.map_err(|(reason, detail)| match self.host_disk_full() {
             Some(full) => (reason, format!("{full}; {detail}")),
@@ -2166,7 +2155,6 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         base: &Arc<Base>,
         order: &SnapshotOrder,
         dir: &Path,
-        protocol: u16,
     ) -> Result<(i64, i32, Base), (ChannelSnapshotFailureReason, String)> {
         let unreadable = |detail: String| (ChannelSnapshotFailureReason::UpperDirectoryUnreadable, detail);
         let expired = |detail: String| {
@@ -2207,7 +2195,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             Err(_) => return Err(expired("its chunks were still being packed".to_string())),
         };
         let urls = self
-            .pack_uploads(&order.snapshot_id, &staged.packs, &staged.reused, protocol, deadline)
+            .pack_uploads(&order.snapshot_id, &staged.packs, &staged.reused, deadline)
             .await
             .map_err(expired)?;
         let uploads: Vec<(&String, &PackFile)> = staged
@@ -3255,7 +3243,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
     }
 
     fn start_snapshot(&mut self, session: String, order: SnapshotOrder) {
-        let Some(protocol) = self.session_protocol else {
+        if self.session_protocol.is_none() {
             emit(
                 &self.runner.out,
                 ChannelSnapshotFailed {
@@ -3270,7 +3258,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 },
             );
             return;
-        };
+        }
         let live = self.slots.get_mut(&session).and_then(|slot| {
             let live = slot.live.take()?;
             slot.busy = true;
@@ -3298,7 +3286,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let runner = self.runner.clone();
         let running = Running::Snapshot;
         self.spawn(session, Work::Snapshot, running, async move {
-            runner.snapshot(live, &order, protocol).await
+            runner.snapshot(live, &order).await
         });
     }
 

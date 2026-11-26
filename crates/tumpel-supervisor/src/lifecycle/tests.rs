@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io::{Cursor, Read};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,11 +12,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
 use tumpel_api::types::{
     BoxRetention, ChannelBoxTeardownFailureReason, ChannelHostMessage, ChannelPackUrl, ChannelProtocol,
-    ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotDownload, ChannelSnapshotFailed,
-    ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads,
-    ChannelSnapshotPackUploadsType, ChannelSnapshotPacks, ChannelTurnClaimed, ChannelTurnClaimedType,
-    ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId, GuestHarnessProtocol, GuestHello, GuestInput,
-    GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
+    ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotDownload, ChannelSnapshotFailureReason,
+    ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType, ChannelSnapshotPacks, ChannelTurnClaimed,
+    ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId, GuestHarnessProtocol, GuestHello,
+    GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
     SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind,
     SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
 };
@@ -688,7 +687,6 @@ struct Host {
     runner: tokio::task::JoinHandle<Result<(), String>>,
     answering: Arc<AtomicBool>,
     accepting: Arc<AtomicBool>,
-    session: Arc<AtomicU16>,
     answers: Answers,
 }
 
@@ -741,37 +739,11 @@ fn forward(sender: &UnboundedSender<ChannelHostMessage>, message: ChannelHostMes
         .expect("the host reads what the control plane forwards");
 }
 
-fn swapped(snapshot_id: EntityId, built: u16) -> ChannelHostMessage {
-    ChannelSnapshotFailed {
-        detail: format!("built for {built}").try_into().expect("detail"),
-        failed_at: chrono::Utc::now().fixed_offset(),
-        reason: ChannelSnapshotFailureReason::NotAnswered,
-        snapshot_id,
-        type_: ChannelSnapshotFailedType::SnapshotFailed,
-    }
-    .into()
-}
-
-fn channel(
-    mut from_lifecycle: UnboundedReceiver<Outgoing>,
-    session: Arc<AtomicU16>,
-    commands: UnboundedSender<Input>,
-) -> UnboundedReceiver<ChannelHostMessage> {
+fn channel(mut from_lifecycle: UnboundedReceiver<Outgoing>) -> UnboundedReceiver<ChannelHostMessage> {
     let (sender, sent) = unbounded_channel();
     tokio::spawn(async move {
         while let Some(outgoing) = from_lifecycle.recv().await {
-            let message = match outgoing {
-                Outgoing::Snapshot(message, built) if built != session.load(Ordering::SeqCst) => {
-                    let snapshot_id = match message {
-                        ChannelHostMessage::SnapshotPacks(packs) => packs.snapshot_id,
-                        ChannelHostMessage::SnapshotDone(done) => done.snapshot_id,
-                        other => panic!("{other:?} is no snapshot frame"),
-                    };
-                    let _ = commands.send(Input::SnapshotFailed(snapshot_id.clone()));
-                    swapped(snapshot_id, built)
-                }
-                Outgoing::Message(message) | Outgoing::Snapshot(message, _) => message,
-            };
+            let Outgoing::Message(message) = outgoing;
             let _ = sender.send(message);
         }
     });
@@ -946,14 +918,13 @@ fn start_host(
     let answering = Arc::new(AtomicBool::new(true));
     let accepting = Arc::new(AtomicBool::new(true));
     let (commands, from_host) = unbounded_channel();
-    let session = Arc::new(AtomicU16::new(welcome.unwrap_or(ChannelProtocol::VERSION)));
     let answers = lifecycle.answers();
     let received = control_plane(
         store.clone(),
         answers.clone(),
         Arc::clone(&log),
         Arc::clone(&answering),
-        channel(from_lifecycle, Arc::clone(&session), commands.clone()),
+        channel(from_lifecycle),
     );
     let received = acking(received, Arc::clone(&accepting), commands.clone());
     lifecycle.start(taken).expect("the lifecycle starts");
@@ -985,7 +956,6 @@ fn start_host(
         runner,
         answering,
         accepting,
-        session,
         answers,
     }
 }
@@ -1089,7 +1059,6 @@ impl Host {
     }
 
     fn welcome(&self, protocol: u16) {
-        self.session.store(protocol, Ordering::SeqCst);
         self.commands.send(Input::Welcomed(protocol)).expect("send");
     }
 
@@ -1472,42 +1441,6 @@ async fn a_snapshot_over_a_base_names_each_reused_pack_once_and_counts_every_pla
         .map(|place| place.pack.clone())
         .collect();
     assert_eq!(referenced, written.union(&once).cloned().collect::<BTreeSet<_>>());
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_snapshot_over_a_base_at_38_names_no_reused_packs_and_sends_only_parts_with_chunks() {
-    let mut host = host("reused-packs-38", 1, Harness::Echo, Boot::Works);
-    host.welcome(38);
-    let mut snapshots = Vec::new();
-    for turn_id in ["turn-1", "turn-2"] {
-        host.turn(turn_id, "session-1", "one", Vec::new());
-        host.settle(SETTLE).await;
-        host.snapshot("session-1");
-        let mut parts = Vec::new();
-        loop {
-            match tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
-                .await
-                .expect("the snapshot ends within its budget")
-                .expect("the lifecycle is running")
-            {
-                ChannelHostMessage::SnapshotPacks(packs) => parts.push(packs),
-                ChannelHostMessage::SnapshotDone(_) => break,
-                _ => {}
-            }
-        }
-        snapshots.push(parts);
-    }
-
-    for parts in &snapshots {
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].part.get(), 1);
-        assert_ne!(parts[0].chunks.len(), 0);
-        assert_eq!(parts[0].reused_pack_digests.len(), 0);
-    }
-}
-
-fn pack_uploads(uploads: &[String]) -> usize {
-    uploads.iter().filter(|url| url.contains("/packs/")).count()
 }
 
 #[tokio::test]
@@ -2272,30 +2205,6 @@ async fn a_snapshot_handed_over_in_the_queue_waits_for_the_control_plane_welcome
     assert_eq!(new.settle(SETTLE).await, Vec::<String>::new());
     new.welcome(ChannelProtocol::VERSION);
     assert_eq!(new.settle_until("snapshot done").await, ["snapshot done"]);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_snapshot_built_at_38_in_a_session_at_39_ends_its_task_at_once_with_one_snapshot_failed() {
-    let mut host = host("snapshot-built-at-38", 1, Harness::Echo, Boot::Works);
-    host.welcome(38);
-    host.turn("turn-1", "session-1", "one", Vec::new());
-    host.settle_until("complete 1").await;
-    let started = tokio::time::Instant::now();
-    host.snapshot("session-1");
-    host.welcome(ChannelProtocol::VERSION);
-    let failed = host.settle_until_starts("snapshot failed").await;
-    host.turn("turn-2", "session-1", "two", Vec::new());
-    let seen = host.settle_until_starts("complete").await;
-    assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
-    let later = host.settle(Duration::from_secs(120)).await;
-    let failures = failed
-        .iter()
-        .chain(&seen)
-        .chain(&later)
-        .filter(|line| line.starts_with("snapshot failed"))
-        .count();
-    assert_eq!(failures, 1, "{failed:?} {seen:?} {later:?}");
-    assert!(host.standing().boxes[0].dirty, "a failed snapshot leaves the box dirty");
 }
 
 #[tokio::test]
