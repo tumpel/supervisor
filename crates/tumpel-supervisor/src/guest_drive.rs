@@ -1,3 +1,6 @@
+use std::ffi::CString;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -25,8 +28,34 @@ pub(crate) fn check() -> Result<&'static str, String> {
     }
 }
 
+fn dir(images: &Path) -> PathBuf {
+    images.join("guest")
+}
+
+pub(crate) fn check_writable(images: &Path) -> Result<&'static str, String> {
+    let dir = dir(images);
+    let (target, fix) = if dir.exists() {
+        (
+            dir.as_path(),
+            format!("make {} writable by the supervisor", dir.display()),
+        )
+    } else {
+        (
+            images,
+            "make imageCacheDir in runtime.json a writable directory".to_string(),
+        )
+    };
+    let path = CString::new(target.as_os_str().as_bytes())
+        .map_err(|error| format!("{} is not a valid path: {error}", target.display()))?;
+    if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(format!("{} is not writable: {error}; {fix}", target.display()));
+    }
+    Ok("cache directory is readable and the guest drive directory is writable")
+}
+
 fn place(images: &Path, drive: &[u8]) -> Result<PathBuf, String> {
-    let dir = images.join("guest");
+    let dir = dir(images);
     let name = name(drive);
     let path = dir.join(&name);
     std::fs::create_dir_all(&dir).map_err(|error| format!("creating {}: {error}", dir.display()))?;
@@ -66,7 +95,7 @@ pub fn path(images: &Path) -> Result<PathBuf, String> {
     static NAME: OnceLock<Option<String>> = OnceLock::new();
     NAME.get_or_init(|| DRIVE.map(name))
         .as_ref()
-        .map(|name| images.join("guest").join(name))
+        .map(|name| dir(images).join(name))
         .ok_or_else(|| "this supervisor was built without a guest drive, so it boots no layered box; install a supervisor the release workflow built".to_string())
 }
 
