@@ -1850,8 +1850,8 @@ async fn packs_of_snapshot(
 async fn after_a_snapshot_is_not_stored_the_next_snapshot_reuses_only_the_stored_snapshots_packs() {
     let mut host = host("not-stored", 1, Harness::Echo, Boot::Works);
     let (_, first, _) = packs_of_snapshot(&mut host, "turn-1", "one").await;
-    let (refused, second, _) = packs_of_snapshot(&mut host, "turn-2", "two").await;
-    host.commands.send(Input::SnapshotNotStored(refused)).expect("send");
+    let (not_stored, second, _) = packs_of_snapshot(&mut host, "turn-2", "two").await;
+    host.commands.send(Input::SnapshotNotStored(not_stored)).expect("send");
     let (_, _, reused) = packs_of_snapshot(&mut host, "turn-3", "three").await;
 
     assert!(!reused.is_empty());
@@ -1874,9 +1874,9 @@ async fn a_stored_snapshot_drops_the_previous_base_so_a_late_not_stored_changes_
 async fn a_snapshot_not_stored_after_a_handover_leaves_the_next_snapshot_reusing_none_of_its_packs() {
     let mut old = host("not-stored-handover", 1, Harness::Echo, Boot::Works);
     packs_of_snapshot(&mut old, "turn-1", "one").await;
-    let (refused, _, _) = packs_of_snapshot(&mut old, "turn-2", "two").await;
+    let (not_stored, _, _) = packs_of_snapshot(&mut old, "turn-2", "two").await;
     let mut new = old.hand_over().await;
-    new.commands.send(Input::SnapshotNotStored(refused)).expect("send");
+    new.commands.send(Input::SnapshotNotStored(not_stored)).expect("send");
     let (_, written, reused) = packs_of_snapshot(&mut new, "turn-3", "three").await;
 
     assert_eq!(reused, BTreeSet::new());
