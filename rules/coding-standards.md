@@ -10,4 +10,4 @@
 8. Run tools through `npm run <script>`. Add a script to `package.json` when one is missing.
 9. Repo utilities are Node `.mjs` scripts in `npm-scripts/`, one job each. Never write Python.
 10. Never commit a token, key or secret. `npm run secrets:check` scans for them.
-11. Keep durable state in a local database: anything that must survive a restart or a handover, such as what a box holds, what was backed up and what was asked of the control plane. Never keep it in process memory or in a flat JSON or text file. Process memory dies with a restart or a handover, and a flat file has no atomic updates or queries.
+11. Keep new durable state, anything that must survive a restart or a handover, in a local database at minimum. Never keep it in process memory or in a flat file.
