@@ -1268,26 +1268,16 @@ mod tests {
             code: CloseCode::from(4426),
             reason: "this control plane speaks 34 to 34, update the supervisor".into(),
         };
-        let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
-            panic!("a refusal ends the session");
-        };
-        let Next::Reconnect(wait) = next(&mut channel, &mut backoff, url, ended, 0) else {
-            panic!("a refusal of the newest protocol reconnects");
-        };
-        assert_eq!(wait, Duration::ZERO);
-        assert_eq!(
-            hello_version(&mut channel),
-            serde_json::json!(ChannelProtocol::VERSION - 1)
-        );
-
-        let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
-            panic!("a refusal ends the session");
-        };
-        let Next::Reconnect(wait) = next(&mut channel, &mut backoff, url, ended, 0) else {
-            panic!("a refusal of the version below the newest reconnects at the oldest");
-        };
-        assert_eq!(wait, Duration::ZERO);
-        assert_eq!(hello_version(&mut channel), serde_json::json!(ChannelProtocol::OLDEST));
+        for version in (ChannelProtocol::OLDEST..ChannelProtocol::VERSION).rev() {
+            let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
+                panic!("a refusal ends the session");
+            };
+            let Next::Reconnect(wait) = next(&mut channel, &mut backoff, url, ended, 0) else {
+                panic!("a refusal above the oldest protocol reconnects one version lower");
+            };
+            assert_eq!(wait, Duration::ZERO);
+            assert_eq!(hello_version(&mut channel), serde_json::json!(version));
+        }
 
         let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
             panic!("a refusal ends the session");
