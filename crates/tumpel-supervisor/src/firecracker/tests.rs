@@ -345,3 +345,239 @@ async fn every_guest_family_survives_unknown_variants_and_extra_fields() {
         assert_eq!(*logs.0.lock().expect("logs"), vec![tumpel_channel::UPDATE_REQUIRED]);
     }
 }
+
+fn scan_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("tumpel-scan-{}-{name}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("clearing the last run");
+    }
+    std::fs::create_dir_all(&dir).expect("the scan directory");
+    dir.canonicalize().expect("the scan directory")
+}
+
+fn holding(files: &[&Path]) -> std::process::Child {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"exec 3<"$1" 4<"$2" 5<"$3"; echo ready; exec sleep 60"#)
+        .arg("sh")
+        .args(files)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("sh starts");
+    let mut ready = String::new();
+    std::io::BufReader::new(child.stdout.take().expect("its output"))
+        .read_line(&mut ready)
+        .expect("it opens the files");
+    assert_eq!(ready, "ready\n");
+    child
+}
+
+fn answer_machine_config(socket: &Path, mem_size_mib: u32) -> std::thread::JoinHandle<()> {
+    std::fs::create_dir_all(socket.parent().expect("the box directory")).expect("the box directory");
+    let listener = std::os::unix::net::UnixListener::bind(socket).expect("the API socket");
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("a connection");
+        let mut request = [0u8; 256];
+        let read = stream.read(&mut request).expect("the request");
+        assert!(request[..read].starts_with(b"GET /machine-config "));
+        let body = format!(r#"{{"vcpu_count":2,"mem_size_mib":{mem_size_mib},"smt":false}}"#);
+        write!(
+            stream,
+            "HTTP/1.1 200 \r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("the answer");
+    })
+}
+
+fn overlay(data: &Path, session: &str, mib: u64) -> PathBuf {
+    let dir = data.join("sessions").join(session);
+    std::fs::create_dir_all(&dir).expect("the session directory");
+    let drive = dir.join("overlay.ext4");
+    std::fs::File::create(&drive)
+        .and_then(|file| file.set_len(mib * 1024 * 1024))
+        .expect("the box disk");
+    drive
+}
+
+const HARNESS: &str = r#"{ "harness": "Shell", "harnessVersion": "1", "protocol": "ShellLines",
+    "command": ["/bin/sh", "-s"], "workingDirectory": "/root",
+    "environment": { "PATH": "/usr/bin:/bin", "HOME": "/root", "LANG": "C.UTF-8" }, "fixedVariables": [], "cloneSeconds": 120 }"#;
+
+#[test]
+fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
+    let dir = scan_dir("running");
+    let images = dir.join("images");
+    let data = dir.join("data");
+    let cgroups = dir.join("cgroups");
+    std::fs::create_dir_all(images.join("layers")).expect("the image cache");
+    let (full, base, layer) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+    std::fs::write(images.join(format!("{full}.ext4")), b"full").expect("the full image");
+    std::fs::write(
+        images.join(format!("{full}.json")),
+        format!(
+            r#"{{ "imageDigest": "{full}", "kernelUrl": "https://example.com/vmlinux", "kernelDigest": "{}",
+            "baseRootfsUrl": "https://example.com/rootfs.squashfs", "baseRootfsDigest": "{}",
+            "harness": {HARNESS}, "components": [] }}"#,
+            "d".repeat(64),
+            "e".repeat(64)
+        ),
+    )
+    .expect("the full manifest");
+    std::fs::write(images.join(format!("{base}.ext4")), b"base").expect("the base image");
+    std::fs::write(
+        images.join(format!("{base}.json")),
+        format!(
+            r#"{{ "imageDigest": "{base}", "kernelUrl": "https://example.com/vmlinux", "kernelDigest": "{}",
+            "baseRootfsUrl": "https://example.com/rootfs.squashfs", "baseRootfsDigest": "{}",
+            "baseLayoutVersion": 1, "components": [] }}"#,
+            "d".repeat(64),
+            "e".repeat(64)
+        ),
+    )
+    .expect("the base manifest");
+    std::fs::write(images.join("layers").join(format!("{layer}.squashfs")), b"layer").expect("the layer");
+    std::fs::write(
+        images.join("layers").join(format!("{layer}.json")),
+        format!(
+            r#"{{ "layerDigest": "{layer}", "recipeDigest": "{}", "architecture": "Amd64", "harness": {HARNESS} }}"#,
+            "f".repeat(64)
+        ),
+    )
+    .expect("the layer manifest");
+    let full_box = holding(&[
+        &images.join(format!("{full}.ext4")),
+        &overlay(&data, "session-three", 64),
+        Path::new("/dev/null"),
+    ]);
+    let layered_box = holding(&[
+        &images.join(format!("{base}.ext4")),
+        &images.join("layers").join(format!("{layer}.squashfs")),
+        &overlay(&data, "session-five", 128),
+    ]);
+    for (group, child) in [("box3", &full_box), ("box5", &layered_box)] {
+        std::fs::create_dir_all(cgroups.join(group)).expect("the scope cgroup");
+        std::fs::write(cgroups.join(group).join("cgroup.procs"), format!("{}\n", child.id())).expect("cgroup.procs");
+    }
+    let servers = [
+        answer_machine_config(&data.join("box3/api.sock"), 2048),
+        answer_machine_config(&data.join("box5/api.sock"), 4096),
+    ];
+    let vmm = Firecracker {
+        binary: PathBuf::from("firecracker"),
+        images: images.clone(),
+        data,
+        vcpus: 1,
+    };
+
+    let scanned = vmm.scanned(
+        "ControlGroup=/box3\nId=tumpel-box3.scope\n\nId=tumpel-box5.scope\nControlGroup=/box5\n",
+        &cgroups,
+    );
+
+    let found: Vec<_> = scanned
+        .into_iter()
+        .map(|(index, vm)| {
+            let vm = vm.expect("the box scans");
+            (index, vm.pid, vm.session_id.to_string(), vm.image.named(), vm.size)
+        })
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (
+                3,
+                libc::pid_t::try_from(full_box.id()).expect("a pid"),
+                "session-three".to_string(),
+                format!("image {full}"),
+                Size {
+                    memory_mib: NonZeroU32::new(2048).expect("2048"),
+                    disk_mib: NonZeroU32::new(64).expect("64"),
+                }
+            ),
+            (
+                5,
+                libc::pid_t::try_from(layered_box.id()).expect("a pid"),
+                "session-five".to_string(),
+                format!("base {base} with harness layer {layer}"),
+                Size {
+                    memory_mib: NonZeroU32::new(4096).expect("4096"),
+                    disk_mib: NonZeroU32::new(128).expect("128"),
+                }
+            ),
+        ]
+    );
+    for server in servers {
+        server.join().expect("the API answers");
+    }
+    for mut child in [full_box, layered_box] {
+        child.kill().expect("the box stops");
+        child.wait().expect("the box is reaped");
+    }
+}
+
+#[test]
+fn a_scan_reports_the_step_that_fails_for_each_box_and_scans_the_rest() {
+    let dir = scan_dir("failing");
+    let images = dir.join("images");
+    let data = dir.join("data");
+    let cgroups = dir.join("cgroups");
+    std::fs::create_dir_all(&images).expect("the image cache");
+    let gone = "a".repeat(64);
+    std::fs::write(images.join(format!("{gone}.ext4")), b"image").expect("an image without manifest");
+    let disk = overlay(&data, "session-eight", 64);
+    let unknown_image = holding(&[&images.join(format!("{gone}.ext4")), &disk, Path::new("/dev/null")]);
+    let no_image = holding(&[&disk, Path::new("/dev/null"), Path::new("/dev/null")]);
+    std::fs::create_dir_all(cgroups.join("box7")).expect("an empty scope cgroup");
+    for (group, procs) in [
+        ("box8", format!("{}\n", unknown_image.id())),
+        ("box6", format!("{}\n", no_image.id())),
+        ("box4", format!("{}\n{}\n", unknown_image.id(), no_image.id())),
+    ] {
+        std::fs::create_dir_all(cgroups.join(group)).expect("the scope cgroup");
+        std::fs::write(cgroups.join(group).join("cgroup.procs"), procs).expect("cgroup.procs");
+    }
+    let vmm = Firecracker {
+        binary: PathBuf::from("firecracker"),
+        images,
+        data,
+        vcpus: 1,
+    };
+
+    let scanned = vmm.scanned(
+        "Id=tumpel-box7.scope\nControlGroup=/box7\n\nId=tumpel-box8.scope\nControlGroup=/box8\n\nId=tumpel-box9.scope\nControlGroup=\n\nId=tumpel-box6.scope\nControlGroup=/box6\n\nId=tumpel-box4.scope\nControlGroup=/box4\n\nId=tumpel-box07.scope\nControlGroup=/box7\n",
+        &cgroups,
+    );
+
+    let failed: Vec<(u8, String)> = scanned
+        .into_iter()
+        .map(|(index, vm)| (index, vm.err().expect("the scan step fails")))
+        .collect();
+    assert_eq!(
+        failed.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        vec![7, 8, 9, 6, 4]
+    );
+    assert!(failed[0].1.contains("box7/cgroup.procs"), "{}", failed[0].1);
+    assert!(
+        failed[1]
+            .1
+            .contains(&format!("runs image {gone}, and its manifest is gone")),
+        "{}",
+        failed[1].1
+    );
+    assert_eq!(failed[2].1, "tumpel-box9.scope runs no process");
+    assert!(
+        failed[3].1.contains("holds no image from the image cache open"),
+        "{}",
+        failed[3].1
+    );
+    assert_eq!(
+        failed[4].1,
+        "tumpel-box4.scope runs 2 processes, and a box scope runs its Firecracker process alone"
+    );
+    for mut child in [unknown_image, no_image] {
+        child.kill().expect("the box stops");
+        child.wait().expect("the box is reaped");
+    }
+}

@@ -21,12 +21,14 @@ use tumpel_api::types::{EntityId, GuestHello, GuestInput, GuestMessage, Supervis
 use tumpel_guest::setup_output::{redacted, strip_ansi};
 use tumpel_guest::{encode, Decoder, GUEST_CID, GUEST_PORT, READY_PORT};
 
-use crate::boot::Boot;
+use crate::boot::{Boot, Layered};
 use crate::bounded::bounded;
 use crate::fd_store;
 use crate::guest_drive;
+use crate::images;
+use crate::layers::{self, LayerCache};
 use crate::lifecycle::{remove_dir, Guest, Machine, Stopped, Vmm};
-use crate::pool::{Disk, Tap};
+use crate::pool::{Disk, Size, Tap};
 use crate::snapshot::Ext4Upper;
 
 const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/sbin/tumpel-init";
@@ -661,6 +663,156 @@ impl Firecracker {
             scoped,
         )?);
         Ok((machine, VsockGuest { stream, decoder }))
+    }
+}
+
+pub struct Scanned {
+    pub pid: libc::pid_t,
+    pub session_id: EntityId,
+    pub image: Boot,
+    pub size: Size,
+}
+
+fn scopes(listing: &str) -> Vec<(u8, String)> {
+    listing
+        .split("\n\n")
+        .filter_map(|unit| {
+            let mut index = None;
+            let mut group = String::new();
+            for line in unit.lines() {
+                if let Some(scope) = line.strip_prefix("Id=") {
+                    index = scope
+                        .strip_prefix("tumpel-box")
+                        .and_then(|rest| rest.strip_suffix(".scope"))
+                        .and_then(|number| number.parse::<u8>().ok())
+                        .filter(|index| scope_of(*index) == scope);
+                }
+                if let Some(path) = line.strip_prefix("ControlGroup=") {
+                    group = path.to_string();
+                }
+            }
+            Some((index?, group))
+        })
+        .collect()
+}
+
+fn scope_pid(cgroups: &Path, index: u8, group: &str) -> Result<libc::pid_t, String> {
+    let scope = scope_of(index);
+    if group.is_empty() {
+        return Err(format!("{scope} runs no process"));
+    }
+    let procs = cgroups.join(group.trim_start_matches('/')).join("cgroup.procs");
+    let listed = std::fs::read_to_string(&procs).map_err(|error| format!("reading {}: {error}", procs.display()))?;
+    match listed.split_whitespace().collect::<Vec<_>>()[..] {
+        [pid] => pid
+            .parse()
+            .map_err(|error| format!("{} lists {pid:?}, not a process id: {error}", procs.display())),
+        ref pids => Err(format!(
+            "{scope} runs {} processes, and a box scope runs its Firecracker process alone",
+            pids.len()
+        )),
+    }
+}
+
+#[derive(Default)]
+struct Held {
+    session: Option<String>,
+    image: Option<String>,
+    layer: Option<String>,
+}
+
+impl Firecracker {
+    /// # Errors
+    /// Fails when systemd does not list the box scopes.
+    pub fn scan(&self) -> Result<Vec<(u8, Result<Scanned, String>)>, String> {
+        let listed = std::process::Command::new("systemctl")
+            .args(["--user", "show", "--property=Id,ControlGroup", "tumpel-box*.scope"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("starting systemctl to list the box scopes: {error}"))?;
+        if !listed.status.success() {
+            return Err(format!(
+                "listing the box scopes failed with {}: {}; run the supervisor from its systemd user unit",
+                listed.status,
+                String::from_utf8_lossy(&listed.stderr).trim()
+            ));
+        }
+        Ok(self.scanned(&String::from_utf8_lossy(&listed.stdout), Path::new("/sys/fs/cgroup")))
+    }
+
+    fn scanned(&self, listing: &str, cgroups: &Path) -> Vec<(u8, Result<Scanned, String>)> {
+        scopes(listing)
+            .into_iter()
+            .map(|(index, group)| (index, self.scan_box(cgroups, index, &group)))
+            .collect()
+    }
+
+    fn scan_box(&self, cgroups: &Path, index: u8, group: &str) -> Result<Scanned, String> {
+        let pid = scope_pid(cgroups, index, group)?;
+        let held = self.held(pid)?;
+        let session = held
+            .session
+            .ok_or_else(|| format!("Firecracker process {pid} holds no box disk open"))?;
+        let session_id = EntityId::try_from(session.as_str())
+            .map_err(|error| format!("Firecracker process {pid} holds the disk of session {session:?}: {error}"))?;
+        let digest = held
+            .image
+            .ok_or_else(|| format!("Firecracker process {pid} holds no image from the image cache open"))?;
+        let missing = |named: &str| {
+            format!("Firecracker process {pid} runs {named}, and its manifest is gone from the image cache")
+        };
+        let image = match held.layer {
+            None => Boot::Full(
+                images::cached(&self.images, &digest)
+                    .map_err(|refusal| refusal.detail)?
+                    .ok_or_else(|| missing(&format!("image {digest}")))?,
+            ),
+            Some(layer) => Boot::Layered(Layered {
+                base: images::cached_base(&self.images, &digest)
+                    .map_err(|refusal| refusal.detail)?
+                    .ok_or_else(|| missing(&format!("base {digest}")))?,
+                layer: layers::cached(&LayerCache::new(&self.images, NonZeroU32::MIN), &layer)
+                    .map_err(|refusal| refusal.detail)?
+                    .ok_or_else(|| missing(&format!("harness layer {layer}")))?,
+            }),
+        };
+        let size = Size {
+            memory_mib: booted_memory(&self.data.join(format!("box{index}")).join("api.sock"))?,
+            disk_mib: self.booted_disk(&session_id)?,
+        };
+        Ok(Scanned {
+            pid,
+            session_id,
+            image,
+            size,
+        })
+    }
+
+    fn held(&self, pid: libc::pid_t) -> Result<Held, String> {
+        let fds = PathBuf::from(format!("/proc/{pid}/fd"));
+        let listed = std::fs::read_dir(&fds)
+            .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+            .map_err(|error| format!("listing {}: {error}", fds.display()))?;
+        let sessions = self.data.join("sessions");
+        let layers = self.images.join("layers");
+        let mut held = Held::default();
+        for entry in listed {
+            let path = std::fs::read_link(entry.path())
+                .map_err(|error| format!("reading {}: {error}", entry.path().display()))?;
+            let stem = path.file_stem().map(|stem| stem.to_string_lossy().into_owned());
+            let extension = path.extension().and_then(|extension| extension.to_str());
+            if let Ok(inside) = path.strip_prefix(&sessions) {
+                held.session = inside
+                    .components()
+                    .next()
+                    .map(|session| session.as_os_str().to_string_lossy().into_owned());
+            } else if path.parent() == Some(self.images.as_path()) && extension == Some("ext4") {
+                held.image = stem;
+            } else if path.parent() == Some(layers.as_path()) && extension == Some("squashfs") {
+                held.layer = stem;
+            }
+        }
+        Ok(held)
     }
 }
 
