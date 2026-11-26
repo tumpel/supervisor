@@ -169,7 +169,7 @@ fn snapshot(tree: &Tree, base: &Base, host: &Host) -> (Staged, Vec<String>) {
     let known = base.places();
     let cut = cut(tree, base, &host.cache).expect("cut");
     let new = fresh(draft_digests(&cut.draft), &known);
-    let staged = stage(cut, known, Places::new(), &new, &host.cache, &host.packs).expect("stage");
+    let staged = stage(cut, known, &new, &host.cache, &host.packs).expect("stage");
     (staged, new)
 }
 

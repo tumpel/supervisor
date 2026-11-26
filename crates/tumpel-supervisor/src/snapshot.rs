@@ -341,23 +341,10 @@ fn placed(places: &mut Places, packs: &[PackFile]) {
     }
 }
 
-pub fn stage(
-    cut: Cut,
-    known: Places,
-    held: Places,
-    new: &[String],
-    cache: &ChunkCache,
-    dir: &Path,
-) -> Result<Staged, String> {
+pub fn stage(cut: Cut, known: Places, new: &[String], cache: &ChunkCache, dir: &Path) -> Result<Staged, String> {
     let mut places = known;
-    places.extend(held);
-    let missing: Vec<String> = new
-        .iter()
-        .filter(|digest| !places.contains_key(*digest))
-        .cloned()
-        .collect();
     let mut packs = Vec::new();
-    pack(&missing, cache, dir, &mut packs)?;
+    pack(new, cache, dir, &mut packs)?;
     placed(&mut places, &packs);
     let manifest = seal(cut.draft, &places)?;
     let placements: usize = manifest.values().map(|stored| stored.chunks.len()).sum();
