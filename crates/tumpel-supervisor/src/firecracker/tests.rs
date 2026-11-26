@@ -425,18 +425,16 @@ const HARNESS: &str = r#"{ "harness": "Shell", "harnessVersion": "1", "protocol"
     "command": ["/bin/sh", "-s"], "workingDirectory": "/root",
     "environment": { "PATH": "/usr/bin:/bin", "HOME": "/root", "LANG": "C.UTF-8" }, "fixedVariables": [], "cloneSeconds": 120 }"#;
 
-#[test]
-fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
-    let mut scan = ScanDir::new("running");
-    let dir = scan.dir.clone();
-    let images = dir.join("images");
-    let data = dir.join("data");
-    let cgroups = dir.join("cgroups");
+/// Puts the image cache and the data directory behind symlinks, as a symlinked home does.
+fn link_caches(dir: &Path, images: &Path, data: &Path) {
     std::fs::create_dir_all(dir.join("cache").join("layers")).expect("the image cache");
-    std::os::unix::fs::symlink("cache", &images).expect("a symlinked image cache");
+    std::os::unix::fs::symlink("cache", images).expect("a symlinked image cache");
     std::fs::create_dir_all(dir.join("state")).expect("the data directory");
-    std::os::unix::fs::symlink("state", &data).expect("a symlinked data directory");
-    let (full, base, layer, other) = ("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+    std::os::unix::fs::symlink("state", data).expect("a symlinked data directory");
+}
+
+fn cache_images(images: &Path, full: &str, base: &str, layer: &str) {
+    let other = "d".repeat(64);
     std::fs::write(images.join(format!("{full}.ext4")), b"full").expect("the full image");
     std::fs::write(
         images.join(format!("{full}.json")),
@@ -463,6 +461,18 @@ fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
         format!(r#"{{ "layerDigest": "{layer}", "recipeDigest": "{other}", "architecture": "Amd64", "harness": {HARNESS} }}"#),
     )
     .expect("the layer manifest");
+}
+
+#[test]
+fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
+    let mut scan = ScanDir::new("running");
+    let dir = scan.dir.clone();
+    let images = dir.join("images");
+    let data = dir.join("data");
+    let cgroups = dir.join("cgroups");
+    let (full, base, layer) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+    link_caches(&dir, &images, &data);
+    cache_images(&images, &full, &base, &layer);
     let full_box = scan.holding(&[
         &images.join(format!("{full}.ext4")),
         &overlay(&data, "session-three", 64),
