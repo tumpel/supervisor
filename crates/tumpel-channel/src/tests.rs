@@ -540,8 +540,11 @@ fn a_refused_chunk_check_is_returned_to_its_snapshot_and_fails_nothing() {
             part: NonZeroU32::new(3).expect("check 3"),
         })
     );
-    assert!(disk.0.borrow().clone().expect("saved state").unacked.is_empty());
-    assert!(channel.take_failed().is_empty());
+    assert_eq!(
+        disk.0.borrow().clone().expect("saved state").unacked,
+        [] as [tumpel_api::types::ChannelStoredHostFrame; 0]
+    );
+    assert_eq!(channel.take_failed(), [] as [EntityId; 0]);
 }
 
 #[test]
