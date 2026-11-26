@@ -135,7 +135,15 @@ fn updater<'a>(layout: &Layout, source: FakeSource, idle: &'a FakeIdle, limits: 
     let (out, events) = unbounded_channel();
     let running = digest(&sha256_hex(OLD_BINARY.as_bytes()));
     Run {
-        updater: Updater::new(source, layout.clone(), limits, running, "0.3.0-rc.5", idle, out),
+        updater: Updater::new(
+            source,
+            layout.clone(),
+            limits,
+            running,
+            "0.3.0-rc.5".parse().expect("the version fits"),
+            idle,
+            out,
+        ),
         events,
     }
 }
@@ -394,6 +402,45 @@ async fn a_release_notice_replaces_the_binary_on_an_idle_host() {
     assert!(!seen(&mut run.events).contains(&Seen::Step(SupervisorUpdatePhase::WaitingForIdle)));
     assert_eq!(text(&layout.binary), good_script());
     assert!(!layout.candidate.exists());
+}
+
+#[tokio::test]
+async fn the_supervisor_started_after_a_swap_reports_online_once_with_its_own_version_and_digest() {
+    let layout = layout("online");
+    let idle = FakeIdle::default();
+    let mut old = updater(&layout, FakeSource::binary(&good_script()), &idle, limits());
+    assert_eq!(old.updater.announced(GRACE).await, Outcome::Restart);
+    assert_eq!(
+        seen(&mut old.events).last(),
+        Some(&Seen::Step(SupervisorUpdatePhase::Restarting))
+    );
+
+    let adopted = FakeIdle(watch::Sender::new(2));
+    let (out, mut events) = unbounded_channel();
+    let running = super::binary_sha256(&layout.binary).expect("the swapped binary hashes");
+    let new = Updater::new(
+        FakeSource::binary(&good_script()),
+        layout.clone(),
+        limits(),
+        running.clone(),
+        "0.4.0".parse().expect("the version fits"),
+        &adopted,
+        out,
+    );
+    assert!(new.first_online());
+    assert!(!new.first_online());
+    let steps: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+        .map(|event| match event {
+            Outgoing::Message(ChannelHostMessage::SupervisorUpdateStep(step)) => step,
+            _ => panic!("only update steps are sent"),
+        })
+        .collect();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].phase, SupervisorUpdatePhase::Online);
+    assert_eq!(steps[0].release_version.as_str(), "0.4.0");
+    assert_eq!(steps[0].from_sha256, digest(&sha256_hex(good_script().as_bytes())));
+    assert_eq!(steps[0].to_sha256, running);
+    assert_eq!(steps[0].boxes_running, 2);
 }
 
 #[tokio::test]

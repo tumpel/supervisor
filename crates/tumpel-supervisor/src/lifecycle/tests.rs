@@ -23,14 +23,14 @@ use tumpel_api::types::{
 use tumpel_channel::{Ask, Key, Outgoing};
 
 use super::{
-    restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SnapshotOrder, Stopped,
-    Taken, TeardownOrder, Vmm,
+    restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, ScannedBoxes, Settings, SnapshotOrder,
+    Stopped, Taken, TeardownOrder, Vmm,
 };
 use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
 use crate::images::ImageOrder;
 use crate::pool::{Disk, Held, Size, Tap, TapPool};
-use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Scan, Stored, Upper};
+use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Layout, Scan, Stored, Upper};
 use crate::store::{DownloadError, Store, UploadError, DOWNLOAD_ATTEMPTS};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -447,6 +447,10 @@ impl Vmm for MemoryVmm {
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
         note(&self.log, format!("keep boxes {claimed:?} and stop the rest"));
         Ok(())
+    }
+
+    fn scan(&self) -> Result<ScannedBoxes, String> {
+        Ok(Vec::new())
     }
 
     fn remove_leftovers(&self, _: &[u8], _: &[EntityId]) -> Result<(), String> {
@@ -1537,6 +1541,96 @@ async fn a_torn_down_box_restores_its_next_turn_from_the_latest_snapshot() {
         host.log(),
         [
             "restore session-1 root/turn-1,root/turn-2",
+            "boot session-1 on tumpel0",
+            "reconnect session-1",
+            "pause session-1"
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_format_2_chunk_list_without_an_idx_restores_its_tar_stream_through_restore_chunks() {
+    let mut host = host("format-2", 1, Harness::Echo, Boot::Works);
+    let sha256 = |bytes: &[u8]| crate::snapshot::hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+    let mut seed = 7u32;
+    let notes: Vec<u8> = (0..600 * 1024)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed.to_le_bytes()[2]
+        })
+        .collect();
+    let mut tar = tar::Builder::new(Vec::new());
+    for (path, content) in [("root/notes", notes.as_slice()), ("root/turn-1", b"one".as_slice())] {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_size(content.len() as u64);
+        header.set_mtime(1);
+        tar.append_data(&mut header, path, content).expect("a tar entry");
+    }
+    let stream = tar.into_inner().expect("the tar stream");
+    let chunks: Vec<Vec<u8>> = crate::snapshot::chunks(stream.as_slice())
+        .collect::<Result<_, _>>()
+        .expect("the chunks");
+    assert!(chunks.len() > 2, "{}", chunks.len());
+    let data_pack = chunks.concat();
+    let data_digest = sha256(&data_pack);
+
+    let mut list = b"TPCL".to_vec();
+    for word in [1u32, 1, u32::try_from(chunks.len()).expect("a count")] {
+        list.extend(word.to_le_bytes());
+    }
+    list.extend(ring::digest::digest(&ring::digest::SHA256, &data_pack).as_ref());
+    let mut offset = 0u32;
+    for chunk in &chunks {
+        let length = u32::try_from(chunk.len()).expect("a length");
+        list.extend(ring::digest::digest(&ring::digest::SHA256, chunk).as_ref());
+        for word in [0u32, offset, length] {
+            list.extend(word.to_le_bytes());
+        }
+        offset += length;
+    }
+    assert_eq!(list.len(), 16 + 32 + 44 * chunks.len());
+    let list_digest = sha256(&list);
+    let root = crate::snapshot::encode_root(&[crate::snapshot::Place {
+        digest: list_digest.clone(),
+        pack: list_digest.clone(),
+        offset: 0,
+        length: u32::try_from(list.len()).expect("a length"),
+    }])
+    .expect("the root");
+    let root_url = "https://store.example/session-1/format-2";
+    {
+        let mut objects = host.store.0.lock().expect("store");
+        objects.insert(root_url.to_string(), root);
+        objects.insert(pack_url(&data_digest), data_pack.clone());
+        objects.insert(pack_url(&list_digest), list.clone());
+        let mut index = host.store.2.lock().expect("index");
+        index.packs.insert(
+            data_digest.clone(),
+            std::num::NonZeroU64::new(data_pack.len() as u64).expect("a size"),
+        );
+        index.packs.insert(
+            list_digest.clone(),
+            std::num::NonZeroU64::new(list.len() as u64).expect("a size"),
+        );
+    }
+    let download: ChannelSnapshotDownload = serde_json::from_value(json!({
+        "snapshotId": "snapshot-1",
+        "snapshotSeq": 1,
+        "storageKey": "tenant/session-1/1",
+        "downloadUrl": root_url,
+        "downloadExpiresAt": in_seconds(60).to_rfc3339(),
+    }))
+    .expect("download");
+
+    host.turn("turn-2", "session-1", "two", vec![download]);
+    assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
+    assert_eq!(
+        host.log(),
+        [
+            "restore session-1 root/notes,root/turn-1",
             "boot session-1 on tumpel0",
             "reconnect session-1",
             "pause session-1"
@@ -2870,7 +2964,7 @@ fn a_snapshot_larger_than_the_box_disk_names_both_sizes_and_the_persona_setting(
     };
     let manifest = BTreeMap::from([(b"root/target".to_vec(), file)]);
     assert_eq!(
-        super::restore_size("snapshot 1", &manifest, 1024 * 1024),
+        super::restore_size("snapshot 1", &Layout::Files(manifest), 1024 * 1024),
         Err("snapshot 1 holds 2097152 bytes, more than the 1048576 bytes of the box's disk; raise the persona's boxDiskMib or start a new session".to_string())
     );
 }

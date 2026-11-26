@@ -256,7 +256,7 @@ async fn resolve_layered<S: Store>(
     }
     let deadline = Instant::now() + Duration::from_secs(u64::from(order.base.fetch_seconds.get()));
     let base = images::cached_base(caches.images, order.base.digest())?;
-    let cached_layer = layers::cached(caches.layers, &order.layer)?;
+    let cached_layer = layers::cached(caches.layers, order.layer.digest())?;
     match (&base, &cached_layer) {
         (None, _) => fetching(digest(order.base.digest())?),
         (Some(_), None) => fetching(layer.layer_digest.clone()),
