@@ -9,8 +9,8 @@ use tumpel_api::types::{
     ChannelControlEnvelope, ChannelControlFrame, ChannelControlMessage, ChannelFrameRateLimited, ChannelFrameRefused,
     ChannelHello, ChannelHelloType, ChannelHostHeartbeat, ChannelHostHeartbeatType, ChannelHostMessage,
     ChannelProtocol, ChannelSnapshotDone, ChannelSnapshotFailed, ChannelStoredHostFrame, ChannelStoredHostFrameType,
-    ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnLines, ChannelTurnLinesType, ChannelWelcome, EntityId,
-    HostReportedHealth, HostUsage, MetricBatch, Sequence, SupervisorChannelState, TurnFailureReason,
+    ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnLines, ChannelWelcome, EntityId, HostReportedHealth,
+    HostUsage, MetricBatch, Sequence, SupervisorChannelState, TurnFailureReason,
 };
 
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
