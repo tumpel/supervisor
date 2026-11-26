@@ -46,7 +46,7 @@ use crate::pool::{mib, restore_charge_mib, Charge, Disk, Held, Size, Tally, Tap,
 use crate::snapshot::{
     assemble, cut, decode_layout, decode_root, draft_digests, fetches, fresh, lacking, pack_parts, restore_parts,
     stage, unpack, write_restore, write_stream, Base, Births, ChunkCache, Cut, Fetch, Kind, Layout, Manifest, PackFile,
-    Place, Span,
+    Place, Places, Span,
 };
 use crate::store::{wait, DownloadError, Store, UploadError, ATTEMPTS_PER_URL, DOWNLOAD_ATTEMPTS};
 use crate::telemetry::{self, Phase};
