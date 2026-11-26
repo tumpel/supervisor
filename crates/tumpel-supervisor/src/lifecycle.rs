@@ -642,11 +642,17 @@ struct Slot<M: Machine> {
     idle: Option<AbortHandle>,
     idle_end: Option<Instant>,
     snapshot: Option<Awaited>,
+    previous: Option<Previous>,
 }
 
 enum Awaited {
     Pending(EntityId),
     Accepted,
+}
+
+enum Previous {
+    Staged(EntityId, Arc<Base>),
+    NotStored(Arc<Base>),
 }
 
 impl<M: Machine> Slot<M> {
@@ -676,6 +682,7 @@ impl<M: Machine> Default for Slot<M> {
             idle: None,
             idle_end: None,
             snapshot: None,
+            previous: None,
         }
     }
 }
@@ -2358,6 +2365,7 @@ pub enum Input {
     Abandon(oneshot::Sender<()>, Abandoned),
     SnapshotAccepted(EntityId),
     SnapshotFailed(EntityId),
+    SnapshotNotStored(EntityId),
     Welcomed(u16),
 }
 
@@ -2591,6 +2599,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
                     Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id).await?,
                     Some(Input::SnapshotFailed(snapshot_id)) => self.snapshot_failed(snapshot_id),
+                    Some(Input::SnapshotNotStored(snapshot_id)) => self.snapshot_not_stored(&snapshot_id),
                     Some(Input::Welcomed(protocol)) => self.welcomed(protocol).await?,
                     None => break,
                 },
@@ -3298,9 +3307,13 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             return;
         }
         let live = self.slots.get_mut(&session).and_then(|slot| {
-            let live = slot.live.take()?;
+            let mut live = slot.live.take()?;
             slot.busy = true;
             slot.snapshot = Some(Awaited::Pending(order.snapshot_id.clone()));
+            if let Some(Previous::NotStored(base)) = slot.previous.take() {
+                live.base = base;
+            }
+            slot.previous = Some(Previous::Staged(order.snapshot_id.clone(), Arc::clone(&live.base)));
             Some(live)
         });
         let Some(live) = live else {
@@ -3569,6 +3582,23 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         });
         if running == Some(true) {
             self.runner.cancels.cancel(snapshot_id);
+        }
+    }
+
+    fn snapshot_not_stored(&mut self, snapshot_id: &EntityId) {
+        let Some(slot) = self
+            .slots
+            .values_mut()
+            .find(|slot| matches!(&slot.previous, Some(Previous::Staged(staged, _)) if staged == snapshot_id))
+        else {
+            eprintln!(
+                "tumpel-supervisor: the control plane did not store snapshot {}, but no box here built on it; a later snapshot started or the box is gone, so no base goes back",
+                **snapshot_id
+            );
+            return;
+        };
+        if let Some(Previous::Staged(_, base)) = slot.previous.take() {
+            slot.previous = Some(Previous::NotStored(base));
         }
     }
 

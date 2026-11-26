@@ -1814,6 +1814,78 @@ async fn a_snapshot_asks_for_no_held_chunks_and_uploads_every_chunk_its_base_doe
     );
 }
 
+async fn packs_of_snapshot(
+    host: &mut Host,
+    turn_id: &str,
+    prompt: &str,
+) -> (EntityId, BTreeSet<String>, BTreeSet<String>) {
+    host.turn(turn_id, "session-1", prompt, Vec::new());
+    host.settle(SETTLE).await;
+    let order = host.snapshot("session-1");
+    let mut written = BTreeSet::new();
+    let mut reused = BTreeSet::new();
+    loop {
+        match tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
+            .await
+            .expect("the snapshot ends within its budget")
+            .expect("the lifecycle is running")
+        {
+            ChannelHostMessage::SnapshotPacks(packs) => {
+                written.extend(packs.packs.iter().map(|pack| pack.pack_digest.as_str().to_string()));
+                reused.extend(
+                    packs
+                        .reused_pack_digests
+                        .iter()
+                        .map(|digest| digest.as_str().to_string()),
+                );
+            }
+            ChannelHostMessage::SnapshotDone(_) => break,
+            _ => {}
+        }
+    }
+    (order.snapshot_id, written, reused)
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_a_snapshot_is_not_stored_the_next_snapshot_reuses_only_the_stored_snapshots_packs() {
+    let mut host = host("not-stored", 1, Harness::Echo, Boot::Works);
+    let (_, first, _) = packs_of_snapshot(&mut host, "turn-1", "one").await;
+    let (refused, second, _) = packs_of_snapshot(&mut host, "turn-2", "two").await;
+    host.commands.send(Input::SnapshotNotStored(refused)).expect("send");
+    let (_, _, reused) = packs_of_snapshot(&mut host, "turn-3", "three").await;
+
+    assert!(!reused.is_empty());
+    assert!(reused.is_subset(&first), "{reused:?} {first:?}");
+    assert!(reused.is_disjoint(&second), "{reused:?} {second:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stored_snapshot_drops_the_previous_base_so_a_late_not_stored_changes_nothing() {
+    let mut host = host("stored-drops-previous", 1, Harness::Echo, Boot::Works);
+    let (first_id, _, _) = packs_of_snapshot(&mut host, "turn-1", "one").await;
+    let (_, second, _) = packs_of_snapshot(&mut host, "turn-2", "two").await;
+    host.commands.send(Input::SnapshotNotStored(first_id)).expect("send");
+    let (_, _, reused) = packs_of_snapshot(&mut host, "turn-3", "three").await;
+
+    assert!(!reused.is_disjoint(&second), "{reused:?} {second:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_not_stored_after_a_handover_leaves_the_next_snapshot_reusing_none_of_its_packs() {
+    let mut old = host("not-stored-handover", 1, Harness::Echo, Boot::Works);
+    packs_of_snapshot(&mut old, "turn-1", "one").await;
+    let (refused, _, _) = packs_of_snapshot(&mut old, "turn-2", "two").await;
+    let mut new = old.hand_over().await;
+    new.commands.send(Input::SnapshotNotStored(refused)).expect("send");
+    let (_, written, reused) = packs_of_snapshot(&mut new, "turn-3", "three").await;
+
+    assert_eq!(reused, BTreeSet::new());
+    assert!(!written.is_empty());
+    assert!(
+        written.iter().all(|pack| new.store.holds(&pack_url(pack))),
+        "{written:?}"
+    );
+}
 #[tokio::test]
 async fn a_box_on_another_host_downloads_the_chunks_its_cache_lacks() {
     let mut first = host("first-host", 1, Harness::Echo, Boot::Works);

@@ -264,6 +264,7 @@ enum BoxCommand {
     Abandon(oneshot::Sender<()>, Abandoned),
     SnapshotAccepted(EntityId),
     SnapshotFailed(EntityId),
+    SnapshotNotStored(EntityId),
     Welcomed(u16),
 }
 
@@ -374,6 +375,13 @@ async fn boxes(
             }
             BoxCommand::SnapshotFailed(snapshot_id) => {
                 if lifecycle.send(Input::SnapshotFailed(snapshot_id)).is_err() {
+                    eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
+                    return;
+                }
+                continue;
+            }
+            BoxCommand::SnapshotNotStored(snapshot_id) => {
+                if lifecycle.send(Input::SnapshotNotStored(snapshot_id)).is_err() {
                     eprintln!("tumpel-supervisor: the box runner stopped; restart the supervisor");
                     return;
                 }
@@ -999,6 +1007,7 @@ fn box_command(message: ChannelControlMessage) -> Result<Option<BoxCommand>, Str
             );
             return Ok(None);
         }
+        ChannelControlMessage::SnapshotNotStored(not_stored) => BoxCommand::SnapshotNotStored(not_stored.snapshot_id),
         ChannelControlMessage::SnapshotChunkCheckHeld(held) => BoxCommand::Answer(Answer::ChunkCheckHeld(held)),
         ChannelControlMessage::SnapshotIndexUpload(ChannelSnapshotIndexUpload { snapshot_id, .. }) => {
             eprintln!(
