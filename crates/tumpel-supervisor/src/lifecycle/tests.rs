@@ -23,14 +23,14 @@ use tumpel_api::types::{
 use tumpel_channel::{Ask, Key, Outgoing};
 
 use super::{
-    restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SnapshotOrder, Stopped,
-    Taken, TeardownOrder, Vmm,
+    restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, ScannedBoxes, Settings, SnapshotOrder,
+    Stopped, Taken, TeardownOrder, Vmm,
 };
 use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
 use crate::images::ImageOrder;
 use crate::pool::{Disk, Held, Size, Tap, TapPool};
-use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Scan, Stored, Upper};
+use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Layout, Scan, Stored, Upper};
 use crate::store::{DownloadError, Store, UploadError, DOWNLOAD_ATTEMPTS};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -40,6 +40,7 @@ enum Harness {
     Silent,
     StallsAfterFirstLine,
     SlowClone,
+    SlowLine,
     HangsCloning,
     RefusesClone,
 }
@@ -93,6 +94,7 @@ struct MemoryGuest {
     lines: i64,
     pending: VecDeque<GuestMessage>,
     ready_at: Option<tokio::time::Instant>,
+    mid_frame: Option<tokio::time::Instant>,
 }
 
 fn message(value: serde_json::Value) -> GuestMessage {
@@ -128,7 +130,7 @@ impl MemoryGuest {
             json!({ "type": "TurnRepositoryReady", "turnId": *start.turn_id }),
         ));
         let texts: Vec<&str> = match self.harness {
-            Harness::Echo | Harness::Reader | Harness::SlowClone => start.prompt.lines().collect(),
+            Harness::Echo | Harness::Reader | Harness::SlowClone | Harness::SlowLine => start.prompt.lines().collect(),
             Harness::StallsAfterFirstLine => start.prompt.lines().take(1).collect(),
             Harness::HangsCloning | Harness::RefusesClone | Harness::Silent => Vec::new(),
         };
@@ -160,7 +162,10 @@ impl MemoryGuest {
                 .or_default()
                 .insert(file, (found, start.prompt.as_bytes().to_vec()));
         }
-        if matches!(self.harness, Harness::Echo | Harness::Reader | Harness::SlowClone) {
+        if matches!(
+            self.harness,
+            Harness::Echo | Harness::Reader | Harness::SlowClone | Harness::SlowLine
+        ) {
             self.pending.push_back(message(json!({
                 "type": "TurnEnd", "turnId": *start.turn_id, "reason": "Completed", "lastLineSeq": self.lines, "detail": ""
             })));
@@ -179,10 +184,22 @@ impl Guest for MemoryGuest {
         if let (true, Harness::SlowClone, Some(ready_at)) = (cloning, self.harness, self.ready_at) {
             tokio::time::sleep_until(ready_at).await;
         }
+        let later_line = matches!(self.pending.front(), Some(GuestMessage::TurnLine(line)) if line.line_seq.0 > 1);
+        if let (true, Harness::SlowLine) = (later_line, self.harness) {
+            let complete_at = *self
+                .mid_frame
+                .get_or_insert_with(|| tokio::time::Instant::now() + SLOW_LINE);
+            tokio::time::sleep_until(complete_at).await;
+            self.mid_frame = None;
+        }
         match self.pending.pop_front() {
             Some(message) => Ok(message),
             None => std::future::pending().await,
         }
+    }
+
+    fn between_frames(&self) -> bool {
+        self.mid_frame.is_none()
     }
 }
 
@@ -241,6 +258,7 @@ impl MemoryMachine {
             lines: 0,
             pending: VecDeque::new(),
             ready_at: None,
+            mid_frame: None,
         }
     }
 }
@@ -431,6 +449,10 @@ impl Vmm for MemoryVmm {
         Ok(())
     }
 
+    fn scan(&self) -> Result<ScannedBoxes, String> {
+        Ok(Vec::new())
+    }
+
     fn remove_leftovers(&self, _: &[u8], _: &[EntityId]) -> Result<(), String> {
         Ok(())
     }
@@ -582,6 +604,7 @@ const BOX: Size = Size {
 
 const SETTLE: Duration = Duration::from_millis(60);
 const SLOW_CLONE: Duration = Duration::from_millis(300);
+const SLOW_LINE: Duration = Duration::from_millis(300);
 const SLOW_BOOT: Duration = Duration::from_millis(50);
 const SLOW_CUT: Duration = Duration::from_millis(300);
 const LATE_CLAIM: Duration = Duration::from_millis(150);
@@ -1526,6 +1549,96 @@ async fn a_torn_down_box_restores_its_next_turn_from_the_latest_snapshot() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_format_2_chunk_list_without_an_idx_restores_its_tar_stream_through_restore_chunks() {
+    let mut host = host("format-2", 1, Harness::Echo, Boot::Works);
+    let sha256 = |bytes: &[u8]| crate::snapshot::hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+    let mut seed = 7u32;
+    let notes: Vec<u8> = (0..600 * 1024)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed.to_le_bytes()[2]
+        })
+        .collect();
+    let mut tar = tar::Builder::new(Vec::new());
+    for (path, content) in [("root/notes", notes.as_slice()), ("root/turn-1", b"one".as_slice())] {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_size(content.len() as u64);
+        header.set_mtime(1);
+        tar.append_data(&mut header, path, content).expect("a tar entry");
+    }
+    let stream = tar.into_inner().expect("the tar stream");
+    let chunks: Vec<Vec<u8>> = crate::snapshot::chunks(stream.as_slice())
+        .collect::<Result<_, _>>()
+        .expect("the chunks");
+    assert!(chunks.len() > 2, "{}", chunks.len());
+    let data_pack = chunks.concat();
+    let data_digest = sha256(&data_pack);
+
+    let mut list = b"TPCL".to_vec();
+    for word in [1u32, 1, u32::try_from(chunks.len()).expect("a count")] {
+        list.extend(word.to_le_bytes());
+    }
+    list.extend(ring::digest::digest(&ring::digest::SHA256, &data_pack).as_ref());
+    let mut offset = 0u32;
+    for chunk in &chunks {
+        let length = u32::try_from(chunk.len()).expect("a length");
+        list.extend(ring::digest::digest(&ring::digest::SHA256, chunk).as_ref());
+        for word in [0u32, offset, length] {
+            list.extend(word.to_le_bytes());
+        }
+        offset += length;
+    }
+    assert_eq!(list.len(), 16 + 32 + 44 * chunks.len());
+    let list_digest = sha256(&list);
+    let root = crate::snapshot::encode_root(&[crate::snapshot::Place {
+        digest: list_digest.clone(),
+        pack: list_digest.clone(),
+        offset: 0,
+        length: u32::try_from(list.len()).expect("a length"),
+    }])
+    .expect("the root");
+    let root_url = "https://store.example/session-1/format-2";
+    {
+        let mut objects = host.store.0.lock().expect("store");
+        objects.insert(root_url.to_string(), root);
+        objects.insert(pack_url(&data_digest), data_pack.clone());
+        objects.insert(pack_url(&list_digest), list.clone());
+        let mut index = host.store.2.lock().expect("index");
+        index.packs.insert(
+            data_digest.clone(),
+            std::num::NonZeroU64::new(data_pack.len() as u64).expect("a size"),
+        );
+        index.packs.insert(
+            list_digest.clone(),
+            std::num::NonZeroU64::new(list.len() as u64).expect("a size"),
+        );
+    }
+    let download: ChannelSnapshotDownload = serde_json::from_value(json!({
+        "snapshotId": "snapshot-1",
+        "snapshotSeq": 1,
+        "storageKey": "tenant/session-1/1",
+        "downloadUrl": root_url,
+        "downloadExpiresAt": in_seconds(60).to_rfc3339(),
+    }))
+    .expect("download");
+
+    host.turn("turn-2", "session-1", "two", vec![download]);
+    assert_eq!(host.settle(SETTLE).await, ["claim turn-2", "line 1 two", "complete 1"]);
+    assert_eq!(
+        host.log(),
+        [
+            "restore session-1 root/notes,root/turn-1",
+            "boot session-1 on tumpel0",
+            "reconnect session-1",
+            "pause session-1"
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_snapshot_asks_for_no_held_chunks_and_uploads_every_chunk_its_base_does_not_place() {
     let mut host = host("unasked", 1, Harness::Echo, Boot::Works);
     let mut snapshots = Vec::new();
@@ -1914,6 +2027,19 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
             "pause session-1"
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_turn_mid_frame_parks_only_after_the_frame_completes() {
+    let mut old = host("handover-mid-frame", 2, Harness::SlowLine, Boot::Works);
+    old.turn("turn-1", "session-1", "one\ntwo", Vec::new());
+    assert_eq!(old.settle_until("line 1 one").await, ["claim turn-1", "line 1 one"]);
+    tokio::time::sleep(SLOW_LINE / 2).await;
+    let handover = old.ask_handover();
+    assert_eq!(old.settle_until("line 2 two").await, ["line 2 two"]);
+    let handover = handover.await.expect("the boxes are handed over");
+    let mut new = old.successor(&handover);
+    assert_eq!(new.settle_until("complete 2").await, ["complete 2"]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2838,7 +2964,7 @@ fn a_snapshot_larger_than_the_box_disk_names_both_sizes_and_the_persona_setting(
     };
     let manifest = BTreeMap::from([(b"root/target".to_vec(), file)]);
     assert_eq!(
-        super::restore_size("snapshot 1", &manifest, 1024 * 1024),
+        super::restore_size("snapshot 1", &Layout::Files(manifest), 1024 * 1024),
         Err("snapshot 1 holds 2097152 bytes, more than the 1048576 bytes of the box's disk; raise the persona's boxDiskMib or start a new session".to_string())
     );
 }

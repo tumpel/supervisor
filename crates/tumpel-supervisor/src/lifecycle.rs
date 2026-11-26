@@ -24,14 +24,14 @@ use tumpel_api::types::{
     ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnImageFetching,
     ChannelTurnImageFetchingType, ChannelTurnLines, ChannelTurnLinesType, ChannelTurnRepositoryCloneFailed,
     ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady, ChannelTurnRepositoryReadyType, CredentialText,
-    DisplayName, EmailAddress, EntityId, GuestHello, GuestInput, GuestMessage, GuestPersonaFile, GuestProtocol,
-    GuestTurnCancel, GuestTurnCancelType, GuestTurnStart, GuestTurnStartPrebuildCommitSha, GuestTurnStartType,
-    ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl, Sequence, Sha256Digest, SupervisorHandover,
-    SupervisorHandoverBox, SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverDiscard,
-    SupervisorHandoverDiscardKind, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
-    SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, SupervisorHandoverTurn,
-    SupervisorHandoverTurnError, SupervisorHandoverTurnKind, SupervisorHandoverWarm, SupervisorHandoverWarmKind,
-    TurnFailureReason,
+    DisplayName, EmailAddress, EntityId, GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, GuestPersonaFile,
+    GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnLine, GuestTurnStart,
+    GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl,
+    Sequence, Sha256Digest, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
+    SupervisorHandoverCommand, SupervisorHandoverDiscard, SupervisorHandoverDiscardKind, SupervisorHandoverMachine,
+    SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown,
+    SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
+    SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
 };
 use tumpel_channel::{Ask, Key, Outgoing, PACK_REUSE};
 
@@ -43,8 +43,9 @@ use crate::images;
 use crate::layers::LayerCache;
 use crate::pool::{mib, restore_charge_mib, Charge, Disk, Held, Size, Tally, Tap, TapPool};
 use crate::snapshot::{
-    assemble, cut, decode, decode_root, draft_digests, fetches, fresh, lacking, pack_parts, restore_parts, stage,
-    unpack, write_restore, Base, Births, ChunkCache, Cut, Fetch, Kind, Manifest, PackFile, Place, Span,
+    assemble, cut, decode_layout, decode_root, draft_digests, fetches, fresh, lacking, pack_parts, restore_parts,
+    stage, unpack, write_restore, write_stream, Base, Births, ChunkCache, Cut, Fetch, Kind, Layout, Manifest, PackFile,
+    Place, Span,
 };
 use crate::store::{wait, DownloadError, Store, UploadError, ATTEMPTS_PER_URL, DOWNLOAD_ATTEMPTS};
 use crate::telemetry::{self, Phase};
@@ -73,20 +74,25 @@ fn positive_mib(value: Option<i32>) -> Result<Option<NonZeroU32>, i32> {
     value.map(|value| mib(value.into()).ok_or(value)).transpose()
 }
 
-fn restore_size(named: &str, manifest: &Manifest, overlay: u64) -> Result<(u64, u64), String> {
-    let bytes = manifest
-        .values()
-        .map(|stored| match stored.entry.kind {
-            Kind::File { size } => size,
-            _ => 0,
-        })
-        .fold(0, u64::saturating_add);
+fn restore_size(named: &str, layout: &Layout, overlay: u64) -> Result<(u64, u64), String> {
+    let (bytes, entries) = match layout {
+        Layout::Files(manifest) => (
+            manifest
+                .values()
+                .map(|stored| match stored.entry.kind {
+                    Kind::File { size } => size,
+                    _ => 0,
+                })
+                .fold(0, u64::saturating_add),
+            manifest.len() as u64,
+        ),
+        Layout::Stream(chunks) => (chunks.iter().map(|place| u64::from(place.length)).sum(), 0),
+    };
     if bytes > overlay {
         return Err(format!(
             "{named} holds {bytes} bytes, more than the {overlay} bytes of the box's disk; raise the persona's boxDiskMib or start a new session"
         ));
     }
-    let entries = manifest.len() as u64;
     let inodes = overlay / OVERLAY_BYTES_PER_INODE;
     if entries > inodes {
         return Err(format!(
@@ -123,6 +129,7 @@ pub struct Settings {
 pub trait Guest: Send + 'static {
     fn send(&mut self, input: &GuestInput) -> impl Future<Output = Result<(), String>> + Send;
     fn receive(&mut self) -> impl Future<Output = Result<GuestMessage, String>> + Send;
+    fn between_frames(&self) -> bool;
 }
 
 pub trait Machine: Send + 'static {
@@ -197,11 +204,22 @@ pub trait Vmm: Send + Sync + 'static {
     fn disk(&self, drives: &[String]) -> Result<Disk, String>;
     fn discard(&self, handed: &SupervisorHandoverMachine);
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String>;
+    /// Lists the running box scopes, each with its process, session, image and size, or the step that failed for it.
+    fn scan(&self) -> Result<ScannedBoxes, String>;
     fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
     fn staging(&self, session_id: &EntityId) -> Result<PathBuf, String>;
     fn image_cache(&self) -> PathBuf;
 }
+
+pub struct Scanned {
+    pub pid: libc::pid_t,
+    pub session_id: EntityId,
+    pub image: Boot,
+    pub size: Size,
+}
+
+pub type ScannedBoxes = Vec<(u8, Result<Scanned, String>)>;
 
 pub struct BoxTurn {
     pub turn_id: EntityId,
@@ -782,7 +800,7 @@ impl Drop for CancelOnDrop {
 }
 
 fn rebuild_archive(
-    manifest: Manifest,
+    layout: Layout,
     cache: &ChunkCache,
     output: &Path,
     cancelled: &AtomicBool,
@@ -794,7 +812,16 @@ fn rebuild_archive(
     if cancelled.load(Ordering::Relaxed) {
         return Err(crate::snapshot::CANCELLED.to_string());
     }
-    write_restore(&manifest, cache, BufWriter::new(&out), cancelled)?;
+    let manifest = match layout {
+        Layout::Files(manifest) => {
+            write_restore(&manifest, cache, BufWriter::new(&out), cancelled)?;
+            manifest
+        }
+        Layout::Stream(chunks) => {
+            write_stream(&chunks, cache, BufWriter::new(&out), cancelled)?;
+            Manifest::new()
+        }
+    };
     let archived = out
         .metadata()
         .map_err(|error| format!("reading the size of {}: {error}", output.display()))?
@@ -1595,16 +1622,21 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         self.fetch_within(turn, wanted, &cache, &dir, &named, expires).await?;
         let reading = Arc::clone(&cache);
         let manifest_places = root.clone();
-        let read = tokio::task::spawn_blocking(move || -> Result<(Manifest, Vec<Place>), String> {
-            let manifest = decode(&assemble(&manifest_places, &reading)?)?;
-            let wanted = lacking(manifest.values().flat_map(|stored| stored.chunks.iter()), &reading)?;
-            Ok((manifest, wanted))
+        let read = tokio::task::spawn_blocking(move || -> Result<(Layout, Vec<Place>), String> {
+            let layout = decode_layout(&assemble(&manifest_places, &reading)?)?;
+            let wanted = match &layout {
+                Layout::Files(manifest) => {
+                    lacking(manifest.values().flat_map(|stored| stored.chunks.iter()), &reading)?
+                }
+                Layout::Stream(chunks) => lacking(chunks, &reading)?,
+            };
+            Ok((layout, wanted))
         })
         .await
         .map_err(|error| unreadable(format!("reading the manifest of {named} stopped: {error}")))?;
-        let (manifest, wanted) = read.map_err(damaged)?;
+        let (layout, wanted) = read.map_err(damaged)?;
         let overlay = u64::from(tap.disk_mib().get()) * 1024 * 1024;
-        let (bytes, entries) = restore_size(&named, &manifest, overlay).map_err(unreadable)?;
+        let (bytes, entries) = restore_size(&named, &layout, overlay).map_err(unreadable)?;
         let charge = self.charge_restore(&named, bytes, tap)?;
         self.fetch_within(turn, wanted, &cache, &dir, &named, expires).await?;
         let target = dir.join("restore.tar");
@@ -1619,7 +1651,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             tokio::fs::File::create(&target)
                 .await
                 .map_err(|error| format!("creating {}: {error}", target.display()))?;
-            tokio::task::spawn_blocking(move || rebuild_archive(manifest, &cache, &output, &cancelled))
+            tokio::task::spawn_blocking(move || rebuild_archive(layout, &cache, &output, &cancelled))
                 .await
                 .map_err(|error| format!("reassembling the files of {named} stopped: {error}"))?
         })
@@ -1909,6 +1941,27 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
+    fn line(&self, state: &mut Follow, protocol: &GuestHarnessProtocol, output: GuestTurnLine) -> Result<(), Failure> {
+        state.seen_line = true;
+        state.error = state.error.take().or_else(|| error_result(protocol, &output.text));
+        let Some(first_line_seq) = u64::try_from(output.line_seq.0).ok().and_then(NonZeroU64::new) else {
+            return Err(Failure::turn(
+                TurnFailureReason::HarnessExited,
+                format!("the guest sent line {}; line numbers start at 1", output.line_seq.0),
+            ));
+        };
+        emit(
+            &self.out,
+            ChannelTurnLines {
+                first_line_seq,
+                lines: vec![output.text],
+                turn_id: output.turn_id,
+                type_: ChannelTurnLinesType::TurnLines,
+            },
+        );
+        Ok(())
+    }
+
     async fn follow(
         &self,
         live: &mut LiveBox<V::Machine>,
@@ -1926,7 +1979,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             let received = tokio::select! {
                 biased;
                 () = self.cancels.cancelled(turn_id), if !cancelling => None,
-                Ok(_) = parking.wait_for(|parking| *parking) => return Followed::Parked(state.park()),
+                Ok(_) = parking.wait_for(|parking| *parking), if live.guest.between_frames() => {
+                    if live.guest.between_frames() {
+                        return Followed::Parked(state.park());
+                    }
+                    continue;
+                }
                 _ = disk_check.tick() => match self.disk_failure() {
                     Some(failure) => return Followed::Ended(Err(failure)),
                     None => continue,
@@ -1969,26 +2027,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     );
                 }
                 Ok(GuestMessage::TurnLine(output)) if output.turn_id == *turn_id => {
-                    state.seen_line = true;
                     if let Some(phase) = first_output.take() {
                         telemetry::reached(&phase);
                     }
-                    state.error = state.error.or_else(|| error_result(&protocol, &output.text));
-                    let Some(first_line_seq) = u64::try_from(output.line_seq.0).ok().and_then(NonZeroU64::new) else {
-                        return Followed::Ended(Err(Failure::turn(
-                            TurnFailureReason::HarnessExited,
-                            format!("the guest sent line {}; line numbers start at 1", output.line_seq.0),
-                        )));
-                    };
-                    emit(
-                        &self.out,
-                        ChannelTurnLines {
-                            first_line_seq,
-                            lines: vec![output.text],
-                            turn_id: output.turn_id,
-                            type_: ChannelTurnLinesType::TurnLines,
-                        },
-                    );
+                    if let Err(failure) = self.line(&mut state, &protocol, output) {
+                        return Followed::Ended(Err(failure));
+                    }
                 }
                 Ok(GuestMessage::TurnEnd(end)) if end.turn_id == *turn_id => {
                     live.credential_file = end.credential_file.as_deref().cloned();
