@@ -30,7 +30,7 @@ use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
 use crate::images::ImageOrder;
 use crate::pool::{Disk, Held, Size, Tap, TapPool};
-use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Scan, Stored, Upper};
+use crate::snapshot::{decode, decode_root, Born, Entry, Found, Kind, Layout, Scan, Stored, Upper};
 use crate::store::{DownloadError, Store, UploadError, DOWNLOAD_ATTEMPTS};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2926,7 +2926,7 @@ fn a_snapshot_larger_than_the_box_disk_names_both_sizes_and_the_persona_setting(
     };
     let manifest = BTreeMap::from([(b"root/target".to_vec(), file)]);
     assert_eq!(
-        super::restore_size("snapshot 1", &manifest, 1024 * 1024),
+        super::restore_size("snapshot 1", &Layout::Files(manifest), 1024 * 1024),
         Err("snapshot 1 holds 2097152 bytes, more than the 1048576 bytes of the box's disk; raise the persona's boxDiskMib or start a new session".to_string())
     );
 }
