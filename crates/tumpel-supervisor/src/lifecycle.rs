@@ -1279,9 +1279,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     async fn held(&self, snapshot_id: &EntityId, digests: &[String], deadline: Instant) -> Result<Places, String> {
-        let checks = futures_util::stream::iter(digests.chunks(DIGESTS_PER_CHECK).enumerate())
+        let checks: Vec<_> = digests
+            .chunks(DIGESTS_PER_CHECK)
+            .enumerate()
             .map(|(index, digests)| self.check(snapshot_id, index, digests, deadline))
-            .buffered(CHECKS_IN_FLIGHT);
+            .collect();
+        let checks = futures_util::stream::iter(checks).buffered(CHECKS_IN_FLIGHT);
         tokio::pin!(checks);
         let mut held = Places::new();
         while let Some(Some(placements)) = checks.try_next().await? {
