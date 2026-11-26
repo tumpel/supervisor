@@ -24,14 +24,14 @@ use tumpel_api::types::{
     ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnImageFetching,
     ChannelTurnImageFetchingType, ChannelTurnLines, ChannelTurnLinesType, ChannelTurnRepositoryCloneFailed,
     ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady, ChannelTurnRepositoryReadyType, CredentialText,
-    DisplayName, EmailAddress, EntityId, GuestHello, GuestInput, GuestMessage, GuestPersonaFile, GuestProtocol,
-    GuestTurnCancel, GuestTurnCancelType, GuestTurnStart, GuestTurnStartPrebuildCommitSha, GuestTurnStartType,
-    ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl, Sequence, Sha256Digest, SupervisorHandover,
-    SupervisorHandoverBox, SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverDiscard,
-    SupervisorHandoverDiscardKind, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
-    SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, SupervisorHandoverTurn,
-    SupervisorHandoverTurnError, SupervisorHandoverTurnKind, SupervisorHandoverWarm, SupervisorHandoverWarmKind,
-    TurnFailureReason,
+    DisplayName, EmailAddress, EntityId, GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, GuestPersonaFile,
+    GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnLine, GuestTurnStart,
+    GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl,
+    Sequence, Sha256Digest, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
+    SupervisorHandoverCommand, SupervisorHandoverDiscard, SupervisorHandoverDiscardKind, SupervisorHandoverMachine,
+    SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown,
+    SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
+    SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
 };
 use tumpel_channel::{Ask, Key, Outgoing, PACK_REUSE};
 
@@ -1910,6 +1910,27 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         }
     }
 
+    fn line(&self, state: &mut Follow, protocol: &GuestHarnessProtocol, output: GuestTurnLine) -> Result<(), Failure> {
+        state.seen_line = true;
+        state.error = state.error.take().or_else(|| error_result(protocol, &output.text));
+        let Some(first_line_seq) = u64::try_from(output.line_seq.0).ok().and_then(NonZeroU64::new) else {
+            return Err(Failure::turn(
+                TurnFailureReason::HarnessExited,
+                format!("the guest sent line {}; line numbers start at 1", output.line_seq.0),
+            ));
+        };
+        emit(
+            &self.out,
+            ChannelTurnLines {
+                first_line_seq,
+                lines: vec![output.text],
+                turn_id: output.turn_id,
+                type_: ChannelTurnLinesType::TurnLines,
+            },
+        );
+        Ok(())
+    }
+
     async fn follow(
         &self,
         live: &mut LiveBox<V::Machine>,
@@ -1975,26 +1996,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                     );
                 }
                 Ok(GuestMessage::TurnLine(output)) if output.turn_id == *turn_id => {
-                    state.seen_line = true;
                     if let Some(phase) = first_output.take() {
                         telemetry::reached(&phase);
                     }
-                    state.error = state.error.or_else(|| error_result(&protocol, &output.text));
-                    let Some(first_line_seq) = u64::try_from(output.line_seq.0).ok().and_then(NonZeroU64::new) else {
-                        return Followed::Ended(Err(Failure::turn(
-                            TurnFailureReason::HarnessExited,
-                            format!("the guest sent line {}; line numbers start at 1", output.line_seq.0),
-                        )));
-                    };
-                    emit(
-                        &self.out,
-                        ChannelTurnLines {
-                            first_line_seq,
-                            lines: vec![output.text],
-                            turn_id: output.turn_id,
-                            type_: ChannelTurnLinesType::TurnLines,
-                        },
-                    );
+                    if let Err(failure) = self.line(&mut state, &protocol, output) {
+                        return Followed::Ended(Err(failure));
+                    }
                 }
                 Ok(GuestMessage::TurnEnd(end)) if end.turn_id == *turn_id => {
                     live.credential_file = end.credential_file.as_deref().cloned();
