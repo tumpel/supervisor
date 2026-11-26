@@ -1256,12 +1256,8 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     fn send(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Option<Instant>) -> Asking {
-        self.send_outgoing(key, message.into(), deadline)
-    }
-
-    fn send_outgoing(&self, key: Key, outgoing: ChannelHostMessage, deadline: Option<Instant>) -> Asking {
         let Waiting { key, answer } = self.answers.expect(key);
-        send_out(&self.out, outgoing);
+        send_out(&self.out, message.into());
         Asking {
             answers: self.answers.clone(),
             key,
@@ -1271,11 +1267,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
     }
 
     async fn ask(&self, key: Key, message: impl Into<ChannelHostMessage>, deadline: Instant) -> Result<Answer, String> {
-        self.ask_outgoing(key, message.into(), deadline).await
-    }
-
-    async fn ask_outgoing(&self, key: Key, outgoing: ChannelHostMessage, deadline: Instant) -> Result<Answer, String> {
-        let mut asking = self.send_outgoing(key, outgoing, Some(deadline));
+        let mut asking = self.send(key, message, Some(deadline));
         asking.answer().await.ok_or_else(|| {
             format!(
                 "the control plane did not answer {} before its URLs would expire; check the channel to the control plane",
@@ -1326,8 +1318,7 @@ impl<V: Vmm, S: Store> Runner<V, S> {
                 snapshot_id: snapshot_id.clone(),
                 type_: ChannelSnapshotPacksType::SnapshotPacks,
             };
-            let outgoing: ChannelHostMessage = message.into();
-            let Answer::PackUploads(answer) = self.ask_outgoing(key.clone(), outgoing, deadline).await? else {
+            let Answer::PackUploads(answer) = self.ask(key.clone(), message, deadline).await? else {
                 return Err(unexpected(&key));
             };
             urls.extend(

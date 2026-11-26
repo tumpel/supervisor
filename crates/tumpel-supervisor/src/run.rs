@@ -1166,6 +1166,7 @@ async fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tumpel_api::types::ChannelProtocol;
 
     #[test]
     fn a_setup_box_boots_the_harness_its_offer_names_and_claude_code_without_one() {
@@ -1242,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_protocol_steps_down_one_version_at_a_time_and_a_dropped_connection_goes_back_to_39() {
+    fn a_refused_protocol_steps_down_one_version_at_a_time_and_a_dropped_connection_goes_back_to_the_newest() {
         let mut channel = HostChannel::new(
             tumpel_channel::empty_state(),
             Unsaved,
@@ -1252,7 +1253,7 @@ mod tests {
         );
         let mut backoff = Backoff::default();
         let url = "wss://control.example.test/v1/channel";
-        assert_eq!(hello_version(&mut channel), serde_json::json!(39));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(ChannelProtocol::VERSION));
 
         let refusal = CloseFrame {
             code: CloseCode::from(4426),
@@ -1265,16 +1266,19 @@ mod tests {
             panic!("a refusal of the newest protocol reconnects");
         };
         assert_eq!(wait, Duration::ZERO);
-        assert_eq!(hello_version(&mut channel), serde_json::json!(38));
+        assert_eq!(
+            hello_version(&mut channel),
+            serde_json::json!(ChannelProtocol::VERSION - 1)
+        );
 
         let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
             panic!("a refusal ends the session");
         };
         let Next::Reconnect(wait) = next(&mut channel, &mut backoff, url, ended, 0) else {
-            panic!("a refusal of 38 reconnects at the oldest");
+            panic!("a refusal of the version below the newest reconnects at the oldest");
         };
         assert_eq!(wait, Duration::ZERO);
-        assert_eq!(hello_version(&mut channel), serde_json::json!(37));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(ChannelProtocol::OLDEST));
 
         let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
             panic!("a refusal ends the session");
@@ -1294,6 +1298,6 @@ mod tests {
             panic!("a dropped connection reconnects");
         };
         assert_eq!(wait, Duration::from_secs(1));
-        assert_eq!(hello_version(&mut channel), serde_json::json!(39));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(ChannelProtocol::VERSION));
     }
 }
