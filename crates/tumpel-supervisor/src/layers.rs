@@ -22,7 +22,7 @@ pub struct LayerOrder {
 }
 
 impl LayerOrder {
-    fn digest(&self) -> &str {
+    pub(crate) fn digest(&self) -> &str {
         &self.layer.layer_digest
     }
 
@@ -123,8 +123,7 @@ fn broken(detail: String) -> Refusal {
     }
 }
 
-pub fn cached(cache: &LayerCache, order: &LayerOrder) -> Result<Option<Layer>, Refusal> {
-    let digest = order.digest();
+pub fn cached(cache: &LayerCache, digest: &str) -> Result<Option<Layer>, Refusal> {
     let manifest_path = cache.manifest(digest);
     let text = match std::fs::read_to_string(&manifest_path) {
         Ok(text) => text,
@@ -326,13 +325,13 @@ pub async fn resolve(
     lock: &Arc<Mutex<()>>,
     deadline: Instant,
 ) -> Result<Layer, Refusal> {
-    if let Some(layer) = cached(cache, order)? {
+    if let Some(layer) = cached(cache, order.digest())? {
         return Ok(layer);
     }
     let Ok(fetching) = timeout_at(deadline, Arc::clone(lock).lock_owned()).await else {
         return Err(order.timed_out());
     };
-    if let Some(layer) = cached(cache, order)? {
+    if let Some(layer) = cached(cache, order.digest())? {
         return Ok(layer);
     }
     fetch(store, cache, order, holds, deadline, fetching).await
