@@ -7,8 +7,8 @@ use tumpel_api::types::{GuestHarness, GuestTurnStart};
 use tumpel_api::types::{GuestHarnessProtocol, GuestTurnEndReason};
 
 use super::{
-    answers_no_prompt, ends_turn, environment, home_path, launch, priced_by_anthropic, reuses, skips, turn_arguments,
-    turn_environment, without_list_price, HostWatch, Output,
+    answers_no_prompt, ends_turn, environment, exit_reason, home_path, launch, priced_by_anthropic, reuses, skips,
+    turn_arguments, turn_environment, without_list_price, HostWatch, Output,
 };
 
 fn start(model: &str, variables: &Value, files: &Value) -> GuestTurnStart {
@@ -344,6 +344,33 @@ fn a_later_codex_turn_resumes_the_recorded_thread() {
 fn a_codex_turn_whose_credential_names_no_provider_does_not_start() {
     let error = turn_arguments(&CODEX, &codex_turn(&json!([])), false, None).expect_err("no Codex provider");
     assert!(error.contains("names no Codex model provider"), "{error}");
+}
+
+const GEMINI: GuestHarnessProtocol = GuestHarnessProtocol::GeminiStreamJson;
+
+#[test]
+fn a_gemini_turn_names_its_model_and_resumes_the_latest_session_after_the_first() {
+    let turn = start("flash", &json!([]), &json!([]));
+    assert_eq!(
+        turn_arguments(&GEMINI, &turn, false, None).expect("a Gemini turn"),
+        ["--model", "flash"].map(String::from)
+    );
+    assert_eq!(
+        turn_arguments(&GEMINI, &turn, true, None).expect("a Gemini turn"),
+        ["--model", "flash", "--resume", "latest"].map(String::from)
+    );
+}
+
+#[test]
+fn a_gemini_exit_41_ends_the_turn_credential_refused_and_other_failures_harness_exited() {
+    let exit = |code: &str| {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("exit {code}")])
+            .status()
+    };
+    assert_eq!(exit_reason(&GEMINI, &exit("41")), GuestTurnEndReason::CredentialRefused);
+    assert_eq!(exit_reason(&GEMINI, &exit("1")), GuestTurnEndReason::HarnessExited);
+    assert_eq!(exit_reason(&CODEX, &exit("41")), GuestTurnEndReason::HarnessExited);
 }
 
 #[test]

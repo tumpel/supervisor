@@ -69,6 +69,17 @@ fn codex_reports_tokens_without_cost_and_splits_cached_input_out_of_input() {
 }
 
 #[test]
+fn gemini_reports_the_result_tokens_without_cost_and_splits_cached_input_out_of_input() {
+    let usage = read(
+        &GuestHarnessProtocol::GeminiStreamJson,
+        include_str!("fixtures/gemini.jsonl"),
+    )
+    .expect("the result carries stats");
+    assert_eq!(usage.tokens, tokens(6_164, 912, 12_288, 0));
+    assert_eq!(usage.cost, Cost::NotReported);
+}
+
+#[test]
 fn a_codex_turn_is_the_difference_of_the_thread_totals_and_a_shrunk_total_starts_a_new_thread() {
     let first = tokens(100, 10, 50, 0);
     let second = tokens(180, 25, 120, 0);

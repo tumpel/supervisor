@@ -18,6 +18,13 @@ pub fn turn_end(
         (GuestTurnEndReason::HarnessOutOfMemory, _) => Err((TurnFailureReason::HarnessOutOfMemory, end.detail.into())),
         (GuestTurnEndReason::BoxDiskFull, _) => Err((TurnFailureReason::BoxDiskFull, end.detail.into())),
         (GuestTurnEndReason::Cancelled, _) => Err((TurnFailureReason::Cancelled, end.detail.into())),
+        (GuestTurnEndReason::CredentialRefused, _) => Err((
+            TurnFailureReason::CredentialRefused,
+            format!(
+                "the harness needs its sign-in again: {}; renew the persona's credential",
+                end.detail
+            ),
+        )),
         (GuestTurnEndReason::Completed, Some((reason, detail))) => Err((
             reason,
             end.warning
@@ -86,6 +93,7 @@ pub fn error_result(protocol: &GuestHarnessProtocol, line: &str) -> Option<(Turn
         GuestHarnessProtocol::PiRpc => pi_error(&value),
         GuestHarnessProtocol::PromptOnStdin => opencode_error(&value),
         GuestHarnessProtocol::CodexExecJson => codex_error(&value),
+        GuestHarnessProtocol::GeminiStreamJson => gemini_error(&value),
         GuestHarnessProtocol::ShellLines => None,
         GuestHarnessProtocol::Unrecognised(_) => {
             tumpel_channel::update_required();
@@ -120,6 +128,19 @@ fn codex_error(value: &Value) -> Option<(TurnFailureReason, String)> {
         .unwrap_or("an error event without a message");
     let refused = CODEX_REFUSAL_STATUSES.iter().any(|status| text.contains(status));
     Some(classify(text, refused))
+}
+
+fn gemini_error(value: &Value) -> Option<(TurnFailureReason, String)> {
+    if value.get("type").and_then(Value::as_str) != Some("result")
+        || value.get("status").and_then(Value::as_str) != Some("error")
+    {
+        return None;
+    }
+    let text = value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("an error result without a message");
+    Some(classify(text, false))
 }
 
 fn opencode_error(value: &Value) -> Option<(TurnFailureReason, String)> {
@@ -413,6 +434,57 @@ mod tests {
         ];
         assert_eq!(lines.iter().find_map(|line| error_result(&CODEX, line)), None);
     }
+
+    const GEMINI: GuestHarnessProtocol = GuestHarnessProtocol::GeminiStreamJson;
+
+    const GEMINI_QUOTA: &str = r#"{"type":"result","timestamp":"2026-11-26T10:14:51.882Z","status":"error","error":{"type":"TerminalQuotaError","message":"[API Error: You have exhausted your capacity on this model. Your quota will reset after 6h41m12s.]"},"stats":{"total_tokens":0,"input_tokens":0,"output_tokens":0,"cached":0,"input":0,"duration_ms":0,"tool_calls":0,"models":{}}}"#;
+
+    fn gemini_end(reason: &str, detail: &str) -> GuestTurnEnd {
+        serde_json::from_value(serde_json::json!({
+            "type": "TurnEnd",
+            "turnId": "turn-1",
+            "reason": reason,
+            "detail": detail,
+            "lastLineSeq": 3,
+        }))
+        .expect("the test end matches GuestTurnEnd")
+    }
+
+    #[test]
+    fn a_gemini_429_fails_the_turn_with_what_gemini_reported() {
+        let error = error_result(&GEMINI, GEMINI_QUOTA);
+        let (reason, detail) = turn_end(
+            gemini_end("HarnessExited", "the harness exited (exit status: 1) mid-turn; "),
+            error,
+        )
+        .map(|(seq, _)| seq.0)
+        .expect_err("a failed turn");
+        assert_eq!(reason, TurnFailureReason::HarnessReportedError);
+        assert!(
+            detail.contains("You have exhausted your capacity on this model"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_gemini_exit_41_fails_the_turn_credential_refused_even_after_an_error_result() {
+        let detail = "the harness exited (exit status: 41) mid-turn; Manual authorization is required but the current session is non-interactive.";
+        let signed_out = r#"{"type":"result","timestamp":"2026-11-26T10:20:03.117Z","status":"error","error":{"type":"FatalAuthenticationError","message":"Manual authorization is required but the current session is non-interactive."},"stats":{"total_tokens":0,"input_tokens":0,"output_tokens":0,"cached":0,"input":0,"duration_ms":0,"tool_calls":0,"models":{}}}"#;
+        for error in [None, error_result(&GEMINI, signed_out)] {
+            let (reason, message) = turn_end(gemini_end("CredentialRefused", detail), error)
+                .map(|(seq, _)| seq.0)
+                .expect_err("a refused turn");
+            assert_eq!(reason, TurnFailureReason::CredentialRefused);
+            assert!(message.ends_with("renew the persona's credential"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_gemini_success_result_is_no_error() {
+        let line = r#"{"type":"result","timestamp":"2026-11-26T10:12:08.402Z","status":"success","stats":{"total_tokens":19364,"input_tokens":18452,"output_tokens":912,"cached":12288,"input":6164,"duration_ms":4891,"tool_calls":1,"models":{}}}"#;
+        assert_eq!(error_result(&GEMINI, line), None);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_future_end_reason_logs_an_update_and_the_next_known_end_still_completes() {
         use tracing_subscriber::layer::SubscriberExt;

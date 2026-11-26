@@ -167,6 +167,18 @@ struct CodexTurnCompleted {
     usage: CodexUsage,
 }
 
+#[derive(Deserialize)]
+struct GeminiStats {
+    input: u64,
+    output_tokens: u64,
+    cached: u64,
+}
+
+#[derive(Deserialize)]
+struct GeminiResult {
+    stats: GeminiStats,
+}
+
 fn claude(value: Value) -> Option<Usage> {
     let result: ClaudeResult = serde_json::from_value(value).ok()?;
     let models: Vec<ClaudeModelUsage> = result.model_usage_since_last_result.into_values().collect();
@@ -233,6 +245,19 @@ fn codex(value: Value) -> Option<Usage> {
     })
 }
 
+fn gemini(value: Value) -> Option<Usage> {
+    let stats = serde_json::from_value::<GeminiResult>(value).ok()?.stats;
+    Some(Usage {
+        tokens: Tokens {
+            input: stats.input,
+            output: stats.output_tokens,
+            cache_read: stats.cached,
+            cache_write: 0,
+        },
+        cost: Cost::NotReported,
+    })
+}
+
 fn reading(protocol: &GuestHarnessProtocol, line: &str) -> Option<Usage> {
     let value: Value = serde_json::from_str(line).ok()?;
     let kind = value.get("type").and_then(Value::as_str)?;
@@ -241,6 +266,7 @@ fn reading(protocol: &GuestHarnessProtocol, line: &str) -> Option<Usage> {
         (GuestHarnessProtocol::PiRpc, "message_end") => pi(value),
         (GuestHarnessProtocol::PromptOnStdin, "step_finish") => open_code(value),
         (GuestHarnessProtocol::CodexExecJson, "turn.completed") => codex(value),
+        (GuestHarnessProtocol::GeminiStreamJson, "result") => gemini(value),
         _ => None,
     }
 }
