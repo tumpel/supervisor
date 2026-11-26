@@ -297,6 +297,14 @@ pub struct Key {
 }
 
 impl Key {
+    fn check(message: &Value) -> Option<Self> {
+        Some(Self {
+            ask: Ask::SnapshotChunkCheck,
+            id: message["snapshotId"].as_str()?.try_into().ok()?,
+            part: serde_json::from_value(message["check"].clone()).ok()?,
+        })
+    }
+
     fn restore(message: &Value) -> Option<Self> {
         Some(Self {
             ask: Ask::RestoreChunks,
@@ -771,9 +779,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                 (None, snapshot_id(&message))
             }
             Some("RestoreChunks") => (Key::restore(&message), None),
+            Some("SnapshotChunkCheck") => (Key::check(&message), None),
             _ => (None, None),
         };
-        if let Some(key) = &key {
+        if let Some(key) = key.as_ref().filter(|key| key.ask != Ask::SnapshotChunkCheck) {
             let failed = ChannelTurnFailed {
                 credential_file: None,
                 detail: refused

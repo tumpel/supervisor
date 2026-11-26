@@ -10,7 +10,8 @@ use tar::Archive;
 use super::cache::sha256;
 use super::{
     assemble, cut, decode, decode_root, draft_digests, encode, fetches, fresh, lacking, pack_parts, stage, unpack,
-    write_restore, Base, Born, ChunkCache, Entry, Ext4Upper, Found, Kind, Manifest, Scan, Span, Staged, Stored, Upper,
+    write_restore, Base, Born, ChunkCache, Entry, Ext4Upper, Found, Kind, Manifest, Places, Scan, Span, Staged, Stored,
+    Upper,
 };
 
 pub(super) fn sbin(tool: &str) -> PathBuf {
@@ -168,7 +169,7 @@ fn snapshot(tree: &Tree, base: &Base, host: &Host) -> (Staged, Vec<String>) {
     let known = base.places();
     let cut = cut(tree, base, &host.cache).expect("cut");
     let new = fresh(draft_digests(&cut.draft), &known);
-    let staged = stage(cut, known, &new, &host.cache, &host.packs).expect("stage");
+    let staged = stage(cut, known, Places::new(), &new, &host.cache, &host.packs).expect("stage");
     (staged, new)
 }
 

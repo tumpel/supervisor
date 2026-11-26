@@ -17,9 +17,9 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotChunkCheckHeld, ChannelSnapshotIndexUpload,
-    ChannelSnapshotRequest, ChannelSupervisorUpdateStepReleaseVersion, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
-    HostReportedHealth, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotIndexUpload, ChannelSnapshotRequest,
+    ChannelSupervisorUpdateStepReleaseVersion, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
+    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
     SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, TurnFailureReason,
 };
 use tumpel_channel::{
@@ -999,8 +999,8 @@ fn box_command(message: ChannelControlMessage) -> Result<Option<BoxCommand>, Str
             );
             return Ok(None);
         }
-        ChannelControlMessage::SnapshotChunkCheckHeld(ChannelSnapshotChunkCheckHeld { snapshot_id, .. })
-        | ChannelControlMessage::SnapshotIndexUpload(ChannelSnapshotIndexUpload { snapshot_id, .. }) => {
+        ChannelControlMessage::SnapshotChunkCheckHeld(held) => BoxCommand::Answer(Answer::ChunkCheckHeld(held)),
+        ChannelControlMessage::SnapshotIndexUpload(ChannelSnapshotIndexUpload { snapshot_id, .. }) => {
             eprintln!(
                 "tumpel-supervisor: an answer for snapshot {} that this host never asks for arrived; dropped it",
                 *snapshot_id

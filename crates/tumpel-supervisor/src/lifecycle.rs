@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset};
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch, Mutex};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -16,28 +16,29 @@ use tokio::time::{timeout, timeout_at, Instant};
 use tracing::Instrument;
 use tumpel_api::types::{
     BoxBudgets, BoxRetention, ChannelBoxGone, ChannelBoxGoneType, ChannelBoxTeardownFailed,
-    ChannelBoxTeardownFailedType, ChannelBoxTeardownFailureReason, ChannelDispatchGrant, ChannelHostMessage,
-    ChannelPack, ChannelPersonaFileDownload, ChannelRestoreChunks, ChannelRestoreChunksType, ChannelRestoreDownloads,
-    ChannelSnapshotDone, ChannelSnapshotDoneType, ChannelSnapshotDownload, ChannelSnapshotFailed,
-    ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPacks, ChannelSnapshotPacksType,
-    ChannelSnapshotRequest, ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete, ChannelTurnCompleteType,
-    ChannelTurnCompleteWarning, ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnImageFetching,
-    ChannelTurnImageFetchingType, ChannelTurnLines, ChannelTurnLinesType, ChannelTurnRepositoryCloneFailed,
-    ChannelTurnRepositoryCloneFailedType, ChannelTurnRepositoryReady, ChannelTurnRepositoryReadyType, CredentialText,
-    DisplayName, EmailAddress, EntityId, GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, GuestPersonaFile,
-    GuestProtocol, GuestTurnCancel, GuestTurnCancelType, GuestTurnLine, GuestTurnStart,
-    GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName, Prompt, RepositoryCloneFailureCause, RepositoryUrl,
-    Sequence, Sha256Digest, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
-    SupervisorHandoverCommand, SupervisorHandoverDiscard, SupervisorHandoverDiscardKind, SupervisorHandoverMachine,
-    SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown,
-    SupervisorHandoverTeardownKind, SupervisorHandoverTurn, SupervisorHandoverTurnError, SupervisorHandoverTurnKind,
-    SupervisorHandoverWarm, SupervisorHandoverWarmKind, TurnFailureReason,
+    ChannelBoxTeardownFailedType, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelDispatchGrant,
+    ChannelHostMessage, ChannelPack, ChannelPersonaFileDownload, ChannelRestoreChunks, ChannelRestoreChunksType,
+    ChannelRestoreDownloads, ChannelSnapshotChunkCheck, ChannelSnapshotChunkCheckType, ChannelSnapshotDone,
+    ChannelSnapshotDoneType, ChannelSnapshotDownload, ChannelSnapshotFailed, ChannelSnapshotFailedType,
+    ChannelSnapshotFailureReason, ChannelSnapshotPacks, ChannelSnapshotPacksType, ChannelSnapshotRequest,
+    ChannelTurnClaim, ChannelTurnClaimType, ChannelTurnComplete, ChannelTurnCompleteType, ChannelTurnCompleteWarning,
+    ChannelTurnFailed, ChannelTurnFailedType, ChannelTurnImageFetching, ChannelTurnImageFetchingType, ChannelTurnLines,
+    ChannelTurnLinesType, ChannelTurnRepositoryCloneFailed, ChannelTurnRepositoryCloneFailedType,
+    ChannelTurnRepositoryReady, ChannelTurnRepositoryReadyType, CredentialText, DisplayName, EmailAddress, EntityId,
+    GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, GuestPersonaFile, GuestProtocol, GuestTurnCancel,
+    GuestTurnCancelType, GuestTurnLine, GuestTurnStart, GuestTurnStartPrebuildCommitSha, GuestTurnStartType, ModelName,
+    Prompt, RepositoryCloneFailureCause, RepositoryUrl, Sequence, Sha256Digest, SupervisorHandover,
+    SupervisorHandoverBox, SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverDiscard,
+    SupervisorHandoverDiscardKind, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
+    SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, SupervisorHandoverTurn,
+    SupervisorHandoverTurnError, SupervisorHandoverTurnKind, SupervisorHandoverWarm, SupervisorHandoverWarmKind,
+    TurnFailureReason,
 };
 use tumpel_channel::{Ask, Key};
 
 use crate::boot::{self, Boot, BootOrder, Caches, Hold, Holds};
 use crate::bounded::{bounded, reported};
-use crate::exchange::{part_number, Answer, Answers, Cancels, Waiting, DIGESTS_PER_PART};
+use crate::exchange::{part_number, Answer, Answers, Cancels, Waiting, DIGESTS_PER_CHECK, DIGESTS_PER_PART};
 use crate::harness_result::{error_result, exit_result, turn_end};
 use crate::images;
 use crate::layers::LayerCache;
@@ -56,6 +57,7 @@ pub(crate) mod setup;
 pub use setup::{SetupCommand, SetupInput, SetupOrder};
 
 const TRANSFERS: usize = 16;
+const CHECKS_IN_FLIGHT: usize = 8;
 const CHUNKS: &str = "chunks";
 const HANDOVER_REPORT_ALLOWANCE: Duration = Duration::from_secs(60);
 const CANCEL_END: Duration = Duration::from_secs(10);
@@ -1276,6 +1278,49 @@ impl<V: Vmm, S: Store> Runner<V, S> {
         })
     }
 
+    async fn held(&self, snapshot_id: &EntityId, digests: &[String], deadline: Instant) -> Result<Places, String> {
+        let checks = futures_util::stream::iter(digests.chunks(DIGESTS_PER_CHECK).enumerate())
+            .map(|(index, digests)| self.check(snapshot_id, index, digests, deadline))
+            .buffered(CHECKS_IN_FLIGHT);
+        tokio::pin!(checks);
+        let mut held = Places::new();
+        while let Some(Some(placements)) = checks.try_next().await? {
+            for placement in &placements {
+                let place = Place::from_wire(placement)?;
+                held.insert(place.digest.clone(), place);
+            }
+        }
+        Ok(held)
+    }
+
+    async fn check(
+        &self,
+        snapshot_id: &EntityId,
+        index: usize,
+        digests: &[String],
+        deadline: Instant,
+    ) -> Result<Option<Vec<ChannelChunkPlacement>>, String> {
+        let key = Key {
+            ask: Ask::SnapshotChunkCheck,
+            id: snapshot_id.clone(),
+            part: part_number(index)?,
+        };
+        let message = ChannelSnapshotChunkCheck {
+            check: key.part,
+            digests: digests
+                .iter()
+                .map(|digest| sha256_digest(digest))
+                .collect::<Result<_, _>>()?,
+            snapshot_id: snapshot_id.clone(),
+            type_: ChannelSnapshotChunkCheckType::SnapshotChunkCheck,
+        };
+        match self.ask(key.clone(), message, deadline).await? {
+            Answer::ChunkCheckHeld(answer) => Ok(Some(answer.held)),
+            Answer::Refused(..) => Ok(None),
+            _ => Err(unexpected(&key)),
+        }
+    }
+
     async fn pack_uploads(
         &self,
         snapshot_id: &EntityId,
@@ -2175,8 +2220,9 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             .cut_files(drive, Arc::clone(base), Arc::clone(&cache), order)
             .await?;
         let new = fresh(draft_digests(&cut.draft), &known);
+        let held = self.held(&order.snapshot_id, &new, deadline).await.map_err(expired)?;
         let staging = dir.to_path_buf();
-        let packing = tokio::task::spawn_blocking(move || stage(cut, known, &new, &cache, &staging));
+        let packing = tokio::task::spawn_blocking(move || stage(cut, known, held, &new, &cache, &staging));
         let staged = match timeout_at(deadline, packing).await {
             Ok(Ok(Ok(staged))) => staged,
             Ok(Ok(Err(error))) => return Err(unreadable(format!("packing the snapshot's chunks failed: {error}"))),
