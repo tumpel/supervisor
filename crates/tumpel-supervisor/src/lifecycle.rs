@@ -1927,7 +1927,12 @@ impl<V: Vmm, S: Store> Runner<V, S> {
             let received = tokio::select! {
                 biased;
                 () = self.cancels.cancelled(turn_id), if !cancelling => None,
-                Ok(_) = parking.wait_for(|parking| *parking), if live.guest.between_frames() => return Followed::Parked(state.park()),
+                Ok(_) = parking.wait_for(|parking| *parking), if live.guest.between_frames() => {
+                    if live.guest.between_frames() {
+                        return Followed::Parked(state.park());
+                    }
+                    continue;
+                }
                 _ = disk_check.tick() => match self.disk_failure() {
                     Some(failure) => return Followed::Ended(Err(failure)),
                     None => continue,

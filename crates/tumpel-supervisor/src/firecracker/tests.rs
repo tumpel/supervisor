@@ -380,7 +380,7 @@ async fn each_receive_returns_one_whole_frame_and_buffers_nothing_past_it() {
     for expected in [1, 2] {
         let message = guest.receive().await.expect("a frame");
         assert_eq!(line_seq(&message), expected);
-        assert!(guest.decoder.buffered().is_empty());
+        assert_eq!(guest.decoder.buffered(), []);
     }
     let split = line_frame(3);
     let receiving = tokio::spawn(async move {
@@ -393,7 +393,7 @@ async fn each_receive_returns_one_whole_frame_and_buffers_nothing_past_it() {
     }
     let (guest, message) = receiving.await.expect("the receive finishes");
     assert_eq!(line_seq(&message), 3);
-    assert!(guest.decoder.buffered().is_empty());
+    assert_eq!(guest.decoder.buffered(), []);
 }
 
 #[tokio::test]
