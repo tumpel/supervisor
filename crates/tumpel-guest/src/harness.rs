@@ -401,7 +401,9 @@ const PI_DELTAS: [&str; 2] = ["message_update", "tool_execution_update"];
 fn per_turn(protocol: &GuestHarnessProtocol) -> bool {
     matches!(
         protocol,
-        GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::CodexExecJson
+        GuestHarnessProtocol::PromptOnStdin
+            | GuestHarnessProtocol::CodexExecJson
+            | GuestHarnessProtocol::GeminiStreamJson
     )
 }
 
@@ -497,6 +499,13 @@ fn turn_arguments(
             }
             arguments
         }
+        GuestHarnessProtocol::GeminiStreamJson => {
+            let mut arguments = vec!["--model".to_string(), model];
+            if started {
+                arguments.extend(["--resume".to_string(), "latest".to_string()]);
+            }
+            arguments
+        }
         GuestHarnessProtocol::ClaudeStreamJson | GuestHarnessProtocol::PiRpc | GuestHarnessProtocol::PromptOnStdin => {
             let mut arguments = vec!["--model".to_string(), model];
             if started {
@@ -535,7 +544,9 @@ fn skips(protocol: &GuestHarnessProtocol, line: &str) -> bool {
         }
         GuestHarnessProtocol::ClaudeStreamJson => claude_thinking_tokens(&value),
         GuestHarnessProtocol::CodexExecJson => record_type(&value) == Some("item.updated"),
-        GuestHarnessProtocol::ShellLines | GuestHarnessProtocol::PromptOnStdin => false,
+        GuestHarnessProtocol::ShellLines
+        | GuestHarnessProtocol::PromptOnStdin
+        | GuestHarnessProtocol::GeminiStreamJson => false,
     }
 }
 
@@ -1035,9 +1046,10 @@ impl GuestState {
                     }
                     killed = (waited.as_ref().ok().and_then(ExitStatusExt::signal) == Some(libc::SIGKILL))
                         .then(|| (harness.child.id(), harness.stderr_tail()));
+                    let reason = exit_reason(&protocol, &waited);
                     let status = waited.map_or_else(|error| error.to_string(), |status| status.to_string());
                     break ended(
-                        GuestTurnEndReason::HarnessExited,
+                        reason,
                         format!("the harness exited ({status}) mid-turn; {}", harness.stderr_tail()),
                     );
                 }
@@ -1089,6 +1101,21 @@ impl GuestState {
     }
 }
 
+const GEMINI_SIGN_IN_NEEDED: i32 = 41;
+
+fn exit_reason(
+    protocol: &GuestHarnessProtocol,
+    waited: &std::io::Result<std::process::ExitStatus>,
+) -> GuestTurnEndReason {
+    let refused = *protocol == GuestHarnessProtocol::GeminiStreamJson
+        && waited.as_ref().ok().and_then(std::process::ExitStatus::code) == Some(GEMINI_SIGN_IN_NEEDED);
+    if refused {
+        GuestTurnEndReason::CredentialRefused
+    } else {
+        GuestTurnEndReason::HarnessExited
+    }
+}
+
 fn prompt_input(protocol: &GuestHarnessProtocol, setup: bool, prompt: &str, marker: &str) -> String {
     match protocol {
         GuestHarnessProtocol::Unrecognised(_) => {
@@ -1099,7 +1126,9 @@ fn prompt_input(protocol: &GuestHarnessProtocol, setup: bool, prompt: &str, mark
         GuestHarnessProtocol::ClaudeStreamJson => format!("{}\n", user_message(prompt)),
         GuestHarnessProtocol::PiRpc => pi_prompt(prompt),
         GuestHarnessProtocol::ShellLines => format!("{prompt}\nprintf '%s\\n' '{marker}'\n"),
-        GuestHarnessProtocol::PromptOnStdin | GuestHarnessProtocol::CodexExecJson => prompt.to_string(),
+        GuestHarnessProtocol::PromptOnStdin
+        | GuestHarnessProtocol::CodexExecJson
+        | GuestHarnessProtocol::GeminiStreamJson => prompt.to_string(),
     }
 }
 

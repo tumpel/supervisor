@@ -10,7 +10,6 @@ use tumpel_api::types::{
     ChannelHostMessage, ChannelProtocol, HostArchitecture, Sha256Digest, SupervisorUpdateFailureReason,
     SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
-use tumpel_channel::Outgoing;
 
 use super::{
     announced_release, named, refresh_unit, sha256_hex, version_refusal, Idle, Layout, Limits, Outcome, Release,
@@ -128,7 +127,7 @@ fn limits() -> Limits {
 
 struct Run<'a> {
     updater: Updater<FakeSource, &'a FakeIdle>,
-    events: UnboundedReceiver<Outgoing>,
+    events: UnboundedReceiver<ChannelHostMessage>,
 }
 
 fn updater<'a>(layout: &Layout, source: FakeSource, idle: &'a FakeIdle, limits: Limits) -> Run<'a> {
@@ -154,20 +153,20 @@ enum Seen {
     Failed(SupervisorUpdateFailureReason),
 }
 
-fn seen(events: &mut UnboundedReceiver<Outgoing>) -> Vec<Seen> {
+fn seen(events: &mut UnboundedReceiver<ChannelHostMessage>) -> Vec<Seen> {
     std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event {
-            Outgoing::Message(ChannelHostMessage::SupervisorUpdateStep(step)) => Some(Seen::Step(step.phase)),
-            Outgoing::Message(ChannelHostMessage::SupervisorUpdateFailed(failed)) => Some(Seen::Failed(failed.reason)),
+            ChannelHostMessage::SupervisorUpdateStep(step) => Some(Seen::Step(step.phase)),
+            ChannelHostMessage::SupervisorUpdateFailed(failed) => Some(Seen::Failed(failed.reason)),
             _ => None,
         })
         .collect()
 }
 
-fn failure(events: &mut UnboundedReceiver<Outgoing>) -> (String, Vec<String>) {
+fn failure(events: &mut UnboundedReceiver<ChannelHostMessage>) -> (String, Vec<String>) {
     std::iter::from_fn(|| events.try_recv().ok())
         .find_map(|event| match event {
-            Outgoing::Message(ChannelHostMessage::SupervisorUpdateFailed(failed)) => Some((
+            ChannelHostMessage::SupervisorUpdateFailed(failed) => Some((
                 failed.detail.into(),
                 failed.output_tail.into_iter().map(String::from).collect(),
             )),
@@ -431,7 +430,7 @@ async fn the_supervisor_started_after_a_swap_reports_online_once_with_its_own_ve
     assert!(!new.first_online());
     let steps: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
         .map(|event| match event {
-            Outgoing::Message(ChannelHostMessage::SupervisorUpdateStep(step)) => step,
+            ChannelHostMessage::SupervisorUpdateStep(step) => step,
             _ => panic!("only update steps are sent"),
         })
         .collect();

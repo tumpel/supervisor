@@ -17,13 +17,13 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelSnapshotRequest, ChannelSupervisorUpdateStepReleaseVersion, ChannelTurnOffer,
-    ClaudeSetupHarness, EntityId, HostReportedHealth, Sha256Digest, SupervisorChannelState, SupervisorConfig,
-    SupervisorFailure, SupervisorHandover, SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime,
-    TurnFailureReason,
+    ChannelControlMessage, ChannelHostMessage, ChannelSnapshotChunkCheckHeld, ChannelSnapshotIndexUpload,
+    ChannelSnapshotRequest, ChannelSupervisorUpdateStepReleaseVersion, ChannelTurnOffer, ClaudeSetupHarness, EntityId,
+    HostReportedHealth, Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
+    SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, TurnFailureReason,
 };
 use tumpel_channel::{
-    Backoff, ChannelError, Event, HeldIds, HostChannel, Outgoing, Phase, Port, RateBackoff, RateLimit, Signer, Store,
+    Backoff, ChannelError, Event, HeldIds, HostChannel, Phase, Port, RateBackoff, RateLimit, Signer, Store,
     HEARTBEAT_DEADLINE,
 };
 
@@ -203,7 +203,7 @@ fn hello(
     channel: &mut Channel,
     nonce: &str,
     usage: &Usage,
-    from_box: &mut UnboundedReceiver<Outgoing>,
+    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
     let turns = usage.turns.borrow().clone();
@@ -218,7 +218,7 @@ fn hello(
 
 fn drain(
     channel: &mut Channel,
-    from_box: &mut UnboundedReceiver<Outgoing>,
+    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
     while let Ok(message) = from_box.try_recv() {
@@ -230,7 +230,7 @@ fn drain(
 fn beat(
     channel: &mut Channel,
     usage: &Usage,
-    from_box: &mut UnboundedReceiver<Outgoing>,
+    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
     health: HostReportedHealth,
     outbox: &mut Outbox,
 ) -> Result<(), Failure> {
@@ -403,7 +403,7 @@ fn start_boxes(
     box_size: Size,
     store: HttpStore,
     received: UnboundedReceiver<BoxCommand>,
-    out: UnboundedSender<Outgoing>,
+    out: UnboundedSender<ChannelHostMessage>,
     telemetry: Telemetry,
     taken: Option<(SupervisorHandover, Taken)>,
     standing: PathBuf,
@@ -466,7 +466,7 @@ fn boxes_stopped(ended: Result<Result<(), String>, JoinError>) -> Failure {
 async fn terminate(
     commands: &UnboundedSender<BoxCommand>,
     layout: &Layout,
-    out: &UnboundedSender<Outgoing>,
+    out: &UnboundedSender<ChannelHostMessage>,
 ) -> Result<(), Failure> {
     let (reply, answer) = oneshot::channel();
     let _ = commands.send(BoxCommand::HandOver(reply));
@@ -546,7 +546,7 @@ fn named_turns(text: &str) -> Vec<EntityId> {
         .collect()
 }
 
-fn handover_lost(layout: &Layout, out: &UnboundedSender<Outgoing>, cause: &str, turns: &[EntityId]) {
+fn handover_lost(layout: &Layout, out: &UnboundedSender<ChannelHostMessage>, cause: &str, turns: &[EntityId]) {
     eprintln!(
         "tumpel-supervisor: HandoverLost: {cause}; this supervisor fails the {} turns it names and starts without the handed boxes",
         turns.len()
@@ -567,7 +567,11 @@ fn handover_lost(layout: &Layout, out: &UnboundedSender<Outgoing>, cause: &str, 
     }
 }
 
-fn read_handover(layout: &Layout, out: &UnboundedSender<Outgoing>, handed: bool) -> Option<SupervisorHandover> {
+fn read_handover(
+    layout: &Layout,
+    out: &UnboundedSender<ChannelHostMessage>,
+    handed: bool,
+) -> Option<SupervisorHandover> {
     let path = layout.handover();
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -759,7 +763,7 @@ fn read_standing(layout: &Layout) -> Option<SupervisorHandover> {
 
 fn taken(
     layout: &Layout,
-    out: &UnboundedSender<Outgoing>,
+    out: &UnboundedSender<ChannelHostMessage>,
     handed: bool,
     mut received: BTreeMap<String, OwnedFd>,
 ) -> Result<Option<(SupervisorHandover, Taken)>, Failure> {
@@ -860,7 +864,7 @@ pub async fn run(
     stopped.map_err(Into::into)
 }
 
-fn store_unsent(channel: &mut Channel, from_box: &mut UnboundedReceiver<Outgoing>) -> Result<(), Failure> {
+fn store_unsent(channel: &mut Channel, from_box: &mut UnboundedReceiver<ChannelHostMessage>) -> Result<(), Failure> {
     while let Ok(message) = from_box.try_recv() {
         channel
             .send(message, &mut Outbox::default())
@@ -876,7 +880,7 @@ async fn serve(
     heartbeat: Duration,
     usage: &Usage,
     commands: &UnboundedSender<BoxCommand>,
-    from_box: &mut UnboundedReceiver<Outgoing>,
+    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
     config: &SupervisorConfig,
     dir: &Path,
     updates: &Updates,
@@ -995,6 +999,14 @@ fn box_command(message: ChannelControlMessage) -> Result<Option<BoxCommand>, Str
             );
             return Ok(None);
         }
+        ChannelControlMessage::SnapshotChunkCheckHeld(ChannelSnapshotChunkCheckHeld { snapshot_id, .. })
+        | ChannelControlMessage::SnapshotIndexUpload(ChannelSnapshotIndexUpload { snapshot_id, .. }) => {
+            eprintln!(
+                "tumpel-supervisor: an answer for snapshot {} that this host never asks for arrived; dropped it",
+                *snapshot_id
+            );
+            return Ok(None);
+        }
         ChannelControlMessage::SnapshotPackUploads(uploads) => BoxCommand::Answer(Answer::PackUploads(uploads)),
         ChannelControlMessage::RestoreDownloads(downloads) => BoxCommand::Answer(Answer::Downloads(downloads)),
         ChannelControlMessage::TurnWithdrawn(withdrawn) => BoxCommand::Answer(Answer::Withdrawn(withdrawn)),
@@ -1048,7 +1060,7 @@ async fn session(
     heartbeat: Duration,
     usage: &Usage,
     commands: &UnboundedSender<BoxCommand>,
-    from_box: &mut UnboundedReceiver<Outgoing>,
+    from_box: &mut UnboundedReceiver<ChannelHostMessage>,
     updates: &Updates,
     limit: &mut RateLimit,
 ) -> Result<Ended, Failure> {
@@ -1154,6 +1166,7 @@ async fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tumpel_api::types::ChannelProtocol;
 
     #[test]
     fn a_setup_box_boots_the_harness_its_offer_names_and_claude_code_without_one() {
@@ -1230,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_protocol_steps_down_one_version_at_a_time_and_a_dropped_connection_goes_back_to_39() {
+    fn a_refused_protocol_steps_down_one_version_at_a_time_and_a_dropped_connection_goes_back_to_the_newest() {
         let mut channel = HostChannel::new(
             tumpel_channel::empty_state(),
             Unsaved,
@@ -1240,7 +1253,7 @@ mod tests {
         );
         let mut backoff = Backoff::default();
         let url = "wss://control.example.test/v1/channel";
-        assert_eq!(hello_version(&mut channel), serde_json::json!(39));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(ChannelProtocol::VERSION));
 
         let refusal = CloseFrame {
             code: CloseCode::from(4426),
@@ -1253,16 +1266,19 @@ mod tests {
             panic!("a refusal of the newest protocol reconnects");
         };
         assert_eq!(wait, Duration::ZERO);
-        assert_eq!(hello_version(&mut channel), serde_json::json!(38));
+        assert_eq!(
+            hello_version(&mut channel),
+            serde_json::json!(ChannelProtocol::VERSION - 1)
+        );
 
         let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
             panic!("a refusal ends the session");
         };
         let Next::Reconnect(wait) = next(&mut channel, &mut backoff, url, ended, 0) else {
-            panic!("a refusal of 38 reconnects at the oldest");
+            panic!("a refusal of the version below the newest reconnects at the oldest");
         };
         assert_eq!(wait, Duration::ZERO);
-        assert_eq!(hello_version(&mut channel), serde_json::json!(37));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(ChannelProtocol::OLDEST));
 
         let Ok(ended) = closed_by_peer(Some(&refusal), false) else {
             panic!("a refusal ends the session");
@@ -1282,6 +1298,6 @@ mod tests {
             panic!("a dropped connection reconnects");
         };
         assert_eq!(wait, Duration::from_secs(1));
-        assert_eq!(hello_version(&mut channel), serde_json::json!(39));
+        assert_eq!(hello_version(&mut channel), serde_json::json!(ChannelProtocol::VERSION));
     }
 }

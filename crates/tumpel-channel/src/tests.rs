@@ -10,8 +10,8 @@ use tumpel_api::types::{
 };
 
 use super::{
-    empty_state, hello_bytes, Ask, Backoff, ChannelError, Event, HeldIds, HostChannel, Key, Outgoing, Phase, Port,
-    RateBackoff, RateLimit, Signer, Store, Usage, TURN_LINES_WAIT,
+    empty_state, hello_bytes, Ask, Backoff, ChannelError, Event, HeldIds, HostChannel, Key, Phase, Port, RateBackoff,
+    RateLimit, Signer, Store, Usage, TURN_LINES_WAIT,
 };
 
 #[derive(Default)]
@@ -91,18 +91,14 @@ fn channel(disk: &Disk, signer: &Recorder) -> HostChannel<Disk, Recorder> {
     )
 }
 
-fn done(snapshot: &str) -> Outgoing {
-    done_at(snapshot, ChannelProtocol::VERSION)
-}
-
-fn done_at(snapshot: &str, version: u16) -> Outgoing {
+fn done(snapshot: &str) -> ChannelHostMessage {
     let message = ChannelSnapshotDone {
         snapshot_id: snapshot.try_into().expect("snapshot id"),
         uploaded_bytes: 10,
         chunk_count: 3,
         type_: ChannelSnapshotDoneType::SnapshotDone,
     };
-    Outgoing::Snapshot(message.into(), version)
+    message.into()
 }
 
 fn frame(seq: i64, ack: i64, snapshot: &str) -> String {
@@ -478,16 +474,11 @@ fn a_refused_chunk_ask_is_replaced_by_its_failure_in_one_save() {
     ];
     for (ask, mut expected) in cases {
         let message = serde_json::from_value(ask.clone()).expect("chunk ask");
-        let outgoing = if ask["type"] == "SnapshotPacks" {
-            Outgoing::Snapshot(message, ChannelProtocol::VERSION)
-        } else {
-            Outgoing::Message(message)
-        };
         let disk = Disk::default();
         let mut channel = channel(&disk, &Recorder::default());
         let mut wire = Wire::default();
         open(&mut channel, &mut wire);
-        channel.send(outgoing, &mut wire).expect("send ask");
+        channel.send(message, &mut wire).expect("send ask");
         assert_eq!(wire.sent()[0]["seq"], 1);
         let before = disk.1.get();
 
@@ -1188,7 +1179,7 @@ fn a_restarted_channel_holds_the_turns_its_saved_unacked_frames_name() {
         "sent": 2,
         "unacked": [
             {"type": "Frame", "seq": 1, "ack": 0, "message": {"type": "TurnClaim", "turnId": "turn-7", "boxId": "box-1"}},
-            {"type": "Frame", "seq": 2, "ack": 0, "message": {"type": "TurnLine", "turnId": "turn-8", "lineSeq": 1, "text": "line 1"}}
+            {"type": "Frame", "seq": 2, "ack": 0, "message": {"type": "TurnLines", "turnId": "turn-8", "firstLineSeq": 1, "lines": ["line 1"]}}
         ],
         "replays": [{"seq": 1, "replays": 4}]
     }))
@@ -1267,7 +1258,7 @@ fn hello_resends_from_the_oldest_unacked_frame_or_else_the_next_seq_and_never_be
 }
 
 #[test]
-fn a_cumulative_ack_drops_every_frame_up_to_its_seq_and_a_welcome_on_37_drops_none() {
+fn a_cumulative_ack_drops_every_frame_up_to_its_seq_and_a_welcome_on_the_oldest_protocol_drops_none() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
@@ -1284,12 +1275,17 @@ fn a_cumulative_ack_drops_every_frame_up_to_its_seq_and_a_welcome_on_37_drops_no
 
     channel.disconnect();
     assert_eq!(say_hello(&mut channel, &mut wire)["resendFrom"], json!(3));
-    let acked = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 37, "ack": 3}).to_string();
+    let acked = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": ChannelProtocol::OLDEST, "ack": 3})
+        .to_string();
     let Ok(Event::Welcomed) = channel.receive(&acked) else {
         panic!("the welcome opens the channel");
     };
     channel.release(usize::MAX, &mut wire).expect("release");
-    assert_eq!(unacked_seqs(&disk), [3], "a Welcome on 37 acks nothing");
+    assert_eq!(
+        unacked_seqs(&disk),
+        [3],
+        "a Welcome on the oldest protocol acks nothing"
+    );
     assert_eq!(sent_frames(&mut wire).len(), 1);
 
     channel
@@ -1379,7 +1375,7 @@ fn transcript_lines_close_a_frame_before_it_passes_256_kb_and_before_any_other_m
 }
 
 #[test]
-fn on_37_a_rate_limited_frame_and_every_frame_after_it_go_out_again_in_order_once_released() {
+fn a_rate_limited_frame_and_every_frame_after_it_go_out_again_in_order_once_released() {
     let disk = Disk::default();
     let mut channel = channel(&disk, &Recorder::default());
     let mut wire = Wire::default();
@@ -1416,220 +1412,6 @@ fn on_37_a_rate_limited_frame_and_every_frame_after_it_go_out_again_in_order_onc
     );
     assert_eq!(unacked_seqs(&disk), [2, 3, 4]);
     assert!(!channel.withholding());
-}
-
-fn packs_at(snapshot: &str, reused: &[String], version: u16) -> Outgoing {
-    let message = serde_json::from_value(json!({
-        "type": "SnapshotPacks",
-        "snapshotId": snapshot,
-        "part": 1,
-        "packs": [],
-        "chunks": [],
-        "reusedPackDigests": reused
-    }))
-    .expect("packs");
-    Outgoing::Snapshot(message, version)
-}
-
-fn failures(wire: &mut Wire) -> Vec<(i64, Value, String)> {
-    sent_frames(wire)
-        .into_iter()
-        .map(|(seq, message)| {
-            (
-                seq,
-                message["type"].clone(),
-                message["detail"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
-}
-
-fn snapshot_failed_naming(kind: &str, built: u16, session: u16) -> String {
-    format!("this host built the snapshot's {kind} for channel protocol {built}, but the session speaks {session}; ask for the snapshot again")
-}
-
-#[test]
-fn a_snapshot_built_at_38_handed_to_a_session_at_39_goes_out_as_snapshot_failed_and_is_never_accepted() {
-    let disk = Disk::default();
-    let mut channel = channel(&disk, &Recorder::default());
-    let mut wire = Wire::default();
-    open(&mut channel, &mut wire);
-    channel.send(packs_at("snap-1", &[], 38), &mut wire).expect("send");
-    channel.send(done_at("snap-1", 38), &mut wire).expect("send");
-    assert_eq!(
-        failures(&mut wire),
-        [
-            (
-                1,
-                json!("SnapshotFailed"),
-                snapshot_failed_naming("SnapshotPacks", 38, 39)
-            ),
-            (
-                2,
-                json!("SnapshotFailed"),
-                snapshot_failed_naming("SnapshotDone", 38, 39)
-            )
-        ]
-    );
-    channel
-        .receive(&json!({"type": "Ack", "seq": 2}).to_string())
-        .expect("the ack retires both frames");
-    assert_eq!(channel.take_accepted(), Vec::<EntityId>::new());
-    let failed: Vec<String> = channel.take_failed().into_iter().map(|id| id.to_string()).collect();
-    assert_eq!(failed, ["snap-1", "snap-1"]);
-}
-
-#[test]
-fn a_snapshot_built_at_39_offers_39_and_goes_out_as_snapshot_failed_when_the_session_steps_down_to_38() {
-    let disk = Disk::default();
-    let mut channel = channel(&disk, &Recorder::default());
-    let mut wire = Wire::default();
-    channel
-        .send(packs_at("snap-1", &["e".repeat(64)], 39), &mut wire)
-        .expect("send");
-    channel.send(done("snap-1"), &mut wire).expect("send");
-    let newest = say_hello(&mut channel, &mut wire);
-    assert_eq!(newest["protocolVersion"], json!(39));
-    assert_eq!(newest["channelProtocolOldest"], json!(37));
-    assert_eq!(channel.step_down(), Some(38));
-    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(38));
-    let at_38 = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 38}).to_string();
-    let Ok(Event::Welcomed) = channel.receive(&at_38) else {
-        panic!("the welcome opens the channel");
-    };
-    channel.release(usize::MAX, &mut wire).expect("release");
-    assert_eq!(
-        failures(&mut wire),
-        [
-            (
-                1,
-                json!("SnapshotFailed"),
-                snapshot_failed_naming("SnapshotPacks", 39, 38)
-            ),
-            (
-                2,
-                json!("SnapshotFailed"),
-                snapshot_failed_naming("SnapshotDone", 39, 38)
-            )
-        ]
-    );
-    channel
-        .receive(&json!({"type": "Ack", "seq": 2}).to_string())
-        .expect("the ack retires both frames");
-    assert_eq!(channel.take_accepted(), Vec::<EntityId>::new());
-    let failed: Vec<String> = channel.take_failed().into_iter().map(|id| id.to_string()).collect();
-    assert_eq!(failed, ["snap-1", "snap-1"]);
-}
-
-#[test]
-fn a_snapshot_built_at_38_goes_out_without_reused_packs_or_chunk_count_in_a_session_at_38() {
-    let disk = Disk::default();
-    let mut channel = channel(&disk, &Recorder::default());
-    let mut wire = Wire::default();
-    open_at(&mut channel, &mut wire, 38);
-    channel.send(packs_at("snap-1", &[], 38), &mut wire).expect("send");
-    channel.send(done_at("snap-1", 38), &mut wire).expect("send");
-    let sent: Vec<(Value, Option<Value>, Option<Value>)> = sent_frames(&mut wire)
-        .into_iter()
-        .map(|(_, message)| {
-            (
-                message["type"].clone(),
-                message.get("reusedPackDigests").cloned(),
-                message.get("chunkCount").cloned(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        sent,
-        [
-            (json!("SnapshotPacks"), None, None),
-            (json!("SnapshotDone"), None, None)
-        ]
-    );
-}
-
-#[test]
-fn snapshot_frames_saved_before_39_offer_38_until_the_control_plane_acks_them() {
-    let saved: SupervisorChannelState = serde_json::from_value(json!({
-        "received": 0,
-        "sent": 2,
-        "unacked": [
-            {"type": "Frame", "seq": 1, "ack": 0, "message": {"type": "SnapshotPacks", "snapshotId": "snap-1", "part": 1, "packs": [], "chunks": []}},
-            {"type": "Frame", "seq": 2, "ack": 0, "message": {"type": "SnapshotDone", "snapshotId": "snap-1", "uploadedBytes": 10}}
-        ]
-    }))
-    .expect("channel.json");
-    let disk = Disk::default();
-    let mut channel = HostChannel::new(
-        saved,
-        disk.clone(),
-        Recorder::default(),
-        "host-1".try_into().expect("host id"),
-        "0.1.0".to_string(),
-    );
-    let mut wire = Wire::default();
-    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(38));
-    assert_eq!(channel.step_down(), Some(37));
-    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(37));
-    channel.step_up();
-    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(38));
-    let at_38 = json!({"type": "Welcome", "hostId": "host-1", "protocolVersion": 38}).to_string();
-    let Ok(Event::Welcomed) = channel.receive(&at_38) else {
-        panic!("the welcome opens the channel");
-    };
-    channel.release(usize::MAX, &mut wire).expect("release");
-    assert_eq!(
-        sent_frames(&mut wire),
-        [
-            (
-                1,
-                json!({"type": "SnapshotPacks", "snapshotId": "snap-1", "part": 1, "packs": [], "chunks": []})
-            ),
-            (
-                2,
-                json!({"type": "SnapshotDone", "snapshotId": "snap-1", "uploadedBytes": 10})
-            )
-        ]
-    );
-    channel
-        .receive(&json!({"type": "Ack", "seq": 2}).to_string())
-        .expect("the ack retires both frames");
-    assert_eq!(say_hello(&mut channel, &mut wire)["protocolVersion"], json!(39));
-}
-
-#[test]
-fn a_backlog_saved_by_an_older_supervisor_goes_out_on_37_with_each_line_its_own_frame_under_its_own_seq() {
-    let saved: SupervisorChannelState = serde_json::from_value(json!({
-        "received": 0,
-        "sent": 5,
-        "unacked": [
-            {"type": "Frame", "seq": 4, "ack": 0, "message": {"type": "TurnLine", "turnId": "turn-1", "lineSeq": 1, "text": "line 1"}},
-            {"type": "Frame", "seq": 5, "ack": 0, "message": {"type": "TurnLine", "turnId": "turn-1", "lineSeq": 2, "text": "line 2"}}
-        ]
-    }))
-    .expect("channel.json");
-    let disk = Disk::default();
-    let mut channel = HostChannel::new(
-        saved,
-        disk.clone(),
-        Recorder::default(),
-        "host-1".try_into().expect("host id"),
-        "0.1.0".to_string(),
-    );
-    let mut wire = Wire::default();
-    open(&mut channel, &mut wire);
-    let resent: Vec<(i64, Value)> = sent_frames(&mut wire)
-        .into_iter()
-        .map(|(seq, message)| (seq, json!([message["type"], message["firstLineSeq"], message["lines"]])))
-        .collect();
-    assert_eq!(
-        resent,
-        [
-            (4, json!(["TurnLines", 1, ["line 1"]])),
-            (5, json!(["TurnLines", 2, ["line 2"]]))
-        ]
-    );
-    assert_eq!(unacked_seqs(&disk), [4, 5]);
 }
 
 #[test]

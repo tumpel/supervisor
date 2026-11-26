@@ -23,7 +23,6 @@ use tumpel_api::types::{
     ReleaseManifestReleaseVersion, ReleaseSupervisorSupervisorVersion, Sha256Digest, SupervisorUpdateFailureReason,
     SupervisorUpdatePhase, SupervisorUpdateRefusal,
 };
-use tumpel_channel::Outgoing;
 use tumpel_guest::setup_output::{redacted, strip_ansi};
 
 use crate::bounded::reported;
@@ -358,7 +357,7 @@ pub struct Updater<S: Source, I: Idle> {
     running: Sha256Digest,
     version: ChannelSupervisorUpdateStepReleaseVersion,
     idle: I,
-    out: UnboundedSender<Outgoing>,
+    out: UnboundedSender<ChannelHostMessage>,
     running_update: Mutex<()>,
     online: AtomicBool,
 }
@@ -371,7 +370,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         running: Sha256Digest,
         version: ChannelSupervisorUpdateStepReleaseVersion,
         idle: I,
-        out: UnboundedSender<Outgoing>,
+        out: UnboundedSender<ChannelHostMessage>,
     ) -> Self {
         Self {
             source,
@@ -510,8 +509,9 @@ impl<S: Source, I: Idle> Updater<S, I> {
         phase: SupervisorUpdatePhase,
         boxes: u32,
     ) {
-        let _ = self.out.send(
-            ChannelHostMessage::SupervisorUpdateStep(ChannelSupervisorUpdateStep {
+        let _ = self
+            .out
+            .send(ChannelHostMessage::SupervisorUpdateStep(ChannelSupervisorUpdateStep {
                 type_: ChannelSupervisorUpdateStepType::SupervisorUpdateStep,
                 from_sha256: self.running.clone(),
                 to_sha256: to.clone(),
@@ -519,16 +519,14 @@ impl<S: Source, I: Idle> Updater<S, I> {
                 boxes_running: i32::try_from(boxes).unwrap_or(i32::MAX),
                 phase,
                 at: Utc::now().fixed_offset(),
-            })
-            .into(),
-        );
+            }));
     }
 
     fn fail(&self, to: &Sha256Digest, stopped: Stop) {
         let detail = redacted(&stopped.detail);
         eprintln!("tumpel-supervisor: {}: {detail}", stopped.reason);
-        let _ = self.out.send(
-            ChannelHostMessage::SupervisorUpdateFailed(ChannelSupervisorUpdateFailed {
+        let _ = self.out.send(ChannelHostMessage::SupervisorUpdateFailed(
+            ChannelSupervisorUpdateFailed {
                 type_: ChannelSupervisorUpdateFailedType::SupervisorUpdateFailed,
                 from_sha256: self.running.clone(),
                 to_sha256: to.clone(),
@@ -540,9 +538,8 @@ impl<S: Source, I: Idle> Updater<S, I> {
                     .map(|line| reported("an update output line", &line))
                     .collect(),
                 failed_at: Utc::now().fixed_offset(),
-            })
-            .into(),
-        );
+            },
+        ));
     }
 
     fn refuse(&self, to: &Sha256Digest, stopped: Stop) -> Stop {
