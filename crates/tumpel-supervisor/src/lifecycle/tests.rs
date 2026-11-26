@@ -12,13 +12,13 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
 use tumpel_api::types::{
     BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
-    ChannelProtocol, ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunkCheckHeld,
-    ChannelSnapshotChunkCheckHeldType, ChannelSnapshotDownload, ChannelSnapshotFailureReason,
-    ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType, ChannelSnapshotPacks, ChannelTurnClaimed,
-    ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId, GuestHarnessProtocol, GuestHello,
-    GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
-    SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind,
-    SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
+    ChannelProtocol, ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunkCheck,
+    ChannelSnapshotChunkCheckHeld, ChannelSnapshotChunkCheckHeldType, ChannelSnapshotDownload,
+    ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType, ChannelSnapshotPacks,
+    ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId,
+    GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox,
+    SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
+    SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
 };
 use tumpel_channel::{Ask, Key};
 
@@ -754,6 +754,27 @@ fn channel(mut from_lifecycle: UnboundedReceiver<ChannelHostMessage>) -> Unbound
     sent
 }
 
+fn check_answer(index: &Index, check: &ChannelSnapshotChunkCheck) -> Answer {
+    if index.refuse_checks {
+        let key = Key {
+            ask: Ask::SnapshotChunkCheck,
+            id: check.snapshot_id.clone(),
+            part: check.check,
+        };
+        return Answer::Refused(key, "message.type: Invalid option".to_string());
+    }
+    Answer::ChunkCheckHeld(ChannelSnapshotChunkCheckHeld {
+        check: check.check,
+        held: check
+            .digests
+            .iter()
+            .filter_map(|digest| index.chunks.get(digest.as_str()).cloned())
+            .collect(),
+        snapshot_id: check.snapshot_id.clone(),
+        type_: ChannelSnapshotChunkCheckHeldType::SnapshotChunkCheckHeld,
+    })
+}
+
 fn control_plane(
     store: MemoryStore,
     answers: Answers,
@@ -767,25 +788,7 @@ fn control_plane(
             let mut index = store.2.lock().expect("index");
             match message {
                 ChannelHostMessage::SnapshotChunkCheck(check) => {
-                    let key = Key {
-                        ask: Ask::SnapshotChunkCheck,
-                        id: check.snapshot_id.clone(),
-                        part: check.check,
-                    };
-                    answers.deliver(if index.refuse_checks {
-                        Answer::Refused(key, "message.type: Invalid option".to_string())
-                    } else {
-                        Answer::ChunkCheckHeld(ChannelSnapshotChunkCheckHeld {
-                            check: check.check,
-                            held: check
-                                .digests
-                                .iter()
-                                .filter_map(|digest| index.chunks.get(digest.as_str()).cloned())
-                                .collect(),
-                            snapshot_id: check.snapshot_id.clone(),
-                            type_: ChannelSnapshotChunkCheckHeldType::SnapshotChunkCheckHeld,
-                        })
-                    });
+                    answers.deliver(check_answer(&index, &check));
                     forward(&sender, ChannelHostMessage::SnapshotChunkCheck(check));
                 }
                 ChannelHostMessage::SnapshotPacks(packs) => {
