@@ -10,8 +10,7 @@ use tar::Archive;
 use super::cache::sha256;
 use super::{
     assemble, cut, decode, decode_root, draft_digests, encode, fetches, fresh, lacking, pack_parts, stage, unpack,
-    write_restore, Base, Born, ChunkCache, Entry, Ext4Upper, Found, Kind, Manifest, Places, Scan, Span, Staged, Stored,
-    Upper,
+    write_restore, Base, Born, ChunkCache, Entry, Ext4Upper, Found, Kind, Manifest, Scan, Span, Staged, Stored, Upper,
 };
 
 pub(super) fn sbin(tool: &str) -> PathBuf {
