@@ -1902,19 +1902,23 @@ async fn a_refused_snapshot_done_leaves_an_empty_base_and_a_dirty_box_and_the_ne
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_snapshot_not_stored_after_a_later_snapshot_started_on_its_base_empties_the_base() {
+async fn a_snapshot_not_stored_cancels_the_later_snapshot_on_its_base_and_the_next_one_starts_empty() {
     let mut host = host("late-not-stored", 1, Harness::Echo, Boot::Works);
     let first = snapshot_after_turn(&mut host, "turn-1", "one").await;
     host.turn("turn-2", "session-1", "two", Vec::new());
     host.settle(SETTLE).await;
-    let order = host.snapshot("session-1");
+    host.snapshot("session-1");
     host.commands
         .send(Input::SnapshotNotStored(first.snapshot_id.clone()))
         .expect("send");
-    let built_on_first = sent_by_snapshot(&mut host, order.snapshot_id).await;
+    let built_on_first = host.settle(settings().budgets.snapshot).await;
+    assert!(
+        !built_on_first.iter().any(|seen| seen == "snapshot done"),
+        "{built_on_first:?}"
+    );
+    assert_dirty(&mut host).await;
     let next = snapshot_after_turn(&mut host, "turn-3", "three").await;
 
-    assert!(!built_on_first.reused.is_disjoint(&first.written));
     assert!(
         next.reused.is_disjoint(&first.written),
         "{:?} {:?}",

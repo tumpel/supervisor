@@ -642,7 +642,7 @@ struct Slot<M: Machine> {
     idle: Option<AbortHandle>,
     idle_end: Option<Instant>,
     snapshot: Option<Awaited>,
-    snapshots: BTreeSet<EntityId>,
+    snapshots: Vec<EntityId>,
     not_stored: bool,
 }
 
@@ -691,7 +691,7 @@ impl<M: Machine> Default for Slot<M> {
             idle: None,
             idle_end: None,
             snapshot: None,
-            snapshots: BTreeSet::new(),
+            snapshots: Vec::new(),
             not_stored: false,
         }
     }
@@ -3320,7 +3320,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             let live = slot.live.take()?;
             slot.busy = true;
             slot.snapshot = Some(Awaited::Pending(order.snapshot_id.clone()));
-            slot.snapshots.insert(order.snapshot_id.clone());
+            slot.snapshots.push(order.snapshot_id.clone());
             Some(live)
         });
         let Some(live) = live else {
@@ -3463,6 +3463,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         let Some(live) = slot.live.take() else {
             return Ok(());
         };
+        slot.snapshots.clear();
         let (tap, _, stopped) = stop_box(&self.runner.standing, live, end).await;
         self.pool.release(tap);
         stopped?;
@@ -3568,6 +3569,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             }
             Outcome::Gone(tap, stopped) => {
                 slot.paused = false;
+                slot.snapshots.clear();
                 freed = Some((tap, stopped));
             }
         }
@@ -3610,6 +3612,12 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
             slot.snapshot = None;
         }
         slot.not_stored = true;
+        slot.snapshots.retain(|taken| taken != snapshot_id);
+        if let (Some(Awaited::Pending(running)), Some((Running::Snapshot, _))) = (&slot.snapshot, &slot.task) {
+            self.runner.cancels.cancel(running.clone());
+            slot.snapshots.retain(|taken| taken != running);
+            slot.snapshot = None;
+        }
         drop_base(slot, &self.runner.standing)
     }
 
@@ -3619,6 +3627,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                 return None;
             }
             slot.snapshot = Some(Awaited::Accepted);
+            if let Some(at) = slot.snapshots.iter().position(|taken| taken == snapshot_id) {
+                slot.snapshots.drain(..at);
+            }
             Some(session.clone())
         });
         let Some(session) = waiting else {
