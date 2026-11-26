@@ -16,7 +16,9 @@ use tumpel_api::types::{
     GuestClaudeSetupUrlType, GuestHarness, GuestInput, GuestMessage,
 };
 use tumpel_guest::codex_login::{access_token_expiry, device_prompt, DevicePrompt};
-use tumpel_guest::setup_output::{minted_token, printed_lines, redacted, refusal, sign_in_url, strip_ansi};
+use tumpel_guest::setup_output::{
+    google_refusal, minted_token, printed_lines, redacted, refusal, sign_in_url, strip_ansi,
+};
 use tumpel_guest::{encode, tail, Decoder};
 
 const COLUMNS: u16 = 4000;
@@ -24,8 +26,10 @@ const SETTLE: Duration = Duration::from_millis(500);
 const ECHO_SETTLE_LIMIT: Duration = Duration::from_secs(3);
 const DETAIL_TAIL: usize = 2048;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-const EXITED: &str = "Claude Code exited without printing a token; start the Claude setup again";
 const CODEX: &str = "Codex";
+const GEMINI: &str = "Gemini";
+const GEMINI_SETTINGS: &str = r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#;
+const NO_BROWSER: [(&str, &str); 1] = [("NO_BROWSER", "true")];
 const CODEX_LOGIN: [&str; 4] = ["-c", "cli_auth_credentials_store=\"file\"", "login", "--device-auth"];
 const CLAUDE_LOGIN: [&str; 1] = ["setup-token"];
 
@@ -94,7 +98,12 @@ fn open_pty() -> Result<(File, OwnedFd), String> {
     Ok((File::from(master), unsafe { OwnedFd::from_raw_fd(slave) }))
 }
 
-fn spawn(config: &GuestHarness, confinement: &Confinement, arguments: &[&str]) -> Result<Terminal, String> {
+fn spawn(
+    config: &GuestHarness,
+    confinement: &Confinement,
+    arguments: &[&str],
+    variables: &[(&str, &str)],
+) -> Result<Terminal, String> {
     let program = config
         .command
         .first()
@@ -119,6 +128,7 @@ fn spawn(config: &GuestHarness, confinement: &Confinement, arguments: &[&str]) -
                 .iter()
                 .map(|variable| (variable.name.as_str(), variable.value.as_str())),
         )
+        .envs(variables.iter().copied())
         .env("TERM", "xterm-256color")
         .current_dir(&*environment.home)
         .stdin(duplicate(&slave)?)
@@ -240,13 +250,43 @@ fn await_token(terminal: &mut Terminal, from: usize, budget: Duration) -> Minted
     }
 }
 
-fn mint_timed_out(seconds: NonZeroU32, lines: &[String]) -> String {
+fn signed_in(path: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let creds: serde_json::Value = serde_json::from_str(&text).ok()?;
+    creds["refresh_token"]
+        .as_str()
+        .is_some_and(|token| !token.is_empty())
+        .then_some(text)
+}
+
+fn await_creds(terminal: &mut Terminal, from: usize, path: &str, budget: Duration) -> Minted {
+    let deadline = Instant::now() + budget;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let exited = terminal.read(SETTLE.min(left)).is_err();
+        if let Some(creds) = signed_in(path) {
+            return Minted::Token(creds);
+        }
+        let printed = terminal.text.get(from..).unwrap_or_default();
+        if let Some(line) = google_refusal(printed) {
+            return Minted::Refused(line);
+        }
+        if exited {
+            return Minted::Exited;
+        }
+        if left.is_zero() {
+            return Minted::TimedOut(printed_lines(printed));
+        }
+    }
+}
+
+fn mint_timed_out(name: &str, seconds: NonZeroU32, lines: &[String]) -> String {
     let printed = if lines.is_empty() {
-        "Claude Code printed nothing after the code".to_string()
+        format!("{name} printed nothing after the code")
     } else {
-        format!("Claude Code printed after the code: {}", lines.join(" / "))
+        format!("{name} printed after the code: {}", lines.join(" / "))
     };
-    format!("Claude Code minted no token within mintBudgetSeconds {seconds} of the code. {printed}; start the Claude setup again")
+    format!("{name} minted no token within mintBudgetSeconds {seconds} of the code. {printed}; start the Claude setup again")
 }
 
 fn store(start: &GuestClaudeSetupStart, token: &str, expires_at: Option<&str>) -> Result<(), String> {
@@ -319,7 +359,7 @@ fn codex(
     confinement: &Confinement,
     stream: &mut File,
 ) -> Result<(), String> {
-    let mut terminal = match spawn(config, confinement, &CODEX_LOGIN) {
+    let mut terminal = match spawn(config, confinement, &CODEX_LOGIN, &[]) {
         Ok(terminal) => terminal,
         Err(detail) => return fail(stream, start, GuestClaudeSetupFailureReason::UrlNotPrinted, detail),
     };
@@ -377,15 +417,29 @@ pub fn run(
     if config.harness.as_str() == CODEX {
         return codex(start, config, confinement, stream);
     }
-    let mut terminal = match spawn(config, confinement, &CLAUDE_LOGIN) {
+    let gemini = config.harness.as_str() == GEMINI;
+    let (name, program, arguments, variables): (_, _, &[&str], &[(&str, &str)]) = if gemini {
+        ("Gemini CLI", "gemini", &[], &NO_BROWSER)
+    } else {
+        ("Claude Code", "claude setup-token", &CLAUDE_LOGIN, &[])
+    };
+    let home = &*config.environment.home;
+    let creds = format!("{home}/.gemini/oauth_creds.json");
+    if gemini {
+        let settings = format!("{home}/.gemini/settings.json");
+        let written = std::fs::create_dir_all(format!("{home}/.gemini"))
+            .and_then(|()| std::fs::write(&settings, GEMINI_SETTINGS));
+        if let Err(error) = written {
+            let detail = format!("writing {settings}: {error}");
+            return fail(stream, start, GuestClaudeSetupFailureReason::UrlNotPrinted, detail);
+        }
+    }
+    let mut terminal = match spawn(config, confinement, arguments, variables) {
         Ok(terminal) => terminal,
         Err(detail) => return fail(stream, start, GuestClaudeSetupFailureReason::UrlNotPrinted, detail),
     };
     let Some(url) = await_url(&mut terminal) else {
-        let detail = format!(
-            "claude setup-token exited without printing a sign-in URL: {}",
-            terminal.tail()
-        );
+        let detail = format!("{program} exited without printing a sign-in URL: {}", terminal.tail());
         return fail(stream, start, GuestClaudeSetupFailureReason::UrlNotPrinted, detail);
     };
     send(
@@ -394,7 +448,7 @@ pub fn run(
             claude_setup_id: start.claude_setup_id.clone(),
             sign_in_url: url
                 .try_into()
-                .map_err(|error| format!("the sign-in URL Claude Code printed: {error}"))?,
+                .map_err(|error| format!("the sign-in URL {name} printed: {error}"))?,
             type_: GuestClaudeSetupUrlType::ClaudeSetupUrl,
             user_code: None,
         },
@@ -407,34 +461,41 @@ pub fn run(
     terminal
         .master
         .write_all(code.code.as_bytes())
-        .map_err(|error| format!("typing the code into claude setup-token: {error}"))?;
+        .map_err(|error| format!("typing the code into {program}: {error}"))?;
     let settled_by = Instant::now() + ECHO_SETTLE_LIMIT;
     while Instant::now() < settled_by && terminal.read(SETTLE) == Ok(true) {}
     terminal
         .master
         .write_all(b"\r")
-        .map_err(|error| format!("pressing Enter in claude setup-token: {error}"))?;
+        .map_err(|error| format!("pressing Enter in {program}: {error}"))?;
     let budget = Duration::from_secs(u64::from(code.mint_budget_seconds.get()));
-    let token = match await_token(&mut terminal, from, budget) {
+    let minted = if gemini {
+        await_creds(&mut terminal, from, &creds, budget)
+    } else {
+        await_token(&mut terminal, from, budget)
+    };
+    drop(terminal);
+    let token = match minted {
         Minted::Token(token) => token,
         Minted::Refused(line) => {
-            let detail = format!("Claude Code refused the code: {line} Start the Claude setup again, sign in at its new sign-in URL and paste the code that page shows");
+            let detail = format!("{name} refused the code: {line} Start the Claude setup again, sign in at its new sign-in URL and paste the code that page shows");
             return fail(stream, start, GuestClaudeSetupFailureReason::CodeRejected, detail);
         }
         Minted::TimedOut(lines) => {
-            let detail = mint_timed_out(code.mint_budget_seconds, &lines);
+            let detail = mint_timed_out(name, code.mint_budget_seconds, &lines);
             return fail(stream, start, GuestClaudeSetupFailureReason::MintTimedOut, detail);
         }
         Minted::Exited => {
-            return fail(
-                stream,
-                start,
-                GuestClaudeSetupFailureReason::ClaudeCodeExited,
-                EXITED.to_string(),
-            )
+            let detail = format!("{name} exited without printing a token; start the Claude setup again");
+            return fail(stream, start, GuestClaudeSetupFailureReason::ClaudeCodeExited, detail);
         }
     };
-    drop(terminal);
     let written = store(start, &token, None);
+    if gemini {
+        let _ = std::fs::remove_file(&creds);
+    }
     stored(stream, start, written)
 }
+
+#[cfg(test)]
+mod tests;
