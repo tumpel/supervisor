@@ -4,14 +4,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::{oneshot, watch};
 use tumpel_api::types::{
-    ChannelRestoreDownloads, ChannelSnapshotChunksHeld, ChannelSnapshotPackUploads, ChannelTurnClaimed,
-    ChannelTurnWithdrawn, ChunkExchange, EntityId,
+    ChannelRestoreDownloads, ChannelSnapshotPackUploads, ChannelTurnClaimed, ChannelTurnWithdrawn, ChunkExchange,
+    EntityId,
 };
 
 use tumpel_channel::{Ask, Key};
 
 pub enum Answer {
-    ChunksHeld(ChannelSnapshotChunksHeld),
     PackUploads(ChannelSnapshotPackUploads),
     Downloads(ChannelRestoreDownloads),
     Claimed(ChannelTurnClaimed),
@@ -22,11 +21,6 @@ pub enum Answer {
 impl Answer {
     fn key(&self) -> Key {
         match self {
-            Self::ChunksHeld(answer) => Key {
-                ask: Ask::SnapshotChunks,
-                id: answer.snapshot_id.clone(),
-                part: answer.part,
-            },
             Self::PackUploads(answer) => Key {
                 ask: Ask::SnapshotPacks,
                 id: answer.snapshot_id.clone(),

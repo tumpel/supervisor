@@ -967,7 +967,13 @@ fn box_command(message: ChannelControlMessage) -> Result<Option<BoxCommand>, Str
         ChannelControlMessage::SnapshotRequest(request) => BoxCommand::Snapshot(request),
         ChannelControlMessage::BoxTeardown(teardown) => BoxCommand::Teardown(teardown),
         ChannelControlMessage::BoxDiscard(discard) => BoxCommand::Discard(discard),
-        ChannelControlMessage::SnapshotChunksHeld(held) => BoxCommand::Answer(Answer::ChunksHeld(held)),
+        ChannelControlMessage::SnapshotChunksHeld(held) => {
+            eprintln!(
+                "tumpel-supervisor: the answer to SnapshotChunks part {} of snapshot {} arrived with nothing waiting for it; dropped it",
+                held.part, *held.snapshot_id
+            );
+            return Ok(None);
+        }
         ChannelControlMessage::SnapshotPackUploads(uploads) => BoxCommand::Answer(Answer::PackUploads(uploads)),
         ChannelControlMessage::RestoreDownloads(downloads) => BoxCommand::Answer(Answer::Downloads(downloads)),
         ChannelControlMessage::TurnWithdrawn(withdrawn) => BoxCommand::Answer(Answer::Withdrawn(withdrawn)),

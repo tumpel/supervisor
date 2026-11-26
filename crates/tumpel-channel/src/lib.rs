@@ -368,7 +368,6 @@ impl RateLimit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ask {
-    SnapshotChunks,
     SnapshotPacks,
     RestoreChunks,
     TurnClaim,
@@ -405,7 +404,6 @@ impl fmt::Display for Key {
         let id = &*self.id;
         let part = self.part;
         match self.ask {
-            Ask::SnapshotChunks => write!(out, "SnapshotChunks part {part} of snapshot {id}"),
             Ask::SnapshotPacks => write!(out, "SnapshotPacks part {part} of snapshot {id}"),
             Ask::RestoreChunks => write!(out, "RestoreChunks part {part} of turn {id}"),
             Ask::TurnClaim => write!(out, "the TurnClaim of turn {id}"),
