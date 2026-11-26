@@ -10,6 +10,7 @@ use std::num::NonZeroU32;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -359,6 +360,7 @@ pub struct Updater<S: Source, I: Idle> {
     idle: I,
     out: UnboundedSender<Outgoing>,
     running_update: Mutex<()>,
+    online: AtomicBool,
 }
 
 impl<S: Source, I: Idle> Updater<S, I> {
@@ -380,7 +382,23 @@ impl<S: Source, I: Idle> Updater<S, I> {
             idle,
             out,
             running_update: Mutex::new(()),
+            online: AtomicBool::new(false),
         }
+    }
+
+    #[must_use]
+    pub fn online(&self) -> bool {
+        if self.online.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        match self.version.parse() {
+            Ok(version) => self.step(&version, &self.running, SupervisorUpdatePhase::Online, self.idle.boxes()),
+            Err(error) => eprintln!(
+                "tumpel-supervisor: not reporting the Online update step: release version {} does not fit the contract: {error}",
+                self.version
+            ),
+        }
+        true
     }
 
     pub async fn now(&self) -> Outcome {
@@ -415,7 +433,12 @@ impl<S: Source, I: Idle> Updater<S, I> {
                 self.idle.busy(),
                 grace.as_secs()
             );
-            self.step(&release, SupervisorUpdatePhase::WaitingForIdle, self.idle.boxes());
+            self.step(
+                &release.version,
+                &release.sha256,
+                SupervisorUpdatePhase::WaitingForIdle,
+                self.idle.boxes(),
+            );
             tokio::select! {
                 () = tokio::time::sleep(grace) => {}
                 () = self.idle.settled() => {}
@@ -465,7 +488,12 @@ impl<S: Source, I: Idle> Updater<S, I> {
             short(&self.running),
             named(release)
         );
-        self.step(release, SupervisorUpdatePhase::Restarting, self.idle.boxes());
+        self.step(
+            &release.version,
+            &release.sha256,
+            SupervisorUpdatePhase::Restarting,
+            self.idle.boxes(),
+        );
         match self.swap(&release.sha256) {
             Ok(()) => Outcome::Restart,
             Err(stopped) => {
@@ -476,13 +504,19 @@ impl<S: Source, I: Idle> Updater<S, I> {
         }
     }
 
-    fn step(&self, release: &Release, phase: SupervisorUpdatePhase, boxes: u32) {
+    fn step(
+        &self,
+        version: &ChannelSupervisorUpdateStepReleaseVersion,
+        to: &Sha256Digest,
+        phase: SupervisorUpdatePhase,
+        boxes: u32,
+    ) {
         let _ = self.out.send(
             ChannelHostMessage::SupervisorUpdateStep(ChannelSupervisorUpdateStep {
                 type_: ChannelSupervisorUpdateStepType::SupervisorUpdateStep,
                 from_sha256: self.running.clone(),
-                to_sha256: release.sha256.clone(),
-                release_version: release.version.clone(),
+                to_sha256: to.clone(),
+                release_version: version.clone(),
                 boxes_running: i32::try_from(boxes).unwrap_or(i32::MAX),
                 phase,
                 at: Utc::now().fixed_offset(),
@@ -532,7 +566,12 @@ impl<S: Source, I: Idle> Updater<S, I> {
 
     async fn prepare(&self, release: &Release) -> Result<(), Stop> {
         use SupervisorUpdateFailureReason as Reason;
-        self.step(release, SupervisorUpdatePhase::Fetching, self.idle.boxes());
+        self.step(
+            &release.version,
+            &release.sha256,
+            SupervisorUpdatePhase::Fetching,
+            self.idle.boxes(),
+        );
         let bytes = match timeout(self.limits.download, self.source.binary()).await {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => return Err(stop(Reason::SupervisorUpdateFetchFailed, error)),
@@ -571,7 +610,12 @@ impl<S: Source, I: Idle> Updater<S, I> {
             ));
         }
         self.place_candidate(&bytes).await?;
-        self.step(release, SupervisorUpdatePhase::DryRunning, self.idle.boxes());
+        self.step(
+            &release.version,
+            &release.sha256,
+            SupervisorUpdatePhase::DryRunning,
+            self.idle.boxes(),
+        );
         if let Err(stopped) = self.dry_run(release).await {
             return Err(self.refuse(&release.sha256, stopped));
         }

@@ -111,6 +111,17 @@ struct Updates {
 }
 
 impl Updates {
+    fn welcomed(&self) {
+        if self.updater.online() {
+            tokio::spawn(async {
+                if let Err(error) = systemctl(&["reset-failed", "tumpel-supervisor.service"]).await {
+                    eprintln!("tumpel-supervisor: {error}; systemd keeps its restart counter");
+                }
+            });
+        }
+        self.announced();
+    }
+
     fn announced(&self) {
         let updater = Arc::clone(&self.updater);
         let restart = self.restart.clone();
@@ -132,24 +143,28 @@ pub(crate) async fn refresh_unit(layout: &Layout) -> Result<(), String> {
         "rewrote {} to the unit this binary installs; reloading systemd",
         layout.unit.display()
     );
-    let reloaded = tokio::time::timeout(
+    systemctl(&["daemon-reload"]).await.map_err(failed)
+}
+
+async fn systemctl(args: &[&str]) -> Result<(), String> {
+    let command = args.join(" ");
+    let ran = tokio::time::timeout(
         UNIT_RELOAD,
         tokio::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
+            .arg("--user")
+            .args(args)
             .kill_on_drop(true)
             .status(),
     )
     .await;
-    match reloaded {
+    match ran {
         Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => Err(failed(format!("systemctl --user daemon-reload exited with {status}"))),
-        Ok(Err(error)) => Err(failed(format!(
-            "starting systemctl --user daemon-reload failed: {error}"
-        ))),
-        Err(_) => Err(failed(format!(
-            "systemctl --user daemon-reload ran past {} s",
+        Ok(Ok(status)) => Err(format!("systemctl --user {command} exited with {status}")),
+        Ok(Err(error)) => Err(format!("starting systemctl --user {command} failed: {error}")),
+        Err(_) => Err(format!(
+            "systemctl --user {command} ran past {} s",
             UNIT_RELOAD.as_secs()
-        ))),
+        )),
     }
 }
 
@@ -1064,7 +1079,7 @@ async fn session(
                                 eprintln!("connected to {url}");
                                 last_beat = Instant::now();
                                 commands.send(BoxCommand::Welcomed(channel.version()))
-                                    .inspect(|()| updates.announced())
+                                    .inspect(|()| updates.welcomed())
                                     .err().map(|_| Err(fail(SupervisorFailure::ProtocolError, "the box task stopped; restart the supervisor")))
                             }
                             Ok(Event::Message(message)) => match box_command(*message) {
