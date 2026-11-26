@@ -11,14 +11,14 @@ use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
 use tumpel_api::types::{
-    BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
-    ChannelProtocol, ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunksHeld,
-    ChannelSnapshotChunksHeldType, ChannelSnapshotDownload, ChannelSnapshotFailed, ChannelSnapshotFailedType,
-    ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType, ChannelSnapshotPacks,
-    ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId,
-    GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox,
-    SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
-    SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
+    BoxRetention, ChannelBoxTeardownFailureReason, ChannelHostMessage, ChannelPackUrl, ChannelProtocol,
+    ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotDownload, ChannelSnapshotFailed,
+    ChannelSnapshotFailedType, ChannelSnapshotFailureReason, ChannelSnapshotPackUploads,
+    ChannelSnapshotPackUploadsType, ChannelSnapshotPacks, ChannelTurnClaimed, ChannelTurnClaimedType,
+    ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId, GuestHarnessProtocol, GuestHello, GuestInput,
+    GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
+    SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind,
+    SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
 };
 use tumpel_channel::{Ask, Key, Outgoing};
 
@@ -456,7 +456,6 @@ impl Vmm for MemoryVmm {
 
 #[derive(Default)]
 struct Index {
-    chunks: HashMap<String, ChannelChunkPlacement>,
     packs: HashMap<String, std::num::NonZeroU64>,
 }
 
@@ -769,12 +768,6 @@ fn control_plane(
             let mut index = store.2.lock().expect("index");
             match message {
                 ChannelHostMessage::SnapshotPacks(packs) => {
-                    for chunk in &packs.chunks {
-                        index
-                            .chunks
-                            .entry(chunk.digest.as_str().to_string())
-                            .or_insert_with(|| chunk.clone());
-                    }
                     for pack in &packs.packs {
                         index
                             .packs
