@@ -86,7 +86,7 @@ pub fn error_result(protocol: &GuestHarnessProtocol, line: &str) -> Option<(Turn
         GuestHarnessProtocol::PiRpc => pi_error(&value),
         GuestHarnessProtocol::PromptOnStdin => opencode_error(&value),
         GuestHarnessProtocol::CodexExecJson => codex_error(&value),
-        GuestHarnessProtocol::ShellLines | GuestHarnessProtocol::GeminiStreamJson => None,
+        GuestHarnessProtocol::ShellLines => None,
         GuestHarnessProtocol::Unrecognised(_) => {
             tumpel_channel::update_required();
             None
