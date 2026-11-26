@@ -25,6 +25,11 @@ pub const AVERAGE_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_CHUNK_BYTES: usize = 256 * 1024;
 pub const PACK_BYTES: u64 = 8 * 1024 * 1024;
 
+const CHUNK_LIST_MAGIC: &[u8] = b"TPCL";
+const CHUNK_LIST_VERSION: u32 = 1;
+const LIST_PACK_BYTES: usize = 32;
+const LIST_RECORD_BYTES: usize = 44;
+
 const UPPER_ON_DRIVE: &str = "/upper";
 const OPAQUE_XATTR: &str = "SCHILY.xattr.trusted.overlay.opaque";
 
@@ -749,6 +754,79 @@ pub fn decode(bytes: &[u8]) -> Result<Manifest, String> {
     Ok(decoded)
 }
 
+pub enum Layout {
+    Files(Manifest),
+    Stream(Vec<Place>),
+}
+
+pub fn decode_layout(bytes: &[u8]) -> Result<Layout, String> {
+    match bytes.strip_prefix(CHUNK_LIST_MAGIC) {
+        Some(list) => decode_chunk_list(list).map(Layout::Stream),
+        None => decode(bytes).map(Layout::Files),
+    }
+}
+
+fn le_u32(bytes: &[u8]) -> Option<u32> {
+    bytes.try_into().ok().map(u32::from_le_bytes)
+}
+
+fn decode_chunk_list(list: &[u8]) -> Result<Vec<Place>, String> {
+    let (header, body) = list
+        .split_at_checked(12)
+        .ok_or("the chunk list ends inside its 16-byte header")?;
+    let word = |at: usize| header.get(at..at + 4).and_then(le_u32).unwrap_or(0);
+    let (version, pack_count, record_count) = (word(0), word(4), word(8));
+    if version != CHUNK_LIST_VERSION {
+        return Err(format!(
+            "the chunk list has version {version}, and this supervisor reads version {CHUNK_LIST_VERSION}"
+        ));
+    }
+    let table_bytes = u64::from(pack_count) * LIST_PACK_BYTES as u64;
+    let expected = 16 + table_bytes + u64::from(record_count) * LIST_RECORD_BYTES as u64;
+    if list.len() as u64 + CHUNK_LIST_MAGIC.len() as u64 != expected {
+        return Err(format!(
+            "the chunk list holds {} bytes, and its header of {pack_count} packs and {record_count} chunks says {expected}",
+            list.len() + CHUNK_LIST_MAGIC.len()
+        ));
+    }
+    let (table, records) = body
+        .split_at_checked(
+            usize::try_from(table_bytes).map_err(|error| format!("the chunk list's pack table: {error}"))?,
+        )
+        .ok_or("the chunk list ends inside its pack table")?;
+    let packs: Vec<String> = table
+        .as_chunks::<LIST_PACK_BYTES>()
+        .0
+        .iter()
+        .map(|pack| hex(pack.as_slice()))
+        .collect();
+    records
+        .as_chunks::<LIST_RECORD_BYTES>()
+        .0
+        .iter()
+        .map(|record| -> Result<Place, String> {
+            let (digest, fields) = record.split_at(32);
+            let field = |at: usize| fields.get(at..at + 4).and_then(le_u32).unwrap_or(0);
+            let digest = hex(digest);
+            let pack = usize::try_from(field(0))
+                .ok()
+                .and_then(|index| packs.get(index))
+                .ok_or_else(|| {
+                    format!(
+                        "chunk {digest} names pack {} of the chunk list's {pack_count}",
+                        field(0)
+                    )
+                })?;
+            Ok(Place {
+                digest,
+                pack: pack.clone(),
+                offset: u64::from(field(4)),
+                length: field(8),
+            })
+        })
+        .collect()
+}
+
 pub fn encode_root(manifest: &[Place]) -> Result<Vec<u8>, String> {
     let manifest = manifest.iter().map(Place::to_wire).collect::<Result<Vec<_>, _>>()?;
     serde_json::to_vec(&SnapshotRoot { manifest }).map_err(|error| format!("writing the root as JSON: {error}"))
@@ -916,6 +994,19 @@ pub fn write_restore<W: Write>(
         .into_inner()
         .and_then(|mut out| out.flush())
         .map_err(|error| format!("finishing the restore archive: {error}"))
+}
+
+pub fn write_stream<W: Write>(
+    chunks: &[Place],
+    cache: &ChunkCache,
+    mut out: W,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let size = chunks.iter().map(|place| u64::from(place.length)).sum();
+    let mut stream = reassembled(b"the restore stream", size, chunks, cache, cancel)?;
+    std::io::copy(&mut stream, &mut out)
+        .and_then(|_| out.flush())
+        .map_err(|error| format!("writing the restore archive: {error}"))
 }
 
 pub struct Ext4Upper {
