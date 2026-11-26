@@ -352,7 +352,7 @@ fn scan_dir(name: &str) -> PathBuf {
         std::fs::remove_dir_all(&dir).expect("clearing the last run");
     }
     std::fs::create_dir_all(&dir).expect("the scan directory");
-    dir.canonicalize().expect("the scan directory")
+    dir
 }
 
 fn holding(files: &[&Path]) -> std::process::Child {
@@ -411,7 +411,8 @@ fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
     let images = dir.join("images");
     let data = dir.join("data");
     let cgroups = dir.join("cgroups");
-    std::fs::create_dir_all(images.join("layers")).expect("the image cache");
+    std::fs::create_dir_all(dir.join("cache").join("layers")).expect("the image cache");
+    std::os::unix::fs::symlink("cache", &images).expect("a symlinked image cache");
     let (full, base, layer, other) = ("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
     std::fs::write(images.join(format!("{full}.ext4")), b"full").expect("the full image");
     std::fs::write(
@@ -501,9 +502,7 @@ fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
             ),
         ]
     );
-    for server in servers {
-        server.join().expect("the API answers");
-    }
+    servers.map(|server| server.join().expect("the API answers"));
     for mut child in [full_box, layered_box] {
         child.kill().expect("the box stops");
         child.wait().expect("the box is reaped");

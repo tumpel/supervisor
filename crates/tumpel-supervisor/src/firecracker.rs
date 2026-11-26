@@ -698,6 +698,24 @@ fn scopes(listing: &str) -> Vec<(u8, String)> {
         .collect()
 }
 
+fn box_scopes(command: &[&str]) -> Result<String, String> {
+    let listed = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(command)
+        .arg("tumpel-box*.scope")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("starting systemctl to list the box scopes: {error}"))?;
+    if !listed.status.success() {
+        return Err(format!(
+            "listing the box scopes failed with {}: {}; run the supervisor from its systemd user unit",
+            listed.status,
+            String::from_utf8_lossy(&listed.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&listed.stdout).into_owned())
+}
+
 fn scope_pid(cgroups: &Path, index: u8, group: &str) -> Result<libc::pid_t, String> {
     let scope = scope_of(index);
     if group.is_empty() {
@@ -727,19 +745,8 @@ impl Firecracker {
     /// # Errors
     /// Fails when systemd does not list the box scopes.
     pub fn scan(&self) -> Result<ScannedBoxes, String> {
-        let listed = std::process::Command::new("systemctl")
-            .args(["--user", "show", "--property=Id,ControlGroup", "tumpel-box*.scope"])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| format!("starting systemctl to list the box scopes: {error}"))?;
-        if !listed.status.success() {
-            return Err(format!(
-                "listing the box scopes failed with {}: {}; run the supervisor from its systemd user unit",
-                listed.status,
-                String::from_utf8_lossy(&listed.stderr).trim()
-            ));
-        }
-        Ok(self.scanned(&String::from_utf8_lossy(&listed.stdout), Path::new("/sys/fs/cgroup")))
+        let listed = box_scopes(&["show", "--property=Id,ControlGroup"])?;
+        Ok(self.scanned(&listed, Path::new("/sys/fs/cgroup")))
     }
 
     fn scanned(&self, listing: &str, cgroups: &Path) -> ScannedBoxes {
@@ -751,7 +758,12 @@ impl Firecracker {
 
     fn scan_box(&self, cgroups: &Path, index: u8, group: &str) -> Result<Scanned, String> {
         let pid = scope_pid(cgroups, index, group)?;
-        let held = self.held(pid)?;
+        let canonical = |dir: &Path| {
+            dir.canonicalize()
+                .map_err(|error| format!("resolving {}: {error}", dir.display()))
+        };
+        let layers = LayerCache::new(&canonical(&self.images)?, NonZeroU32::MIN);
+        let held = held(pid, &canonical(&self.data)?.join("sessions"), &layers)?;
         let session = held
             .session
             .ok_or_else(|| format!("Firecracker process {pid} holds no box disk open"))?;
@@ -773,7 +785,7 @@ impl Firecracker {
                 base: images::cached_base(&self.images, &digest)
                     .map_err(|refusal| refusal.detail)?
                     .ok_or_else(|| missing(&format!("base {digest}")))?,
-                layer: layers::cached(&LayerCache::new(&self.images, NonZeroU32::MIN), &layer)
+                layer: layers::cached(&layers, &layer)
                     .map_err(|refusal| refusal.detail)?
                     .ok_or_else(|| missing(&format!("harness layer {layer}")))?,
             }),
@@ -789,33 +801,34 @@ impl Firecracker {
             size,
         })
     }
+}
 
-    fn held(&self, pid: libc::pid_t) -> Result<Held, String> {
-        let fds = PathBuf::from(format!("/proc/{pid}/fd"));
-        let listed = std::fs::read_dir(&fds)
-            .and_then(Iterator::collect::<std::io::Result<Vec<_>>>)
-            .map_err(|error| format!("listing {}: {error}", fds.display()))?;
-        let sessions = self.data.join("sessions");
-        let layers = self.images.join("layers");
-        let mut held = Held::default();
-        for entry in listed {
-            let path = std::fs::read_link(entry.path())
-                .map_err(|error| format!("reading {}: {error}", entry.path().display()))?;
-            let stem = path.file_stem().map(|stem| stem.to_string_lossy().into_owned());
-            let extension = path.extension().and_then(|extension| extension.to_str());
-            if let Ok(inside) = path.strip_prefix(&sessions) {
-                held.session = inside
-                    .components()
-                    .next()
-                    .map(|session| session.as_os_str().to_string_lossy().into_owned());
-            } else if path.parent() == Some(self.images.as_path()) && extension == Some("ext4") {
-                held.image = stem;
-            } else if path.parent() == Some(layers.as_path()) && extension == Some("squashfs") {
-                held.layer = stem;
-            }
+fn held(pid: libc::pid_t, sessions: &Path, layers: &LayerCache) -> Result<Held, String> {
+    let fds = PathBuf::from(format!("/proc/{pid}/fd"));
+    let listed = std::fs::read_dir(&fds)
+        .and_then(Iterator::collect::<std::io::Result<Vec<_>>>)
+        .map_err(|error| format!("listing {}: {error}", fds.display()))?;
+    let mut held = Held::default();
+    for entry in listed {
+        let path = match std::fs::read_link(entry.path()) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("reading {}: {error}", entry.path().display())),
+        };
+        let stem = path.file_stem().map(|stem| stem.to_string_lossy().into_owned());
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        if let Ok(inside) = path.strip_prefix(sessions) {
+            held.session = inside
+                .components()
+                .next()
+                .map(|session| session.as_os_str().to_string_lossy().into_owned());
+        } else if path.parent() == Some(layers.images.as_path()) && extension == Some("ext4") {
+            held.image = stem;
+        } else if path.parent() == Some(layers.dir.as_path()) && extension == Some("squashfs") {
+            held.layer = stem;
         }
-        Ok(held)
     }
+    Ok(held)
 }
 
 impl Vmm for Firecracker {
@@ -895,27 +908,9 @@ impl Vmm for Firecracker {
     }
 
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
-        let listed = std::process::Command::new("systemctl")
-            .args([
-                "--user",
-                "list-units",
-                "--all",
-                "--plain",
-                "--no-legend",
-                "tumpel-box*.scope",
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| format!("starting systemctl to list the box scopes: {error}"))?;
-        if !listed.status.success() {
-            return Err(format!(
-                "listing the box scopes failed with {}: {}; run the supervisor from its systemd user unit",
-                listed.status,
-                String::from_utf8_lossy(&listed.stderr).trim()
-            ));
-        }
+        let listed = box_scopes(&["list-units", "--all", "--plain", "--no-legend"])?;
         let kept: Vec<String> = claimed.iter().copied().map(scope_of).collect();
-        let unclaimed: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        let unclaimed: Vec<String> = listed
             .lines()
             .filter_map(|line| line.split_whitespace().next())
             .filter(|scope| !kept.iter().any(|kept| kept == scope))
