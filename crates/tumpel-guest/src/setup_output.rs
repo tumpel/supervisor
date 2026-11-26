@@ -1,5 +1,7 @@
 pub const TOKEN_PREFIX: &str = "sk-ant-oat";
 const REFUSAL: &str = "OAuth error";
+const GOOGLE_SIGN_IN: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_REFUSAL: &str = "Failed to authenticate with authorization code";
 const RETRY: &str = "Press Enter to retry";
 const ECHO: &str = "Paste code here";
 const SECRET_RUN: usize = 32;
@@ -65,7 +67,7 @@ pub fn sign_in_url(text: &str) -> Option<String> {
             .unwrap_or(candidate.len());
         if end < candidate.len() {
             let url = candidate[..end].trim_end_matches(['.', ',', ')', ']']);
-            if url.contains("/oauth/authorize") {
+            if url.contains("/oauth/authorize") || url.starts_with(GOOGLE_SIGN_IN) {
                 return Some(url.to_string());
             }
         }
@@ -113,6 +115,15 @@ fn awaits_retry(text: &str) -> Option<String> {
 #[must_use]
 pub fn refusal(text: &str) -> Option<String> {
     oauth_error(text).or_else(|| awaits_retry(text))
+}
+
+#[must_use]
+pub fn google_refusal(text: &str) -> Option<String> {
+    if let Some(at) = text.find(GOOGLE_REFUSAL) {
+        let line = &text[at..];
+        return Some(redacted(line.lines().next().unwrap_or(line).trim_end()));
+    }
+    sign_in_url(text).map(|_| "Gemini CLI printed a new sign-in URL instead of signing in".to_string())
 }
 
 #[must_use]
@@ -165,6 +176,29 @@ mod tests {
         let cut = &text[..text.find("state=").unwrap_or(0) + 7];
         assert_eq!(sign_in_url(cut), None, "a URL still arriving is not taken");
         assert_eq!(sign_in_url("see https://docs.anthropic.com/ for help\n"), None);
+    }
+
+    #[test]
+    fn google_s_sign_in_url_comes_out_of_the_gemini_output() {
+        let text = strip_ansi("\r\nPlease visit the following URL to authorize the application:\r\n\r\nhttps://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https%3A%2F%2Fcodeassist.google.com%2Fauthcode&access_type=offline&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&code_challenge_method=S256&code_challenge=x1Y2&state=s7&response_type=code&client_id=681255809395.apps.googleusercontent.com\r\n\r\nEnter the authorization code: ");
+        assert_eq!(
+            sign_in_url(&text).as_deref(),
+            Some("https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https%3A%2F%2Fcodeassist.google.com%2Fauthcode&access_type=offline&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&code_challenge_method=S256&code_challenge=x1Y2&state=s7&response_type=code&client_id=681255809395.apps.googleusercontent.com")
+        );
+        assert_eq!(sign_in_url("see https://accounts.google.com/signin for help\n"), None);
+    }
+
+    #[test]
+    fn gemini_refuses_a_code_with_a_failure_line_or_a_new_sign_in_url() {
+        assert_eq!(
+            google_refusal("4/0Ab-code\nFailed to authenticate with authorization code: invalid_grant\n").as_deref(),
+            Some("Failed to authenticate with authorization code: invalid_grant")
+        );
+        assert_eq!(
+            google_refusal("4/0Ab-code\nhttps://accounts.google.com/o/oauth2/v2/auth?state=s8\n").as_deref(),
+            Some("Gemini CLI printed a new sign-in URL instead of signing in")
+        );
+        assert_eq!(google_refusal("4/0Ab-code\nLoading\n"), None);
     }
 
     #[test]
