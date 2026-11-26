@@ -65,6 +65,13 @@ fn boot_word(value: &str, named: &str) -> Result<String, String> {
     ))
 }
 
+fn left_in_frame(buffered: &[u8]) -> usize {
+    match buffered.first_chunk::<4>() {
+        Some(header) => 4 + u32::from_be_bytes(*header) as usize - buffered.len(),
+        None => 4 - buffered.len(),
+    }
+}
+
 pub struct VsockGuest {
     stream: UnixStream,
     decoder: Decoder,
@@ -81,9 +88,10 @@ impl VsockGuest {
                 }
                 return Ok(message);
             }
+            let wanted = left_in_frame(self.decoder.buffered()).min(buffer.len());
             let read = self
                 .stream
-                .read(&mut buffer)
+                .read(&mut buffer[..wanted])
                 .await
                 .map_err(|error| format!("reading from the guest: {error}"))?;
             if read == 0 {
@@ -112,6 +120,10 @@ impl Guest for VsockGuest {
 
     async fn receive(&mut self) -> Result<GuestMessage, String> {
         self.read_message().await
+    }
+
+    fn between_frames(&self) -> bool {
+        self.decoder.buffered().is_empty()
     }
 }
 

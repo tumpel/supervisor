@@ -346,6 +346,71 @@ async fn every_guest_family_survives_unknown_variants_and_extra_fields() {
     }
 }
 
+fn line_frame(line: i64) -> Vec<u8> {
+    let message: GuestMessage =
+        serde_json::from_value(json!({"type":"TurnLine","turnId":"turn-1","lineSeq":line,"text":"work"}))
+            .expect("a guest message");
+    encode(&message).expect("a frame")
+}
+
+fn guest_pair() -> (tokio::net::UnixStream, super::VsockGuest) {
+    let (producer, stream) = tokio::net::UnixStream::pair().expect("guest socket");
+    let guest = super::VsockGuest {
+        stream,
+        decoder: tumpel_guest::Decoder::default(),
+    };
+    (producer, guest)
+}
+
+fn line_seq(message: &GuestMessage) -> i64 {
+    match message {
+        GuestMessage::TurnLine(line) => line.line_seq.0,
+        other => panic!("expected a turn line, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn each_receive_returns_one_whole_frame_and_buffers_nothing_past_it() {
+    use tokio::io::AsyncWriteExt;
+    let (mut producer, mut guest) = guest_pair();
+    producer
+        .write_all(&[line_frame(1), line_frame(2)].concat())
+        .await
+        .expect("two frames in one write");
+    for expected in [1, 2] {
+        let message = guest.receive().await.expect("a frame");
+        assert_eq!(line_seq(&message), expected);
+        assert_eq!(guest.decoder.buffered(), [0_u8; 0]);
+    }
+    let split = line_frame(3);
+    let receiving = tokio::spawn(async move {
+        let message = guest.receive().await.expect("a frame");
+        (guest, message)
+    });
+    for part in [&split[..2], &split[2..10], &split[10..]] {
+        producer.write_all(part).await.expect("part of a frame");
+        tokio::task::yield_now().await;
+    }
+    let (guest, message) = receiving.await.expect("the receive finishes");
+    assert_eq!(line_seq(&message), 3);
+    assert_eq!(guest.decoder.buffered(), [0_u8; 0]);
+}
+
+#[tokio::test]
+async fn a_receive_dropped_mid_body_loses_no_byte_of_the_frame() {
+    use tokio::io::AsyncWriteExt;
+    let (mut producer, mut guest) = guest_pair();
+    let frame = line_frame(1);
+    producer.write_all(&frame[..8]).await.expect("the frame's head");
+    let cut = tokio::time::timeout(std::time::Duration::from_millis(50), guest.receive()).await;
+    assert!(cut.is_err(), "the receive waits for the rest of the frame");
+    assert!(!guest.between_frames());
+    producer.write_all(&frame[8..]).await.expect("the frame's tail");
+    let message = guest.receive().await.expect("the whole frame");
+    assert_eq!(line_seq(&message), 1);
+    assert!(guest.between_frames());
+}
+
 struct ScanDir {
     dir: PathBuf,
     boxes: Vec<std::process::Child>,

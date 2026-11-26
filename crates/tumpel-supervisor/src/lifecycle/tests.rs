@@ -40,6 +40,7 @@ enum Harness {
     Silent,
     StallsAfterFirstLine,
     SlowClone,
+    SlowLine,
     HangsCloning,
     RefusesClone,
 }
@@ -93,6 +94,7 @@ struct MemoryGuest {
     lines: i64,
     pending: VecDeque<GuestMessage>,
     ready_at: Option<tokio::time::Instant>,
+    mid_frame: Option<tokio::time::Instant>,
 }
 
 fn message(value: serde_json::Value) -> GuestMessage {
@@ -128,7 +130,7 @@ impl MemoryGuest {
             json!({ "type": "TurnRepositoryReady", "turnId": *start.turn_id }),
         ));
         let texts: Vec<&str> = match self.harness {
-            Harness::Echo | Harness::Reader | Harness::SlowClone => start.prompt.lines().collect(),
+            Harness::Echo | Harness::Reader | Harness::SlowClone | Harness::SlowLine => start.prompt.lines().collect(),
             Harness::StallsAfterFirstLine => start.prompt.lines().take(1).collect(),
             Harness::HangsCloning | Harness::RefusesClone | Harness::Silent => Vec::new(),
         };
@@ -160,7 +162,10 @@ impl MemoryGuest {
                 .or_default()
                 .insert(file, (found, start.prompt.as_bytes().to_vec()));
         }
-        if matches!(self.harness, Harness::Echo | Harness::Reader | Harness::SlowClone) {
+        if matches!(
+            self.harness,
+            Harness::Echo | Harness::Reader | Harness::SlowClone | Harness::SlowLine
+        ) {
             self.pending.push_back(message(json!({
                 "type": "TurnEnd", "turnId": *start.turn_id, "reason": "Completed", "lastLineSeq": self.lines, "detail": ""
             })));
@@ -179,10 +184,22 @@ impl Guest for MemoryGuest {
         if let (true, Harness::SlowClone, Some(ready_at)) = (cloning, self.harness, self.ready_at) {
             tokio::time::sleep_until(ready_at).await;
         }
+        let later_line = matches!(self.pending.front(), Some(GuestMessage::TurnLine(line)) if line.line_seq.0 > 1);
+        if let (true, Harness::SlowLine) = (later_line, self.harness) {
+            let complete_at = *self
+                .mid_frame
+                .get_or_insert_with(|| tokio::time::Instant::now() + SLOW_LINE);
+            tokio::time::sleep_until(complete_at).await;
+            self.mid_frame = None;
+        }
         match self.pending.pop_front() {
             Some(message) => Ok(message),
             None => std::future::pending().await,
         }
+    }
+
+    fn between_frames(&self) -> bool {
+        self.mid_frame.is_none()
     }
 }
 
@@ -241,6 +258,7 @@ impl MemoryMachine {
             lines: 0,
             pending: VecDeque::new(),
             ready_at: None,
+            mid_frame: None,
         }
     }
 }
@@ -586,6 +604,7 @@ const BOX: Size = Size {
 
 const SETTLE: Duration = Duration::from_millis(60);
 const SLOW_CLONE: Duration = Duration::from_millis(300);
+const SLOW_LINE: Duration = Duration::from_millis(300);
 const SLOW_BOOT: Duration = Duration::from_millis(50);
 const SLOW_CUT: Duration = Duration::from_millis(300);
 const LATE_CLAIM: Duration = Duration::from_millis(150);
@@ -2008,6 +2027,19 @@ async fn a_turn_mid_flight_is_handed_to_the_new_supervisor_and_completes_there()
             "pause session-1"
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_turn_mid_frame_parks_only_after_the_frame_completes() {
+    let mut old = host("handover-mid-frame", 2, Harness::SlowLine, Boot::Works);
+    old.turn("turn-1", "session-1", "one\ntwo", Vec::new());
+    assert_eq!(old.settle_until("line 1 one").await, ["claim turn-1", "line 1 one"]);
+    tokio::time::sleep(SLOW_LINE / 2).await;
+    let handover = old.ask_handover();
+    assert_eq!(old.settle_until("line 2 two").await, ["line 2 two"]);
+    let handover = handover.await.expect("the boxes are handed over");
+    let mut new = old.successor(&handover);
+    assert_eq!(new.settle_until("complete 2").await, ["complete 2"]);
 }
 
 #[tokio::test(start_paused = true)]
