@@ -3615,6 +3615,20 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         slot.snapshots.retain(|taken| taken != snapshot_id);
         if let (Some(Awaited::Pending(running)), Some((Running::Snapshot, _))) = (&slot.snapshot, &slot.task) {
             self.runner.cancels.cancel(running.clone());
+            let detail = format!(
+                "snapshot {} was built on snapshot {}, which the control plane did not store, so it was stopped; the next snapshot starts from an empty base",
+                **running, **snapshot_id
+            );
+            emit(
+                &self.runner.out,
+                ChannelSnapshotFailed {
+                    detail: reported("the snapshot failure detail", &detail),
+                    failed_at: now(),
+                    reason: ChannelSnapshotFailureReason::NotAnswered,
+                    snapshot_id: running.clone(),
+                    type_: ChannelSnapshotFailedType::SnapshotFailed,
+                },
+            );
             slot.snapshots.retain(|taken| taken != running);
             slot.snapshot = None;
         }

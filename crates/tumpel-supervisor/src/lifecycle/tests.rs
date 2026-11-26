@@ -1907,14 +1907,19 @@ async fn a_snapshot_not_stored_cancels_the_later_snapshot_on_its_base_and_the_ne
     let first = snapshot_after_turn(&mut host, "turn-1", "one").await;
     host.turn("turn-2", "session-1", "two", Vec::new());
     host.settle(SETTLE).await;
-    host.snapshot("session-1");
+    let built = host.snapshot("session-1");
     host.commands
         .send(Input::SnapshotNotStored(first.snapshot_id.clone()))
         .expect("send");
     let built_on_first = host.settle(settings().budgets.snapshot).await;
-    assert!(
-        !built_on_first.iter().any(|seen| seen == "snapshot done"),
-        "{built_on_first:?}"
+    assert_eq!(
+        built_on_first,
+        [format!(
+            "snapshot failed {}: snapshot {} was built on snapshot {}, which the control plane did not store, so it was stopped; the next snapshot starts from an empty base",
+            ChannelSnapshotFailureReason::NotAnswered,
+            *built.snapshot_id,
+            *first.snapshot_id
+        )]
     );
     assert_dirty(&mut host).await;
     let next = snapshot_after_turn(&mut host, "turn-3", "three").await;
