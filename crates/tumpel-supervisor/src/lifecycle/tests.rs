@@ -1886,6 +1886,26 @@ async fn a_snapshot_not_stored_after_a_handover_leaves_the_next_snapshot_reusing
         "{written:?}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_not_stored_after_a_crash_leaves_the_next_snapshot_reusing_none_of_its_packs() {
+    let mut old = host("not-stored-crash", 1, Harness::Echo, Boot::Works);
+    packs_of_snapshot(&mut old, "turn-1", "one").await;
+    let (not_stored, _, _) = packs_of_snapshot(&mut old, "turn-2", "two").await;
+    let mut standing = old.standing();
+    old.keep_guest(&mut standing.boxes[0], 40);
+    let mut new = old.after_crash(standing);
+    drop(old);
+    new.commands.send(Input::SnapshotNotStored(not_stored)).expect("send");
+    let (_, written, reused) = packs_of_snapshot(&mut new, "turn-3", "three").await;
+
+    assert_eq!(reused, BTreeSet::new());
+    assert!(!written.is_empty());
+    assert!(
+        written.iter().all(|pack| new.store.holds(&pack_url(pack))),
+        "{written:?}"
+    );
+}
 #[tokio::test]
 async fn a_box_on_another_host_downloads_the_chunks_its_cache_lacks() {
     let mut first = host("first-host", 1, Harness::Echo, Boot::Works);
