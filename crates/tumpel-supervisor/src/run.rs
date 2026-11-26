@@ -17,9 +17,10 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tumpel_api::types::{
     BoxDiskLimit, BoxMemoryLimit, ChannelBoxDiscard, ChannelBoxTeardown, ChannelClaudeSetupBoxOffer, ChannelCloseCode,
-    ChannelControlMessage, ChannelSnapshotRequest, ChannelTurnOffer, ClaudeSetupHarness, EntityId, HostReportedHealth,
-    Sha256Digest, SupervisorChannelState, SupervisorConfig, SupervisorFailure, SupervisorHandover,
-    SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime, TurnFailureReason,
+    ChannelControlMessage, ChannelSnapshotRequest, ChannelSupervisorUpdateStepReleaseVersion, ChannelTurnOffer,
+    ClaudeSetupHarness, EntityId, HostReportedHealth, Sha256Digest, SupervisorChannelState, SupervisorConfig,
+    SupervisorFailure, SupervisorHandover, SupervisorHandoverBoxState, SupervisorHostKey, SupervisorRuntime,
+    TurnFailureReason,
 };
 use tumpel_channel::{
     Backoff, ChannelError, Event, HeldIds, HostChannel, Outgoing, Phase, Port, RateBackoff, RateLimit, Signer, Store,
@@ -112,9 +113,9 @@ struct Updates {
 
 impl Updates {
     fn welcomed(&self) {
-        if self.updater.online() {
+        if self.updater.first_online() {
             tokio::spawn(async {
-                if let Err(error) = systemctl(&["reset-failed", "tumpel-supervisor.service"]).await {
+                if let Err(error) = systemctl(&["reset-failed", dir::SUPERVISOR_UNIT]).await {
                     eprintln!("tumpel-supervisor: {error}; systemd keeps its restart counter");
                 }
             });
@@ -695,6 +696,7 @@ pub(crate) struct Started {
     pub(crate) url: String,
     layout: Layout,
     pub(crate) running: Sha256Digest,
+    version: ChannelSupervisorUpdateStepReleaseVersion,
     source: HttpSource,
     box_size: Size,
     store: HttpStore,
@@ -706,6 +708,9 @@ pub(crate) fn start() -> Result<Started, Failure> {
     let binary = std::env::current_exe()
         .map_err(|error| unusable(format!("finding this supervisor's own binary failed: {error}")))?;
     let running = update::binary_sha256(&binary).map_err(unusable)?;
+    let version = env!("TUMPEL_RELEASE_VERSION")
+        .parse()
+        .map_err(|error| unusable(format!("the supervisor version does not fit the contract: {error}")))?;
     let layout = Layout::new(binary, dir.clone(), dir::supervisor_unit_path());
     let (config, pair, state) = load()?;
     let runtime = load_runtime(&dir)?;
@@ -735,6 +740,7 @@ pub(crate) fn start() -> Result<Started, Failure> {
         url,
         layout,
         running,
+        version,
         source,
         box_size,
         store,
@@ -817,7 +823,7 @@ pub async fn run(
             started.layout.clone(),
             Limits::HOST,
             started.running,
-            env!("TUMPEL_RELEASE_VERSION"),
+            started.version,
             idle.clone(),
             out.clone(),
         )),

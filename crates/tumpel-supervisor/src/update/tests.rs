@@ -135,7 +135,15 @@ fn updater<'a>(layout: &Layout, source: FakeSource, idle: &'a FakeIdle, limits: 
     let (out, events) = unbounded_channel();
     let running = digest(&sha256_hex(OLD_BINARY.as_bytes()));
     Run {
-        updater: Updater::new(source, layout.clone(), limits, running, "0.3.0-rc.5", idle, out),
+        updater: Updater::new(
+            source,
+            layout.clone(),
+            limits,
+            running,
+            "0.3.0-rc.5".parse().expect("the version fits"),
+            idle,
+            out,
+        ),
         events,
     }
 }
@@ -415,12 +423,12 @@ async fn the_supervisor_started_after_a_swap_reports_online_once_with_its_own_ve
         layout.clone(),
         limits(),
         running.clone(),
-        "0.4.0",
+        "0.4.0".parse().expect("the version fits"),
         &adopted,
         out,
     );
-    assert!(new.online());
-    assert!(!new.online());
+    assert!(new.first_online());
+    assert!(!new.first_online());
     let steps: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
         .map(|event| match event {
             Outgoing::Message(ChannelHostMessage::SupervisorUpdateStep(step)) => step,

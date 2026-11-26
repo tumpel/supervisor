@@ -356,7 +356,7 @@ pub struct Updater<S: Source, I: Idle> {
     layout: Layout,
     limits: Limits,
     running: Sha256Digest,
-    version: &'static str,
+    version: ChannelSupervisorUpdateStepReleaseVersion,
     idle: I,
     out: UnboundedSender<Outgoing>,
     running_update: Mutex<()>,
@@ -369,7 +369,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         layout: Layout,
         limits: Limits,
         running: Sha256Digest,
-        version: &'static str,
+        version: ChannelSupervisorUpdateStepReleaseVersion,
         idle: I,
         out: UnboundedSender<Outgoing>,
     ) -> Self {
@@ -387,17 +387,16 @@ impl<S: Source, I: Idle> Updater<S, I> {
     }
 
     #[must_use]
-    pub fn online(&self) -> bool {
+    pub fn first_online(&self) -> bool {
         if self.online.swap(true, Ordering::SeqCst) {
             return false;
         }
-        match self.version.parse() {
-            Ok(version) => self.step(&version, &self.running, SupervisorUpdatePhase::Online, self.idle.boxes()),
-            Err(error) => eprintln!(
-                "tumpel-supervisor: not reporting the Online update step: release version {} does not fit the contract: {error}",
-                self.version
-            ),
-        }
+        self.step(
+            &self.version,
+            &self.running,
+            SupervisorUpdatePhase::Online,
+            self.idle.boxes(),
+        );
         true
     }
 
@@ -417,11 +416,11 @@ impl<S: Source, I: Idle> Updater<S, I> {
             Ok(release) => release,
             Err(outcome) => return outcome,
         };
-        if let Some(refusal) = version_refusal(self.version, &release.supervisor_version, release.rollback) {
+        if let Some(refusal) = version_refusal(&self.version, &release.supervisor_version, release.rollback) {
             eprintln!(
                 "tumpel-supervisor: refusing supervisor update to {}: {refusal}; supervisor {} ({}) keeps running",
                 named(&release),
-                self.version,
+                *self.version,
                 short(&self.running)
             );
             return Outcome::Refused;
@@ -484,7 +483,7 @@ impl<S: Source, I: Idle> Updater<S, I> {
         }
         eprintln!(
             "tumpel-supervisor: swapping supervisor {} ({}) for {} and handing its boxes over",
-            self.version,
+            *self.version,
             short(&self.running),
             named(release)
         );
