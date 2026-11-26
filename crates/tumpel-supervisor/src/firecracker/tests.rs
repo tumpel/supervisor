@@ -346,31 +346,51 @@ async fn every_guest_family_survives_unknown_variants_and_extra_fields() {
     }
 }
 
-fn scan_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("tumpel-scan-{}-{name}", std::process::id()));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clearing the last run");
-    }
-    std::fs::create_dir_all(&dir).expect("the scan directory");
-    dir
+struct ScanDir {
+    dir: PathBuf,
+    boxes: Vec<std::process::Child>,
 }
 
-fn holding(files: &[&Path]) -> std::process::Child {
-    use std::io::BufRead;
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(r#"exec 3<"$1" 4<"$2" 5<"$3"; echo ready; exec sleep 60"#)
-        .arg("sh")
-        .args(files)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("sh starts");
-    let mut ready = String::new();
-    std::io::BufReader::new(child.stdout.take().expect("its output"))
-        .read_line(&mut ready)
-        .expect("it opens the files");
-    assert_eq!(ready, "ready\n");
-    child
+impl ScanDir {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("tumpel-scan-{}-{name}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).expect("clearing the last run");
+        }
+        std::fs::create_dir_all(&dir).expect("the scan directory");
+        Self { dir, boxes: Vec::new() }
+    }
+
+    fn holding(&mut self, files: &[&Path]) -> u32 {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"exec 3<"$1" 4<"$2" 5<"$3"; echo ready; exec sleep 60"#)
+            .arg("sh")
+            .args(files)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh starts");
+        let stdout = child.stdout.take().expect("its output");
+        let pid = child.id();
+        self.boxes.push(child);
+        let mut ready = String::new();
+        std::io::BufReader::new(stdout)
+            .read_line(&mut ready)
+            .expect("it opens the files");
+        assert_eq!(ready, "ready\n");
+        pid
+    }
+}
+
+impl Drop for ScanDir {
+    fn drop(&mut self) {
+        for child in &mut self.boxes {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 fn answer_machine_config(socket: &Path, mem_size_mib: u32) -> std::thread::JoinHandle<()> {
@@ -407,12 +427,15 @@ const HARNESS: &str = r#"{ "harness": "Shell", "harnessVersion": "1", "protocol"
 
 #[test]
 fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
-    let dir = scan_dir("running");
+    let mut scan = ScanDir::new("running");
+    let dir = scan.dir.clone();
     let images = dir.join("images");
     let data = dir.join("data");
     let cgroups = dir.join("cgroups");
     std::fs::create_dir_all(dir.join("cache").join("layers")).expect("the image cache");
     std::os::unix::fs::symlink("cache", &images).expect("a symlinked image cache");
+    std::fs::create_dir_all(dir.join("state")).expect("the data directory");
+    std::os::unix::fs::symlink("state", &data).expect("a symlinked data directory");
     let (full, base, layer, other) = ("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
     std::fs::write(images.join(format!("{full}.ext4")), b"full").expect("the full image");
     std::fs::write(
@@ -440,19 +463,19 @@ fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
         format!(r#"{{ "layerDigest": "{layer}", "recipeDigest": "{other}", "architecture": "Amd64", "harness": {HARNESS} }}"#),
     )
     .expect("the layer manifest");
-    let full_box = holding(&[
+    let full_box = scan.holding(&[
         &images.join(format!("{full}.ext4")),
         &overlay(&data, "session-three", 64),
         Path::new("/dev/null"),
     ]);
-    let layered_box = holding(&[
+    let layered_box = scan.holding(&[
         &images.join(format!("{base}.ext4")),
         &images.join("layers").join(format!("{layer}.squashfs")),
         &overlay(&data, "session-five", 128),
     ]);
-    for (group, child) in [("box3", &full_box), ("box5", &layered_box)] {
+    for (group, pid) in [("box3", full_box), ("box5", layered_box)] {
         std::fs::create_dir_all(cgroups.join(group)).expect("the scope cgroup");
-        std::fs::write(cgroups.join(group).join("cgroup.procs"), format!("{}\n", child.id())).expect("cgroup.procs");
+        std::fs::write(cgroups.join(group).join("cgroup.procs"), format!("{pid}\n")).expect("cgroup.procs");
     }
     let servers = [
         answer_machine_config(&data.join("box3/api.sock"), 2048),
@@ -465,10 +488,12 @@ fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
         vcpus: 1,
     };
 
-    let scanned = vmm.scanned(
-        "ControlGroup=/box3\nId=tumpel-box3.scope\n\nId=tumpel-box5.scope\nControlGroup=/box5\n",
-        &cgroups,
-    );
+    let scanned = vmm
+        .scanned(
+            "ControlGroup=/box3\nId=tumpel-box3.scope\n\nId=tumpel-box5.scope\nControlGroup=/box5\n",
+            &cgroups,
+        )
+        .expect("the caches resolve");
 
     let found: Vec<_> = scanned
         .into_iter()
@@ -482,7 +507,7 @@ fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
         vec![
             (
                 3,
-                libc::pid_t::try_from(full_box.id()).expect("a pid"),
+                libc::pid_t::try_from(full_box).expect("a pid"),
                 "session-three".to_string(),
                 format!("image {full}"),
                 Size {
@@ -492,7 +517,7 @@ fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
             ),
             (
                 5,
-                libc::pid_t::try_from(layered_box.id()).expect("a pid"),
+                libc::pid_t::try_from(layered_box).expect("a pid"),
                 "session-five".to_string(),
                 format!("base {base} with harness layer {layer}"),
                 Size {
@@ -505,15 +530,12 @@ fn a_scan_tells_each_running_box_its_index_process_session_image_and_size() {
     for server in servers {
         server.join().expect("the API answers");
     }
-    for mut child in [full_box, layered_box] {
-        child.kill().expect("the box stops");
-        child.wait().expect("the box is reaped");
-    }
 }
 
 #[test]
 fn a_scan_reports_the_step_that_fails_for_each_box_and_scans_the_rest() {
-    let dir = scan_dir("failing");
+    let mut scan = ScanDir::new("failing");
+    let dir = scan.dir.clone();
     let images = dir.join("images");
     let data = dir.join("data");
     let cgroups = dir.join("cgroups");
@@ -521,13 +543,13 @@ fn a_scan_reports_the_step_that_fails_for_each_box_and_scans_the_rest() {
     let gone = "a".repeat(64);
     std::fs::write(images.join(format!("{gone}.ext4")), b"image").expect("an image without manifest");
     let disk = overlay(&data, "session-eight", 64);
-    let unknown_image = holding(&[&images.join(format!("{gone}.ext4")), &disk, Path::new("/dev/null")]);
-    let no_image = holding(&[&disk, Path::new("/dev/null"), Path::new("/dev/null")]);
+    let unknown_image = scan.holding(&[&images.join(format!("{gone}.ext4")), &disk, Path::new("/dev/null")]);
+    let no_image = scan.holding(&[&disk, Path::new("/dev/null"), Path::new("/dev/null")]);
     std::fs::create_dir_all(cgroups.join("box7")).expect("an empty scope cgroup");
     for (group, procs) in [
-        ("box8", format!("{}\n", unknown_image.id())),
-        ("box6", format!("{}\n", no_image.id())),
-        ("box4", format!("{}\n{}\n", unknown_image.id(), no_image.id())),
+        ("box8", format!("{unknown_image}\n")),
+        ("box6", format!("{no_image}\n")),
+        ("box4", format!("{unknown_image}\n{no_image}\n")),
     ] {
         std::fs::create_dir_all(cgroups.join(group)).expect("the scope cgroup");
         std::fs::write(cgroups.join(group).join("cgroup.procs"), procs).expect("cgroup.procs");
@@ -542,7 +564,7 @@ fn a_scan_reports_the_step_that_fails_for_each_box_and_scans_the_rest() {
     let scanned = vmm.scanned(
         "Id=tumpel-box7.scope\nControlGroup=/box7\n\nId=tumpel-box8.scope\nControlGroup=/box8\n\nId=tumpel-box9.scope\nControlGroup=\n\nId=tumpel-box6.scope\nControlGroup=/box6\n\nId=tumpel-box4.scope\nControlGroup=/box4\n\nId=tumpel-box07.scope\nControlGroup=/box7\n",
         &cgroups,
-    );
+    ).expect("the caches resolve");
 
     let failed: Vec<(u8, String)> = scanned
         .into_iter()
@@ -570,8 +592,4 @@ fn a_scan_reports_the_step_that_fails_for_each_box_and_scans_the_rest() {
         failed[4].1,
         "tumpel-box4.scope runs 2 processes, and a box scope runs its Firecracker process alone"
     );
-    for mut child in [unknown_image, no_image] {
-        child.kill().expect("the box stops");
-        child.wait().expect("the box is reaped");
-    }
 }

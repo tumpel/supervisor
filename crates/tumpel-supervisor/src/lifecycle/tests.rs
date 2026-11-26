@@ -23,8 +23,8 @@ use tumpel_api::types::{
 use tumpel_channel::{Ask, Key, Outgoing};
 
 use super::{
-    restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, Settings, SnapshotOrder, Stopped,
-    Taken, TeardownOrder, Vmm,
+    restore_budget, BoxTurn, Budgets, Command, Guest, Input, Lifecycle, Machine, ScannedBoxes, Settings, SnapshotOrder,
+    Stopped, Taken, TeardownOrder, Vmm,
 };
 use crate::boot::BootOrder;
 use crate::exchange::{Answer, Answers, Cancels};
@@ -429,6 +429,10 @@ impl Vmm for MemoryVmm {
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {
         note(&self.log, format!("keep boxes {claimed:?} and stop the rest"));
         Ok(())
+    }
+
+    fn scan(&self) -> Result<ScannedBoxes, String> {
+        Ok(Vec::new())
     }
 
     fn remove_leftovers(&self, _: &[u8], _: &[EntityId]) -> Result<(), String> {

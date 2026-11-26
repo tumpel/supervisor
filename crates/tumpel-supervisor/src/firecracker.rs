@@ -27,7 +27,7 @@ use crate::fd_store;
 use crate::guest_drive;
 use crate::images;
 use crate::layers::{self, LayerCache};
-use crate::lifecycle::{remove_dir, Guest, Machine, Stopped, Vmm};
+use crate::lifecycle::{remove_dir, Guest, Machine, Scanned, ScannedBoxes, Stopped, Vmm};
 use crate::pool::{Disk, Size, Tap};
 use crate::snapshot::Ext4Upper;
 
@@ -666,15 +666,6 @@ impl Firecracker {
     }
 }
 
-pub struct Scanned {
-    pub pid: libc::pid_t,
-    pub session_id: EntityId,
-    pub image: Boot,
-    pub size: Size,
-}
-
-pub type ScannedBoxes = Vec<(u8, Result<Scanned, String>)>;
-
 fn scopes(listing: &str) -> Vec<(u8, String)> {
     listing
         .split("\n\n")
@@ -742,28 +733,29 @@ struct Held {
 }
 
 impl Firecracker {
-    /// # Errors
-    /// Fails when systemd does not list the box scopes.
-    pub fn scan(&self) -> Result<ScannedBoxes, String> {
-        let listed = box_scopes(&["show", "--property=Id,ControlGroup"])?;
-        Ok(self.scanned(&listed, Path::new("/sys/fs/cgroup")))
-    }
-
-    fn scanned(&self, listing: &str, cgroups: &Path) -> ScannedBoxes {
-        scopes(listing)
-            .into_iter()
-            .map(|(index, group)| (index, self.scan_box(cgroups, index, &group)))
-            .collect()
-    }
-
-    fn scan_box(&self, cgroups: &Path, index: u8, group: &str) -> Result<Scanned, String> {
-        let pid = scope_pid(cgroups, index, group)?;
+    fn scanned(&self, listing: &str, cgroups: &Path) -> Result<ScannedBoxes, String> {
         let canonical = |dir: &Path| {
             dir.canonicalize()
                 .map_err(|error| format!("resolving {}: {error}", dir.display()))
         };
         let layers = LayerCache::new(&canonical(&self.images)?, NonZeroU32::MIN);
-        let held = held(pid, &canonical(&self.data)?.join("sessions"), &layers)?;
+        let sessions = canonical(&self.data)?.join("sessions");
+        Ok(scopes(listing)
+            .into_iter()
+            .map(|(index, group)| (index, self.scan_box(cgroups, &sessions, &layers, index, &group)))
+            .collect())
+    }
+
+    fn scan_box(
+        &self,
+        cgroups: &Path,
+        sessions: &Path,
+        layers: &LayerCache,
+        index: u8,
+        group: &str,
+    ) -> Result<Scanned, String> {
+        let pid = scope_pid(cgroups, index, group)?;
+        let held = held(pid, sessions, layers)?;
         let session = held
             .session
             .ok_or_else(|| format!("Firecracker process {pid} holds no box disk open"))?;
@@ -785,7 +777,7 @@ impl Firecracker {
                 base: images::cached_base(&self.images, &digest)
                     .map_err(|refusal| refusal.detail)?
                     .ok_or_else(|| missing(&format!("base {digest}")))?,
-                layer: layers::cached(&layers, &layer)
+                layer: layers::cached(layers, &layer)
                     .map_err(|refusal| refusal.detail)?
                     .ok_or_else(|| missing(&format!("harness layer {layer}")))?,
             }),
@@ -905,6 +897,11 @@ impl Vmm for Firecracker {
             end_child(pid);
         }
         drop(taken);
+    }
+
+    fn scan(&self) -> Result<ScannedBoxes, String> {
+        let listed = box_scopes(&["show", "--property=Id,ControlGroup"])?;
+        self.scanned(&listed, Path::new("/sys/fs/cgroup"))
     }
 
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String> {

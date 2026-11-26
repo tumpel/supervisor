@@ -197,11 +197,22 @@ pub trait Vmm: Send + Sync + 'static {
     fn disk(&self, drives: &[String]) -> Result<Disk, String>;
     fn discard(&self, handed: &SupervisorHandoverMachine);
     fn end_unclaimed(&self, claimed: &[u8]) -> Result<(), String>;
+    /// Lists the running box scopes, each with its process, session, image and size, or the step that failed for it.
+    fn scan(&self) -> Result<ScannedBoxes, String>;
     fn remove_leftovers(&self, boxes: &[u8], sessions: &[EntityId]) -> Result<(), String>;
     fn open_upper(&self, drive: &Path) -> Result<Self::Upper, String>;
     fn staging(&self, session_id: &EntityId) -> Result<PathBuf, String>;
     fn image_cache(&self) -> PathBuf;
 }
+
+pub struct Scanned {
+    pub pid: libc::pid_t,
+    pub session_id: EntityId,
+    pub image: Boot,
+    pub size: Size,
+}
+
+pub type ScannedBoxes = Vec<(u8, Result<Scanned, String>)>;
 
 pub struct BoxTurn {
     pub turn_id: EntityId,
