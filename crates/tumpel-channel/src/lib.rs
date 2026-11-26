@@ -283,6 +283,7 @@ impl RateLimit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ask {
+    SnapshotChunkCheck,
     SnapshotPacks,
     RestoreChunks,
     TurnClaim,
@@ -296,6 +297,14 @@ pub struct Key {
 }
 
 impl Key {
+    fn check(message: &Value) -> Option<Self> {
+        Some(Self {
+            ask: Ask::SnapshotChunkCheck,
+            id: message["snapshotId"].as_str()?.try_into().ok()?,
+            part: serde_json::from_value(message["check"].clone()).ok()?,
+        })
+    }
+
     fn restore(message: &Value) -> Option<Self> {
         Some(Self {
             ask: Ask::RestoreChunks,
@@ -319,6 +328,7 @@ impl fmt::Display for Key {
         let id = &*self.id;
         let part = self.part;
         match self.ask {
+            Ask::SnapshotChunkCheck => write!(out, "SnapshotChunkCheck {part} of snapshot {id}"),
             Ask::SnapshotPacks => write!(out, "SnapshotPacks part {part} of snapshot {id}"),
             Ask::RestoreChunks => write!(out, "RestoreChunks part {part} of turn {id}"),
             Ask::TurnClaim => write!(out, "the TurnClaim of turn {id}"),
@@ -769,9 +779,10 @@ impl<S: Store, K: Signer> HostChannel<S, K> {
                 (None, snapshot_id(&message))
             }
             Some("RestoreChunks") => (Key::restore(&message), None),
+            Some("SnapshotChunkCheck") => (Key::check(&message), None),
             _ => (None, None),
         };
-        if let Some(key) = &key {
+        if let Some(key) = key.as_ref().filter(|key| key.ask != Ask::SnapshotChunkCheck) {
             let failed = ChannelTurnFailed {
                 credential_file: None,
                 detail: refused

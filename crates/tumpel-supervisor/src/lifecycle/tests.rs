@@ -11,13 +11,14 @@ use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
 use tumpel_api::types::{
-    BoxRetention, ChannelBoxTeardownFailureReason, ChannelHostMessage, ChannelPackUrl, ChannelProtocol,
-    ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotDownload, ChannelSnapshotFailureReason,
-    ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType, ChannelSnapshotPacks, ChannelTurnClaimed,
-    ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId, GuestHarnessProtocol, GuestHello,
-    GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox, SupervisorHandoverBoxState,
-    SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot, SupervisorHandoverSnapshotKind,
-    SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
+    BoxRetention, ChannelBoxTeardownFailureReason, ChannelChunkPlacement, ChannelHostMessage, ChannelPackUrl,
+    ChannelProtocol, ChannelRestoreDownloads, ChannelRestoreDownloadsType, ChannelSnapshotChunkCheck,
+    ChannelSnapshotChunkCheckHeld, ChannelSnapshotChunkCheckHeldType, ChannelSnapshotDownload,
+    ChannelSnapshotFailureReason, ChannelSnapshotPackUploads, ChannelSnapshotPackUploadsType, ChannelSnapshotPacks,
+    ChannelTurnClaimed, ChannelTurnClaimedType, ChannelTurnWithdrawn, ChannelTurnWithdrawnType, EntityId,
+    GuestHarnessProtocol, GuestHello, GuestInput, GuestMessage, Sequence, SupervisorHandover, SupervisorHandoverBox,
+    SupervisorHandoverBoxState, SupervisorHandoverCommand, SupervisorHandoverMachine, SupervisorHandoverSnapshot,
+    SupervisorHandoverSnapshotKind, SupervisorHandoverTeardown, SupervisorHandoverTeardownKind, TurnFailureReason,
 };
 use tumpel_channel::{Ask, Key};
 
@@ -477,6 +478,8 @@ impl Vmm for MemoryVmm {
 
 #[derive(Default)]
 struct Index {
+    chunks: HashMap<String, ChannelChunkPlacement>,
+    refuse_checks: bool,
     packs: HashMap<String, std::num::NonZeroU64>,
 }
 
@@ -751,6 +754,27 @@ fn channel(mut from_lifecycle: UnboundedReceiver<ChannelHostMessage>) -> Unbound
     sent
 }
 
+fn check_answer(index: &Index, check: &ChannelSnapshotChunkCheck) -> Answer {
+    if index.refuse_checks {
+        let key = Key {
+            ask: Ask::SnapshotChunkCheck,
+            id: check.snapshot_id.clone(),
+            part: check.check,
+        };
+        return Answer::Refused(key, "message.type: Invalid option".to_string());
+    }
+    Answer::ChunkCheckHeld(ChannelSnapshotChunkCheckHeld {
+        check: check.check,
+        held: check
+            .digests
+            .iter()
+            .filter_map(|digest| index.chunks.get(digest.as_str()).cloned())
+            .collect(),
+        snapshot_id: check.snapshot_id.clone(),
+        type_: ChannelSnapshotChunkCheckHeldType::SnapshotChunkCheckHeld,
+    })
+}
+
 fn control_plane(
     store: MemoryStore,
     answers: Answers,
@@ -763,6 +787,10 @@ fn control_plane(
         while let Some(message) = from_lifecycle.recv().await {
             let mut index = store.2.lock().expect("index");
             match message {
+                ChannelHostMessage::SnapshotChunkCheck(check) => {
+                    answers.deliver(check_answer(&index, &check));
+                    forward(&sender, ChannelHostMessage::SnapshotChunkCheck(check));
+                }
                 ChannelHostMessage::SnapshotPacks(packs) => {
                     for pack in &packs.packs {
                         index
@@ -1446,6 +1474,163 @@ async fn a_snapshot_over_a_base_names_each_reused_pack_once_and_counts_every_pla
 
 fn pack_uploads(uploads: &[String]) -> usize {
     uploads.iter().filter(|url| url.contains("/packs/")).count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_checks_its_new_chunks_in_batches_of_100_and_packs_none_the_control_plane_holds() {
+    let mut host = host("checked", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    let contents: Vec<String> = (0..250).map(|file| format!("file {file:03}")).collect();
+    let digests: Vec<String> = contents
+        .iter()
+        .map(|text| crate::snapshot::hex(ring::digest::digest(&ring::digest::SHA256, text.as_bytes()).as_ref()))
+        .collect();
+    *host
+        .vmm
+        .drives
+        .lock()
+        .expect("drives")
+        .values_mut()
+        .next()
+        .expect("the box's drive") = contents
+        .iter()
+        .enumerate()
+        .map(|(file, text)| {
+            let found = Found {
+                entry: Entry {
+                    kind: Kind::File {
+                        size: text.len() as u64,
+                    },
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 1,
+                    mtime_nanos: 0,
+                },
+                born: Born { seconds: 1, nanos: 0 },
+            };
+            (
+                format!("root/file-{file:03}").into_bytes(),
+                (found, text.clone().into_bytes()),
+            )
+        })
+        .collect();
+    host.store.2.lock().expect("index").chunks = digests[..60]
+        .iter()
+        .enumerate()
+        .map(|(at, digest)| {
+            let placement = serde_json::from_value(
+                json!({"digest": digest, "packDigest": "b".repeat(64), "offset": at * 8, "length": 8}),
+            )
+            .expect("a placement");
+            (digest.clone(), placement)
+        })
+        .collect();
+
+    host.snapshot("session-1");
+    let mut checks = BTreeMap::new();
+    let mut packed = BTreeSet::new();
+    loop {
+        match tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
+            .await
+            .expect("the snapshot ends within its budget")
+            .expect("the lifecycle is running")
+        {
+            ChannelHostMessage::SnapshotChunkCheck(check) => {
+                checks.insert(check.check.get(), check.digests.len());
+            }
+            ChannelHostMessage::SnapshotPacks(packs) => {
+                packed.extend(packs.chunks.iter().map(|chunk| chunk.digest.as_str().to_string()));
+            }
+            ChannelHostMessage::SnapshotFailed(failed) => panic!("the snapshot failed: {failed:?}"),
+            ChannelHostMessage::SnapshotDone(_) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(checks.into_iter().collect::<Vec<_>>(), [(1, 100), (2, 100), (3, 50)]);
+    assert!(digests[..60].iter().all(|digest| !packed.contains(digest)));
+    assert!(digests[60..].iter().all(|digest| packed.contains(digest)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_chunk_check_still_stores_the_snapshot_with_every_chunk_packed() {
+    let mut host = host("check-refused", 1, Harness::Echo, Boot::Works);
+    host.turn("turn-1", "session-1", "one", Vec::new());
+    host.settle(SETTLE).await;
+    let contents: Vec<String> = (0..250).map(|file| format!("file {file:03}")).collect();
+    let digests: Vec<String> = contents
+        .iter()
+        .map(|text| crate::snapshot::hex(ring::digest::digest(&ring::digest::SHA256, text.as_bytes()).as_ref()))
+        .collect();
+    *host
+        .vmm
+        .drives
+        .lock()
+        .expect("drives")
+        .values_mut()
+        .next()
+        .expect("the box's drive") = contents
+        .iter()
+        .enumerate()
+        .map(|(file, text)| {
+            let found = Found {
+                entry: Entry {
+                    kind: Kind::File {
+                        size: text.len() as u64,
+                    },
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 1,
+                    mtime_nanos: 0,
+                },
+                born: Born { seconds: 1, nanos: 0 },
+            };
+            (
+                format!("root/file-{file:03}").into_bytes(),
+                (found, text.clone().into_bytes()),
+            )
+        })
+        .collect();
+    {
+        let mut index = host.store.2.lock().expect("index");
+        index.refuse_checks = true;
+        index.chunks = digests[..60]
+            .iter()
+            .enumerate()
+            .map(|(at, digest)| {
+                let placement = serde_json::from_value(
+                    json!({"digest": digest, "packDigest": "b".repeat(64), "offset": at * 8, "length": 8}),
+                )
+                .expect("a placement");
+                (digest.clone(), placement)
+            })
+            .collect();
+    }
+
+    host.snapshot("session-1");
+    let mut checked = 0;
+    let mut packed = BTreeSet::new();
+    loop {
+        match tokio::time::timeout(settings().budgets.snapshot, host.received.recv())
+            .await
+            .expect("the snapshot ends within its budget")
+            .expect("the lifecycle is running")
+        {
+            ChannelHostMessage::SnapshotChunkCheck(_) => checked += 1,
+            ChannelHostMessage::SnapshotPacks(packs) => {
+                packed.extend(packs.chunks.iter().map(|chunk| chunk.digest.as_str().to_string()));
+            }
+            ChannelHostMessage::SnapshotFailed(failed) => panic!("the snapshot failed: {failed:?}"),
+            ChannelHostMessage::SnapshotDone(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(checked >= 1);
+    assert!(digests.iter().all(|digest| packed.contains(digest)));
 }
 
 #[tokio::test]
