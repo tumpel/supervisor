@@ -160,6 +160,22 @@ fn a_failed_local_check_still_reports_the_other_checks() {
     }
 }
 
+#[test]
+fn the_image_cache_check_fails_a_read_only_guest_drive_directory_without_writing() {
+    for (mode, status) in [(0o555, "FAIL"), (0o755, "PASS")] {
+        let host = Host::new(&format!("guest-{mode:o}"), "http://127.0.0.1:9").expect("test host");
+        fs::create_dir(host.root.join("images/guest")).expect("guest drive directory");
+        fs::set_permissions(host.root.join("images/guest"), fs::Permissions::from_mode(mode))
+            .expect("guest drive directory mode");
+        let before = contents(&host.root).expect("read initial state");
+        let output = host.command(Path::new(BINARY)).output().expect("report exits");
+        let report = String::from_utf8(output.stdout).expect("report text");
+        assert_eq!(output.status.success(), status == "PASS", "{report}");
+        assert!(report.contains(&format!("{status} image cache: ")), "{report}");
+        assert_eq!(contents(&host.root).expect("read state after report"), before);
+    }
+}
+
 #[tokio::test]
 async fn explicit_check_still_dials_for_a_challenge_and_prints_a_supervisor_check_report() {
     let control_plane = tokio::net::TcpListener::bind("127.0.0.1:0")
