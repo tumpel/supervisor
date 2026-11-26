@@ -2608,7 +2608,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
                     Some(Input::HandOver(reply)) => self.start_handover(reply),
                     Some(Input::Abandon(reply, abandoned)) => self.abandon(reply, abandoned).await,
                     Some(Input::SnapshotAccepted(snapshot_id)) => self.snapshot_accepted(&snapshot_id).await?,
-                    Some(Input::SnapshotFailed(snapshot_id)) => self.snapshot_failed(snapshot_id)?,
+                    Some(Input::SnapshotFailed(snapshot_id)) => self.snapshot_failed(&snapshot_id)?,
                     Some(Input::SnapshotNotStored(snapshot_id)) => self.snapshot_not_stored(&snapshot_id)?,
                     Some(Input::Welcomed(protocol)) => self.welcomed(protocol).await?,
                     None => break,
@@ -3580,9 +3580,9 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         self.drain(session).await
     }
 
-    fn snapshot_failed(&mut self, snapshot_id: EntityId) -> Result<(), String> {
+    fn snapshot_failed(&mut self, snapshot_id: &EntityId) -> Result<(), String> {
         let running = self.slots.values_mut().find_map(|slot| {
-            if !matches!(&slot.snapshot, Some(Awaited::Pending(pending)) if *pending == snapshot_id) {
+            if !matches!(&slot.snapshot, Some(Awaited::Pending(pending)) if pending == snapshot_id) {
                 return None;
             }
             slot.snapshot = None;
@@ -3591,7 +3591,7 @@ impl<V: Vmm, S: Store> Lifecycle<V, S> {
         if running == Some(true) {
             self.runner.cancels.cancel(snapshot_id.clone());
         }
-        self.snapshot_not_stored(&snapshot_id)
+        self.snapshot_not_stored(snapshot_id)
     }
 
     fn snapshot_not_stored(&mut self, snapshot_id: &EntityId) -> Result<(), String> {
