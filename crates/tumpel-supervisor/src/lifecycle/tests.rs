@@ -1540,6 +1540,8 @@ async fn a_format_2_chunk_list_without_an_idx_restores_its_tar_stream_through_re
     for (path, content) in [("root/notes", notes.as_slice()), ("root/turn-1", b"one".as_slice())] {
         let mut header = tar::Header::new_gnu();
         header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
         header.set_size(content.len() as u64);
         header.set_mtime(1);
         tar.append_data(&mut header, path, content).expect("a tar entry");
