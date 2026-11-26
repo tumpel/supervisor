@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -167,8 +168,16 @@ fn the_image_cache_check_fails_a_read_only_guest_drive_directory_without_writing
         fs::create_dir(host.root.join("images/guest")).expect("guest drive directory");
         fs::set_permissions(host.root.join("images/guest"), fs::Permissions::from_mode(mode))
             .expect("guest drive directory mode");
+        let binary = host.root.join("supervisor");
+        fs::copy(BINARY, &binary).expect("fixture binary any uid can run");
+        let mut command = host.command(&binary);
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(host.root.join("images/guest"), Some(65534), Some(65534))
+                .expect("hand the guest drive directory to an unprivileged uid");
+            command.uid(65534).gid(65534);
+        }
         let before = contents(&host.root).expect("read initial state");
-        let output = host.command(Path::new(BINARY)).output().expect("report exits");
+        let output = command.output().expect("report exits");
         let report = String::from_utf8(output.stdout).expect("report text");
         assert_eq!(output.status.success(), status == "PASS", "{report}");
         assert!(report.contains(&format!("{status} image cache: ")), "{report}");

@@ -34,15 +34,22 @@ fn dir(images: &Path) -> PathBuf {
 
 pub(crate) fn check_writable(images: &Path) -> Result<&'static str, String> {
     let dir = dir(images);
-    let target = if dir.exists() { dir.as_path() } else { images };
+    let (target, fix) = if dir.exists() {
+        (
+            dir.as_path(),
+            format!("make {} writable by the supervisor", dir.display()),
+        )
+    } else {
+        (
+            images,
+            "make imageCacheDir in runtime.json a writable directory".to_string(),
+        )
+    };
     let path = CString::new(target.as_os_str().as_bytes())
         .map_err(|error| format!("{} is not a valid path: {error}", target.display()))?;
     if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
-        return Err(format!(
-            "{} is not writable: {}; make imageCacheDir in runtime.json a writable directory",
-            target.display(),
-            io::Error::last_os_error()
-        ));
+        let error = io::Error::last_os_error();
+        return Err(format!("{} is not writable: {error}; {fix}", target.display()));
     }
     Ok("cache directory is readable and the guest drive directory is writable")
 }
